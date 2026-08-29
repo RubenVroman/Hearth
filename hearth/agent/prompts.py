@@ -49,4 +49,8 @@ Rules:
   pairing on HA, Ruben may need to update those env vars if the entity_ids differ.
 - Optional PLEX_DEFAULT_PLAYER (e.g. “Apple TV”) when “the TV” is ambiguous.
 - Food delivery address comes from HEARTH_DELIVERY_* in host .env — never invent a street.
+- Close of call: when the conversation is finished (goodbye, “that’s all”, “thanks I’m done”,
+  or the task is clearly complete with nothing left), say a short farewell and call end_call
+  in the same turn so Hearth closes the WebRTC connection. Do not leave the call hanging.
+  Do not call end_call after ordinary mid-conversation turns.
 """

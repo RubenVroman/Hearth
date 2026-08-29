@@ -88,12 +88,15 @@ def test_login_and_home_are_installable_and_phone_ready():
     app_js = (UI / "app.js").read_text(encoding="utf-8")
     assert "displayRole" in app_js
     assert "conversation.item.input_audio_transcription.completed" in app_js
+    assert "pendingHangup" in app_js
+    assert 'event.name === "end_call"' in app_js
     settings_js = (UI / "settings.js").read_text(encoding="utf-8")
     assert "hearth.look.v1" in settings_js
     assert "HearthSettings" in settings_js
     assert "localStorage" in settings_js
     assert ".settings-sheet" in css
     assert 'html[data-theme="ash"]' in css
+    assert "hearth-shell-v6" in (UI / "sw.js").read_text(encoding="utf-8")
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200

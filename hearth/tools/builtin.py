@@ -245,6 +245,12 @@ async def _get_weather(args: dict[str, Any]) -> dict[str, Any]:
     place = args.get("place")
     return await fetch_weather(place=str(place) if place else None)
 
+async def _end_call(args: dict[str, Any]) -> dict[str, Any]:
+    """Signal close-of-call. Sideband / client tear down the live WebRTC session."""
+    reason = str(args.get("reason") or "close_of_call").strip() or "close_of_call"
+    return {"ok": True, "ended": True, "reason": reason}
+
+
 def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
@@ -745,6 +751,27 @@ def register_builtin_tools() -> None:
             handler=_tb_order,
             destructive=True,
             preview=_tb_order_preview,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="end_call",
+            description=(
+                "End the live voice conversation and close the connection. Call this when the "
+                "exchange is finished — explicit goodbye/done, nothing left to do, or a natural "
+                "close-of-call. Say a brief farewell first, then call end_call in the same turn. "
+                "Do not use between ordinary turns."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the call is ending, e.g. goodbye, done, natural_end.",
+                    }
+                },
+            },
+            handler=_end_call,
         )
     )
     load_workspace_skills()
