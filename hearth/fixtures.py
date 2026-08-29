@@ -229,6 +229,279 @@ def _filter_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any
 pipeline = MockPipeline()
 
 
+MOCK_THUISBEZORGD_RESTAURANTS: list[dict[str, Any]] = [
+    {
+        "id": "resto-napoli",
+        "name": "Pizzeria Napoli",
+        "cuisine": ["Pizza", "Italian"],
+        "rating": 4.6,
+        "delivery_fee_cents": 249,
+        "eta_minutes": 35,
+    },
+    {
+        "id": "resto-saigon",
+        "name": "Saigon Kitchen",
+        "cuisine": ["Vietnamese", "Asian"],
+        "rating": 4.4,
+        "delivery_fee_cents": 199,
+        "eta_minutes": 40,
+    },
+    {
+        "id": "resto-burgerbar",
+        "name": "Burger Bar VAULT",
+        "cuisine": ["Burgers", "American"],
+        "rating": 4.2,
+        "delivery_fee_cents": 299,
+        "eta_minutes": 30,
+    },
+]
+
+MOCK_THUISBEZORGD_MENUS: dict[str, dict[str, Any]] = {
+    "resto-napoli": {
+        "restaurant_id": "resto-napoli",
+        "restaurant": "Pizzeria Napoli",
+        "items": [
+            {
+                "id": "napoli-margherita",
+                "name": "Margherita",
+                "description": "Tomato, mozzarella, basil",
+                "price_cents": 950,
+                "price": "€9.50",
+                "category": "Pizza",
+            },
+            {
+                "id": "napoli-diavola",
+                "name": "Diavola",
+                "description": "Spicy salami, mozzarella",
+                "price_cents": 1250,
+                "price": "€12.50",
+                "category": "Pizza",
+            },
+            {
+                "id": "napoli-garlic",
+                "name": "Garlic bread",
+                "description": "Side",
+                "price_cents": 450,
+                "price": "€4.50",
+                "category": "Sides",
+            },
+        ],
+    },
+    "resto-saigon": {
+        "restaurant_id": "resto-saigon",
+        "restaurant": "Saigon Kitchen",
+        "items": [
+            {
+                "id": "saigon-pho",
+                "name": "Phở bò",
+                "description": "Beef noodle soup",
+                "price_cents": 1350,
+                "price": "€13.50",
+                "category": "Noodles",
+            },
+            {
+                "id": "saigon-banhmi",
+                "name": "Bánh mì",
+                "description": "Crispy baguette",
+                "price_cents": 850,
+                "price": "€8.50",
+                "category": "Sandwiches",
+            },
+        ],
+    },
+    "resto-burgerbar": {
+        "restaurant_id": "resto-burgerbar",
+        "restaurant": "Burger Bar VAULT",
+        "items": [
+            {
+                "id": "bb-classic",
+                "name": "Classic burger",
+                "description": "Beef, cheddar, pickles",
+                "price_cents": 1150,
+                "price": "€11.50",
+                "category": "Burgers",
+            },
+            {
+                "id": "bb-fries",
+                "name": "Fries",
+                "description": "Salted",
+                "price_cents": 350,
+                "price": "€3.50",
+                "category": "Sides",
+            },
+        ],
+    },
+}
+
+
+class MockThuisbezorgd:
+    """In-memory Thuisbezorgd kitchen so browse/cart/order work without partner keys."""
+
+    def __init__(self) -> None:
+        self.restaurants: list[dict[str, Any]] = deepcopy(MOCK_THUISBEZORGD_RESTAURANTS)
+        self.menus: dict[str, dict[str, Any]] = deepcopy(MOCK_THUISBEZORGD_MENUS)
+        self.cart: dict[str, Any] = _empty_cart()
+        self.orders: list[dict[str, Any]] = []
+        self._order_seq = 0
+
+    def list_restaurants(self, *, cuisine: str = "", query: str = "") -> list[dict[str, Any]]:
+        rows = deepcopy(self.restaurants)
+        cuisine_needle = (cuisine or "").strip().lower()
+        query_needle = (query or "").strip().lower()
+        if cuisine_needle:
+            rows = [
+                r
+                for r in rows
+                if any(cuisine_needle in str(c).lower() for c in (r.get("cuisine") or []))
+            ]
+        if query_needle:
+            rows = [r for r in rows if query_needle in str(r.get("name") or "").lower()]
+        return rows
+
+    def get_menu(self, restaurant_id: str) -> dict[str, Any]:
+        menu = self.menus.get(restaurant_id)
+        if menu is None:
+            return {"ok": False, "error": f"unknown restaurant {restaurant_id}"}
+        return {"ok": True, **deepcopy(menu)}
+
+    def cart_snapshot(self) -> dict[str, Any]:
+        return deepcopy(self.cart)
+
+    def add_to_cart(
+        self,
+        *,
+        restaurant_id: str,
+        item_id: str,
+        quantity: int = 1,
+        notes: str = "",
+    ) -> dict[str, Any]:
+        restaurant_id = (restaurant_id or "").strip()
+        item_id = (item_id or "").strip()
+        qty = max(1, int(quantity or 1))
+        menu = self.menus.get(restaurant_id)
+        if menu is None:
+            return {"ok": False, "error": f"unknown restaurant {restaurant_id}"}
+        product = next((p for p in menu["items"] if p["id"] == item_id), None)
+        if product is None:
+            return {"ok": False, "error": f"unknown item {item_id}"}
+
+        current_rid = self.cart.get("restaurant_id")
+        if current_rid and current_rid != restaurant_id:
+            return {
+                "ok": False,
+                "error": (
+                    f"cart already has items from {self.cart.get('restaurant', {}).get('name')}; "
+                    "clear the cart before ordering from another restaurant"
+                ),
+                "cart": self.cart_snapshot(),
+            }
+
+        resto = next((r for r in self.restaurants if r["id"] == restaurant_id), None)
+        self.cart["restaurant_id"] = restaurant_id
+        self.cart["restaurant"] = {
+            "id": restaurant_id,
+            "name": (resto or {}).get("name") or menu.get("restaurant"),
+        }
+        existing = next(
+            (i for i in self.cart["items"] if i["item_id"] == item_id),
+            None,
+        )
+        if existing:
+            existing["quantity"] += qty
+            if notes:
+                existing["notes"] = notes
+        else:
+            self.cart["items"].append(
+                {
+                    "item_id": item_id,
+                    "name": product["name"],
+                    "quantity": qty,
+                    "unit_price_cents": product["price_cents"],
+                    "price_cents": product["price_cents"] * qty,
+                    "price": _eur(product["price_cents"] * qty),
+                    "notes": notes or "",
+                }
+            )
+        self._reprice_cart()
+        return {"ok": True, "added": {"item_id": item_id, "quantity": qty}, "cart": self.cart_snapshot()}
+
+    def remove_from_cart(self, item_id: str) -> dict[str, Any]:
+        item_id = (item_id or "").strip()
+        before = len(self.cart["items"])
+        self.cart["items"] = [i for i in self.cart["items"] if i.get("item_id") != item_id]
+        if not self.cart["items"]:
+            self.cart = _empty_cart()
+        else:
+            self._reprice_cart()
+        return {
+            "ok": True,
+            "removed": item_id if before != len(self.cart["items"]) else None,
+            "cart": self.cart_snapshot(),
+        }
+
+    def clear_cart(self) -> dict[str, Any]:
+        self.cart = _empty_cart()
+        return {"ok": True, "cart": self.cart_snapshot()}
+
+    def place_order(self, *, delivery_line: str) -> dict[str, Any]:
+        self._order_seq += 1
+        order = {
+            "id": f"mock-order-{self._order_seq:04d}",
+            "status": "accepted",
+            "restaurant": deepcopy(self.cart.get("restaurant")),
+            "items": deepcopy(self.cart.get("items") or []),
+            "total_cents": self.cart.get("total_cents") or 0,
+            "total": self.cart.get("total") or "€0.00",
+            "currency": "EUR",
+            "delivery_address": delivery_line,
+            "live": False,
+        }
+        self.orders.append(deepcopy(order))
+        self.cart = _empty_cart()
+        return order
+
+    def _reprice_cart(self) -> None:
+        total = 0
+        for item in self.cart["items"]:
+            item["price_cents"] = int(item["unit_price_cents"]) * int(item["quantity"])
+            item["price"] = _eur(item["price_cents"])
+            total += item["price_cents"]
+        fee = 0
+        rid = self.cart.get("restaurant_id")
+        if rid:
+            resto = next((r for r in self.restaurants if r["id"] == rid), None)
+            fee = int((resto or {}).get("delivery_fee_cents") or 0)
+        self.cart["delivery_fee_cents"] = fee
+        self.cart["delivery_fee"] = _eur(fee)
+        self.cart["subtotal_cents"] = total
+        self.cart["subtotal"] = _eur(total)
+        self.cart["total_cents"] = total + fee
+        self.cart["total"] = _eur(total + fee)
+        self.cart["currency"] = "EUR"
+
+
+def _empty_cart() -> dict[str, Any]:
+    return {
+        "restaurant_id": None,
+        "restaurant": None,
+        "items": [],
+        "subtotal_cents": 0,
+        "subtotal": "€0.00",
+        "delivery_fee_cents": 0,
+        "delivery_fee": "€0.00",
+        "total_cents": 0,
+        "total": "€0.00",
+        "currency": "EUR",
+    }
+
+
+def _eur(cents: int) -> str:
+    return f"€{int(cents) / 100:.2f}"
+
+
+mock_thuisbezorgd = MockThuisbezorgd()
+
+
 class MockHouse:
     """Mutable in-memory house so mocked lights actually toggle in the UI."""
 

@@ -11,6 +11,7 @@ from hearth.tools.ha import ha
 from hearth.tools.media import house_media_inventory, media_control
 from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
+from hearth.tools.thuisbezorgd import thuisbezorgd
 
 
 async def _ha_list(args: dict[str, Any]) -> dict[str, Any]:
@@ -167,6 +168,77 @@ async def _overseerr_request(args: dict[str, Any]) -> dict[str, Any]:
         media_id=int(media_id) if media_id else None,
         media_type=str(args.get("mediaType") or "") or None,
     )
+
+
+async def _tb_restaurants(args: dict[str, Any]) -> dict[str, Any]:
+    return await thuisbezorgd.restaurants(
+        cuisine=str(args.get("cuisine") or ""),
+        query=str(args.get("query") or ""),
+    )
+
+
+async def _tb_menu(args: dict[str, Any]) -> dict[str, Any]:
+    restaurant_id = str(args.get("restaurant_id") or args.get("restaurantId") or "")
+    return await thuisbezorgd.menu(restaurant_id)
+
+
+async def _tb_cart(args: dict[str, Any]) -> dict[str, Any]:
+    action = str(args.get("action") or "view").strip().lower()
+    if action in {"view", "show", "get", "status"}:
+        return thuisbezorgd.cart_view()
+    if action in {"clear", "empty", "reset"}:
+        return thuisbezorgd.cart_clear()
+    if action in {"remove", "delete"}:
+        item_id = str(args.get("item_id") or args.get("itemId") or "")
+        if not item_id:
+            return {"ok": False, "error": "item_id required to remove from cart"}
+        return thuisbezorgd.cart_remove(item_id)
+    if action in {"add", "put"}:
+        restaurant_id = str(args.get("restaurant_id") or args.get("restaurantId") or "")
+        item_id = str(args.get("item_id") or args.get("itemId") or "")
+        if not restaurant_id or not item_id:
+            return {"ok": False, "error": "restaurant_id and item_id required to add"}
+        qty = args.get("quantity")
+        return thuisbezorgd.cart_add(
+            restaurant_id=restaurant_id,
+            item_id=item_id,
+            quantity=int(qty) if qty is not None else 1,
+            notes=str(args.get("notes") or ""),
+        )
+    return {
+        "ok": False,
+        "error": f"unknown cart action {action!r}; use view, add, remove, or clear",
+    }
+
+
+async def _tb_auth(_args: dict[str, Any]) -> dict[str, Any]:
+    return thuisbezorgd.auth_status()
+
+
+async def _tb_order(_args: dict[str, Any]) -> dict[str, Any]:
+    # confirm/dry-run enforced by ToolRegistry (destructive=True).
+    return await thuisbezorgd.place_order()
+
+
+def _tb_order_preview(_args: dict[str, Any]) -> dict[str, Any]:
+    """Attach restaurant / items / price / address so Confirm UX is speakable."""
+    address = thuisbezorgd.delivery_address()
+    cart = thuisbezorgd.cart_view().get("cart") or {}
+    return {
+        "restaurant": cart.get("restaurant"),
+        "items": cart.get("items") or [],
+        "total": cart.get("total"),
+        "total_cents": cart.get("total_cents"),
+        "delivery_address": address.get("line") or None,
+        "delivery_configured": address.get("configured"),
+        "live_submit_ready": thuisbezorgd.live_submit_ready,
+        "widget": "order_status",
+        "summary": (
+            f"{(cart.get('restaurant') or {}).get('name') or 'Restaurant'}: "
+            f"{len(cart.get('items') or [])} item(s) for {cart.get('total') or '€0.00'} "
+            f"→ {address.get('line') or '(set HEARTH_DELIVERY_* )'}"
+        ),
+    }
 
 
 def register_builtin_tools() -> None:
@@ -566,6 +638,93 @@ def register_builtin_tools() -> None:
             },
             handler=_overseerr_request,
             destructive=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="thuisbezorgd_restaurants",
+            description=(
+                "Browse nearby Thuisbezorgd restaurants for the house delivery address "
+                "(HEARTH_DELIVERY_*). Optional cuisine or name query. Returns a restaurant_list "
+                "payload the UI may overlay later."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "cuisine": {"type": "string", "description": "e.g. pizza, vietnamese"},
+                    "query": {"type": "string", "description": "Restaurant name filter"},
+                },
+            },
+            handler=_tb_restaurants,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="thuisbezorgd_menu",
+            description="Fetch a Thuisbezorgd restaurant menu by restaurant_id from thuisbezorgd_restaurants.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "restaurant_id": {"type": "string"},
+                },
+                "required": ["restaurant_id"],
+            },
+            handler=_tb_menu,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="thuisbezorgd_cart",
+            description=(
+                "View or mutate the in-session Thuisbezorgd cart. "
+                "action=view|add|remove|clear. For add: restaurant_id + item_id (+ optional quantity)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "view, add, remove, or clear",
+                    },
+                    "restaurant_id": {"type": "string"},
+                    "item_id": {"type": "string"},
+                    "quantity": {"type": "integer"},
+                    "notes": {"type": "string"},
+                },
+            },
+            handler=_tb_cart,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="thuisbezorgd_auth_status",
+            description=(
+                "Thuisbezorgd auth/config status (partner key present?, session?, delivery address). "
+                "Never returns credentials or tokens."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_tb_auth,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="thuisbezorgd_order",
+            description=(
+                "Place the current Thuisbezorgd cart. Spends money — destructive: dry-run unless "
+                "confirm=true. Before confirm, preview shows restaurant, items, price, and delivery "
+                "address. No auto-reorder. Live paid submit only when THUISBEZORGD_API_KEY + session "
+                "are configured; otherwise confirm places a fixture order only."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+            },
+            handler=_tb_order,
+            destructive=True,
+            preview=_tb_order_preview,
         )
     )
     load_workspace_skills()

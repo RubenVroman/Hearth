@@ -7,6 +7,7 @@ from hearth.runtime import PendingConfirm, runtime
 
 Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 ConfiguredFn = Callable[[], bool]
+PreviewFn = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 @dataclass
@@ -19,6 +20,8 @@ class ToolSpec:
     source: str = "builtin"
     configured: ConfiguredFn | None = None
     not_configured: str = ""
+    # Optional enricher for dry-run / confirm previews (e.g. cart + address).
+    preview: PreviewFn | None = None
 
 
 @dataclass
@@ -119,6 +122,13 @@ class ToolRegistry:
                     "would_call_with": preview_args,
                     "hint": "Re-run with confirm=true to execute. Destructive tools default to dry-run.",
                 }
+                if spec.preview is not None:
+                    try:
+                        extra = spec.preview(preview_args)
+                        if isinstance(extra, dict):
+                            preview.update(extra)
+                    except Exception as exc:  # noqa: BLE001
+                        preview["preview_error"] = str(exc)
                 runtime.pending = PendingConfirm(
                     tool=name,
                     args=args,

@@ -4,6 +4,7 @@ from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.media import house_media_inventory, media_control
 from hearth.tools.plex import plex
+from hearth.tools.thuisbezorgd import thuisbezorgd
 
 __all__ = [
     "register_builtin_tools",
@@ -15,4 +16,5 @@ __all__ = [
     "radarr",
     "sonarr",
     "overseerr",
+    "thuisbezorgd",
 ]
