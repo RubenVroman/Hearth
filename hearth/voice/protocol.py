@@ -20,6 +20,7 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
 
 def session_update_payload(tools: list[dict[str, Any]]) -> dict[str, Any]:
     from hearth.agent.prompts import SYSTEM_PROMPT
+    from hearth.voice.vad import audio_input_config
 
     return {
         "type": "session.update",
@@ -29,9 +30,7 @@ def session_update_payload(tools: list[dict[str, Any]]) -> dict[str, Any]:
             "instructions": SYSTEM_PROMPT,
             "output_modalities": ["audio"],
             "audio": {
-                "input": {
-                    "turn_detection": {"type": "semantic_vad"},
-                },
+                "input": audio_input_config(),
                 "output": {
                     "voice": settings.openai_tts_voice,
                 },
