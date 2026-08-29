@@ -78,7 +78,17 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "min-height: 28vh" not in css
     assert 'id="logout-btn"' in index_html
     assert 'id="agent-pill"' in index_html
+    assert 'id="settings-btn"' in index_html
+    assert 'id="settings-sheet"' in index_html
+    assert "/static/settings.js" in index_html
     assert "setEmpty" in (UI / "app.js").read_text(encoding="utf-8")
+    settings_js = (UI / "settings.js").read_text(encoding="utf-8")
+    assert "hearth.look.v1" in settings_js
+    assert "HearthSettings" in settings_js
+    assert "localStorage" in settings_js
+    assert ".settings-sheet" in css
+    assert 'html[data-theme="ash"]' in css
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200
+    assert "/static/settings.js" in (UI / "sw.js").read_text(encoding="utf-8")
