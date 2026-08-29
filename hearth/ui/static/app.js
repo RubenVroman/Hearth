@@ -188,11 +188,20 @@ function renderStatus(status) {
   }
 }
 
+function displayRole(role) {
+  const raw = String(role || "").toLowerCase();
+  if (raw === "user" || raw === "you") return "you";
+  if (raw === "assistant" || raw === "hearth") return "hearth";
+  if (raw === "system") return "system";
+  return raw || "system";
+}
+
 function appendLog(role, text) {
   if (!text) return;
   const log = $("log");
   const li = document.createElement("li");
-  li.innerHTML = `<span class="who">${role}</span>${text}`;
+  li.dataset.role = displayRole(role);
+  li.innerHTML = `<span class="who">${displayRole(role)}</span>${text}`;
   log.appendChild(li);
   log.scrollTop = log.scrollHeight;
   setEmpty("transcript", false);
@@ -227,7 +236,7 @@ async function refresh() {
   if ($("log").childElementCount === 0) {
     for (const line of transcript.lines || []) {
       if (line.kind === "delta") continue;
-      appendLog(line.role, line.text);
+      appendLog(displayRole(line.role), line.text);
     }
   }
   setEmpty("transcript", $("log").childElementCount === 0);
@@ -279,7 +288,11 @@ function onRealtimeEvent(event) {
   if (type === "response.output_audio_transcript.done" || type === "response.audio_transcript.done") {
     appendLog("hearth", event.transcript);
   }
-  if (type === "conversation.item.input_audio_transcription.completed") {
+  // User speech — requires session audio.input.transcription (see webrtc.session_config).
+  if (
+    type === "conversation.item.input_audio_transcription.completed" ||
+    type === "conversation.item.audio_transcription.completed"
+  ) {
     appendLog("you", event.transcript);
   }
   if (type === "error") {

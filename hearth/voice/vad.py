@@ -40,9 +40,15 @@ def turn_detection_config() -> dict[str, Any]:
     }
 
 
+def transcription_config() -> dict[str, str]:
+    """GA Realtime input transcription for live user turns in the phone UI."""
+    return {"model": "gpt-4o-mini-transcribe"}
+
+
 def audio_input_config() -> dict[str, Any]:
     return {
         "noise_reduction": noise_reduction_config(),
+        "transcription": transcription_config(),
         "turn_detection": turn_detection_config(),
     }
 

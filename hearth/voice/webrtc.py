@@ -56,6 +56,11 @@ def session_config() -> dict[str, Any]:
     ``noise_reduction`` runs before server VAD so TV/HVAC energy is less likely
     to fire ``speech_started``. Client barge-in gate (``/static/vad.js``) adds a
     second speech-band check while the assistant is talking.
+
+    Input ``transcription`` is required for
+    ``conversation.item.input_audio_transcription.completed`` so the phone UI
+    can show what the user said. This is live-session display only — it does
+    not change house memory pipelines.
     """
     return {
         "type": "realtime",
@@ -165,7 +170,10 @@ class Sideband:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("assistant", text)
-        elif etype == "conversation.item.input_audio_transcription.completed":
+        elif etype in {
+            "conversation.item.input_audio_transcription.completed",
+            "conversation.item.audio_transcription.completed",
+        }:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("user", text)
