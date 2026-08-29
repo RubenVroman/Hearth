@@ -103,6 +103,8 @@ class Sideband:
         self._ws = None
         self._pump: asyncio.Task[None] | None = None
         self._done_calls: set[str] = set()
+        self._pending_hangup = False
+        self._hangup_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         url = f"{SIDEBAND_URL}?call_id={self.call_id}"
@@ -116,6 +118,15 @@ class Sideband:
         runtime.agent_status = "listening"
 
     async def close(self) -> None:
+        self._pending_hangup = False
+        current = asyncio.current_task()
+        if (
+            self._hangup_task is not None
+            and not self._hangup_task.done()
+            and self._hangup_task is not current
+        ):
+            self._hangup_task.cancel()
+            self._hangup_task = None
         if self._pump is not None:
             self._pump.cancel()
             self._pump = None
@@ -129,6 +140,20 @@ class Sideband:
             runtime.voice_mode = "disconnected"
             runtime.openai_live = False
             runtime.agent_status = "idle"
+
+    def _schedule_hangup(self) -> None:
+        """Close this call once the current Realtime response has finished."""
+        if self._hangup_task is not None and not self._hangup_task.done():
+            return
+        self._hangup_task = asyncio.create_task(self._hangup_self())
+
+    async def _hangup_self(self) -> None:
+        band = _sidebands.pop(self.call_id, None)
+        self._hangup_task = None
+        if band is self or band is None:
+            await self.close()
+        elif band is not None:
+            await band.close()
 
     async def _listen(self) -> None:
         assert self._ws is not None
@@ -174,6 +199,8 @@ class Sideband:
         elif etype == "response.done":
             await self._handle_function_calls(event)
             runtime.agent_status = "listening"
+            if self._pending_hangup:
+                self._schedule_hangup()
         elif etype == "error":
             err = event.get("error") or event
             runtime.voice_reason = str(err)[:300]
@@ -222,6 +249,11 @@ class Sideband:
                 }
             )
         )
+        if name == "end_call":
+            # Close after this response finishes so farewell audio can play.
+            self._pending_hangup = True
+            runtime.voice_reason = f"close_of_call:{result.get('reason', 'close_of_call')}"
+            return
         await self._ws.send(dumps({"type": "response.create"}))
 
 

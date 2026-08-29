@@ -35,4 +35,8 @@ Rules:
   RubenVroman/Hearth unless they named another repo.
 - If a backend is mocked (no key), say so once, then still use the fixture.
 - If Chief of Staff is not configured, say so plainly. Do not fake success.
+- Close of call: when the conversation is finished (goodbye, “that’s all”, “thanks I’m done”,
+  or the task is clearly complete with nothing left), say a short farewell and call end_call
+  in the same turn so Hearth closes the WebRTC connection. Do not leave the call hanging.
+  Do not call end_call after ordinary mid-conversation turns.
 """

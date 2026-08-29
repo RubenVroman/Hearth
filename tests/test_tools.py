@@ -175,3 +175,14 @@ async def test_radarr_add_with_confirm_queues_mock():
     assert result.ok
     assert not result.needs_confirm
     assert result.data["added"]["title"]
+
+
+async def test_end_call_is_registered_and_not_destructive():
+    result = await registry.call("end_call", {"reason": "natural_end"})
+    assert result.ok
+    assert not result.needs_confirm
+    assert result.data["ended"] is True
+    assert result.data["reason"] == "natural_end"
+    public = {t["name"]: t for t in registry.list_public()}
+    assert "end_call" in public
+    assert public["end_call"]["destructive"] is False

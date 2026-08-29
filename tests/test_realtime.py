@@ -1,5 +1,8 @@
 from unittest.mock import patch
 
+import json
+import pytest
+
 from hearth.config import settings
 from hearth.voice import webrtc as realtime_rtc
 
@@ -195,3 +198,78 @@ def test_secret_value_reads_ga_and_nested_shapes():
     assert realtime_rtc.secret_value({"value": "ek_abc"}) == "ek_abc"
     assert realtime_rtc.secret_value({"client_secret": {"value": "ek_nested"}}) == "ek_nested"
     assert realtime_rtc.secret_value({}) is None
+
+
+@pytest.mark.asyncio
+async def test_end_call_tool_marks_close_of_call():
+    from hearth.agent.registry import registry
+
+    result = await registry.call("end_call", {"reason": "goodbye"})
+    assert result.ok
+    assert result.data["ended"] is True
+    assert result.data["reason"] == "goodbye"
+    tools = {t["name"] for t in registry.openai_realtime_tools()}
+    assert "end_call" in tools
+
+
+@pytest.mark.asyncio
+async def test_sideband_end_call_closes_after_response_done(monkeypatch):
+    """Close-of-call: end_call tool → response.done → sideband hangup (no extra response.create)."""
+    sent: list[dict] = []
+    closed = {"n": 0}
+
+    class DummyWS:
+        async def send(self, msg):
+            sent.append(json.loads(msg) if isinstance(msg, str) else msg)
+
+        async def close(self):
+            closed["n"] += 1
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    band = realtime_rtc.Sideband("rtc_close_test")
+    band._ws = DummyWS()
+    realtime_rtc._sidebands["rtc_close_test"] = band
+
+    await band._on_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "end_call",
+            "arguments": '{"reason":"goodbye"}',
+            "call_id": "call_end_1",
+        }
+    )
+    assert band._pending_hangup is True
+    assert any(m.get("type") == "conversation.item.create" for m in sent)
+    assert not any(m.get("type") == "response.create" for m in sent)
+
+    await band._on_event({"type": "response.done", "response": {"output": []}})
+    # Hangup is scheduled as a task; let it run.
+    if band._hangup_task is not None:
+        await band._hangup_task
+
+    assert "rtc_close_test" not in realtime_rtc._sidebands
+    assert closed["n"] >= 1
+    assert band._ws is None
+
+
+@pytest.mark.asyncio
+async def test_sideband_house_tool_still_requests_follow_up_response():
+    sent: list[dict] = []
+
+    class DummyWS:
+        async def send(self, msg):
+            sent.append(json.loads(msg) if isinstance(msg, str) else msg)
+
+        async def close(self):
+            return None
+
+    band = realtime_rtc.Sideband("rtc_tool_test")
+    band._ws = DummyWS()
+    await band._run_function_call("plex_now_playing", "{}", "call_plex_1")
+    assert any(m.get("type") == "response.create" for m in sent)
+    assert band._pending_hangup is False

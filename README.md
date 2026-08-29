@@ -104,7 +104,9 @@ Reach Plex on the existing stack:
 
 Live voice is the **GA OpenAI Realtime API over WebRTC** — the same family as ChatGPT Advanced Voice / GPT Realtime. It is **not** hold-to-talk, and it is **not** the old beta websocket.
 
-**Live** (key present): the browser opens `RTCPeerConnection`, POSTs SDP to Hearth `POST /api/realtime/calls`, and Hearth forwards a multipart `sdp` + `session` to `https://api.openai.com/v1/realtime/calls` with the NAS `OPENAI_API_KEY`. No `OpenAI-Beta` header. Mic uses browser AEC (`echoCancellation`) and remote audio plays through a hidden `<audio>` element so you can interrupt. House tools (`ha_*`, `plex_*`, `radarr_*`, `sonarr_*`, `overseerr_*`, `workspace_*`, `docker_*`, `chief_of_staff`) run on Hearth over a sideband `wss://api.openai.com/v1/realtime?call_id=…`.
+**Live** (key present): the browser opens `RTCPeerConnection`, POSTs SDP to Hearth `POST /api/realtime/calls`, and Hearth forwards a multipart `sdp` + `session` to `https://api.openai.com/v1/realtime/calls` with the NAS `OPENAI_API_KEY`. No `OpenAI-Beta` header. Mic uses browser AEC (`echoCancellation`) and remote audio plays through a hidden `<audio>` element so you can interrupt. House tools (`ha_*`, `plex_*`, `radarr_*`, `sonarr_*`, `overseerr_*`, `workspace_*`, `docker_*`, `chief_of_staff`, `end_call`) run on Hearth over a sideband `wss://api.openai.com/v1/realtime?call_id=…`.
+
+**Close of call:** when the conversation is finished (goodbye / done / nothing left), the model calls `end_call`. After that response completes, Hearth closes the sideband and the UI hangs up the WebRTC peer connection so the session does not stay open idle.
 
 **Fallback** (`WS /ws/voice`, or no key): text only. Composer always uses `POST /api/chat`. Do not send PCM over that socket expecting live voice.
 
