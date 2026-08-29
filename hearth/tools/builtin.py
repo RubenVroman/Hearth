@@ -10,6 +10,7 @@ from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
+from hearth.tools.weather import fetch_weather
 
 
 async def _ha_list(args: dict[str, Any]) -> dict[str, Any]:
@@ -124,7 +125,28 @@ async def _overseerr_request(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+async def _get_weather(args: dict[str, Any]) -> dict[str, Any]:
+    place = args.get("place")
+    return await fetch_weather(place=str(place) if place else None)
+
+
 def register_builtin_tools() -> None:
+    registry.register(
+        ToolSpec(
+            name="get_weather",
+            description="Current weather near the house (temperature, condition, wind). Use when asked for the weather or forecast outside.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "place": {
+                        "type": "string",
+                        "description": "Optional label (defaults to the house place).",
+                    }
+                },
+            },
+            handler=_get_weather,
+        )
+    )
     registry.register(
         ToolSpec(
             name="ha_list_entities",
