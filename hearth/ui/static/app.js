@@ -476,6 +476,7 @@ $("logout-btn").addEventListener("click", async () => {
 });
 
 async function boot() {
+  if (window.HearthSettings) window.HearthSettings.mount();
   const ok = await refreshAccessToken();
   if (!ok) {
     bounceToLogin();
