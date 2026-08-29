@@ -25,6 +25,7 @@ from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
+from hearth.tools.thuisbezorgd import thuisbezorgd
 from hearth.voice.gateway import voice_socket
 from hearth.voice import webrtc as realtime_rtc
 
@@ -45,6 +46,7 @@ async def lifespan(_app: FastAPI):
     await radarr.aclose()
     await sonarr.aclose()
     await overseerr.aclose()
+    await thuisbezorgd.aclose()
 
 
 app = FastAPI(
@@ -117,6 +119,11 @@ async def status() -> dict[str, Any]:
         "radarr": {"configured": settings.radarr_configured},
         "sonarr": {"configured": settings.sonarr_configured},
         "overseerr": {"configured": settings.overseerr_configured},
+        "thuisbezorgd": {
+            "configured": settings.thuisbezorgd_configured,
+            "live_submit_ready": thuisbezorgd.live_submit_ready,
+            "delivery_address": settings.delivery_address_configured,
+        },
         "docker": {"socket": docker.live},
         "tools": registry.names(),
         "workspace": str(settings.workspace_path.resolve()),

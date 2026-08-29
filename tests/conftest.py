@@ -28,6 +28,13 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "radarr_api_key", "")
     monkeypatch.setattr(settings, "sonarr_api_key", "")
     monkeypatch.setattr(settings, "overseerr_api_key", "")
+    monkeypatch.setattr(settings, "thuisbezorgd_api_key", "")
+    monkeypatch.setattr(settings, "thuisbezorgd_email", "")
+    monkeypatch.setattr(settings, "thuisbezorgd_password", "")
+    monkeypatch.setattr(settings, "thuisbezorgd_session_token", "")
+    monkeypatch.setattr(settings, "hearth_delivery_street", "")
+    monkeypatch.setattr(settings, "hearth_delivery_postcode", "")
+    monkeypatch.setattr(settings, "hearth_delivery_city", "")
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
     monkeypatch.setattr(settings, "app_secret_key", TEST_APP_SECRET)
     monkeypatch.setattr(settings, "algorithm", "HS256")
@@ -37,6 +44,13 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "cookie_samesite", "lax")
     monkeypatch.setattr(settings, "admin_email", TEST_ADMIN_EMAIL)
     monkeypatch.setattr(settings, "admin_password", TEST_ADMIN_PASSWORD)
+    from hearth.fixtures import mock_thuisbezorgd
+    from hearth.tools.thuisbezorgd import thuisbezorgd
+
+    mock_thuisbezorgd.clear_cart()
+    mock_thuisbezorgd.orders.clear()
+    mock_thuisbezorgd._order_seq = 0
+    thuisbezorgd._session_token = ""
     (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
     (tmp_path / "skills" / "vault_echo.py").write_text(
         Path(__file__).resolve().parents[1].joinpath("workspace/skills/vault_echo.py").read_text(),

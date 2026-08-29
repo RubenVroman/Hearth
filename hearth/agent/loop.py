@@ -135,8 +135,9 @@ class AgentLoop:
         if plan is None:
             reply = (
                 "I can drive the house — lights, Denon, LG TV, grab movies in Radarr or shows in "
-                "Sonarr, request via Overseerr, Plex now-playing, workspace, docker inspect. "
-                "Repo, Gridways, Discord, calendar, and anything I can't do yet go to Chief of Staff."
+                "Sonarr, request via Overseerr, order food on Thuisbezorgd, Plex now-playing, "
+                "workspace, docker inspect. Repo, Gridways, Discord, calendar, and anything I "
+                "can't do yet go to Chief of Staff."
             )
             runtime.note("assistant", reply)
             return {"reply": reply, "mode": "local", "tools": used}
@@ -166,8 +167,9 @@ def _format_tool_reply(tools: list[dict[str, Any]]) -> str:
     for tool in tools:
         name = tool.get("name", "tool")
         if tool.get("needs_confirm"):
-            preview = tool.get("data", {}).get("would_call_with", {})
-            spoken = _confirm_line(name, preview)
+            data = tool.get("data") or {}
+            preview = data.get("would_call_with", {})
+            spoken = _confirm_line(name, preview, data=data)
             parts.append(spoken)
             continue
         if not tool.get("ok"):
@@ -253,10 +255,23 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     if name == "overseerr_request":
         item = data.get("requested") or {}
         return f"I'll request {item.get('title') or 'that'} in Overseerr{mock}."
+    if name == "thuisbezorgd_restaurants":
+        return str(data.get("speak") or f"Thuisbezorgd restaurants{mock}.")
+    if name == "thuisbezorgd_menu":
+        return str(data.get("speak") or f"Menu{mock}.")
+    if name == "thuisbezorgd_cart":
+        return str(data.get("speak") or f"Cart{mock}.")
+    if name == "thuisbezorgd_auth_status":
+        addr = (data.get("delivery_address") or {}).get("line") or "address not set"
+        mode = data.get("mode") or "mock"
+        return f"Thuisbezorgd is {mode}; delivery {addr}."
+    if name == "thuisbezorgd_order":
+        return str(data.get("speak") or f"Order placed{mock}.")
     return None
 
 
-def _confirm_line(name: str, preview: dict[str, Any]) -> str:
+def _confirm_line(name: str, preview: dict[str, Any], data: dict[str, Any] | None = None) -> str:
+    data = data or {}
     if name == "chief_of_staff":
         task = preview.get("task") or preview.get("said") or "that"
         return f"I'll ask Chief of Staff to handle that: {task}. Confirm to send."
@@ -270,6 +285,14 @@ def _confirm_line(name: str, preview: dict[str, Any]) -> str:
         device = preview.get("device") or "device"
         action = preview.get("action") or "control"
         return f"I'll {action.replace('_', ' ')} the {device}. Confirm to run."
+    if name == "thuisbezorgd_order":
+        summary = data.get("summary")
+        if summary:
+            return f"Order ready: {summary}. Confirm to place — this spends money."
+        restaurant = (data.get("restaurant") or {}).get("name") or "the restaurant"
+        total = data.get("total") or "?"
+        address = data.get("delivery_address") or "the house address"
+        return f"I'll order from {restaurant} for {total} to {address}. Confirm to place."
     return f"{name} is waiting for confirm. Preview: {preview}"
 
 
@@ -303,6 +326,18 @@ _GRAB = re.compile(
     r"|\badd .{0,80}\b(to|in) (radarr|sonarr|overseerr|the library|the queue)\b",
     re.I,
 )
+_FOOD = re.compile(
+    r"\b("
+    r"thuisbezorgd|just\s*eat|takeaway|"
+    r"order food|order (a |some )?(pizza|burger|sushi|pho|noodles)|"
+    r"i'?m hungry|food delivery|nearby restaurants|restaurants nearby|"
+    r"what('s| is) (for dinner|to eat)|"
+    r"browse restaurants|food cart|my (food )?cart"
+    r")\b",
+    re.I,
+)
+_FOOD_CART = re.compile(r"\b(cart|basket)\b", re.I)
+_FOOD_ORDER = re.compile(r"\b(place|submit|checkout|confirm)\b.*\b(order|cart|basket)\b", re.I)
 _CONNECT = re.compile(r"\bconnect(?: me)? to\s+(.+)", re.I)
 _HOUSE_CONNECT = re.compile(r"\b(denon|avr|tv|lg|plex|home assistant|\bha\b|light)\b", re.I)
 _COS = re.compile(
@@ -343,6 +378,8 @@ def route_intent(text: str) -> dict[str, Any] | None:
             "tool": "chief_of_staff",
             "args": {"task": raw, "said": raw, "repo": "RubenVroman/Hearth"},
         }
+    if _FOOD.search(raw) or (_FOOD_CART.search(raw) and _FOOD_ORDER.search(raw)):
+        return _food_plan(raw)
     if _GRAB.search(raw):
         query = _media_query(raw)
         if _OVERSEERR.search(raw):
@@ -399,6 +436,24 @@ def route_intent(text: str) -> dict[str, Any] | None:
     if _LIGHTS.search(raw):
         return {"tool": "ha_list_entities", "args": {}}
     return None
+
+
+def _food_plan(text: str) -> dict[str, Any]:
+    raw = text.strip()
+    lower = raw.lower()
+    if _FOOD_ORDER.search(raw) or "place order" in lower or "checkout" in lower:
+        return {"tool": "thuisbezorgd_order", "args": {}}
+    if _FOOD_CART.search(raw) and not re.search(r"\b(restaurant|menu|pizza|burger)\b", lower):
+        return {"tool": "thuisbezorgd_cart", "args": {"action": "view"}}
+    cuisine = ""
+    for token in ("pizza", "vietnamese", "burger", "sushi", "asian", "italian"):
+        if token in lower:
+            cuisine = token
+            break
+    return {
+        "tool": "thuisbezorgd_restaurants",
+        "args": {"cuisine": cuisine} if cuisine else {},
+    }
 
 
 def _media_device(phrase: str | None) -> str:

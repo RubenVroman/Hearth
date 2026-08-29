@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Lights/AVR/TV via HA, *arr/Overseerr grab/request, Plex now-playing, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Lights/AVR/TV via HA, *arr/Overseerr grab/request, Thuisbezorgd food order, Plex now-playing, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -85,6 +85,10 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `RADARR_URL` / `RADARR_API_KEY` | **Live** movie search/add. Default URL `http://host.docker.internal:7878`. Empty key → fixtures. |
 | `SONARR_URL` / `SONARR_API_KEY` | **Live** series search/add. Default `http://host.docker.internal:8989`. |
 | `OVERSEERR_URL` / `OVERSEERR_API_KEY` | **Live** request front door. Default `http://host.docker.internal:5055`. |
+| `HEARTH_DELIVERY_STREET` / `POSTCODE` / `CITY` | House delivery address for Thuisbezorgd. Empty → browse/order refuse until set. Never invent an address in code. |
+| `THUISBEZORGD_API_KEY` | **Live** partner JE-API-KEY. Empty → fixtures only. Just Eat Takeaway has no public self-serve consumer ordering API. |
+| `THUISBEZORGD_SESSION_TOKEN` / `EMAIL` / `PASSWORD` | Server-side consumer auth for live submit (with API key). Never sent to the browser; never logged. |
+| `THUISBEZORGD_API_BASE` / `TENANT` | Default `https://nl.api.just-eat.io` / `nl`. |
 | `HEARTH_COS_WEBHOOK` | **Live** Chief of Staff POST. Empty → tool returns “not configured” (not fake success). |
 | `HEARTH_COS_WEBHOOK_KEY` | Optional. Sent as `Authorization: Bearer <key>`. |
 | `HEARTH_COS_REPO` | Default `RubenVroman/Hearth`. |
@@ -133,6 +137,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
+- Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
 
 **Call Chief of Staff** (`chief_of_staff`)
 
@@ -162,6 +167,7 @@ Destructive tools **default to dry-run** unless `confirm=true`:
 - `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG)
 - `ha_media_control` — LG TV / Denon AVR turn_on/off, volume, source, play_media
 - `radarr_add` / `sonarr_add` / `overseerr_request`
+- `thuisbezorgd_order` — places the food cart (spends money)
 - `workspace_write` / `workspace_delete`
 - `docker_stop`
 - `chief_of_staff`
@@ -172,6 +178,7 @@ Read-only / inspect:
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`
 - `radarr_search`, `sonarr_search`, `overseerr_search`
+- `thuisbezorgd_restaurants`, `thuisbezorgd_menu`, `thuisbezorgd_cart`, `thuisbezorgd_auth_status`
 - `workspace_list`, `workspace_read`
 - `docker_ps`, `docker_inspect`
 
@@ -239,6 +246,7 @@ Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve →
 | `/ws/voice` text fallback | Live protocol; not the disabled beta websocket |
 | Whisper/TTS on fallback | Live when a key is set but Realtime is down |
 | HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
+| Thuisbezorgd / Just Eat Takeaway NL | Fixtures + confirm/dry-run always. Live paid submit needs partner `THUISBEZORGD_API_KEY` + session (no public consumer OAuth; no scrape). |
 | Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |
 | HA onboarding, TV/AVR pairing | Yours — service is included unconfigured |
 | Auth | Login (bcrypt + X-Auth-Token + HttpOnly refresh). Optional `HEARTH_TOKEN` for machines |
