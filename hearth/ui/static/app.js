@@ -62,11 +62,17 @@ function fmtMs(ms) {
   return `${m}m ${String(r).padStart(2, "0")}s`;
 }
 
+function setEmpty(id, empty) {
+  const el = $(id);
+  if (el) el.classList.toggle("is-empty", empty);
+}
+
 function renderNowPlaying(payload) {
   const root = $("now-playing");
   const session = (payload.sessions || [])[0];
   if (!session) {
     root.innerHTML = `<p class="muted">Nothing on the wire.</p>`;
+    setEmpty("now-playing-block", true);
     return;
   }
   const pct = session.duration_ms
@@ -79,6 +85,8 @@ function renderNowPlaying(payload) {
     <p class="meta">${session.player || "player"} · ${session.state || "idle"} · ${fmtMs(session.remaining_ms)} left</p>
     <div class="progress"><span style="width:${pct}%"></span></div>
   `;
+  setEmpty("now-playing-block", false);
+  setEmpty("rail-media", false);
 }
 
 function renderRooms(payload) {
@@ -136,13 +144,23 @@ function renderRooms(payload) {
     );
     media.appendChild(el);
   }
+  setEmpty("lights-block", lights.childElementCount === 0);
+  setEmpty("scenes-block", scenes.childElementCount === 0);
+  setEmpty("rail-rooms", lights.childElementCount === 0 && scenes.childElementCount === 0);
+  setEmpty("media-block", media.childElementCount === 0);
+  setEmpty("rail-media", $("now-playing-block")?.classList.contains("is-empty") && media.childElementCount === 0);
+}
+
+function phoneUi() {
+  return window.matchMedia("(max-width: 960px)").matches;
 }
 
 function idleHint() {
-  const rt = state.realtime || {};
   if (!state.openai) {
-    return "Text works now. Live voice needs OPENAI_API_KEY on the NAS — then tap the hearth.";
+    return phoneUi() ? "Text still works." : "Text works now. Live voice needs OPENAI_API_KEY on the NAS — then tap the hearth.";
   }
+  if (phoneUi()) return "Tap to talk.";
+  const rt = state.realtime || {};
   return `Tap the hearth for a live conversation (${rt.model || "gpt-realtime-2.1"} · ${rt.path || "webrtc-ga"}). Interrupt anytime.`;
 }
 
@@ -177,6 +195,7 @@ function appendLog(role, text) {
   li.innerHTML = `<span class="who">${role}</span>${text}`;
   log.appendChild(li);
   log.scrollTop = log.scrollHeight;
+  setEmpty("transcript", false);
 }
 
 async function invoke(tool, args) {
@@ -211,6 +230,7 @@ async function refresh() {
       appendLog(line.role, line.text);
     }
   }
+  setEmpty("transcript", $("log").childElementCount === 0);
 }
 
 function sendRealtime(event) {
@@ -369,7 +389,7 @@ async function startConversation() {
   $("orb").classList.add("live", "hot");
   $("orb").setAttribute("aria-label", "End conversation");
   $("orb-label").textContent = "Listening";
-  $("hint").textContent = "Live WebRTC conversation. Talk over it — barge-in is on. Tap to hang up.";
+  $("hint").textContent = phoneUi() ? "Listening. Tap to hang up." : "Live WebRTC conversation. Talk over it — barge-in is on. Tap to hang up.";
   $("voice-pill").textContent = "voice webrtc-ga";
   $("voice-pill").classList.add("live");
 }
@@ -409,7 +429,7 @@ $("orb").addEventListener("click", async () => {
   }
   $("orb").classList.add("hot");
   $("orb-label").textContent = "Connecting";
-  $("hint").textContent = "Opening GA WebRTC session…";
+  $("hint").textContent = phoneUi() ? "Connecting…" : "Opening GA WebRTC session…";
   try {
     await startConversation();
   } catch (err) {

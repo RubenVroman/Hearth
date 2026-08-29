@@ -68,6 +68,12 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "safe-area-inset" in css
     assert "--keyboard-inset" in css
     assert "100dvh" in css
+    assert ".pills .pill" in css
+    assert ".is-empty" in css
+    assert "min-height: 28vh" not in css
+    assert 'id="logout-btn"' in index_html
+    assert 'id="agent-pill"' in index_html
+    assert "setEmpty" in (UI / "app.js").read_text(encoding="utf-8")
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200

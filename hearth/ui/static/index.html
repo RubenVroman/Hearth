@@ -44,13 +44,17 @@
     </header>
 
     <main class="stage">
-      <aside class="rail rail-media">
-        <p class="kicker">Now playing</p>
-        <article class="card film" id="now-playing">
-          <p class="muted">Nothing on the wire.</p>
-        </article>
-        <p class="kicker rest">AVR · TV</p>
-        <div id="media-stack" class="stack"></div>
+      <aside class="rail rail-media is-empty" id="rail-media">
+        <div class="rail-block is-empty" id="now-playing-block">
+          <p class="kicker">Now playing</p>
+          <article class="card film" id="now-playing">
+            <p class="muted">Nothing on the wire.</p>
+          </article>
+        </div>
+        <div class="rail-block is-empty" id="media-block">
+          <p class="kicker rest">AVR · TV</p>
+          <div id="media-stack" class="stack"></div>
+        </div>
       </aside>
 
       <section class="hearth">
@@ -60,7 +64,7 @@
           <span class="orb-core"></span>
           <span class="orb-label" id="orb-label">Tap to talk</span>
         </button>
-        <p class="hint" id="hint">Tap for a live conversation. Interrupt anytime. Text still works.</p>
+        <p class="hint" id="hint">Tap to talk.</p>
         <div class="composer-dock">
           <form id="composer" class="composer" autocomplete="off">
             <input
@@ -79,14 +83,18 @@
         </div>
       </section>
 
-      <aside class="rail rail-rooms">
-        <p class="kicker">Lights</p>
-        <div id="lights" class="tiles"></div>
-        <p class="kicker rest">Scenes</p>
-        <div id="scenes" class="stack"></div>
+      <aside class="rail rail-rooms is-empty" id="rail-rooms">
+        <div class="rail-block is-empty" id="lights-block">
+          <p class="kicker">Lights</p>
+          <div id="lights" class="tiles"></div>
+        </div>
+        <div class="rail-block is-empty" id="scenes-block">
+          <p class="kicker rest">Scenes</p>
+          <div id="scenes" class="stack"></div>
+        </div>
       </aside>
 
-      <section class="transcript" aria-live="polite">
+      <section class="transcript is-empty" id="transcript" aria-live="polite">
         <p class="kicker">Conversation</p>
         <ol id="log"></ol>
       </section>

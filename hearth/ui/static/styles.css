@@ -509,14 +509,14 @@ input,
 
   .top {
     flex-shrink: 0;
-    flex-wrap: wrap;
-    gap: 10px;
+    flex-wrap: nowrap;
+    gap: 8px;
     align-items: center;
-    padding: calc(10px + var(--safe-top)) max(16px, var(--safe-right)) 8px max(16px, var(--safe-left));
+    padding: calc(8px + var(--safe-top)) max(16px, var(--safe-right)) 4px max(16px, var(--safe-left));
   }
 
   .mark {
-    font-size: 24px;
+    font-size: 22px;
   }
 
   .house {
@@ -524,17 +524,19 @@ input,
   }
 
   .pills {
-    width: 100%;
-    flex-wrap: wrap;
-    justify-content: flex-start;
+    width: auto;
+    flex-shrink: 0;
+    gap: 0;
   }
 
-  .pill,
+  .pills .pill {
+    display: none;
+  }
+
   .pill-btn {
-    min-height: 44px;
-    display: inline-flex;
-    align-items: center;
-    padding: 10px 14px;
+    min-height: 36px;
+    padding: 6px 12px;
+    font-size: 10px;
   }
 
   .stage {
@@ -545,21 +547,24 @@ input,
     overflow-x: hidden;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
-    gap: 18px;
-    padding: 4px max(16px, var(--safe-right)) calc(var(--dock-space) + var(--safe-bottom) + var(--keyboard-inset)) max(16px, var(--safe-left));
+    gap: 10px;
+    padding: 0 max(16px, var(--safe-right)) calc(var(--dock-space) + var(--safe-bottom) + var(--keyboard-inset)) max(16px, var(--safe-left));
     grid-template-columns: none;
     grid-template-areas: none;
   }
 
   .hearth {
     order: 1;
+    flex: 1 0 auto;
+    justify-content: center;
     padding-top: 0;
+    min-height: 0;
   }
 
   .transcript {
     order: 2;
     padding: 0;
-    min-height: 28vh;
+    min-height: 0;
   }
 
   .rail-media {
@@ -568,21 +573,26 @@ input,
 
   .rail-rooms {
     order: 4;
-    padding-bottom: 12px;
+    padding-bottom: 8px;
+  }
+
+  .is-empty {
+    display: none !important;
   }
 
   .orb {
-    width: 168px;
-    height: 168px;
+    width: min(72vw, 280px);
+    height: min(72vw, 280px);
   }
 
   .orb-core {
-    inset: 28px;
+    inset: 16%;
   }
 
   .hint {
-    margin: 10px 12px 0;
+    margin: 8px 16px 0;
     font-size: 13px;
+    max-width: 22em;
   }
 
   .composer-dock {
@@ -628,6 +638,14 @@ input,
     margin-top: 18px;
   }
 
+  .rail-block .kicker.rest {
+    margin-top: 0;
+  }
+
+  .rail-block + .rail-block {
+    margin-top: 18px;
+  }
+
   .tiles {
     grid-template-columns: 1fr 1fr;
   }
@@ -638,7 +656,7 @@ input,
   }
 
   .transcript ol {
-    max-height: none;
+    max-height: min(28vh, 180px);
   }
 
   body.login {
