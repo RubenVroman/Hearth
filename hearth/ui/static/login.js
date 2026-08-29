@@ -1,6 +1,14 @@
 const form = document.getElementById("login-form");
 const errorEl = document.getElementById("login-error");
 
+["email", "password"].forEach((id) => {
+  const field = document.getElementById(id);
+  if (!field) return;
+  field.addEventListener("focus", () => {
+    field.scrollIntoView({ block: "center", inline: "nearest" });
+  });
+});
+
 form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   errorEl.classList.add("hidden");

@@ -2,8 +2,22 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <title>Hearth — VAULT</title>
+    <meta name="theme-color" content="#070604" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="application-name" content="Hearth" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Hearth" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/static/icons/icon-512.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -12,7 +26,7 @@
     />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
-  <body>
+  <body class="app">
     <div class="grain" aria-hidden="true"></div>
     <div class="ember" aria-hidden="true"></div>
 
@@ -30,7 +44,7 @@
     </header>
 
     <main class="stage">
-      <aside class="rail">
+      <aside class="rail rail-media">
         <p class="kicker">Now playing</p>
         <article class="card film" id="now-playing">
           <p class="muted">Nothing on the wire.</p>
@@ -47,32 +61,38 @@
           <span class="orb-label" id="orb-label">Tap to talk</span>
         </button>
         <p class="hint" id="hint">Tap for a live conversation. Interrupt anytime. Text still works.</p>
-        <form id="composer" class="composer" autocomplete="off">
-          <input
-            id="line"
-            type="text"
-            name="line"
-            placeholder="Ask the house…"
-            maxlength="2000"
-          />
-          <button type="submit">Send</button>
-        </form>
-        <button type="button" id="confirm-btn" class="confirm hidden">Confirm last action</button>
+        <div class="composer-dock">
+          <form id="composer" class="composer" autocomplete="off">
+            <input
+              id="line"
+              type="text"
+              name="line"
+              placeholder="Ask the house…"
+              maxlength="2000"
+              enterkeyhint="send"
+              autocapitalize="sentences"
+              autocomplete="off"
+            />
+            <button type="submit">Send</button>
+          </form>
+          <button type="button" id="confirm-btn" class="confirm hidden">Confirm last action</button>
+        </div>
       </section>
 
-      <aside class="rail right">
+      <aside class="rail rail-rooms">
         <p class="kicker">Lights</p>
         <div id="lights" class="tiles"></div>
         <p class="kicker rest">Scenes</p>
         <div id="scenes" class="stack"></div>
       </aside>
+
+      <section class="transcript" aria-live="polite">
+        <p class="kicker">Conversation</p>
+        <ol id="log"></ol>
+      </section>
     </main>
 
-    <section class="transcript" aria-live="polite">
-      <p class="kicker">Conversation</p>
-      <ol id="log"></ol>
-    </section>
-
+    <script src="/static/pwa.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

@@ -231,6 +231,25 @@ async def ws_voice(websocket: WebSocket) -> None:
 
 
 if UI_DIR.exists():
+    @app.get("/manifest.webmanifest")
+    async def web_manifest() -> FileResponse:
+        return FileResponse(
+            UI_DIR / "manifest.webmanifest",
+            media_type="application/manifest+json",
+        )
+
+    @app.get("/sw.js")
+    async def service_worker() -> FileResponse:
+        return FileResponse(
+            UI_DIR / "sw.js",
+            media_type="text/javascript",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.get("/apple-touch-icon.png")
+    async def apple_touch_icon() -> FileResponse:
+        return FileResponse(UI_DIR / "icons" / "apple-touch-icon.png", media_type="image/png")
+
     app.mount("/static", StaticFiles(directory=UI_DIR), name="static")
 
     @app.get("/login")

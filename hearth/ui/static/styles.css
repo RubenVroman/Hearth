@@ -6,6 +6,13 @@
   --ember-2: #ffce8a;
   --line: rgba(244, 234, 216, 0.12);
   --card: rgba(18, 14, 10, 0.72);
+  --keyboard-inset: 0px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --dock-space: 108px;
+  color-scheme: dark;
 }
 
 * {
@@ -20,11 +27,30 @@ body {
   color: var(--ink);
   font-family: Outfit, system-ui, sans-serif;
   font-weight: 300;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+html {
+  height: 100%;
 }
 
 body {
   min-height: 100vh;
+  min-height: 100dvh;
   overflow-x: hidden;
+  overscroll-behavior: none;
+}
+
+button,
+a,
+input,
+.tile,
+.stack button,
+.orb,
+.pill-btn {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: rgba(224, 138, 58, 0.18);
 }
 
 .grain,
@@ -49,7 +75,7 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  padding: 28px 36px 0;
+  padding: calc(28px + var(--safe-top)) calc(36px + var(--safe-right)) 0 calc(36px + var(--safe-left));
   position: relative;
   z-index: 2;
 }
@@ -101,11 +127,30 @@ body {
 .stage {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) minmax(320px, 1.3fr) minmax(220px, 1fr);
+  grid-template-areas:
+    "media hearth rooms"
+    "log log log";
   gap: 28px;
-  padding: 28px 36px 12px;
+  padding: 28px calc(36px + var(--safe-right)) 12px calc(36px + var(--safe-left));
   position: relative;
   z-index: 2;
   align-items: start;
+}
+
+.rail-media {
+  grid-area: media;
+}
+
+.hearth {
+  grid-area: hearth;
+}
+
+.rail-rooms {
+  grid-area: rooms;
+}
+
+.transcript {
+  grid-area: log;
 }
 
 .kicker {
@@ -176,6 +221,7 @@ body {
   background: transparent;
   cursor: pointer;
   color: var(--ink);
+  flex-shrink: 0;
 }
 
 .orb-core {
@@ -224,16 +270,25 @@ body {
   color: var(--muted);
   font-size: 13px;
   margin: 18px 0 22px;
+  text-align: center;
+}
+
+.composer-dock {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: min(520px, 100%);
 }
 
 .composer {
   display: flex;
   gap: 8px;
-  width: min(520px, 100%);
+  width: 100%;
 }
 
 .composer input {
   flex: 1;
+  min-width: 0;
   background: transparent;
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -259,10 +314,11 @@ body {
 
 .confirm {
   margin-top: 12px;
+  width: 100%;
 }
 
 .hidden {
-  display: none;
+  display: none !important;
 }
 
 .tiles {
@@ -280,6 +336,12 @@ body {
   cursor: pointer;
   text-align: left;
   width: 100%;
+  gap: 10px;
+}
+
+.tile span:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .tile.on .dot {
@@ -292,6 +354,7 @@ body {
   height: 9px;
   border-radius: 50%;
   background: #3a342c;
+  flex-shrink: 0;
 }
 
 .stack {
@@ -306,12 +369,13 @@ body {
   font: inherit;
   text-align: left;
   cursor: pointer;
+  overflow-wrap: anywhere;
 }
 
 .transcript {
   position: relative;
   z-index: 2;
-  padding: 8px 36px 36px;
+  padding: 8px 0 calc(36px + var(--safe-bottom));
 }
 
 .transcript ol {
@@ -326,6 +390,7 @@ body {
   padding: 8px 0;
   border-bottom: 1px solid var(--line);
   font-size: 14px;
+  overflow-wrap: anywhere;
 }
 
 .transcript .who {
@@ -345,12 +410,6 @@ body {
   50% {
     transform: scale(1.04);
     opacity: 1;
-  }
-}
-
-@media (max-width: 960px) {
-  .stage {
-    grid-template-columns: 1fr;
   }
 }
 
@@ -375,7 +434,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 40px 20px;
+  padding: 40px max(20px, var(--safe-right)) calc(40px + var(--safe-bottom) + var(--keyboard-inset)) max(20px, var(--safe-left));
 }
 
 .login-card {
@@ -415,6 +474,7 @@ body {
   font: inherit;
   letter-spacing: 0;
   text-transform: none;
+  width: 100%;
 }
 
 .login-card button {
@@ -436,4 +496,183 @@ body {
   font-size: 13px;
   letter-spacing: 0;
   text-transform: none;
+}
+
+@media (max-width: 960px) {
+  body.app {
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    max-height: 100dvh;
+    overflow: hidden;
+  }
+
+  .top {
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    padding: calc(10px + var(--safe-top)) max(16px, var(--safe-right)) 8px max(16px, var(--safe-left));
+  }
+
+  .mark {
+    font-size: 24px;
+  }
+
+  .house {
+    letter-spacing: 0.18em;
+  }
+
+  .pills {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .pill,
+  .pill-btn {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    padding: 10px 14px;
+  }
+
+  .stage {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    gap: 18px;
+    padding: 4px max(16px, var(--safe-right)) calc(var(--dock-space) + var(--safe-bottom) + var(--keyboard-inset)) max(16px, var(--safe-left));
+    grid-template-columns: none;
+    grid-template-areas: none;
+  }
+
+  .hearth {
+    order: 1;
+    padding-top: 0;
+  }
+
+  .transcript {
+    order: 2;
+    padding: 0;
+    min-height: 28vh;
+  }
+
+  .rail-media {
+    order: 3;
+  }
+
+  .rail-rooms {
+    order: 4;
+    padding-bottom: 12px;
+  }
+
+  .orb {
+    width: 168px;
+    height: 168px;
+  }
+
+  .orb-core {
+    inset: 28px;
+  }
+
+  .hint {
+    margin: 10px 12px 0;
+    font-size: 13px;
+  }
+
+  .composer-dock {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    width: 100%;
+    align-items: stretch;
+    padding: 12px max(16px, var(--safe-right)) calc(12px + var(--safe-bottom) + var(--keyboard-inset)) max(16px, var(--safe-left));
+    background: linear-gradient(180deg, transparent, var(--bg) 36%);
+  }
+
+  .composer input,
+  .composer button,
+  .confirm {
+    min-height: 48px;
+    font-size: 16px;
+    letter-spacing: 0.04em;
+  }
+
+  .composer button,
+  .confirm {
+    padding: 12px 20px;
+  }
+
+  .confirm {
+    margin-top: 8px;
+  }
+
+  .film {
+    min-height: 0;
+    padding: 16px;
+  }
+
+  .film h2 {
+    font-size: 22px;
+  }
+
+  .kicker.rest {
+    margin-top: 18px;
+  }
+
+  .tiles {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .tile,
+  .stack button {
+    min-height: 48px;
+  }
+
+  .transcript ol {
+    max-height: none;
+  }
+
+  body.login {
+    min-height: 100dvh;
+  }
+
+  .login-stage {
+    min-height: calc(100dvh - 72px);
+    align-items: flex-end;
+    padding: 16px max(16px, var(--safe-right)) calc(20px + var(--safe-bottom) + var(--keyboard-inset)) max(16px, var(--safe-left));
+  }
+
+  .login-card {
+    width: 100%;
+    padding: 28px 20px 24px;
+    border-radius: 24px;
+    gap: 16px;
+  }
+
+  .login-card h1 {
+    font-size: 30px;
+  }
+
+  .login-card input {
+    min-height: 52px;
+    font-size: 16px;
+    padding: 14px 18px;
+    border-radius: 16px;
+  }
+
+  .login-card button {
+    min-height: 52px;
+    font-size: 16px;
+    letter-spacing: 0.08em;
+    padding: 14px 18px;
+    border-radius: 16px;
+  }
 }

@@ -16,6 +16,9 @@ PUBLIC_EXACT = {
     "/auth/token",
     "/auth/session/refresh",
     "/auth/session/logout",
+    "/manifest.webmanifest",
+    "/sw.js",
+    "/apple-touch-icon.png",
 }
 PUBLIC_PREFIXES = ("/static/",)
 

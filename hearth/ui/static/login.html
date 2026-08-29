@@ -2,8 +2,22 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <title>Hearth — Sign in</title>
+    <meta name="theme-color" content="#070604" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="application-name" content="Hearth" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Hearth" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/static/icons/icon-512.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -12,7 +26,7 @@
     />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
-  <body>
+  <body class="login">
     <div class="grain" aria-hidden="true"></div>
     <div class="ember" aria-hidden="true"></div>
 
@@ -30,17 +44,35 @@
         <p class="muted">Same house account as the rest of Ruben’s stack. Email and password.</p>
         <label>
           Email
-          <input id="email" name="email" type="email" required autocomplete="username" />
+          <input
+            id="email"
+            name="email"
+            type="email"
+            inputmode="email"
+            required
+            autocomplete="username"
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
+          />
         </label>
         <label>
           Password
-          <input id="password" name="password" type="password" required autocomplete="current-password" />
+          <input
+            id="password"
+            name="password"
+            type="password"
+            required
+            autocomplete="current-password"
+            enterkeyhint="go"
+          />
         </label>
         <p class="error hidden" id="login-error" role="alert"></p>
-        <button type="submit">Enter</button>
+        <button type="submit">Sign in</button>
       </form>
     </main>
 
+    <script src="/static/pwa.js"></script>
     <script src="/static/login.js"></script>
   </body>
 </html>
