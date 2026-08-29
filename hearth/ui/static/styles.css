@@ -593,8 +593,9 @@ input,
     z-index: 30;
     width: 100%;
     align-items: stretch;
-    padding: 12px max(16px, var(--safe-right)) calc(12px + var(--safe-bottom) + var(--keyboard-inset)) max(16px, var(--safe-left));
+    padding: 12px max(16px, var(--safe-right)) calc(12px + var(--safe-bottom)) max(16px, var(--safe-left));
     background: linear-gradient(180deg, transparent, var(--bg) 36%);
+    transform: translateY(calc(-1 * var(--keyboard-inset)));
   }
 
   .composer input,

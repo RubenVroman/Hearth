@@ -4,7 +4,7 @@
   function applyKeyboardInset() {
     const viewport = window.visualViewport;
     if (!viewport) return;
-    const inset = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
+    const inset = Math.max(0, window.innerHeight - (viewport.height + viewport.offsetTop));
     root.style.setProperty("--keyboard-inset", `${inset}px`);
   }
 
