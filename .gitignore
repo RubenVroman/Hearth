@@ -25,3 +25,10 @@ ha/blueprints/
 # Local workspace scratch (keep example skills)
 workspace/.cache/
 workspace/tmp/
+
+# Auth SQLite (users). Keep the directory via compose volume.
+data/*.db
+data/*.db-journal
+!data/.gitkeep
+
+

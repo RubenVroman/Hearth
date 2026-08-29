@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hearth — Sign in</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Outfit:wght@300;400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <div class="ember" aria-hidden="true"></div>
+
+    <header class="top">
+      <div class="brand">
+        <span class="mark">Hearth</span>
+        <span class="house">VAULT</span>
+      </div>
+    </header>
+
+    <main class="login-stage">
+      <form id="login-form" class="login-card" autocomplete="on">
+        <p class="kicker">House login</p>
+        <h1>Sit by the fire</h1>
+        <p class="muted">Same house account as the rest of Ruben’s stack. Email and password.</p>
+        <label>
+          Email
+          <input id="email" name="email" type="email" required autocomplete="username" />
+        </label>
+        <label>
+          Password
+          <input id="password" name="password" type="password" required autocomplete="current-password" />
+        </label>
+        <p class="error hidden" id="login-error" role="alert"></p>
+        <button type="submit">Enter</button>
+      </form>
+    </main>
+
+    <script src="/static/login.js"></script>
+  </body>
+</html>

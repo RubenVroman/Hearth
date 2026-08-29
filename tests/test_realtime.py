@@ -1,22 +1,18 @@
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
-
-from hearth.app import app
 from hearth.config import settings
 from hearth.voice import webrtc as realtime_rtc
 
 
-def test_status_advertises_ga_webrtc_path():
-    with TestClient(app) as client:
-        status = client.get("/api/status").json()
-        assert status["realtime"]["path"] == "webrtc-ga"
-        assert status["realtime"]["beta"] is False
-        assert status["realtime"]["model"] == settings.openai_realtime_model
-        assert settings.openai_realtime_model == "gpt-realtime-2.1"
-        assert status["realtime"]["calls"] == "/api/realtime/calls"
-        assert status["realtime"]["client_secrets"] == "/api/realtime/client_secrets"
-        assert status["voice"]["beta"] is False
+def test_status_advertises_ga_webrtc_path(client):
+    status = client.get("/api/status").json()
+    assert status["realtime"]["path"] == "webrtc-ga"
+    assert status["realtime"]["beta"] is False
+    assert status["realtime"]["model"] == settings.openai_realtime_model
+    assert settings.openai_realtime_model == "gpt-realtime-2.1"
+    assert status["realtime"]["calls"] == "/api/realtime/calls"
+    assert status["realtime"]["client_secrets"] == "/api/realtime/client_secrets"
+    assert status["voice"]["beta"] is False
 
 
 def test_ga_headers_never_send_beta_shape(monkeypatch):
@@ -29,19 +25,18 @@ def test_ga_headers_never_send_beta_shape(monkeypatch):
     assert "OpenAI-Beta" not in json_headers
 
 
-def test_client_secrets_without_key_is_503(monkeypatch):
+def test_client_secrets_without_key_is_503(client, monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "")
-    with TestClient(app) as client:
-        response = client.post("/api/realtime/client_secrets")
-        assert response.status_code == 503
-        body = response.json()
-        assert body["ok"] is False
-        assert body["path"] == "webrtc-ga"
-        assert body.get("value") in {None, ""}
-        assert "sk-" not in response.text
+    response = client.post("/api/realtime/client_secrets")
+    assert response.status_code == 503
+    body = response.json()
+    assert body["ok"] is False
+    assert body["path"] == "webrtc-ga"
+    assert body.get("value") in {None, ""}
+    assert "sk-" not in response.text
 
 
-def test_client_secrets_mints_ephemeral_ek_token(monkeypatch):
+def test_client_secrets_mints_ephemeral_ek_token(client, monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "sk-test-hearth")
     captured: dict = {}
 
@@ -69,8 +64,7 @@ def test_client_secrets_mints_ephemeral_ek_token(monkeypatch):
             return FakeResp()
 
     with patch("hearth.voice.webrtc.httpx.AsyncClient", FakeClient):
-        with TestClient(app) as client:
-            response = client.post("/api/realtime/client_secrets")
+        response = client.post("/api/realtime/client_secrets")
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
@@ -85,7 +79,7 @@ def test_client_secrets_mints_ephemeral_ek_token(monkeypatch):
     assert captured["json"]["session"]["model"] == "gpt-realtime-2.1"
 
 
-def test_create_call_posts_ga_calls_without_beta_header(monkeypatch):
+def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "sk-test-hearth")
     captured: dict = {}
     answer = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
@@ -137,13 +131,12 @@ def test_create_call_posts_ga_calls_without_beta_header(monkeypatch):
         patch("hearth.voice.webrtc.httpx.AsyncClient", FakeClient),
         patch("hearth.voice.webrtc.ws_connect", fake_ws_connect),
     ):
-        with TestClient(app) as client:
-            response = client.post(
-                "/api/realtime/calls",
-                content="v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n",
-                headers={"Content-Type": "application/sdp"},
-            )
-            hangup = client.post("/api/realtime/calls/rtc_test_call/hangup")
+        response = client.post(
+            "/api/realtime/calls",
+            content="v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n",
+            headers={"Content-Type": "application/sdp"},
+        )
+        hangup = client.post("/api/realtime/calls/rtc_test_call/hangup")
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/sdp")
@@ -165,40 +158,37 @@ def test_create_call_posts_ga_calls_without_beta_header(monkeypatch):
     assert hangup.json()["path"] == "webrtc-ga"
 
 
-def test_create_call_empty_sdp_is_400():
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/realtime/calls",
-            content="   ",
-            headers={"Content-Type": "application/sdp"},
-        )
-        assert response.status_code == 400
-        assert response.json()["path"] == "webrtc-ga"
+def test_create_call_empty_sdp_is_400(client):
+    response = client.post(
+        "/api/realtime/calls",
+        content="   ",
+        headers={"Content-Type": "application/sdp"},
+    )
+    assert response.status_code == 400
+    assert response.json()["path"] == "webrtc-ga"
 
 
-def test_create_call_without_key_is_503(monkeypatch):
+def test_create_call_without_key_is_503(client, monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "")
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/realtime/calls",
-            content="v=0",
-            headers={"Content-Type": "application/sdp"},
-        )
-        assert response.status_code == 503
-        assert response.json()["path"] == "webrtc-ga"
+    response = client.post(
+        "/api/realtime/calls",
+        content="v=0",
+        headers={"Content-Type": "application/sdp"},
+    )
+    assert response.status_code == 503
+    assert response.json()["path"] == "webrtc-ga"
 
 
-def test_realtime_tools_run_on_hearth():
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/realtime/tools",
-            json={"name": "plex_now_playing", "arguments": {}, "call_id": "rtc_x"},
-        )
-        assert response.status_code == 200
-        body = response.json()
-        assert body["path"] == "webrtc-ga"
-        assert body["output"]["name"] == "plex_now_playing"
-        assert "Dune" in str(body["output"])
+def test_realtime_tools_run_on_hearth(client):
+    response = client.post(
+        "/api/realtime/tools",
+        json={"name": "plex_now_playing", "arguments": {}, "call_id": "rtc_x"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["path"] == "webrtc-ga"
+    assert body["output"]["name"] == "plex_now_playing"
+    assert "Dune" in str(body["output"])
 
 
 def test_secret_value_reads_ga_and_nested_shapes():

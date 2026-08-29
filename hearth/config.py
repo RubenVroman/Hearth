@@ -22,6 +22,16 @@ class Settings(BaseSettings):
     mock_if_unconfigured: bool = Field(default=True, alias="HEARTH_MOCK_IF_UNCONFIGURED")
 
     workspace_path: Path = Field(default=Path("./workspace"), alias="WORKSPACE_PATH")
+    auth_db_path: Path = Field(default=Path("./data/hearth-auth.db"), alias="HEARTH_AUTH_DB")
+
+    app_secret_key: str = Field(default="", alias="APP_SECRET_KEY")
+    algorithm: str = Field(default="HS256", alias="ALGORITHM")
+    access_token_expire_minutes: int = Field(default=30, alias="ACCESS_TOKEN_EXPIRE_MINUTES")
+    refresh_token_expire_days: int = Field(default=14, alias="REFRESH_TOKEN_EXPIRE_DAYS")
+    cookie_secure: bool = Field(default=True, alias="COOKIE_SECURE")
+    cookie_samesite: str = Field(default="lax", alias="COOKIE_SAMESITE")
+    admin_email: str = Field(default="", alias="HEARTH_ADMIN_EMAIL")
+    admin_password: str = Field(default="", alias="HEARTH_ADMIN_PASSWORD")
 
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")

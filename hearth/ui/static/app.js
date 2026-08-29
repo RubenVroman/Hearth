@@ -5,12 +5,48 @@ const state = {
   call: null,
   openai: false,
   realtime: { path: "webrtc-ga", model: "gpt-realtime-2.1", beta: false },
+  accessToken: "",
 };
 
-async function api(path, opts) {
-  const response = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (state.accessToken) headers["X-Auth-Token"] = state.accessToken;
+  return headers;
+}
+
+function bounceToLogin() {
+  state.accessToken = "";
+  window.location.replace("/login");
+}
+
+async function refreshAccessToken() {
+  const response = await fetch("/auth/session/refresh", { method: "POST" });
+  if (!response.ok) return false;
+  const body = await response.json();
+  state.accessToken = body.access_token || "";
+  return Boolean(state.accessToken);
+}
+
+async function request(path, opts = {}, retried = false) {
+  const headers = authHeaders(opts.headers || {});
+  const response = await fetch(path, { ...opts, headers });
+  if (response.status !== 401) return response;
+  if (retried) {
+    bounceToLogin();
+    throw new Error("unauthorized");
+  }
+  const ok = await refreshAccessToken();
+  if (!ok) {
+    bounceToLogin();
+    throw new Error("unauthorized");
+  }
+  return request(path, opts, true);
+}
+
+async function api(path, opts = {}) {
+  const response = await request(path, {
     ...opts,
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
   });
   if (!response.ok) {
     throw new Error(`${path} ${response.status}`);
@@ -291,7 +327,7 @@ async function startConversation() {
   });
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  const sdpResponse = await fetch("/api/realtime/calls", {
+  const sdpResponse = await request("/api/realtime/calls", {
     method: "POST",
     body: offer.sdp,
     headers: { "Content-Type": "application/sdp" },
@@ -356,7 +392,7 @@ async function stopConversation() {
   $("remote-audio").srcObject = null;
   if (call.callId) {
     try {
-      await fetch(`/api/realtime/calls/${encodeURIComponent(call.callId)}/hangup`, {
+      await request(`/api/realtime/calls/${encodeURIComponent(call.callId)}/hangup`, {
         method: "POST",
       });
     } catch (_) {
@@ -384,5 +420,23 @@ $("orb").addEventListener("click", async () => {
   }
 });
 
-refresh();
-setInterval(refresh, 8000);
+$("logout-btn").addEventListener("click", async () => {
+  try {
+    await fetch("/auth/session/logout", { method: "POST" });
+  } catch (_) {
+    /* still leave */
+  }
+  bounceToLogin();
+});
+
+async function boot() {
+  const ok = await refreshAccessToken();
+  if (!ok) {
+    bounceToLogin();
+    return;
+  }
+  refresh();
+  setInterval(refresh, 8000);
+}
+
+boot();

@@ -11,7 +11,8 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 | Surface | Role |
 | --- | --- |
 | Agent loop + tool registry | Lights/AVR/TV via HA, *arr/Overseerr grab/request, Plex now-playing, workspace, docker inspect, Chief of Staff escalate |
-| `GET /` command center | Now playing, lights/scenes, transcript, agent status. Dark, cinematic. |
+| `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
+| `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
 | `WS /ws/voice` | Text fallback only. Never the disabled beta Realtime websocket. |
 | `workspace/` | Sandboxed “build whatever I ask” directory. Not the whole NAS. |
@@ -33,9 +34,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
    docker compose up -d --build
    ```
 
-4. Open the command center on the **LAN or Tailscale** address, never a WAN port-forward:
-
-   `http://<vault-lan-or-tailscale>:8787`
+4. Set `APP_SECRET_KEY` (long random string) and create the first user (see Login below). Open `https://vault.taileff393.ts.net:8443/login` on Tailscale, never a WAN port-forward.
 
 5. Home Assistant onboarding: `http://<vault-lan-or-tailscale>:8123`  
    Create a long-lived token (Profile → Security), put it in `.env` as `HA_TOKEN`, then `docker compose up -d`.
@@ -47,9 +46,28 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 - Do **not** port-forward `8787` or `8123` on the router.
 - Do **not** expose SMB for the agent. Workspace is a local bind mount only.
 - Set `HEARTH_BIND` / `HA_BIND` in `.env` to the Tailscale IP (`100.x.y.z`) or a LAN IP if you want the ports off the rest of the host’s interfaces.
-- Optional: set `HEARTH_TOKEN` so the UI/API require `X-Hearth-Token`.
+- Optional: `HEARTH_TOKEN` is a **machine/agent** bypass (`X-Hearth-Token` header only). Browser users log in. A shared URL with `?token=` does nothing.
 
 The compose file publishes `0.0.0.0` by default so Tailscale and LAN both work. That is **not** the public internet unless you forward the port.
+
+## Login
+
+Hearth copies Ruben’s house FastAPI auth: bcrypt user, short-lived JWT in `X-Auth-Token` (not Bearer), HttpOnly refresh cookie. There is no Google, signup, or Next.js.
+
+**First user** — either:
+
+1. Set `APP_SECRET_KEY`, `HEARTH_ADMIN_EMAIL`, and `HEARTH_ADMIN_PASSWORD` in `.env`. On boot, if the users table is empty, Hearth creates that superuser, then you can remove the password from `.env` if you want.
+2. Or run, once the container is up:
+
+   ```bash
+   docker compose exec hearth python -m hearth.auth.create_superuser
+   ```
+
+Users live in SQLite at `HEARTH_AUTH_DB` (compose bind-mounts `./data`). No Postgres.
+
+`COOKIE_SECURE=true` is correct behind Tailscale HTTPS. Set `COOKIE_SECURE=false` only if you are hitting plain HTTP on the LAN.
+
+Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/auth/session/logout`, `/health`, static files needed to render login. Everything else (including `/` and `/api/status`) requires a session or `X-Hearth-Token`.
 
 ## Environment
 
@@ -71,6 +89,9 @@ The compose file publishes `0.0.0.0` by default so Tailscale and LAN both work. 
 | `DOCKER_SOCKET` | Read-only socket is mounted. If missing → mocked container list (plex/sonarr/…/gluetun). |
 | `WORKSPACE_PATH` | Inside the container, `/app/workspace`. |
 | `HEARTH_MOCK_IF_UNCONFIGURED` | Default `true`. If a live call fails, fall back to fixtures instead of dying. |
+| `APP_SECRET_KEY` | Required to sign JWTs. Empty → nobody can log in. |
+| `HEARTH_ADMIN_EMAIL` / `HEARTH_ADMIN_PASSWORD` | Bootstrap first superuser if the users table is empty. Leave empty after that. |
+| `HEARTH_TOKEN` | Optional **machine** bypass (`X-Hearth-Token` header). Not a browser login. |
 
 Plex token: Plex Web → settings URL, or XML at `http://<plex>:32400/library/sections` while signed in — `X-Plex-Token` in the query. Do not commit it.
 
@@ -209,5 +230,5 @@ For LAN discovery (Cast, some TVs), you may want host networking on the HA servi
 | HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
 | Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |
 | HA onboarding, TV/AVR pairing | Yours — service is included unconfigured |
-| Auth | Optional `HEARTH_TOKEN` only; trust the LAN/Tailscale |
+| Auth | Login (bcrypt + X-Auth-Token + HttpOnly refresh). Optional `HEARTH_TOKEN` for machines |
 | SMB / public internet | Not exposed. Don’t add it. |

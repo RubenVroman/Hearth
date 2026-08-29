@@ -30,6 +30,15 @@ services:
       HEARTH_HOUSE_NAME: ${HEARTH_HOUSE_NAME:-VAULT}
       HEARTH_OWNER: ${HEARTH_OWNER:-Ruben}
       HEARTH_TOKEN: ${HEARTH_TOKEN:-}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-}
+      ALGORITHM: ${ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-14}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
+      HEARTH_ADMIN_EMAIL: ${HEARTH_ADMIN_EMAIL:-}
+      HEARTH_ADMIN_PASSWORD: ${HEARTH_ADMIN_PASSWORD:-}
+      HEARTH_AUTH_DB: /app/data/hearth-auth.db
       HEARTH_MOCK_IF_UNCONFIGURED: ${HEARTH_MOCK_IF_UNCONFIGURED:-true}
       WORKSPACE_PATH: /app/workspace
       DOCKER_SOCKET: /var/run/docker.sock
@@ -39,6 +48,7 @@ services:
       - "${HEARTH_BIND:-0.0.0.0}:${HEARTH_PORT:-8787}:8787"
     volumes:
       - ./workspace:/app/workspace
+      - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"

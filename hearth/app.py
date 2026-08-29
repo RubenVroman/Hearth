@@ -6,13 +6,17 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from hearth import __version__
 from hearth.agent.loop import AgentLoop
 from hearth.agent.registry import registry
+from hearth.auth.bootstrap import bootstrap_admin
+from hearth.auth.db import init_db
+from hearth.auth.gate import http_authorized, is_public_path, ws_authorized
+from hearth.auth.routers import auth_router
 from hearth.config import settings
 from hearth.runtime import runtime
 from hearth.tools.builtin import register_builtin_tools
@@ -30,6 +34,8 @@ _agent = AgentLoop()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings.workspace_path.mkdir(parents=True, exist_ok=True)
+    init_db()
+    bootstrap_admin()
     register_builtin_tools()
     yield
     await ha.aclose()
@@ -56,19 +62,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
+
 
 @app.middleware("http")
-async def hearth_token_gate(request: Request, call_next):
-    if not settings.token:
+async def house_auth_gate(request: Request, call_next):
+    if is_public_path(request.url.path):
         return await call_next(request)
-    if request.url.path in {"/health"}:
+    if http_authorized(request):
         return await call_next(request)
-    header = request.headers.get("x-hearth-token", "")
-    query = request.query_params.get("token", "")
-    cookie = request.cookies.get("hearth_token", "")
-    if settings.token not in {header, query, cookie}:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return await call_next(request)
+    if request.url.path == "/" and request.method in {"GET", "HEAD"}:
+        return RedirectResponse("/login", status_code=302)
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
 class ChatBody(BaseModel):
@@ -219,17 +224,18 @@ async def realtime_tools(body: RealtimeToolBody) -> dict[str, Any]:
 
 @app.websocket("/ws/voice")
 async def ws_voice(websocket: WebSocket) -> None:
-    if settings.token:
-        header = websocket.headers.get("x-hearth-token", "")
-        query = websocket.query_params.get("token", "")
-        if settings.token not in {header, query}:
-            await websocket.close(code=4401)
-            return
+    if not ws_authorized(websocket):
+        await websocket.close(code=4401)
+        return
     await voice_socket(websocket)
 
 
 if UI_DIR.exists():
     app.mount("/static", StaticFiles(directory=UI_DIR), name="static")
+
+    @app.get("/login")
+    async def login_page() -> FileResponse:
+        return FileResponse(UI_DIR / "login.html")
 
     @app.get("/")
     async def index() -> FileResponse:
