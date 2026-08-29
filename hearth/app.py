@@ -165,6 +165,25 @@ async def transcript() -> dict[str, Any]:
     }
 
 
+@app.get("/api/widgets")
+async def widgets() -> dict[str, Any]:
+    return {"widgets": runtime.list_widgets()}
+
+
+@app.delete("/api/widgets/{widget_id}")
+async def dismiss_widget(widget_id: str) -> dict[str, Any]:
+    ok = runtime.dismiss_widget(widget_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="unknown widget")
+    return {"ok": True, "id": widget_id, "widgets": runtime.list_widgets()}
+
+
+@app.delete("/api/widgets")
+async def clear_widgets() -> dict[str, Any]:
+    removed = runtime.clear_widgets(dismissible_only=True)
+    return {"ok": True, "removed": removed, "widgets": runtime.list_widgets()}
+
+
 @app.get("/api/tools")
 async def tools() -> dict[str, Any]:
     return {"tools": registry.list_public()}
@@ -174,7 +193,9 @@ async def tools() -> dict[str, Any]:
 async def chat(body: ChatBody) -> dict[str, Any]:
     runtime.agent_status = "thinking"
     try:
-        return await _agent.run(body.message, confirm=body.confirm)
+        out = await _agent.run(body.message, confirm=body.confirm)
+        out.setdefault("widgets", runtime.list_widgets())
+        return out
     finally:
         runtime.agent_status = "idle"
 
@@ -184,7 +205,7 @@ async def invoke(body: InvokeBody) -> dict[str, Any]:
     if registry.get(body.tool) is None:
         raise HTTPException(status_code=404, detail="unknown tool")
     result = await registry.call(body.tool, body.args)
-    return result.as_dict()
+    return {**result.as_dict(), "widgets": runtime.list_widgets()}
 
 
 @app.post("/api/realtime/client_secrets")
@@ -241,6 +262,7 @@ async def realtime_tools(body: RealtimeToolBody) -> dict[str, Any]:
         "path": "webrtc-ga",
         "call_id": body.call_id,
         "output": result,
+        "widgets": runtime.list_widgets(),
     }
 
 

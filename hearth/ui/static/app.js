@@ -27,6 +27,8 @@ const state = {
   openai: false,
   realtime: { path: "webrtc-ga", model: "gpt-realtime-2.1", beta: false },
   accessToken: "",
+  widgets: [],
+  widgetTimers: {},
 };
 
 function micStorageGet(key) {
@@ -280,6 +282,105 @@ function setEmpty(id, empty) {
   if (el) el.classList.toggle("is-empty", empty);
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function kindLabel(kind) {
+  if (kind === "weather") return "Weather";
+  if (kind === "action") return "Action";
+  return "Update";
+}
+
+function clearWidgetTimer(id) {
+  const timer = state.widgetTimers[id];
+  if (timer) {
+    clearTimeout(timer);
+    delete state.widgetTimers[id];
+  }
+}
+
+function scheduleAutoDismiss(widget) {
+  clearWidgetTimer(widget.id);
+  if (widget.sticky) return;
+  if (widget.status !== "done" && widget.status !== "error") return;
+  state.widgetTimers[widget.id] = setTimeout(() => {
+    dismissWidget(widget.id, { silent: true });
+  }, 12000);
+}
+
+function renderWidgets(widgets) {
+  const list = Array.isArray(widgets) ? widgets : [];
+  state.widgets = list;
+  const root = $("widget-stack");
+  if (!root) return;
+  const seen = new Set(list.map((w) => w.id));
+  for (const id of Object.keys(state.widgetTimers)) {
+    if (!seen.has(id)) clearWidgetTimer(id);
+  }
+  root.innerHTML = "";
+  for (const widget of list) {
+    const el = document.createElement("article");
+    el.className = `widget widget-${widget.kind || "generic"}`;
+    el.dataset.id = widget.id;
+    el.dataset.status = widget.status || "info";
+    el.setAttribute("role", "status");
+    const dismissible = widget.dismissible !== false;
+    el.innerHTML = `
+      <div class="widget-head">
+        <span class="widget-kind">${escapeHtml(kindLabel(widget.kind))}</span>
+        <span class="widget-status">${escapeHtml(widget.status || "info")}</span>
+        ${
+          dismissible
+            ? `<button type="button" class="widget-dismiss" aria-label="Dismiss ${escapeHtml(
+                widget.title || "widget"
+              )}">×</button>`
+            : ""
+        }
+      </div>
+      <h3 class="widget-title">${escapeHtml(widget.title || "")}</h3>
+      <p class="widget-body">${escapeHtml(widget.body || "")}</p>
+      ${widget.detail ? `<p class="widget-detail">${escapeHtml(widget.detail)}</p>` : ""}
+    `;
+    const btn = el.querySelector(".widget-dismiss");
+    if (btn) {
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        dismissWidget(widget.id);
+      });
+    }
+    root.appendChild(el);
+    scheduleAutoDismiss(widget);
+  }
+  setEmpty("widget-stack", list.length === 0);
+}
+
+function upsertLocalWidget(widget) {
+  const next = [...state.widgets.filter((w) => w.id !== widget.id), widget];
+  renderWidgets(next);
+}
+
+async function dismissWidget(id, { silent = false } = {}) {
+  clearWidgetTimer(id);
+  renderWidgets(state.widgets.filter((w) => w.id !== id));
+  try {
+    await api(`/api/widgets/${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch (err) {
+    if (!silent) appendLog("system", `Dismiss failed: ${err.message}`);
+  }
+}
+
+function applyWidgetPayload(payload) {
+  if (payload && Array.isArray(payload.widgets)) {
+    renderWidgets(payload.widgets);
+  }
+}
+
 function renderNowPlaying(payload) {
   const root = $("now-playing");
   const session = (payload.sessions || [])[0];
@@ -398,6 +499,9 @@ function renderStatus(status) {
   if (status.pending) {
     $("confirm-btn").textContent = `Confirm ${status.pending.tool}`;
   }
+  if (Array.isArray(status.widgets)) {
+    renderWidgets(status.widgets);
+  }
   if (!state.call) {
     $("hint").textContent = idleHint();
     $("orb-label").textContent = "Tap to talk";
@@ -424,10 +528,12 @@ function appendLog(role, text) {
 }
 
 async function invoke(tool, args) {
-  return api("/api/invoke", {
+  const out = await api("/api/invoke", {
     method: "POST",
     body: JSON.stringify({ tool, args }),
   });
+  applyWidgetPayload(out);
+  return out;
 }
 
 async function talk(message, confirm = false) {
@@ -436,6 +542,7 @@ async function talk(message, confirm = false) {
     body: JSON.stringify({ message, confirm }),
   });
   appendLog("hearth", out.reply);
+  applyWidgetPayload(out);
   return out;
 }
 
@@ -474,6 +581,15 @@ $("composer").addEventListener("submit", async (ev) => {
   if (!text) return;
   input.value = "";
   appendLog("you", text);
+  upsertLocalWidget({
+    id: "turn-active",
+    kind: "action",
+    title: "House",
+    status: "running",
+    body: text.length > 72 ? `${text.slice(0, 69)}…` : text,
+    detail: "Thinking…",
+    dismissible: true,
+  });
   if (
     sendRealtime({
       type: "conversation.item.create",
@@ -501,8 +617,40 @@ function onRealtimeEvent(event) {
   if (state.call?.bargeIn) {
     state.call.bargeIn.noteRealtimeEvent(type);
   }
+  if (type === "response.created") {
+    upsertLocalWidget({
+      id: "turn-active",
+      kind: "action",
+      title: "House",
+      status: "running",
+      body: "Listening to the house…",
+      detail: "Working…",
+      dismissible: true,
+    });
+  }
+  if (type === "response.function_call_arguments.done") {
+    const name = event.name || "tool";
+    upsertLocalWidget({
+      id: `action-${name}`,
+      kind: "action",
+      title: name.replace(/_/g, " "),
+      status: "running",
+      body: "Running…",
+      detail: name,
+      dismissible: true,
+    });
+  }
   if (type === "response.output_audio_transcript.done" || type === "response.audio_transcript.done") {
     appendLog("hearth", event.transcript);
+    upsertLocalWidget({
+      id: "turn-active",
+      kind: "action",
+      title: "House",
+      status: "done",
+      body: "Answered",
+      detail: "Done.",
+      dismissible: true,
+    });
   }
   // User speech — requires session audio.input.transcription (see webrtc.session_config).
   if (
@@ -510,10 +658,33 @@ function onRealtimeEvent(event) {
     type === "conversation.item.audio_transcription.completed"
   ) {
     appendLog("you", event.transcript);
+    if (event.transcript) {
+      upsertLocalWidget({
+        id: "turn-active",
+        kind: "action",
+        title: "House",
+        status: "running",
+        body:
+          event.transcript.length > 72
+            ? `${event.transcript.slice(0, 69)}…`
+            : event.transcript,
+        detail: "Thinking…",
+        dismissible: true,
+      });
+    }
   }
   if (type === "error") {
     const message = event.error?.message || event.message || "realtime error";
     appendLog("system", message);
+    upsertLocalWidget({
+      id: "turn-active",
+      kind: "action",
+      title: "House",
+      status: "error",
+      body: message,
+      detail: "Failed",
+      dismissible: true,
+    });
   }
   if (state.call?.sidebandOk) return;
   if (type !== "response.function_call_arguments.done") return;
@@ -545,6 +716,7 @@ async function relayTool(event) {
       },
     });
     sendRealtime({ type: "response.create" });
+    applyWidgetPayload(out);
     refresh();
   } catch (err) {
     appendLog("system", `Tool failed: ${err.message}`);

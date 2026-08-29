@@ -8,6 +8,7 @@ from hearth.agent.prompts import SYSTEM_PROMPT
 from hearth.agent.registry import ToolRegistry, registry
 from hearth.config import settings
 from hearth.runtime import runtime
+from hearth import widgets as widget_bus
 
 MAX_TURNS = 8
 
@@ -23,29 +24,44 @@ class AgentLoop:
     async def run(self, user_text: str, *, confirm: bool = False) -> dict[str, Any]:
         runtime.agent_status = "thinking"
         runtime.note("user", user_text)
+        widget_bus.start_turn(user_text)
         text = user_text.strip()
-        if confirm and runtime.pending is not None:
-            pending = runtime.pending
-            args = dict(pending.args)
-            args["confirm"] = True
-            args["dry_run"] = False
-            result = await self.tools.call(pending.tool, args)
-            reply = _format_tool_reply([result.as_dict()])
-            runtime.note("assistant", reply)
-            runtime.agent_status = "idle"
-            return {"reply": reply, "mode": "confirm", "tools": [result.as_dict()]}
-
-        if settings.openai_configured:
-            try:
-                out = await self._run_openai(text)
+        try:
+            if confirm and runtime.pending is not None:
+                pending = runtime.pending
+                args = dict(pending.args)
+                args["confirm"] = True
+                args["dry_run"] = False
+                result = await self.tools.call(pending.tool, args)
+                reply = _format_tool_reply([result.as_dict()])
+                runtime.note("assistant", reply)
                 runtime.agent_status = "idle"
-                return out
-            except Exception as exc:  # noqa: BLE001
-                runtime.note("system", f"OpenAI path failed, using local router: {exc}", kind="status")
+                widget_bus.finish_turn(ok=True, detail="Confirmed.")
+                return {
+                    "reply": reply,
+                    "mode": "confirm",
+                    "tools": [result.as_dict()],
+                    "widgets": runtime.list_widgets(),
+                }
 
-        out = await self._run_local(text)
-        runtime.agent_status = "idle"
-        return out
+            if settings.openai_configured:
+                try:
+                    out = await self._run_openai(text)
+                    runtime.agent_status = "idle"
+                    widget_bus.finish_turn(ok=True, detail="Done.")
+                    out["widgets"] = runtime.list_widgets()
+                    return out
+                except Exception as exc:  # noqa: BLE001
+                    runtime.note("system", f"OpenAI path failed, using local router: {exc}", kind="status")
+
+            out = await self._run_local(text)
+            runtime.agent_status = "idle"
+            widget_bus.finish_turn(ok=True, detail="Done.")
+            out["widgets"] = runtime.list_widgets()
+            return out
+        except Exception:
+            widget_bus.finish_turn(ok=False, detail="Failed.")
+            raise
 
     async def iter_events(self, user_text: str, *, confirm: bool = False) -> AsyncIterator[dict[str, Any]]:
         """Yield protocol events while running a turn (used by the voice fallback)."""
@@ -298,6 +314,14 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         return f"Thuisbezorgd is {mode}; delivery {addr}."
     if name == "thuisbezorgd_order":
         return str(data.get("speak") or f"Order placed{mock}.")
+    if name == "get_weather":
+        place = data.get("place") or "Home"
+        temp = data.get("temperature")
+        unit = data.get("temperature_unit") or "°C"
+        condition = data.get("condition") or "unknown"
+        if temp is None:
+            return f"Weather{mock} at {place}: {condition}."
+        return f"{place}{mock}: {temp}{unit}, {condition}."
     return None
 
 
@@ -357,6 +381,10 @@ _PLEX_ONLY = re.compile(r"\bplex\b", re.I)
 _DOCKER = re.compile(r"\b(docker|containers?)\b", re.I)
 _LIGHTS = re.compile(r"\b(lights?|scenes?|rooms?|home assistant)\b", re.I)
 _WORKSPACE = re.compile(r"\b(workspace|skills?)\b", re.I)
+_WEATHER = re.compile(
+    r"\b(weather|forecast|temperature|how hot|how cold|is it raining|is it snowing)\b",
+    re.I,
+)
 _TURN_ON = re.compile(r"\bturn on\s+(.+)$", re.I)
 _TURN_OFF = re.compile(r"\bturn off\s+(.+)$", re.I)
 _VOLUME = re.compile(
@@ -493,6 +521,8 @@ def route_intent(text: str) -> dict[str, Any] | None:
         return {"tool": "docker_inspect", "args": {"container": m.group(1)}}
     if _PLAYING.search(raw) or (_PLEX_ONLY.search(raw) and not _GRAB.search(raw)):
         return {"tool": "plex_now_playing", "args": {}}
+    if _WEATHER.search(raw):
+        return {"tool": "get_weather", "args": {}}
     if _DOCKER.search(raw):
         return {"tool": "docker_ps", "args": {}}
     if _WORKSPACE.search(raw):

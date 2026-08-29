@@ -20,6 +20,7 @@ Do it yourself (house):
 - Play a specific library title on Apple TV / LG / living-room Plex client → plex_play
   (optional plex_search / plex_clients first). Destructive: confirm=true to actually start.
   If the title is not in the Plex library, say so — do not silently queue Radarr unless asked to grab it.
+- Weather / forecast outside → get_weather.
 - Download / grab / get a movie → radarr_search then radarr_add (confirm=true to queue).
 - Download / grab a show or season → sonarr_search then sonarr_add (confirm=true).
 - “Request X” / Overseerr as the request front door → overseerr_search / overseerr_request.

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from hearth.app import app
 from hearth.auth.db import reset_engine
 from hearth.config import settings
+from hearth.runtime import runtime
 from hearth.tools.builtin import register_builtin_tools
 
 TEST_ADMIN_EMAIL = "admin@hearth.test"
@@ -35,6 +36,7 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "hearth_delivery_street", "")
     monkeypatch.setattr(settings, "hearth_delivery_postcode", "")
     monkeypatch.setattr(settings, "hearth_delivery_city", "")
+    monkeypatch.setattr(settings, "weather_force_mock", True)
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
     monkeypatch.setattr(settings, "app_secret_key", TEST_APP_SECRET)
     monkeypatch.setattr(settings, "algorithm", "HS256")
@@ -57,6 +59,11 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         encoding="utf-8",
     )
     reset_engine()
+    runtime.widgets.clear()
+    runtime.pending = None
+    runtime.last_tools.clear()
+    runtime.transcript.clear()
+    runtime.agent_status = "idle"
     register_builtin_tools()
     return tmp_path
 

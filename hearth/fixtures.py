@@ -132,6 +132,22 @@ MOCK_PLEX_CLIENTS: list[dict[str, Any]] = [
         "controllable": True,
     },
 ]
+MOCK_WEATHER: dict[str, Any] = {
+    "ok": True,
+    "mode": "mock",
+    "place": "Home",
+    "latitude": 51.05,
+    "longitude": 3.72,
+    "temperature": 14,
+    "temperature_unit": "°C",
+    "humidity": 68,
+    "wind_speed": 12,
+    "wind_unit": "km/h",
+    "weather_code": 2,
+    "condition": "Partly cloudy",
+    "observed_at": "2026-08-29T12:00",
+}
+
 
 MOCK_DOCKER_CONTAINERS: list[dict[str, Any]] = [
     {"Id": "plex01", "Names": ["/plex"], "Image": "lscr.io/linuxserver/plex", "State": "running", "Status": "Up 3 days"},

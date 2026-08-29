@@ -60,6 +60,12 @@ class Settings(BaseSettings):
 
     docker_socket: str = Field(default="/var/run/docker.sock", alias="DOCKER_SOCKET")
 
+    # Weather (Open-Meteo — no API key). Defaults near Ghent / VAULT.
+    weather_latitude: float = Field(default=51.05, alias="HEARTH_WEATHER_LAT")
+    weather_longitude: float = Field(default=3.72, alias="HEARTH_WEATHER_LON")
+    weather_place: str = Field(default="Home", alias="HEARTH_WEATHER_PLACE")
+    weather_force_mock: bool = Field(default=False, alias="HEARTH_WEATHER_MOCK")
+
     # Chief of Staff escalate (repo/code/PR). Empty webhook = not configured.
     cos_webhook: str = Field(default="", alias="HEARTH_COS_WEBHOOK")
     cos_webhook_key: str = Field(default="", alias="HEARTH_COS_WEBHOOK_KEY")

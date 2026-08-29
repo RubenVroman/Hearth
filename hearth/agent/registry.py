@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from hearth.runtime import PendingConfirm, runtime
+from hearth import widgets as widget_bus
 
 Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 ConfiguredFn = Callable[[], bool]
@@ -107,7 +108,9 @@ class ToolRegistry:
                 ok=False,
                 data={"ok": False, "configured": False, "error": message},
             )
-            runtime.last_tools.append(result.as_dict())
+            payload = result.as_dict()
+            runtime.last_tools.append(payload)
+            widget_bus.publish_tool(payload)
             return result
 
         if spec.destructive:
@@ -141,7 +144,9 @@ class ToolRegistry:
                     dry_run=True,
                     data=preview,
                 )
-                runtime.last_tools.append(result.as_dict())
+                payload = result.as_dict()
+                runtime.last_tools.append(payload)
+                widget_bus.publish_tool(payload)
                 return result
             args["confirm"] = True
             args["dry_run"] = False
@@ -150,15 +155,19 @@ class ToolRegistry:
             data = await spec.handler(args)
         except Exception as exc:  # noqa: BLE001 — surface tool errors to the agent
             result = ToolResult(name=name, ok=False, data={"error": str(exc)})
-            runtime.last_tools.append(result.as_dict())
+            payload = result.as_dict()
+            runtime.last_tools.append(payload)
+            widget_bus.publish_tool(payload)
             return result
 
         if spec.destructive:
             runtime.pending = None
-        payload = data if isinstance(data, dict) else {"result": data}
-        ok = not (isinstance(payload, dict) and payload.get("ok") is False)
-        result = ToolResult(name=name, ok=ok, data=payload)
-        runtime.last_tools.append(result.as_dict())
+        payload_data = data if isinstance(data, dict) else {"result": data}
+        ok = not (isinstance(payload_data, dict) and payload_data.get("ok") is False)
+        result = ToolResult(name=name, ok=ok, data=payload_data)
+        payload = result.as_dict()
+        runtime.last_tools.append(payload)
+        widget_bus.publish_tool(payload)
         return result
 
 
