@@ -132,6 +132,7 @@ class ToolRegistry:
                     data=preview,
                 )
                 runtime.last_tools.append(result.as_dict())
+                _offer_memory(spec, result)
                 return result
             args["confirm"] = True
             args["dry_run"] = False
@@ -149,7 +150,17 @@ class ToolRegistry:
         ok = not (isinstance(payload, dict) and payload.get("ok") is False)
         result = ToolResult(name=name, ok=ok, data=payload)
         runtime.last_tools.append(result.as_dict())
+        _offer_memory(spec, result)
         return result
+
+
+def _offer_memory(spec: ToolSpec, result: ToolResult) -> None:
+    try:
+        from hearth.memory.events import on_tool_result
+
+        on_tool_result(spec, result)
+    except Exception:  # noqa: BLE001 — memory must not break tools
+        return
 
 
 registry = ToolRegistry()

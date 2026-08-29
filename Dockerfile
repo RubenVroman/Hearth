@@ -17,6 +17,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     WORKSPACE_PATH=/app/workspace \
     HEARTH_AUTH_DB=/app/data/hearth-auth.db \
+    HEARTH_MEMORY_DB=/app/data/hearth-memory.db \
     HEARTH_PORT=8787
 
 RUN mkdir -p /app/data

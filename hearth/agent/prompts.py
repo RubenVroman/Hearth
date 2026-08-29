@@ -28,11 +28,40 @@ Call Chief of Staff (chief_of_staff) — you have no other way to do these:
 
 Rules:
 - Prefer a tool over guessing.
-- Destructive tools (HA writes, *arr/Overseerr add, file delete, docker stop, chief_of_staff)
+- Destructive tools (HA writes, *arr/Overseerr add, file delete, docker stop, chief_of_staff,
+  memory_forget / memory_export / memory_purge)
   default to dry-run. Ask {settings.owner} to confirm, then call again with confirm=true.
   A voice or UI confirm is enough.
 - Pass chief_of_staff task as a clear instruction, said as the original user text, repo as
   RubenVroman/Hearth unless they named another repo.
 - If a backend is mocked (no key), say so once, then still use the fixture.
 - If Chief of Staff is not configured, say so plainly. Do not fake success.
+- House memory: memory_remember for stable preferences {settings.owner} asks you to keep.
+  memory_search / memory_list to recall. memory_forget / memory_export / memory_purge
+  are destructive (confirm=true). Never store API keys, tokens, passwords, or .env.
+  A retrieved slice may be attached below — it is not the whole store. Do not invent facts.
 """
+
+
+def compose_system_prompt(
+    query: str = "",
+    *,
+    include_recent_turns: bool = True,
+    hits: list | None = None,
+) -> str:
+    """SYSTEM_PROMPT plus a small retrieved memory slice (chat + Realtime)."""
+    from hearth.memory.retrieve import prompt_block
+
+    extra = prompt_block(query, include_recent_turns=include_recent_turns, hits=hits)
+    if extra:
+        return f"{SYSTEM_PROMPT}\n\n{extra}"
+    return SYSTEM_PROMPT
+
+
+async def compose_system_prompt_async(query: str = "", *, include_recent_turns: bool = True) -> str:
+    from hearth.memory.retrieve import prompt_block_async
+
+    extra = await prompt_block_async(query, include_recent_turns=include_recent_turns)
+    if extra:
+        return f"{SYSTEM_PROMPT}\n\n{extra}"
+    return SYSTEM_PROMPT

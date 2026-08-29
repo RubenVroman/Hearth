@@ -71,5 +71,11 @@ class Runtime:
             "last_tools": list(self.last_tools),
         }
 
+    def latest_user(self) -> str:
+        for line in reversed(self.transcript):
+            if line.role == "user" and line.text:
+                return line.text
+        return ""
+
 
 runtime = Runtime()

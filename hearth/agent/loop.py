@@ -4,9 +4,11 @@ import json
 import re
 from typing import Any, AsyncIterator
 
-from hearth.agent.prompts import SYSTEM_PROMPT
+from hearth.agent.prompts import SYSTEM_PROMPT, compose_system_prompt_async
 from hearth.agent.registry import ToolRegistry, registry
 from hearth.config import settings
+from hearth.memory import store as memory_store
+from hearth.memory.summarize import maybe_summarize
 from hearth.runtime import runtime
 
 MAX_TURNS = 8
@@ -32,18 +34,22 @@ class AgentLoop:
             result = await self.tools.call(pending.tool, args)
             reply = _format_tool_reply([result.as_dict()])
             runtime.note("assistant", reply)
+            out = {"reply": reply, "mode": "confirm", "tools": [result.as_dict()]}
+            await _after_turn(text or pending.tool, out, channel="chat")
             runtime.agent_status = "idle"
-            return {"reply": reply, "mode": "confirm", "tools": [result.as_dict()]}
+            return out
 
         if settings.openai_configured:
             try:
                 out = await self._run_openai(text)
+                await _after_turn(text, out, channel="chat")
                 runtime.agent_status = "idle"
                 return out
             except Exception as exc:  # noqa: BLE001
                 runtime.note("system", f"OpenAI path failed, using local router: {exc}", kind="status")
 
         out = await self._run_local(text)
+        await _after_turn(text, out, channel="chat")
         runtime.agent_status = "idle"
         return out
 
@@ -64,8 +70,12 @@ class AgentLoop:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(api_key=settings.openai_api_key)
+        system = await compose_system_prompt_async(
+            user_text,
+            include_recent_turns=not bool(self.history),
+        )
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             *self.history,
             {"role": "user", "content": user_text},
         ]
@@ -147,6 +157,21 @@ class AgentLoop:
         reply = _format_tool_reply(used)
         runtime.note("assistant", reply)
         return {"reply": reply, "mode": "local", "tools": used}
+
+
+async def _after_turn(user_text: str, out: dict[str, Any], *, channel: str) -> None:
+    """Persist the turn and maybe roll a session summary. Never raise into the house loop."""
+    try:
+        session_id = memory_store.ensure_session(channel)
+        if user_text.strip():
+            memory_store.persist_turn("user", user_text, session_id=session_id, channel=channel)
+        reply = str(out.get("reply") or "")
+        if reply:
+            memory_store.persist_turn("assistant", reply, session_id=session_id, channel=channel)
+        if session_id:
+            await maybe_summarize(session_id)
+    except Exception:  # noqa: BLE001
+        return
 
 
 def _parse_args(raw: str | None) -> dict[str, Any]:
@@ -246,6 +271,33 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     if name == "overseerr_request":
         item = data.get("requested") or {}
         return f"I'll request {item.get('title') or 'that'} in Overseerr{mock}."
+    if name == "memory_remember":
+        if data.get("ok"):
+            return f"I'll remember {data.get('key')}: {data.get('value')}"
+        return f"Couldn't remember that: {data.get('error')}"
+    if name == "memory_forget":
+        forgotten = data.get("forgotten") or {}
+        if data.get("ok"):
+            return f"Forgotten {forgotten.get('key') or 'that'}."
+        return f"Nothing to forget: {data.get('error')}"
+    if name == "memory_list":
+        items = data.get("items") or []
+        if not items:
+            return "I don't have anything stored for that yet."
+        if data.get("kind") == "house_events":
+            titles = "; ".join(str(item.get("title") or "") for item in items[:8])
+            return f"House history: {titles}"
+        bits = "; ".join(f"{item.get('key')}: {item.get('value')}" for item in items[:8])
+        return f"I remember: {bits}"
+    if name == "memory_search":
+        hits = data.get("hits") or []
+        if not hits:
+            return "Nothing in memory matched that."
+        return "From memory: " + "; ".join(str(hit.get("text") or "") for hit in hits[:5])
+    if name == "memory_export":
+        return f"Exported memory to {data.get('path')} ({data.get('counts')})."
+    if name == "memory_purge":
+        return f"Purged house memory: {data.get('purged') or data}."
     return None
 
 
@@ -259,6 +311,13 @@ def _confirm_line(name: str, preview: dict[str, Any]) -> str:
         return f"I'll grab {preview.get('query') or 'that'} in Sonarr. Confirm to add."
     if name == "overseerr_request":
         return f"I'll request {preview.get('query') or 'that'} in Overseerr. Confirm to send."
+    if name == "memory_forget":
+        target = preview.get("key") or preview.get("id") or "that"
+        return f"I'll forget {target}. Confirm to delete it."
+    if name == "memory_export":
+        return "I'll export a redacted memory snapshot into the workspace. Confirm to write it."
+    if name == "memory_purge":
+        return f"I'll purge house memory ({preview.get('kind') or 'all'}). Confirm to delete it."
     return f"{name} is waiting for confirm. Preview: {preview}"
 
 
@@ -280,6 +339,13 @@ _GRAB = re.compile(
 )
 _CONNECT = re.compile(r"\bconnect(?: me)? to\s+(.+)", re.I)
 _HOUSE_CONNECT = re.compile(r"\b(denon|avr|tv|lg|plex|home assistant|\bha\b|light)\b", re.I)
+_REMEMBER_FACT = re.compile(r"\bremember (?:that |this |i |my |we )(.+)$", re.I)
+_FORGET_FACT = re.compile(r"\bforget (?:that |this |my |the )(.+)$", re.I)
+_MEMORY_LIST = re.compile(
+    r"\b(what do you remember|what you remember|list (?:my )?preferences|show (?:my )?(?:house )?memory)\b",
+    re.I,
+)
+_MEMORY_SEARCH = re.compile(r"\b(?:do you remember|search memory|recall)\b", re.I)
 _COS = re.compile(
     r"("
     r"\bgithub\b|\bgitlab\b|"
@@ -318,6 +384,18 @@ def route_intent(text: str) -> dict[str, Any] | None:
             "tool": "chief_of_staff",
             "args": {"task": raw, "said": raw, "repo": "RubenVroman/Hearth"},
         }
+    if _MEMORY_LIST.search(raw):
+        return {"tool": "memory_list", "args": {"kind": "preferences"}}
+    if _MEMORY_SEARCH.search(raw):
+        return {"tool": "memory_search", "args": {"query": raw}}
+    forget = _FORGET_FACT.search(raw)
+    if forget:
+        rest = forget.group(1).strip(" .?!")
+        return {"tool": "memory_forget", "args": {"key": rest, "text": rest}}
+    remember = _REMEMBER_FACT.search(raw)
+    if remember:
+        rest = remember.group(1).strip(" .?!")
+        return {"tool": "memory_remember", "args": {"text": rest, "value": rest, "key": rest}}
     if _GRAB.search(raw):
         query = _media_query(raw)
         if _OVERSEERR.search(raw):
