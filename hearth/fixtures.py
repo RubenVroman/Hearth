@@ -71,7 +71,7 @@ MOCK_PLEX_SESSIONS: dict[str, Any] = {
                 "duration": 16600000,
                 "viewOffset": 4920000,
                 "Player": {
-                    "title": "Living Room Shield",
+                    "title": "Apple TV",
                     "state": "playing",
                     "local": True,
                 },
@@ -107,6 +107,23 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "ratingKey": "1002",
         "key": "/library/metadata/1002",
         "guid": "plex://movie/the-brutalist",
+    },
+    # Two exact-title editions so ambiguous library matches can be tested.
+    {
+        "title": "Heat",
+        "type": "movie",
+        "year": 1995,
+        "ratingKey": "3001",
+        "key": "/library/metadata/3001",
+        "guid": "plex://movie/heat-1995",
+    },
+    {
+        "title": "Heat",
+        "type": "movie",
+        "year": 1986,
+        "ratingKey": "3002",
+        "key": "/library/metadata/3002",
+        "guid": "plex://movie/heat-1986",
     },
 ]
 

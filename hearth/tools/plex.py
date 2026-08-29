@@ -151,6 +151,61 @@ class Plex:
                 return info
             raise
 
+    async def resolve_play(
+        self,
+        query: str,
+        *,
+        player: str | None = None,
+        rating_key: str | int | None = None,
+        offset_ms: int = 0,
+    ) -> dict[str, Any]:
+        """Resolve library item + target client without starting playback."""
+        title_query = (query or "").strip()
+        if not title_query and rating_key is None:
+            return {
+                "ok": False,
+                "error": "query or rating_key required",
+                "speak": "Tell me which title to play.",
+            }
+
+        item_result = await self._resolve_item(title_query, rating_key=rating_key)
+        if not item_result.get("ok"):
+            return item_result
+        item = item_result["item"]
+
+        playing = await self.now_playing()
+        sessions = playing.get("sessions") or []
+
+        clients_result = await self.clients()
+        clients = clients_result.get("clients") or []
+        resolved = _resolve_client(clients, player, sessions=sessions)
+        if not resolved.get("ok"):
+            return {
+                **resolved,
+                "mode": clients_result.get("mode") or item_result.get("mode") or playing.get("mode"),
+                "item": item,
+                "clients": clients,
+                "sessions": sessions,
+            }
+
+        client_row = resolved["client"]
+        already = _session_on_client(sessions, client_row)
+        offset = max(int(offset_ms or 0), 0)
+        speak = _plan_speak(item, client_row, already)
+
+        return {
+            "ok": True,
+            "mode": clients_result.get("mode") or item_result.get("mode") or playing.get("mode"),
+            "item": item,
+            "client": client_row,
+            "resolved": resolved.get("resolved"),
+            "offset_ms": offset,
+            "sessions": sessions,
+            "already_playing": already,
+            "candidates": item_result.get("candidates"),
+            "speak": speak,
+        }
+
     async def play(
         self,
         query: str,
@@ -160,74 +215,19 @@ class Plex:
         offset_ms: int = 0,
     ) -> dict[str, Any]:
         """Search (or use ratingKey), resolve a client, start playback via PMS-proxied playMedia."""
-        title_query = (query or "").strip()
-        if not title_query and rating_key is None:
-            return {
-                "ok": False,
-                "error": "query or rating_key required",
-                "speak": "Tell me which title to play.",
-            }
+        plan = await self.resolve_play(
+            query,
+            player=player,
+            rating_key=rating_key,
+            offset_ms=offset_ms,
+        )
+        if not plan.get("ok"):
+            return plan
 
-        item: dict[str, Any] | None = None
-        if rating_key is not None:
-            item = {
-                "title": title_query or f"item {rating_key}",
-                "type": "movie",
-                "ratingKey": str(rating_key),
-                "key": f"/library/metadata/{rating_key}",
-            }
-            if title_query:
-                searched = await self.search(title_query, limit=8)
-                for hit in searched.get("results") or []:
-                    if str(hit.get("ratingKey")) == str(rating_key):
-                        item = hit
-                        break
-        else:
-            searched = await self.search(title_query, limit=8)
-            hits = [
-                h
-                for h in (searched.get("results") or [])
-                if h.get("type") in {"movie", "episode", "show", "season", "clip", "track"}
-                or h.get("ratingKey")
-            ]
-            # Prefer exact / starts-with title matches among library items.
-            needle = title_query.lower()
-            exact = [h for h in hits if str(h.get("title") or "").lower() == needle]
-            soft = [
-                h
-                for h in hits
-                if needle in str(h.get("title") or "").lower()
-                or needle in str(h.get("grandparentTitle") or "").lower()
-            ]
-            ordered = exact or soft or hits
-            library_hits = [h for h in ordered if h.get("ratingKey") and h.get("type") != "hint"]
-            if not library_hits:
-                return {
-                    "ok": False,
-                    "mode": searched.get("mode"),
-                    "in_library": False,
-                    "query": title_query,
-                    "results": searched.get("results") or [],
-                    "error": f"{title_query!r} is not in the Plex library",
-                    "speak": (
-                        f"{title_query} is not in the Plex library. "
-                        "Say grab or download if you want Radarr or Overseerr to get it."
-                    ),
-                }
-            item = library_hits[0]
+        item = plan["item"]
+        client_row = plan["client"]
+        offset = plan.get("offset_ms") or 0
 
-        clients_result = await self.clients()
-        clients = clients_result.get("clients") or []
-        resolved = _resolve_client(clients, player)
-        if not resolved.get("ok"):
-            return {
-                **resolved,
-                "mode": clients_result.get("mode"),
-                "item": item,
-                "clients": clients,
-            }
-
-        client_row = resolved["client"]
         identity = await self.identity()
         machine_id = identity.get("machineIdentifier")
         if not machine_id:
@@ -235,11 +235,12 @@ class Plex:
                 "ok": False,
                 "error": "Plex server machineIdentifier unavailable",
                 "speak": "Plex server identity is missing; cannot start playback.",
+                "item": item,
+                "client": client_row,
             }
 
         key = str(item.get("key") or f"/library/metadata/{item.get('ratingKey')}")
         media_type = _playback_type(item.get("type"))
-        offset = max(int(offset_ms or 0), 0)
 
         if not self.live:
             speak = f"Playing {item.get('title')} on {client_row.get('name')} (mock)."
@@ -249,7 +250,9 @@ class Plex:
                 "played": True,
                 "item": item,
                 "client": client_row,
+                "resolved": plan.get("resolved"),
                 "offset_ms": offset,
+                "already_playing": plan.get("already_playing"),
                 "speak": speak,
             }
 
@@ -296,8 +299,10 @@ class Plex:
                 "played": True,
                 "item": item,
                 "client": client_row,
+                "resolved": plan.get("resolved"),
                 "offset_ms": offset,
                 "playQueueID": play_queue_id,
+                "already_playing": plan.get("already_playing"),
                 "speak": speak,
             }
         except Exception as exc:  # noqa: BLE001
@@ -325,6 +330,73 @@ class Plex:
                     f"Couldn't start {item.get('title')} on {client_row.get('name')}: {exc}."
                 ),
             }
+
+    async def _resolve_item(
+        self,
+        title_query: str,
+        *,
+        rating_key: str | int | None = None,
+    ) -> dict[str, Any]:
+        if rating_key is not None:
+            item: dict[str, Any] = {
+                "title": title_query or f"item {rating_key}",
+                "type": "movie",
+                "ratingKey": str(rating_key),
+                "key": f"/library/metadata/{rating_key}",
+            }
+            if title_query:
+                searched = await self.search(title_query, limit=8)
+                for hit in searched.get("results") or []:
+                    if str(hit.get("ratingKey")) == str(rating_key):
+                        item = hit
+                        break
+                return {"ok": True, "mode": searched.get("mode"), "item": item, "candidates": [item]}
+            return {"ok": True, "item": item, "candidates": [item]}
+
+        searched = await self.search(title_query, limit=8)
+        hits = [
+            h
+            for h in (searched.get("results") or [])
+            if h.get("type") in {"movie", "episode", "show", "season", "clip", "track"}
+            or h.get("ratingKey")
+        ]
+        needle = title_query.lower()
+        exact = [h for h in hits if str(h.get("title") or "").lower() == needle]
+        soft = [
+            h
+            for h in hits
+            if needle in str(h.get("title") or "").lower()
+            or needle in str(h.get("grandparentTitle") or "").lower()
+        ]
+        ordered = exact or soft or hits
+        library_hits = [h for h in ordered if h.get("ratingKey") and h.get("type") != "hint"]
+        if not library_hits:
+            return {
+                "ok": False,
+                "mode": searched.get("mode"),
+                "in_library": False,
+                "query": title_query,
+                "results": searched.get("results") or [],
+                "error": f"{title_query!r} is not in the Plex library",
+                "speak": (
+                    f"{title_query} is not in the Plex library. "
+                    "Say grab or download if you want Radarr or Overseerr to get it."
+                ),
+            }
+
+        # Prefer exact title matches; ask when several editions share the same title.
+        if len(exact) > 1:
+            return _ambiguous_titles(exact, title_query, mode=searched.get("mode"))
+        if not exact and len(soft) > 1:
+            # Multiple soft matches with no exact hit — ask rather than guessing.
+            return _ambiguous_titles(soft, title_query, mode=searched.get("mode"))
+
+        return {
+            "ok": True,
+            "mode": searched.get("mode"),
+            "item": library_hits[0],
+            "candidates": library_hits,
+        }
 
     async def _create_play_queue(
         self,
@@ -459,7 +531,12 @@ def _playback_type(item_type: Any) -> str:
     return "video"
 
 
-def _resolve_client(clients: list[dict[str, Any]], player: str | None) -> dict[str, Any]:
+def _resolve_client(
+    clients: list[dict[str, Any]],
+    player: str | None,
+    *,
+    sessions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     controllable = [c for c in clients if c.get("controllable") and c.get("machineIdentifier")]
     pool = controllable or [c for c in clients if c.get("machineIdentifier")]
 
@@ -473,18 +550,29 @@ def _resolve_client(clients: list[dict[str, Any]], player: str | None) -> dict[s
             "ambiguous": False,
         }
 
+    sessions = sessions or []
+    active = _active_clients(pool, sessions)
+
     hint = (player or "").strip().lower()
+    explicit = bool(player and player.strip())
     if not hint:
         hint = (settings.plex_default_player or "").strip().lower()
 
     if hint:
         matched = [c for c in pool if _client_matches(c, hint)]
+        # Vague "tv" / default: narrow with the active/recent session when possible.
+        if len(matched) > 1 and active:
+            narrowed = [c for c in matched if c in active]
+            if len(narrowed) == 1:
+                return {"ok": True, "client": narrowed[0], "resolved": "active"}
+            if len(narrowed) > 1:
+                return _ambiguous(narrowed, hint)
         if len(matched) == 1:
             return {"ok": True, "client": matched[0], "resolved": "hint"}
         if len(matched) > 1:
             return _ambiguous(matched, hint)
         # Hint given but nothing matched — fall through with a clear miss if it was explicit.
-        if player and player.strip():
+        if explicit:
             names = ", ".join(str(c.get("name")) for c in pool)
             return {
                 "ok": False,
@@ -497,6 +585,12 @@ def _resolve_client(clients: list[dict[str, Any]], player: str | None) -> dict[s
                 "clients": pool,
             }
 
+    # No usable hint: prefer currently playing / recently used client.
+    if len(active) == 1:
+        return {"ok": True, "client": active[0], "resolved": "active"}
+    if len(active) > 1:
+        return _ambiguous(active, "active player")
+
     preferred = [c for c in pool if any(_client_matches(c, h) for h in _PREFERRED_CLIENT_HINTS)]
     if len(preferred) == 1:
         return {"ok": True, "client": preferred[0], "resolved": "preferred"}
@@ -507,6 +601,109 @@ def _resolve_client(clients: list[dict[str, Any]], player: str | None) -> dict[s
         return {"ok": True, "client": pool[0], "resolved": "only"}
 
     return _ambiguous(pool, player or "TV")
+
+
+def _active_clients(
+    clients: list[dict[str, Any]],
+    sessions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Clients that appear in now-playing sessions (playing/paused preferred)."""
+    if not sessions:
+        return []
+    ranked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    ordered_sessions = sorted(
+        sessions,
+        key=lambda s: 0 if str(s.get("state") or "").lower() in {"playing", "paused"} else 1,
+    )
+    for session in ordered_sessions:
+        state = str(session.get("state") or "").lower()
+        if state and state not in {"playing", "paused", "buffering"}:
+            continue
+        player_name = str(session.get("player") or "").strip()
+        if not player_name:
+            continue
+        for client in clients:
+            mid = str(client.get("machineIdentifier") or "")
+            if mid and mid in seen:
+                continue
+            if _client_matches(client, player_name.lower()):
+                if mid:
+                    seen.add(mid)
+                ranked.append(client)
+                break
+    return ranked
+
+
+def _session_on_client(
+    sessions: list[dict[str, Any]],
+    client: dict[str, Any],
+) -> dict[str, Any] | None:
+    for session in sessions:
+        state = str(session.get("state") or "").lower()
+        if state and state not in {"playing", "paused", "buffering"}:
+            continue
+        player_name = str(session.get("player") or "").strip()
+        if player_name and _client_matches(client, player_name.lower()):
+            return {
+                "title": session.get("title"),
+                "show": session.get("show"),
+                "state": session.get("state"),
+                "player": session.get("player"),
+            }
+    return None
+
+
+def _plan_speak(
+    item: dict[str, Any],
+    client: dict[str, Any],
+    already: dict[str, Any] | None,
+) -> str:
+    title = item.get("title") or "that"
+    year = item.get("year")
+    label = f"{title} ({year})" if year else str(title)
+    player = client.get("name") or "the TV"
+    base = f"I'll play {label} on {player}."
+    if already and already.get("title"):
+        current = already.get("title")
+        show = already.get("show")
+        current_label = f"{show} — {current}" if show else current
+        return (
+            f"{base} {current_label} is currently "
+            f"{already.get('state') or 'playing'} there — confirm to switch."
+        )
+    return f"{base} Confirm to start."
+
+
+def _ambiguous_titles(
+    candidates: list[dict[str, Any]],
+    query: str,
+    *,
+    mode: str | None = None,
+) -> dict[str, Any]:
+    bits = []
+    for hit in candidates[:6]:
+        title = hit.get("title") or "Untitled"
+        year = hit.get("year")
+        kind = hit.get("type")
+        rk = hit.get("ratingKey")
+        label = f"{title} ({year})" if year else str(title)
+        if kind:
+            label = f"{label} [{kind}]"
+        if rk:
+            label = f"{label} #{rk}"
+        bits.append(label)
+    listed = "; ".join(bits)
+    return {
+        "ok": False,
+        "ambiguous": True,
+        "ambiguous_titles": True,
+        "mode": mode,
+        "query": query,
+        "candidates": candidates,
+        "error": f"multiple Plex titles match {query!r}",
+        "speak": f"Which title? I found {listed}.",
+    }
 
 
 def _client_matches(client: dict[str, Any], hint: str) -> bool:

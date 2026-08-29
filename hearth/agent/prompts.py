@@ -18,7 +18,9 @@ Do it yourself (house):
 - House media snapshot (TV + AVR + Plex, speakable) → house_media.
 - What's playing on Plex → plex_now_playing.
 - Play a specific library title on Apple TV / LG / living-room Plex client → plex_play
-  (optional plex_search / plex_clients first). Destructive: confirm=true to actually start.
+  (optional plex_search / plex_clients first). Prefers the active/recent Plex client when no
+  player is named. Asks which title/player when matches are ambiguous. Destructive: confirm=true
+  to actually start (also confirms switching away from whatever is already playing).
   If the title is not in the Plex library, say so — do not silently queue Radarr unless asked to grab it.
 - Download / grab / get a movie → radarr_search then radarr_add (confirm=true to queue).
 - Download / grab a show or season → sonarr_search then sonarr_add (confirm=true).

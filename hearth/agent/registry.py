@@ -19,6 +19,9 @@ class ToolSpec:
     source: str = "builtin"
     configured: ConfiguredFn | None = None
     not_configured: str = ""
+    # Optional: run during destructive dry-run to resolve/preview before confirm.
+    # Return ok=False to surface ambiguity/errors without a confirm button.
+    preview_handler: Handler | None = None
 
 
 @dataclass
@@ -114,11 +117,29 @@ class ToolRegistry:
                 dry_run = not confirm
             if not confirm:
                 preview_args = {k: v for k, v in args.items() if k not in {"confirm", "dry_run"}}
-                preview = {
+                plan: dict[str, Any] | None = None
+                if spec.preview_handler is not None:
+                    try:
+                        planned = await spec.preview_handler(preview_args)
+                    except Exception as exc:  # noqa: BLE001
+                        result = ToolResult(name=name, ok=False, data={"error": str(exc)})
+                        runtime.last_tools.append(result.as_dict())
+                        return result
+                    plan = planned if isinstance(planned, dict) else {"result": planned}
+                    if plan.get("ok") is False:
+                        runtime.pending = None
+                        result = ToolResult(name=name, ok=False, data=plan)
+                        runtime.last_tools.append(result.as_dict())
+                        return result
+                preview: dict[str, Any] = {
                     "tool": name,
                     "would_call_with": preview_args,
                     "hint": "Re-run with confirm=true to execute. Destructive tools default to dry-run.",
                 }
+                if plan is not None:
+                    preview["plan"] = plan
+                    if plan.get("speak"):
+                        preview["speak"] = plan["speak"]
                 runtime.pending = PendingConfirm(
                     tool=name,
                     args=args,

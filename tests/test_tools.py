@@ -267,6 +267,12 @@ async def test_plex_play_defaults_to_dry_run():
     result = await registry.call("plex_play", {"query": "The Endless", "player": "Apple TV"})
     assert result.needs_confirm
     assert result.dry_run
+    assert result.data.get("speak")
+    assert "The Endless" in result.data["speak"]
+    assert "Apple TV" in result.data["speak"]
+    # Fixture session is playing on Apple TV — dry-run should mention switching.
+    assert "Dune" in result.data["speak"]
+    assert result.data.get("plan", {}).get("already_playing", {}).get("title") == "Dune: Part Two"
 
 
 async def test_plex_play_starts_on_apple_tv_with_confirm():
@@ -292,7 +298,46 @@ async def test_plex_play_missing_title_is_clear():
     assert "not in the Plex library" in result.data["speak"]
 
 
-async def test_plex_play_ambiguous_tv_asks_which_player():
+async def test_plex_play_ambiguous_titles_ask_which():
+    result = await registry.call(
+        "plex_play",
+        {"query": "Heat", "player": "Apple TV", "confirm": True},
+    )
+    assert not result.ok
+    assert result.data.get("ambiguous_titles") is True
+    assert "Which title" in result.data["speak"]
+    keys = {str(c.get("ratingKey")) for c in result.data.get("candidates") or []}
+    assert "3001" in keys and "3002" in keys
+
+
+async def test_plex_play_rating_key_disambiguates_title():
+    result = await registry.call(
+        "plex_play",
+        {"query": "Heat", "ratingKey": "3001", "player": "Apple TV", "confirm": True},
+    )
+    assert result.ok
+    assert result.data["item"]["ratingKey"] == "3001"
+    assert result.data["item"]["year"] == 1995
+
+
+async def test_plex_play_tv_prefers_active_client():
+    """Vague 'tv' + an active session on Apple TV → use that client, not ask."""
+    result = await registry.call(
+        "plex_play",
+        {"query": "The Endless", "player": "tv", "confirm": True},
+    )
+    assert result.ok
+    assert result.data["client"]["name"] == "Apple TV"
+    assert result.data.get("resolved") == "active"
+
+
+async def test_plex_play_ambiguous_tv_without_sessions(monkeypatch):
+    from hearth.tools.plex import plex as plex_client
+
+    async def _no_sessions():
+        return {"mode": "mock", "sessions": []}
+
+    monkeypatch.setattr(plex_client, "now_playing", _no_sessions)
     result = await registry.call(
         "plex_play",
         {"query": "The Endless", "player": "tv", "confirm": True},
@@ -320,16 +365,41 @@ async def test_intent_plex_clients():
     assert route_intent("which plex clients are available")["tool"] == "plex_clients"
 
 
-async def test_plex_play_uses_default_player(monkeypatch):
-    from hearth.config import settings
-
-    monkeypatch.setattr(settings, "plex_default_player", "Apple TV")
+async def test_plex_play_prefers_active_without_player():
     result = await registry.call(
         "plex_play",
         {"query": "The Endless", "confirm": True},
     )
     assert result.ok
     assert result.data["client"]["name"] == "Apple TV"
+    assert result.data.get("resolved") == "active"
+
+
+async def test_plex_play_uses_default_player(monkeypatch):
+    from hearth.config import settings
+    from hearth.tools.plex import plex as plex_client
+
+    async def _no_sessions():
+        return {"mode": "mock", "sessions": []}
+
+    monkeypatch.setattr(settings, "plex_default_player", "Apple TV")
+    monkeypatch.setattr(plex_client, "now_playing", _no_sessions)
+    result = await registry.call(
+        "plex_play",
+        {"query": "The Endless", "confirm": True},
+    )
+    assert result.ok
+    assert result.data["client"]["name"] == "Apple TV"
+
+
+async def test_plex_play_dry_run_missing_title_skips_confirm():
+    result = await registry.call(
+        "plex_play",
+        {"query": "Definitely Not In Library XYZ", "player": "Apple TV"},
+    )
+    assert not result.ok
+    assert not result.needs_confirm
+    assert result.data.get("in_library") is False
 
 
 async def test_plex_play_live_proxies_play_media(monkeypatch):
@@ -368,6 +438,8 @@ async def test_plex_play_live_proxies_play_media(monkeypatch):
                     200,
                     {"MediaContainer": {"machineIdentifier": "server-abc", "port": 32400}},
                 )
+            if path == "/status/sessions":
+                return FakeResponse(200, {"MediaContainer": {"Metadata": []}})
             if path == "/clients":
                 return FakeResponse(
                     200,

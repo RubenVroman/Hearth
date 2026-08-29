@@ -86,6 +86,22 @@ async def _plex_play(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+async def _plex_play_preview(args: dict[str, Any]) -> dict[str, Any]:
+    """Dry-run resolve: title + client + already-playing, without playMedia."""
+    rating = args.get("ratingKey") or args.get("rating_key")
+    offset = args.get("offset_ms") or args.get("offset") or 0
+    try:
+        offset_ms = int(offset)
+    except (TypeError, ValueError):
+        offset_ms = 0
+    return await plex.resolve_play(
+        str(args.get("query") or ""),
+        player=str(args.get("player") or "") or None,
+        rating_key=rating,
+        offset_ms=offset_ms,
+    )
+
+
 async def _docker_ps(_args: dict[str, Any]) -> dict[str, Any]:
     return await docker.ps()
 
@@ -314,10 +330,12 @@ def register_builtin_tools() -> None:
             description=(
                 "Start playback of a specific Plex library title on a Plex client "
                 "(Apple TV / LG TV / living-room player) without tapping Play on the client. "
-                "Searches the library, resolves the player (named hint, else PLEX_DEFAULT_PLAYER, "
-                "else Apple TV/LG/living room, else the only client), then playMedia via the PMS. "
-                "Destructive: dry-run unless confirm=true. If the title is not in the library, "
-                "say so clearly — do not silently grab it in Radarr."
+                "Searches the library (asks when multiple titles match), resolves the player "
+                "(named hint, else active/recent session, else PLEX_DEFAULT_PLAYER, else "
+                "Apple TV/LG/living room, else the only client), then playMedia via the PMS. "
+                "Destructive: dry-run unless confirm=true. Confirm also covers switching away "
+                "from whatever is already playing. If the title is not in the library, say so "
+                "clearly — do not silently grab it in Radarr."
             ),
             parameters={
                 "type": "object",
@@ -344,6 +362,7 @@ def register_builtin_tools() -> None:
                 "required": ["query"],
             },
             handler=_plex_play,
+            preview_handler=_plex_play_preview,
             destructive=True,
         )
     )
