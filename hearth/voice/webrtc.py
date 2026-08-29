@@ -26,6 +26,7 @@ from hearth.agent.registry import registry
 from hearth.config import settings
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
+from hearth.voice.vad import audio_input_config
 
 CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
@@ -50,16 +51,19 @@ def openai_auth_headers(*, json_body: bool = False) -> dict[str, str]:
 
 
 def session_config() -> dict[str, Any]:
-    """GA session shape. ChatGPT-app voice: gpt-realtime-2.1 + semantic VAD."""
+    """GA session shape. ChatGPT-app voice: gpt-realtime-2.1 + speech-aware VAD.
+
+    ``noise_reduction`` runs before server VAD so TV/HVAC energy is less likely
+    to fire ``speech_started``. Client barge-in gate (``/static/vad.js``) adds a
+    second speech-band check while the assistant is talking.
+    """
     return {
         "type": "realtime",
         "model": settings.openai_realtime_model,
         "instructions": SYSTEM_PROMPT,
         "output_modalities": ["audio"],
         "audio": {
-            "input": {
-                "turn_detection": {"type": "semantic_vad"},
-            },
+            "input": audio_input_config(),
             "output": {
                 "voice": settings.openai_tts_voice,
             },
