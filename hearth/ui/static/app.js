@@ -283,6 +283,13 @@ function onRealtimeEvent(event) {
     const message = event.error?.message || event.message || "realtime error";
     appendLog("system", message);
   }
+  if (type === "response.function_call_arguments.done" && event.name === "end_call") {
+    if (state.call) state.call.pendingHangup = true;
+  }
+  if (type === "response.done" && state.call?.pendingHangup) {
+    stopConversation();
+    return;
+  }
   if (state.call?.sidebandOk) return;
   if (type !== "response.function_call_arguments.done") return;
   relayTool(event);
@@ -295,6 +302,7 @@ async function relayTool(event) {
   } catch (_) {
     args = {};
   }
+  const endCall = event.name === "end_call";
   try {
     const out = await api("/api/realtime/tools", {
       method: "POST",
@@ -312,6 +320,11 @@ async function relayTool(event) {
         output: JSON.stringify(out.output || out),
       },
     });
+    if (endCall) {
+      if (state.call) state.call.pendingHangup = true;
+      // Hang up when this response finishes (response.done); do not start another turn.
+      return;
+    }
     sendRealtime({ type: "response.create" });
     refresh();
   } catch (err) {
@@ -385,7 +398,14 @@ async function startConversation() {
     stream,
     callId,
     sidebandOk: sideband === "ok" || sideband === "starting",
+    pendingHangup: false,
   };
+  pc.addEventListener("connectionstatechange", () => {
+    if (!state.call || state.call.pc !== pc) return;
+    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+      stopConversation();
+    }
+  });
   $("orb").classList.add("live", "hot");
   $("orb").setAttribute("aria-label", "End conversation");
   $("orb-label").textContent = "Listening";

@@ -78,7 +78,11 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "min-height: 28vh" not in css
     assert 'id="logout-btn"' in index_html
     assert 'id="agent-pill"' in index_html
-    assert "setEmpty" in (UI / "app.js").read_text(encoding="utf-8")
+    app_js = (UI / "app.js").read_text(encoding="utf-8")
+    assert "setEmpty" in app_js
+    assert "pendingHangup" in app_js
+    assert 'event.name === "end_call"' in app_js
+    assert "hearth-shell-v6" in (UI / "sw.js").read_text(encoding="utf-8")
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200
