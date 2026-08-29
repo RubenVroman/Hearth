@@ -65,10 +65,13 @@ MOCK_PLEX_SESSIONS: dict[str, Any] = {
                 "title": "Dune: Part Two",
                 "type": "movie",
                 "year": 2024,
+                "ratingKey": "1001",
+                "key": "/library/metadata/1001",
+                "guid": "plex://movie/dune-part-two",
                 "duration": 16600000,
                 "viewOffset": 4920000,
                 "Player": {
-                    "title": "Living Room Shield",
+                    "title": "Apple TV",
                     "state": "playing",
                     "local": True,
                 },
@@ -78,6 +81,74 @@ MOCK_PLEX_SESSIONS: dict[str, Any] = {
         ],
     }
 }
+
+# Library titles for mock search / play (not only now-playing sessions).
+MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
+    {
+        "title": "Dune: Part Two",
+        "type": "movie",
+        "year": 2024,
+        "ratingKey": "1001",
+        "key": "/library/metadata/1001",
+        "guid": "plex://movie/dune-part-two",
+    },
+    {
+        "title": "The Endless",
+        "type": "movie",
+        "year": 2017,
+        "ratingKey": "2042",
+        "key": "/library/metadata/2042",
+        "guid": "plex://movie/the-endless",
+    },
+    {
+        "title": "The Brutalist",
+        "type": "movie",
+        "year": 2024,
+        "ratingKey": "1002",
+        "key": "/library/metadata/1002",
+        "guid": "plex://movie/the-brutalist",
+    },
+    # Two exact-title editions so ambiguous library matches can be tested.
+    {
+        "title": "Heat",
+        "type": "movie",
+        "year": 1995,
+        "ratingKey": "3001",
+        "key": "/library/metadata/3001",
+        "guid": "plex://movie/heat-1995",
+    },
+    {
+        "title": "Heat",
+        "type": "movie",
+        "year": 1986,
+        "ratingKey": "3002",
+        "key": "/library/metadata/3002",
+        "guid": "plex://movie/heat-1986",
+    },
+]
+
+MOCK_PLEX_CLIENTS: list[dict[str, Any]] = [
+    {
+        "name": "Apple TV",
+        "host": "192.168.1.40",
+        "machineIdentifier": "mock-apple-tv",
+        "product": "Plex for Apple TV",
+        "deviceClass": "stb",
+        "version": "8.0",
+        "protocolCapabilities": ["timeline", "playback", "navigation", "playqueues"],
+        "controllable": True,
+    },
+    {
+        "name": "LG webOS TV",
+        "host": "192.168.1.41",
+        "machineIdentifier": "mock-lg-webos",
+        "product": "Plex for LG",
+        "deviceClass": "tv",
+        "version": "5.0",
+        "protocolCapabilities": ["timeline", "playback", "navigation"],
+        "controllable": True,
+    },
+]
 
 MOCK_DOCKER_CONTAINERS: list[dict[str, Any]] = [
     {"Id": "plex01", "Names": ["/plex"], "Image": "lscr.io/linuxserver/plex", "State": "running", "Status": "Up 3 days"},
