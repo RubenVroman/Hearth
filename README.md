@@ -78,6 +78,8 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `OPENAI_REALTIME_MODEL` | Conversational Realtime model. Default `gpt-realtime-2.1` (ChatGPT-app equivalent). |
 | `HA_URL` | Default `http://homeassistant:8123` (compose DNS). |
 | `HA_TOKEN` | **Live** HA REST. Empty → mocked lights/scenes/Denon/LG. |
+| `HA_TV_ENTITY` | LG webOS `media_player` entity_id. Default `media_player.lg_webos_tv`. Set after HA pairing if different. |
+| `HA_AVR_ENTITY` | Denon AVR entity_id. Default `media_player.denon_avr_x3700h`. |
 | `PLEX_URL` | Existing Plex on the host. Default `http://host.docker.internal:32400`. |
 | `PLEX_TOKEN` | **Live** Plex sessions/search. Empty → mocked now-playing. |
 | `RADARR_URL` / `RADARR_API_KEY` | **Live** movie search/add. Default URL `http://host.docker.internal:7878`. Empty key → fixtures. |
@@ -124,7 +126,9 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 
 **Do it yourself**
 
-- Lights, scenes, Denon, LG TV → Home Assistant tools
+- Lights, scenes → Home Assistant tools
+- LG TV / Denon AVR power, volume, source → `ha_media_control` (prefer over raw `ha_call_service`)
+- House media snapshot (TV + AVR + Plex) → `house_media` or `GET /api/media`
 - What's playing → Plex (playback only)
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
@@ -155,7 +159,8 @@ Auth: `Authorization: Bearer <HEARTH_COS_WEBHOOK_KEY>` when the key is set. Writ
 
 Destructive tools **default to dry-run** unless `confirm=true`:
 
-- `ha_call_service` — lights, scenes, `media_player` (Denon, LG)
+- `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG)
+- `ha_media_control` — LG TV / Denon AVR turn_on/off, volume, source, play_media
 - `radarr_add` / `sonarr_add` / `overseerr_request`
 - `workspace_write` / `workspace_delete`
 - `docker_stop`
@@ -163,6 +168,7 @@ Destructive tools **default to dry-run** unless `confirm=true`:
 
 Read-only / inspect:
 
+- `house_media` — speakable TV + AVR + Plex inventory (`GET /api/media`)
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`
 - `radarr_search`, `sonarr_search`, `overseerr_search`
@@ -209,12 +215,17 @@ Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the
 
 Hearth will not talk webOS or Denon protocol itself. After HA is on:
 
-1. Add **LG webOS TV**.
-2. Add **Denon AVR** / HEOS for the AVR-X3700H.
+1. Add **LG webOS TV** (accept the pairing PIN on the TV).
+2. Add **Denon AVR** / HEOS for the AVR-X3700H (same LAN as HA).
 3. Add lights (Hue, ZHA, Matter, …).
 4. Paste a long-lived token into `HA_TOKEN`.
+5. Check Developer Tools → States for the real `media_player.*` entity_ids. If they are not
+   `media_player.lg_webos_tv` / `media_player.denon_avr_x3700h`, set `HA_TV_ENTITY` and
+   `HA_AVR_ENTITY` in `.env` and recreate the hearth container.
 
 For LAN discovery (Cast, some TVs), you may want host networking on the HA service — see comments in `docker-compose.yml`. Hearth itself stays on the `hearth` bridge.
+
+Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve → the app). Do not document or use `:8443` / `:8787` in the UI.
 
 ## What is stubbed vs live in v0.1
 

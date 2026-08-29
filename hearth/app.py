@@ -23,6 +23,7 @@ from hearth.tools.builtin import register_builtin_tools
 from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
 from hearth.voice.gateway import voice_socket
 from hearth.voice import webrtc as realtime_rtc
@@ -107,8 +108,15 @@ async def status() -> dict[str, Any]:
             "calls": "/api/realtime/calls",
             "client_secrets": "/api/realtime/client_secrets",
         },
-        "ha": ha_ping,
+        "ha": {
+            **ha_ping,
+            "tv_entity": settings.ha_tv_entity,
+            "avr_entity": settings.ha_avr_entity,
+        },
         "plex": {"configured": settings.plex_configured},
+        "radarr": {"configured": settings.radarr_configured},
+        "sonarr": {"configured": settings.sonarr_configured},
+        "overseerr": {"configured": settings.overseerr_configured},
         "docker": {"socket": docker.live},
         "tools": registry.names(),
         "workspace": str(settings.workspace_path.resolve()),
@@ -118,6 +126,12 @@ async def status() -> dict[str, Any]:
 @app.get("/api/now-playing")
 async def now_playing() -> dict[str, Any]:
     return await plex.now_playing()
+
+
+@app.get("/api/media")
+async def media_inventory() -> dict[str, Any]:
+    """TV + AVR (HA) + Plex — speakable house media snapshot for the agent/UI."""
+    return await house_media_inventory()
 
 
 @app.get("/api/rooms")
@@ -130,6 +144,7 @@ async def rooms() -> dict[str, Any]:
         "scenes": scenes.get("states") or [],
         "media": media.get("states") or [],
         "mode": lights.get("mode"),
+        "entities": {"tv": settings.ha_tv_entity, "avr": settings.ha_avr_entity},
     }
 
 

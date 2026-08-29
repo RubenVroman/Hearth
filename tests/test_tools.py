@@ -175,3 +175,69 @@ async def test_radarr_add_with_confirm_queues_mock():
     assert result.ok
     assert not result.needs_confirm
     assert result.data["added"]["title"]
+
+
+async def test_house_media_inventory_speaks_tv_avr_plex():
+    result = await registry.call("house_media", {})
+    assert result.ok
+    assert result.data["tv"]["entity_id"] == "media_player.lg_webos_tv"
+    assert result.data["avr"]["entity_id"] == "media_player.denon_avr_x3700h"
+    assert result.data["plex"]["sessions"][0]["title"] == "Dune: Part Two"
+    speak = result.data["speak"].lower()
+    assert "lg" in speak or "tv" in speak
+    assert "denon" in speak or "avr" in speak
+    assert "plex" in speak or "dune" in speak
+
+
+async def test_ha_media_control_tv_defaults_to_dry_run():
+    result = await registry.call("ha_media_control", {"device": "tv", "action": "turn_off"})
+    assert result.needs_confirm
+    assert result.dry_run
+
+
+async def test_ha_media_control_turns_tv_on_with_confirm():
+    off = await registry.call(
+        "ha_media_control",
+        {"device": "tv", "action": "turn_off", "confirm": True},
+    )
+    assert off.ok
+    on = await registry.call(
+        "ha_media_control",
+        {"device": "tv", "action": "turn_on", "confirm": True},
+    )
+    assert on.ok
+    assert on.data["entity_id"] == "media_player.lg_webos_tv"
+    assert on.data["state"]["state"] == "on"
+
+
+async def test_ha_media_control_sets_avr_volume():
+    result = await registry.call(
+        "ha_media_control",
+        {"device": "avr", "action": "volume_set", "volume_level": 40, "confirm": True},
+    )
+    assert result.ok
+    assert result.data["state"]["attributes"]["volume_level"] == 0.4
+
+
+async def test_intent_turn_on_the_tv_uses_ha_media_control():
+    plan = route_intent("turn on the TV")
+    assert plan["tool"] == "ha_media_control"
+    assert plan["args"]["device"] == "tv"
+    assert plan["args"]["action"] == "turn_on"
+
+
+async def test_intent_avr_volume_and_house_media():
+    vol = route_intent("set denon volume to 25")
+    assert vol["tool"] == "ha_media_control"
+    assert vol["args"]["device"] == "avr"
+    assert vol["args"]["action"] == "volume_set"
+    assert vol["args"]["volume_level"] == 25
+    assert route_intent("media status")["tool"] == "house_media"
+    assert route_intent("is the TV on")["tool"] == "house_media"
+
+
+async def test_intent_mute_avr():
+    plan = route_intent("mute the denon")
+    assert plan["tool"] == "ha_media_control"
+    assert plan["args"]["action"] == "volume_mute"
+    assert plan["args"]["device"] == "avr"

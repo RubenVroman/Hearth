@@ -8,6 +8,7 @@ from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.cos import cos_configured, escalate, not_configured_message
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.media import house_media_inventory, media_control
 from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
 
@@ -31,6 +32,31 @@ async def _ha_call(args: dict[str, Any]) -> dict[str, Any]:
     if not domain or not service or not entity_id:
         return {"ok": False, "error": "domain, service, and entity_id required"}
     return await ha.call_service(domain, service, entity_id, data)
+
+
+async def _house_media(_args: dict[str, Any]) -> dict[str, Any]:
+    return await house_media_inventory()
+
+
+async def _ha_media(args: dict[str, Any]) -> dict[str, Any]:
+    device = str(args.get("device") or "")
+    action = str(args.get("action") or "")
+    if not device or not action:
+        return {"ok": False, "error": "device and action required"}
+    volume = args.get("volume_level")
+    muted = args.get("is_volume_muted")
+    try:
+        return await media_control(
+            device,
+            action,
+            volume_level=float(volume) if volume is not None else None,
+            source=str(args.get("source") or "") or None,
+            media_content_id=str(args.get("media_content_id") or "") or None,
+            media_content_type=str(args.get("media_content_type") or "") or None,
+            is_volume_muted=bool(muted) if muted is not None else None,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 async def _plex_now(_args: dict[str, Any]) -> dict[str, Any]:
@@ -175,6 +201,52 @@ def register_builtin_tools() -> None:
                 "required": ["domain", "service", "entity_id"],
             },
             handler=_ha_call,
+            destructive=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_media",
+            description=(
+                "House media inventory the agent can speak: LG webOS TV and Denon AVR status "
+                "via Home Assistant, plus Plex now-playing and which backends have API keys. "
+                "Use for “what's on the TV”, “media status”, “is the AVR on”."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_house_media,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="ha_media_control",
+            description=(
+                "Control the LG webOS TV or Denon AVR via Home Assistant media_player services. "
+                "Prefer this over raw ha_call_service for TV/AVR. Destructive: dry-run unless confirm=true. "
+                "device=tv|avr; action=turn_on|turn_off|volume_set|volume_mute|unmute|volume_up|"
+                "volume_down|select_source|play_media|media_play|media_pause|media_stop."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "device": {
+                        "type": "string",
+                        "description": "tv (LG webOS) or avr (Denon). Aliases: lg, denon, receiver.",
+                    },
+                    "action": {"type": "string"},
+                    "volume_level": {
+                        "type": "number",
+                        "description": "0.0–1.0 or 0–100 for volume_set",
+                    },
+                    "source": {"type": "string", "description": "Input/source name for select_source"},
+                    "media_content_id": {"type": "string"},
+                    "media_content_type": {"type": "string"},
+                    "is_volume_muted": {"type": "boolean"},
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["device", "action"],
+            },
+            handler=_ha_media,
             destructive=True,
         )
     )

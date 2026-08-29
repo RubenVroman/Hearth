@@ -227,17 +227,34 @@ class MockHouse:
                     self._set_light(light, "off", 0)
         elif domain == "media_player":
             if service == "volume_set" and "volume_level" in data:
-                state["attributes"]["volume_level"] = data["volume_level"]
+                state["attributes"]["volume_level"] = float(data["volume_level"])
             elif service == "volume_mute":
                 state["attributes"]["is_volume_muted"] = bool(data.get("is_volume_muted", True))
+            elif service == "volume_up":
+                current = float(state["attributes"].get("volume_level") or 0)
+                state["attributes"]["volume_level"] = min(1.0, round(current + 0.05, 2))
+            elif service == "volume_down":
+                current = float(state["attributes"].get("volume_level") or 0)
+                state["attributes"]["volume_level"] = max(0.0, round(current - 0.05, 2))
+            elif service == "toggle":
+                state["state"] = "off" if state["state"] not in {"off", "unavailable"} else "on"
             elif service in {"turn_on", "media_play"}:
-                state["state"] = "playing" if domain else "on"
                 if service == "turn_on":
                     state["state"] = "on"
+                else:
+                    state["state"] = "playing"
             elif service in {"turn_off", "media_stop"}:
                 state["state"] = "off" if service == "turn_off" else "idle"
+            elif service == "media_pause":
+                state["state"] = "paused"
             elif service == "select_source" and "source" in data:
                 state["attributes"]["source"] = data["source"]
+            elif service == "play_media":
+                state["state"] = "playing"
+                if "media_content_id" in data:
+                    state["attributes"]["media_content_id"] = data["media_content_id"]
+                if "media_content_type" in data:
+                    state["attributes"]["media_content_type"] = data["media_content_type"]
         return {"ok": True, "entity": deepcopy(state)}
 
     def _set_light(self, entity_id: str, on_off: str, brightness: int) -> None:
