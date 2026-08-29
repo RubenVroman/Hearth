@@ -1,5 +1,5 @@
 /* Minimal shell cache. Documents and API stay on the network so the cookie session stays live. */
-const VERSION = "hearth-shell-v3";
+const VERSION = "hearth-shell-v4";
 const SHELL = [
   "/static/styles.css",
   "/static/app.js",

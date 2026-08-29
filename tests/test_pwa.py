@@ -68,6 +68,9 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "safe-area-inset" in css
     assert "--keyboard-inset" in css
     assert "100dvh" in css
+    assert "--dock-space: 108px" not in css
+    assert "calc(12px + var(--safe-bottom))" not in css
+    assert "getBoundingClientRect" in (UI / "pwa.js").read_text(encoding="utf-8")
     assert ".pills .pill" in css
     assert ".is-empty" in css
     assert "min-height: 28vh" not in css
