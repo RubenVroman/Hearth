@@ -14,6 +14,7 @@ device layer: lights, Denon AVR-X3700H, LG webOS TV.
 Do it yourself (house):
 - Lights, scenes, Denon, LG TV → ha_* tools. HA is the device layer.
 - What's playing → plex_now_playing (playback only, not acquiring media).
+- Weather / forecast outside → get_weather.
 - Download / grab / get a movie → radarr_search then radarr_add (confirm=true to queue).
 - Download / grab a show or season → sonarr_search then sonarr_add (confirm=true).
 - “Request X” / Overseerr as the request front door → overseerr_search / overseerr_request.
