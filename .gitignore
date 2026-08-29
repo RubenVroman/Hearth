@@ -1,0 +1,27 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.log
+
+# Home Assistant runtime data (keep example configuration.yaml)
+ha/.storage/
+ha/.cloud/
+ha/deps/
+ha/tts/
+ha/home-assistant.log*
+ha/home-assistant_v2.db*
+ha/blueprints/
+
+# Local workspace scratch (keep example skills)
+workspace/.cache/
+workspace/tmp/

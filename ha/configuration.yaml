@@ -1,0 +1,29 @@
+# Minimal Home Assistant config for the Hearth compose service.
+# Complete onboarding in the UI (LAN/Tailscale :8123), then add:
+#   - LG webOS TV integration
+#   - Denon AVR (HEOS / Network receivers) for AVR-X3700H
+#   - your lights (Hue, ZHA, Matter, …)
+#
+# HA is the device layer. Hearth talks to HA over the REST API; it does not
+# speak webOS or Denon protocol itself.
+
+default_config:
+
+homeassistant:
+  name: VAULT
+  unit_system: metric
+  currency: EUR
+  country: BE
+
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 127.0.0.1
+    - ::1
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - fd7a:115c:a1e0::/48
+
+logger:
+  default: warning

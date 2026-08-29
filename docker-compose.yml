@@ -1,0 +1,67 @@
+# Hearth on VAULT (Synology DS1817+, DSM 7.3, x86_64)
+#
+# Binds to LAN / Tailscale. Do not port-forward 8787 or 8123 on the router.
+# Existing media stack (Plex, Sonarr, Radarr, Prowlarr, Overseerr, Gluetun)
+# stays in its own compose file; point PLEX_URL at the host.
+
+services:
+  hearth:
+    build: .
+    image: hearth:local
+    container_name: hearth
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_REALTIME_MODEL: ${OPENAI_REALTIME_MODEL:-gpt-realtime}
+      HA_URL: ${HA_URL:-http://homeassistant:8123}
+      HA_TOKEN: ${HA_TOKEN:-}
+      PLEX_URL: ${PLEX_URL:-http://host.docker.internal:32400}
+      PLEX_TOKEN: ${PLEX_TOKEN:-}
+      HEARTH_HOUSE_NAME: ${HEARTH_HOUSE_NAME:-VAULT}
+      HEARTH_OWNER: ${HEARTH_OWNER:-Ruben}
+      HEARTH_TOKEN: ${HEARTH_TOKEN:-}
+      HEARTH_MOCK_IF_UNCONFIGURED: ${HEARTH_MOCK_IF_UNCONFIGURED:-true}
+      WORKSPACE_PATH: /app/workspace
+      DOCKER_SOCKET: /var/run/docker.sock
+    ports:
+      # Default publishes on all host interfaces. Prefer HEARTH_BIND=100.x.y.z
+      # (Tailscale) or a LAN IP. Never forward this on the WAN router.
+      - "${HEARTH_BIND:-0.0.0.0}:${HEARTH_PORT:-8787}:8787"
+    volumes:
+      - ./workspace:/app/workspace
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - homeassistant
+    networks:
+      - hearth
+    mem_limit: 512m
+
+  homeassistant:
+    image: homeassistant/home-assistant:stable
+    container_name: hearth-ha
+    restart: unless-stopped
+    # HA is the device layer (lights, Denon AVR-X3700H, LG webOS). This service
+    # is included unconfigured — complete onboarding on :8123 from LAN/Tailscale.
+    ports:
+      - "${HA_BIND:-0.0.0.0}:8123:8123"
+    volumes:
+      - ./ha:/config
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      TZ: ${TZ:-Europe/Brussels}
+    # For mDNS / Cast / HDMI-CEC discovery on the LAN, DSM Container Manager
+    # can use host networking. If you switch this on, comment out `ports:`
+    # and `networks:` for this service and set HA_URL=http://127.0.0.1:8123
+    # from hearth via host.docker.internal:8123 instead.
+    # network_mode: host
+    networks:
+      - hearth
+    mem_limit: 1g
+
+networks:
+  hearth:
+    name: hearth
+    driver: bridge

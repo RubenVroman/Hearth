@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hearth — VAULT</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Outfit:wght@300;400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <div class="ember" aria-hidden="true"></div>
+
+    <header class="top">
+      <div class="brand">
+        <span class="mark">Hearth</span>
+        <span class="house" id="house">VAULT</span>
+      </div>
+      <div class="pills">
+        <span class="pill" id="agent-pill">idle</span>
+        <span class="pill" id="voice-pill">voice off</span>
+        <span class="pill dim" id="mode-pill">fallback</span>
+      </div>
+    </header>
+
+    <main class="stage">
+      <aside class="rail">
+        <p class="kicker">Now playing</p>
+        <article class="card film" id="now-playing">
+          <p class="muted">Nothing on the wire.</p>
+        </article>
+        <p class="kicker rest">AVR · TV</p>
+        <div id="media-stack" class="stack"></div>
+      </aside>
+
+      <section class="hearth">
+        <button type="button" id="orb" class="orb" aria-label="Hold to talk">
+          <span class="orb-ring"></span>
+          <span class="orb-core"></span>
+          <span class="orb-label" id="orb-label">Hold to speak</span>
+        </button>
+        <p class="hint" id="hint">Voice is the front door. Text still works.</p>
+        <form id="composer" class="composer" autocomplete="off">
+          <input
+            id="line"
+            type="text"
+            name="line"
+            placeholder="Ask the house…"
+            maxlength="2000"
+          />
+          <button type="submit">Send</button>
+        </form>
+        <button type="button" id="confirm-btn" class="confirm hidden">Confirm last action</button>
+      </section>
+
+      <aside class="rail right">
+        <p class="kicker">Lights</p>
+        <div id="lights" class="tiles"></div>
+        <p class="kicker rest">Scenes</p>
+        <div id="scenes" class="stack"></div>
+      </aside>
+    </main>
+
+    <section class="transcript" aria-live="polite">
+      <p class="kicker">Conversation</p>
+      <ol id="log"></ol>
+    </section>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
