@@ -76,6 +76,12 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert ".pills .pill" in css
     assert ".is-empty" in css
     assert "min-height: 28vh" not in css
+    # Phone: confirm stacks above Ask the House; hidden confirm must not reserve space.
+    assert ".composer-dock .confirm" in css
+    assert "order: 0" in css
+    assert "margin-bottom: 8px" in css
+    assert "has-confirm" in (UI / "app.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v6" in (UI / "sw.js").read_text(encoding="utf-8")
     assert 'id="logout-btn"' in index_html
     assert 'id="agent-pill"' in index_html
     assert "setEmpty" in (UI / "app.js").read_text(encoding="utf-8")

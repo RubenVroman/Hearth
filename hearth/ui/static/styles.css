@@ -633,9 +633,11 @@ input,
     width: 100%;
     max-width: none;
     align-items: stretch;
+    /* Ask the House hugs the bottom; confirm (when shown) stacks above it. */
     padding: 0 max(16px, var(--safe-right)) var(--dock-safe-bottom) max(16px, var(--safe-left));
     background: var(--bg);
     transform: none;
+    min-height: 0;
   }
 
   .composer-dock::before {
@@ -647,6 +649,10 @@ input,
     height: 20px;
     pointer-events: none;
     background: linear-gradient(180deg, transparent, var(--bg));
+  }
+
+  .composer-dock .composer {
+    order: 1;
   }
 
   .composer input,
@@ -662,8 +668,15 @@ input,
     padding: 12px 20px;
   }
 
-  .confirm {
-    margin-top: 8px;
+  /*
+   * Confirm stacks above Ask the House on phone so the composer stays on the
+   * bottom edge. When .confirm is .hidden (display:none), that row collapses
+   * and the field keeps the bottom slot — no reserved empty confirm gap.
+   */
+  .composer-dock .confirm {
+    order: 0;
+    margin-top: 0;
+    margin-bottom: 8px;
   }
 
   .film {
