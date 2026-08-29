@@ -209,8 +209,16 @@ def _format_tool_reply(tools: list[dict[str, Any]]) -> str:
         name = tool.get("name", "tool")
         if tool.get("needs_confirm"):
             data = tool.get("data") or {}
+            if data.get("speak"):
+                parts.append(str(data["speak"]))
+                continue
             preview = data.get("would_call_with", {})
-            spoken = _confirm_line(name, preview, data=data)
+            spoken = _confirm_line(
+                name,
+                preview,
+                data=data,
+                plan=data.get("plan") if isinstance(data.get("plan"), dict) else None,
+            )
             parts.append(spoken)
             continue
         if not tool.get("ok"):
@@ -377,8 +385,15 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     return None
 
 
-def _confirm_line(name: str, preview: dict[str, Any], data: dict[str, Any] | None = None) -> str:
+def _confirm_line(
+    name: str,
+    preview: dict[str, Any],
+    data: dict[str, Any] | None = None,
+    plan: dict[str, Any] | None = None,
+) -> str:
     data = data or {}
+    if plan is None and isinstance(data.get("plan"), dict):
+        plan = data.get("plan")
     if name == "chief_of_staff":
         task = preview.get("task") or preview.get("said") or "that"
         return f"I'll ask Chief of Staff to handle that: {task}. Confirm to send."
@@ -393,6 +408,10 @@ def _confirm_line(name: str, preview: dict[str, Any], data: dict[str, Any] | Non
         action = preview.get("action") or "control"
         return f"I'll {action.replace('_', ' ')} the {device}. Confirm to run."
     if name == "plex_play":
+        if plan and plan.get("speak"):
+            return str(plan["speak"])
+        if data.get("speak"):
+            return str(data["speak"])
         query = preview.get("query") or "that"
         player = preview.get("player") or "the TV"
         return f"I'll play {query} on {player}. Confirm to start."

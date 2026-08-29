@@ -23,6 +23,9 @@ class ToolSpec:
     not_configured: str = ""
     # Optional enricher for dry-run / confirm previews (e.g. cart + address).
     preview: PreviewFn | None = None
+    # Optional: async resolve during destructive dry-run (e.g. plex_play plan).
+    # Return ok=False to surface ambiguity/errors without a confirm button.
+    preview_handler: Handler | None = None
 
 
 @dataclass
@@ -120,11 +123,34 @@ class ToolRegistry:
                 dry_run = not confirm
             if not confirm:
                 preview_args = {k: v for k, v in args.items() if k not in {"confirm", "dry_run"}}
-                preview = {
+                plan: dict[str, Any] | None = None
+                if spec.preview_handler is not None:
+                    try:
+                        planned = await spec.preview_handler(preview_args)
+                    except Exception as exc:  # noqa: BLE001
+                        result = ToolResult(name=name, ok=False, data={"error": str(exc)})
+                        payload = result.as_dict()
+                        runtime.last_tools.append(payload)
+                        widget_bus.publish_tool(payload)
+                        return result
+                    plan = planned if isinstance(planned, dict) else {"result": planned}
+                    if plan.get("ok") is False:
+                        runtime.pending = None
+                        result = ToolResult(name=name, ok=False, data=plan)
+                        payload = result.as_dict()
+                        runtime.last_tools.append(payload)
+                        widget_bus.publish_tool(payload)
+                        _offer_memory(spec, result)
+                        return result
+                preview: dict[str, Any] = {
                     "tool": name,
                     "would_call_with": preview_args,
                     "hint": "Re-run with confirm=true to execute. Destructive tools default to dry-run.",
                 }
+                if plan is not None:
+                    preview["plan"] = plan
+                    if plan.get("speak"):
+                        preview["speak"] = plan["speak"]
                 if spec.preview is not None:
                     try:
                         extra = spec.preview(preview_args)
