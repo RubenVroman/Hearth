@@ -63,6 +63,25 @@ class Settings(BaseSettings):
     cos_webhook_key: str = Field(default="", alias="HEARTH_COS_WEBHOOK_KEY")
     cos_repo: str = Field(default="RubenVroman/Hearth", alias="HEARTH_COS_REPO")
 
+    # House delivery address for food orders (never invent a street in code).
+    hearth_delivery_street: str = Field(default="", alias="HEARTH_DELIVERY_STREET")
+    hearth_delivery_postcode: str = Field(default="", alias="HEARTH_DELIVERY_POSTCODE")
+    hearth_delivery_city: str = Field(default="", alias="HEARTH_DELIVERY_CITY")
+    hearth_delivery_country: str = Field(default="NL", alias="HEARTH_DELIVERY_COUNTRY")
+
+    # Thuisbezorgd / Just Eat Takeaway NL — credentials stay on the host .env only.
+    # There is no public self-serve consumer ordering API; partner JE-API-KEY required
+    # for live submit. Empty key → fixtures only (browse/cart/confirm still work).
+    thuisbezorgd_api_base: str = Field(
+        default="https://nl.api.just-eat.io",
+        alias="THUISBEZORGD_API_BASE",
+    )
+    thuisbezorgd_api_key: str = Field(default="", alias="THUISBEZORGD_API_KEY")
+    thuisbezorgd_tenant: str = Field(default="nl", alias="THUISBEZORGD_TENANT")
+    thuisbezorgd_email: str = Field(default="", alias="THUISBEZORGD_EMAIL")
+    thuisbezorgd_password: str = Field(default="", alias="THUISBEZORGD_PASSWORD")
+    thuisbezorgd_session_token: str = Field(default="", alias="THUISBEZORGD_SESSION_TOKEN")
+
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key.strip())
@@ -86,6 +105,18 @@ class Settings(BaseSettings):
     @property
     def overseerr_configured(self) -> bool:
         return bool(self.overseerr_api_key.strip())
+
+    @property
+    def thuisbezorgd_configured(self) -> bool:
+        return bool(self.thuisbezorgd_api_key.strip())
+
+    @property
+    def delivery_address_configured(self) -> bool:
+        return bool(
+            self.hearth_delivery_street.strip()
+            and self.hearth_delivery_postcode.strip()
+            and self.hearth_delivery_city.strip()
+        )
 
 
 settings = Settings()
