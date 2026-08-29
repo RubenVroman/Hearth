@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Lights/AVR/TV via HA, *arr/Overseerr grab/request, Plex now-playing, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Lights/AVR/TV via HA, *arr/Overseerr grab/request, Plex now-playing + play-on-client, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -81,7 +81,8 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HA_TV_ENTITY` | LG webOS `media_player` entity_id. Default `media_player.lg_webos_tv`. Set after HA pairing if different. |
 | `HA_AVR_ENTITY` | Denon AVR entity_id. Default `media_player.denon_avr_x3700h`. |
 | `PLEX_URL` | Existing Plex on the host. Default `http://host.docker.internal:32400`. |
-| `PLEX_TOKEN` | **Live** Plex sessions/search. Empty → mocked now-playing. |
+| `PLEX_TOKEN` | **Live** Plex sessions/search/clients/play. Empty → mocked now-playing + library/play fixtures. |
+| `PLEX_DEFAULT_PLAYER` | Optional default client name substring (e.g. `Apple TV`) when “the TV” is ambiguous. |
 | `RADARR_URL` / `RADARR_API_KEY` | **Live** movie search/add. Default URL `http://host.docker.internal:7878`. Empty key → fixtures. |
 | `SONARR_URL` / `SONARR_API_KEY` | **Live** series search/add. Default `http://host.docker.internal:8989`. |
 | `OVERSEERR_URL` / `OVERSEERR_API_KEY` | **Live** request front door. Default `http://host.docker.internal:5055`. |
@@ -129,7 +130,8 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Lights, scenes → Home Assistant tools
 - LG TV / Denon AVR power, volume, source → `ha_media_control` (prefer over raw `ha_call_service`)
 - House media snapshot (TV + AVR + Plex) → `house_media` or `GET /api/media`
-- What's playing → Plex (playback only)
+- What's playing → `plex_now_playing`
+- Play a specific library title on Apple TV / LG / living-room Plex → `plex_play` (optional `plex_search` / `plex_clients`). Starts playback on the client via the Plex Media Server remote API — not HA `play_media` on the webOS entity.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
@@ -161,6 +163,7 @@ Destructive tools **default to dry-run** unless `confirm=true`:
 
 - `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG)
 - `ha_media_control` — LG TV / Denon AVR turn_on/off, volume, source, play_media
+- `plex_play` — start a Plex library title on a Plex client (Apple TV / LG / …)
 - `radarr_add` / `sonarr_add` / `overseerr_request`
 - `workspace_write` / `workspace_delete`
 - `docker_stop`
@@ -170,7 +173,7 @@ Read-only / inspect:
 
 - `house_media` — speakable TV + AVR + Plex inventory (`GET /api/media`)
 - `ha_list_entities`, `ha_get_state`
-- `plex_now_playing`, `plex_search`
+- `plex_now_playing`, `plex_search`, `plex_clients`
 - `radarr_search`, `sonarr_search`, `overseerr_search`
 - `workspace_list`, `workspace_read`
 - `docker_ps`, `docker_inspect`
@@ -209,7 +212,7 @@ cp .env.example .env
 python -m hearth
 ```
 
-Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should dry-run `radarr_add`.
+Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire. `{"message":"play The Endless on the Apple TV"}` dry-runs `plex_play` until confirm. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should dry-run `radarr_add`.
 
 ## Home Assistant devices
 
@@ -233,7 +236,7 @@ Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve →
 | --- | --- |
 | FastAPI runtime + UI + compose (incl. HA) | Live |
 | Tool registry + agent loop | Live |
-| Local intent router (no API key) | Live — playing, lights, *arr/Overseerr grab, docker, workspace, CoS escalate |
+| Local intent router (no API key) | Live — playing, play-on-TV, lights, *arr/Overseerr grab, docker, workspace, CoS escalate |
 | OpenAI chat tools | Live when `OPENAI_API_KEY` is set |
 | Realtime voice (GA WebRTC + sideband tools) | Live when `OPENAI_API_KEY` is set; UI is tap-to-talk duplex |
 | `/ws/voice` text fallback | Live protocol; not the disabled beta websocket |

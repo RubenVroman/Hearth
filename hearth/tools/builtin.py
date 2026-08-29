@@ -67,6 +67,25 @@ async def _plex_search(args: dict[str, Any]) -> dict[str, Any]:
     return await plex.search(str(args.get("query") or ""), int(args.get("limit") or 8))
 
 
+async def _plex_clients(_args: dict[str, Any]) -> dict[str, Any]:
+    return await plex.clients()
+
+
+async def _plex_play(args: dict[str, Any]) -> dict[str, Any]:
+    rating = args.get("ratingKey") or args.get("rating_key")
+    offset = args.get("offset_ms") or args.get("offset") or 0
+    try:
+        offset_ms = int(offset)
+    except (TypeError, ValueError):
+        offset_ms = 0
+    return await plex.play(
+        str(args.get("query") or ""),
+        player=str(args.get("player") or "") or None,
+        rating_key=rating,
+        offset_ms=offset_ms,
+    )
+
+
 async def _docker_ps(_args: dict[str, Any]) -> dict[str, Any]:
     return await docker.ps()
 
@@ -261,7 +280,11 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="plex_search",
-            description="Search the Plex library.",
+            description=(
+                "Search the Plex library. Returns title, type, year, ratingKey, key, guid. "
+                "Use before plex_play when you need to pick among matches. "
+                "If the title is missing, say so — do not silently queue Radarr."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -271,6 +294,57 @@ def register_builtin_tools() -> None:
                 "required": ["query"],
             },
             handler=_plex_search,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="plex_clients",
+            description=(
+                "List controllable Plex clients (Apple TV, LG webOS, Shield, …). "
+                "Use when the user asks which players are available, or before plex_play "
+                "if the target is ambiguous."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_plex_clients,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="plex_play",
+            description=(
+                "Start playback of a specific Plex library title on a Plex client "
+                "(Apple TV / LG TV / living-room player) without tapping Play on the client. "
+                "Searches the library, resolves the player (named hint, else PLEX_DEFAULT_PLAYER, "
+                "else Apple TV/LG/living room, else the only client), then playMedia via the PMS. "
+                "Destructive: dry-run unless confirm=true. If the title is not in the library, "
+                "say so clearly — do not silently grab it in Radarr."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Title to play, e.g. The Endless",
+                    },
+                    "player": {
+                        "type": "string",
+                        "description": "Optional client hint: Apple TV, LG, living room, …",
+                    },
+                    "ratingKey": {
+                        "type": "string",
+                        "description": "Optional Plex ratingKey when already known from plex_search",
+                    },
+                    "offset_ms": {
+                        "type": "integer",
+                        "description": "Start offset in milliseconds (default 0)",
+                    },
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["query"],
+            },
+            handler=_plex_play,
+            destructive=True,
         )
     )
     registry.register(

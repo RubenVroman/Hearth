@@ -134,9 +134,10 @@ class AgentLoop:
         used: list[dict[str, Any]] = []
         if plan is None:
             reply = (
-                "I can drive the house — lights, Denon, LG TV, grab movies in Radarr or shows in "
-                "Sonarr, request via Overseerr, Plex now-playing, workspace, docker inspect. "
-                "Repo, Gridways, Discord, calendar, and anything I can't do yet go to Chief of Staff."
+                "I can drive the house — lights, Denon, LG TV, play a Plex title on the TV, "
+                "grab movies in Radarr or shows in Sonarr, request via Overseerr, Plex now-playing, "
+                "workspace, docker inspect. Repo, Gridways, Discord, calendar, and anything I can't "
+                "do yet go to Chief of Staff."
             )
             runtime.note("assistant", reply)
             return {"reply": reply, "mode": "local", "tools": used}
@@ -175,6 +176,9 @@ def _format_tool_reply(tools: list[dict[str, Any]]) -> str:
             if name == "chief_of_staff" and data.get("error"):
                 parts.append(str(data["error"]))
                 continue
+            if data.get("speak"):
+                parts.append(str(data["speak"]))
+                continue
             parts.append(f"{name} failed: {data}")
             continue
         data = tool.get("data") or {}
@@ -196,6 +200,34 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
             state = session.get("state") or "idle"
             lines.append(f"{title} on {player} — {state}{mock}.")
         return " ".join(lines)
+    if name == "plex_search":
+        results = data.get("results") or []
+        if not results:
+            return f"Nothing in the Plex library{mock}."
+        titles = ", ".join(
+            f"{r.get('title')} ({r.get('year') or r.get('type')})"
+            for r in results[:4]
+            if r.get("title")
+        )
+        return f"Plex{mock} found: {titles or 'nothing'}."
+    if name == "plex_clients":
+        clients = data.get("clients") or []
+        if not clients:
+            return f"No Plex clients online{mock}."
+        names = ", ".join(str(c.get("name") or "unknown") for c in clients[:6])
+        return f"Plex clients{mock}: {names}."
+    if name == "plex_play":
+        spoken = data.get("speak")
+        if spoken:
+            return spoken if mock == "" else f"{spoken.rstrip('.')}" + mock + "."
+        if data.get("in_library") is False:
+            return str(data.get("error") or "That title is not in the Plex library.")
+        item = data.get("item") or {}
+        client = data.get("client") or {}
+        return (
+            f"Playing {item.get('title') or 'that'} on "
+            f"{client.get('name') or 'the TV'}{mock}."
+        )
     if name == "ha_list_entities":
         states = data.get("states") or []
         if not states:
@@ -270,13 +302,33 @@ def _confirm_line(name: str, preview: dict[str, Any]) -> str:
         device = preview.get("device") or "device"
         action = preview.get("action") or "control"
         return f"I'll {action.replace('_', ' ')} the {device}. Confirm to run."
+    if name == "plex_play":
+        query = preview.get("query") or "that"
+        player = preview.get("player") or "the TV"
+        return f"I'll play {query} on {player}. Confirm to start."
     return f"{name} is waiting for confirm. Preview: {preview}"
 
 
 _PLAYING = re.compile(r"\b(now playing|what'?s (on|playing)|what is playing|now-playing)\b", re.I)
+_PLAY_ON_TV = re.compile(
+    r"\bplay\s+(.+?)\s+on\s+(?:the\s+)?("
+    r"apple\s*tv|lg(?:\s*webos)?(?:\s*tv)?|webos|"
+    r"living\s*room(?:\s*tv)?|shield|plex|"
+    r"tv|television"
+    r")\b",
+    re.I,
+)
+_PLAY_TITLE = re.compile(
+    r"\b(?:play|put on)\s+(.+?)(?:\s+please)?$",
+    re.I,
+)
 _MEDIA_STATUS = re.compile(
     r"\b(house media|media status|media inventory|what'?s on the (tv|avr|denon)|"
     r"is the (tv|avr|denon) on|avr status|tv status)\b",
+    re.I,
+)
+_PLEX_CLIENTS = re.compile(
+    r"\b(plex clients|which (plex )?(players?|clients?)|list (plex )?(players?|clients?))\b",
     re.I,
 )
 _PLEX_ONLY = re.compile(r"\bplex\b", re.I)
@@ -352,6 +404,19 @@ def route_intent(text: str) -> dict[str, Any] | None:
         if _MOVIE.search(raw):
             return {"tool": "radarr_add", "args": {"query": query or raw}}
         return {"tool": "overseerr_request", "args": {"query": query or raw}}
+    play_on = _PLAY_ON_TV.search(raw)
+    if play_on:
+        title = _play_title_clean(play_on.group(1))
+        player = _plex_player_hint(play_on.group(2))
+        return {"tool": "plex_play", "args": {"query": title, "player": player}}
+    play_title = _PLAY_TITLE.search(raw)
+    if play_title and not _PLAYING.search(raw):
+        title = _play_title_clean(play_title.group(1))
+        # Avoid treating "play" as resume on HA media_player without a title.
+        if title and title.lower() not in {"it", "that", "this", "something"}:
+            return {"tool": "plex_play", "args": {"query": title}}
+    if _PLEX_CLIENTS.search(raw):
+        return {"tool": "plex_clients", "args": {}}
     if _MEDIA_STATUS.search(raw):
         return {"tool": "house_media", "args": {}}
     mute = _MUTE.search(raw)
@@ -406,6 +471,32 @@ def _media_device(phrase: str | None) -> str:
     if name in {"tv", "lg", "webos", "television"}:
         return "tv"
     return "avr"
+
+
+def _plex_player_hint(phrase: str | None) -> str:
+    name = re.sub(r"\s+", " ", (phrase or "").strip().lower())
+    if name in {"tv", "television", "plex"}:
+        return "tv"
+    if "apple" in name:
+        return "Apple TV"
+    if "lg" in name or "webos" in name:
+        return "LG"
+    if "living" in name:
+        return "living room"
+    if "shield" in name:
+        return "Shield"
+    return phrase.strip() if phrase else "tv"
+
+
+_PLAY_NOISE = re.compile(
+    r"\b(please|can you|could you|for me|the movie|the film|the show|a movie|a show)\b",
+    re.I,
+)
+
+
+def _play_title_clean(text: str) -> str:
+    cleaned = _PLAY_NOISE.sub(" ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip(" .?!'\"")
 
 
 def _turn_plan(phrase: str, *, on: bool) -> dict[str, Any]:
