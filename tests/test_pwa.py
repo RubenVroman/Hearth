@@ -76,9 +76,34 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert ".pills .pill" in css
     assert ".is-empty" in css
     assert "min-height: 28vh" not in css
+    # Phone transcript shares the column with house rails instead of overlapping.
+    assert ":has(#transcript:not(.is-empty))" in css
+    assert "isolation: isolate" in css
     assert 'id="logout-btn"' in index_html
     assert 'id="agent-pill"' in index_html
     assert "setEmpty" in (UI / "app.js").read_text(encoding="utf-8")
+    app_js = (UI / "app.js").read_text(encoding="utf-8")
+    assert "displayRole" in app_js
+    assert "conversation.item.input_audio_transcription.completed" in app_js
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200
+
+
+def test_phone_transcript_shows_user_and_assistant_roles():
+    app_js = (UI / "app.js").read_text(encoding="utf-8")
+    assert 'appendLog("you"' in app_js or "appendLog(\"you\"" in app_js
+    assert 'appendLog("hearth"' in app_js or "appendLog(\"hearth\"" in app_js
+    assert "input_audio_transcription.completed" in app_js
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+    assert 'li[data-role="you"]' in css
+    assert "max-height: min(30vh, 200px)" in css
+    assert ".rail-media" in css and "z-index: 0" in css
+
+
+def test_realtime_session_enables_user_input_transcription():
+    from hearth.voice.webrtc import session_config
+
+    cfg = session_config()
+    assert cfg["audio"]["input"]["transcription"]["model"] == "gpt-4o-mini-transcribe"
+    assert cfg["audio"]["input"]["turn_detection"]["type"] == "semantic_vad"
