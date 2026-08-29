@@ -118,3 +118,34 @@ def test_realtime_session_enables_user_input_transcription():
     cfg = session_config()
     assert cfg["audio"]["input"]["transcription"]["model"] == "gpt-4o-mini-transcribe"
     assert cfg["audio"]["input"]["turn_detection"]["type"] == "semantic_vad"
+
+
+def test_mic_permission_ux_avoids_boot_probe_and_keeps_warm_stream():
+    app_js = (UI / "app.js").read_text(encoding="utf-8")
+    index_html = (UI / "index.html").read_text(encoding="utf-8")
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+
+    assert "queryMicPermission" in app_js
+    assert "acquireMicStream" in app_js
+    assert "permissions.query" in app_js
+    assert 'name: "microphone"' in app_js
+    assert "shouldShowMicGate" in app_js
+    assert "MIC_GATE_COOLDOWN_MS" in app_js
+    assert "hearth.mic.granted" in app_js
+    assert "releaseMicStream" in app_js
+    assert "track.enabled = false" in app_js
+    assert "do not track.stop()" in app_js
+    assert "never probe with getUserMedia on boot" in app_js
+
+    # getUserMedia only via acquireMicStream — not on boot or as a permission probe.
+    assert app_js.count("getUserMedia(") == 1
+    assert "acquireMicStream" in app_js
+
+    assert 'id="mic-gate"' in index_html
+    assert 'id="mic-gate-continue"' in index_html
+    assert 'id="mic-denied"' in index_html
+    assert 'id="mic-denied-retry"' in index_html
+    assert "Settings → Hearth → Microphone" in app_js
+    assert ".mic-panel" in css
+    assert "SpeechBargeIn" in app_js
+    assert "HearthVad" in app_js

@@ -68,6 +68,26 @@
           <span class="orb-label" id="orb-label">Tap to talk</span>
         </button>
         <p class="hint" id="hint">Tap to talk.</p>
+        <div id="mic-gate" class="mic-panel hidden" role="dialog" aria-labelledby="mic-gate-title">
+          <p class="mic-panel-title" id="mic-gate-title">Microphone for live voice</p>
+          <p class="mic-panel-copy" id="mic-gate-detail">
+            Hearth only opens the mic when you tap to talk — never in the background.
+          </p>
+          <div class="mic-panel-actions">
+            <button type="button" id="mic-gate-continue" class="mic-panel-primary">Continue</button>
+            <button type="button" id="mic-gate-not-now" class="mic-panel-secondary">Not now</button>
+          </div>
+        </div>
+        <div id="mic-denied" class="mic-panel hidden" role="status" aria-live="polite">
+          <p class="mic-panel-title">Microphone blocked</p>
+          <p class="mic-panel-copy" id="mic-denied-detail">
+            Enable the microphone in Settings, then tap the hearth again.
+          </p>
+          <div class="mic-panel-actions">
+            <button type="button" id="mic-denied-retry" class="mic-panel-primary">Try again</button>
+            <button type="button" id="mic-denied-dismiss" class="mic-panel-secondary">Dismiss</button>
+          </div>
+        </div>
         <div class="composer-dock">
           <form id="composer" class="composer" autocomplete="off">
             <input

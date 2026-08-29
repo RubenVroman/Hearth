@@ -1,12 +1,225 @@
 const $ = (id) => document.getElementById(id);
 
+const MIC_CONSTRAINTS = {
+  audio: {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    channelCount: 1,
+  },
+};
+
+const MIC_STORAGE = {
+  granted: "hearth.mic.granted",
+  denied: "hearth.mic.denied",
+  gateAt: "hearth.mic.gateAt",
+};
+
+/** Re-show the in-app mic explainer at most this often when the OS won't remember. */
+const MIC_GATE_COOLDOWN_MS = 14 * 24 * 60 * 60 * 1000;
+
 const state = {
   pending: null,
   call: null,
+  /** Kept alive across hangups so iOS Safari / Home Screen PWAs avoid re-prompting. */
+  mic: null,
+  micPermission: "unknown",
   openai: false,
   realtime: { path: "webrtc-ga", model: "gpt-realtime-2.1", beta: false },
   accessToken: "",
 };
+
+function micStorageGet(key) {
+  try {
+    return localStorage.getItem(key) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function micStorageSet(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (_) {
+    /* private mode / quota */
+  }
+}
+
+function micStorageClear(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function isStandalonePwa() {
+  return (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    window.navigator.standalone === true
+  );
+}
+
+function isAppleTouchDevice() {
+  return (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
+/**
+ * Query mic permission without calling getUserMedia.
+ * Returns "granted" | "denied" | "prompt" | "unknown".
+ * iOS Safari / Home Screen PWAs often lack Permissions API support for microphone.
+ */
+async function queryMicPermission() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return "denied";
+  }
+  const permissions = navigator.permissions;
+  if (!permissions || typeof permissions.query !== "function") {
+    return "unknown";
+  }
+  try {
+    const status = await permissions.query({ name: "microphone" });
+    if (status) {
+      status.onchange = () => {
+        state.micPermission = status.state || "unknown";
+        if (status.state === "granted") {
+          micStorageSet(MIC_STORAGE.granted, "1");
+          micStorageClear(MIC_STORAGE.denied);
+          hideMicPanels();
+        }
+        if (status.state === "denied") {
+          micStorageSet(MIC_STORAGE.denied, "1");
+        }
+        if (!state.call) $("hint").textContent = idleHint();
+      };
+    }
+    return (status && status.state) || "unknown";
+  } catch (_) {
+    return "unknown";
+  }
+}
+
+function rememberMicGranted() {
+  micStorageSet(MIC_STORAGE.granted, "1");
+  micStorageClear(MIC_STORAGE.denied);
+  state.micPermission = "granted";
+}
+
+function rememberMicDenied() {
+  micStorageSet(MIC_STORAGE.denied, "1");
+  state.micPermission = "denied";
+}
+
+function micTracksLive(stream) {
+  if (!stream) return false;
+  return stream.getAudioTracks().some((t) => t.readyState === "live");
+}
+
+function releaseMicStream({ hard = false } = {}) {
+  const stream = state.mic;
+  if (!stream) return;
+  for (const track of stream.getAudioTracks()) {
+    try {
+      if (hard) track.stop();
+      else track.enabled = false;
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  if (hard) state.mic = null;
+}
+
+async function acquireMicStream() {
+  if (micTracksLive(state.mic)) {
+    for (const track of state.mic.getAudioTracks()) track.enabled = true;
+    rememberMicGranted();
+    return state.mic;
+  }
+  if (state.mic) releaseMicStream({ hard: true });
+  const stream = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
+  state.mic = stream;
+  for (const track of stream.getAudioTracks()) {
+    track.addEventListener("ended", () => {
+      if (state.mic === stream) state.mic = null;
+    });
+  }
+  rememberMicGranted();
+  return stream;
+}
+
+function shouldShowMicGate(permission) {
+  if (permission === "granted") return false;
+  if (permission === "denied") return false;
+  if (micStorageGet(MIC_STORAGE.denied) === "1" && permission !== "prompt") {
+    /* Sticky denial from a prior NotAllowedError — show settings, not the gate. */
+    return false;
+  }
+  if (micStorageGet(MIC_STORAGE.granted) === "1" && permission === "unknown") {
+    /* Previously succeeded; OS may still re-prompt on cold start — skip nag copy. */
+    return false;
+  }
+  const last = Number(micStorageGet(MIC_STORAGE.gateAt) || 0);
+  if (last && Date.now() - last < MIC_GATE_COOLDOWN_MS) return false;
+  return true;
+}
+
+function micSettingsCopy() {
+  if (isAppleTouchDevice()) {
+    return isStandalonePwa()
+      ? "On iPhone: Settings → Hearth → Microphone. Turn it on, then return here and tap the hearth."
+      : "On iPhone: Settings → Safari → [site settings] or the aA menu → Website Settings → Microphone. Then tap the hearth again.";
+  }
+  return "Allow the microphone for this site in your browser settings, then tap the hearth again.";
+}
+
+function hideMicPanels() {
+  $("mic-gate")?.classList.add("hidden");
+  $("mic-denied")?.classList.add("hidden");
+}
+
+function showMicGate() {
+  hideMicPanels();
+  const gate = $("mic-gate");
+  if (!gate) return;
+  micStorageSet(MIC_STORAGE.gateAt, String(Date.now()));
+  const detail = $("mic-gate-detail");
+  if (detail) {
+    detail.textContent = isAppleTouchDevice()
+      ? "iPhone may ask again after you leave the app. Hearth only opens the mic when you tap to talk — never in the background."
+      : "Your browser should remember this after you allow it once. Hearth only opens the mic when you tap to talk.";
+  }
+  gate.classList.remove("hidden");
+}
+
+function showMicDenied(message) {
+  hideMicPanels();
+  const panel = $("mic-denied");
+  if (!panel) return;
+  const detail = $("mic-denied-detail");
+  if (detail) detail.textContent = message || micSettingsCopy();
+  panel.classList.remove("hidden");
+  $("hint").textContent = "Microphone blocked.";
+  $("orb-label").textContent = "Mic blocked";
+}
+
+function classifyMicError(err) {
+  const name = err && err.name ? err.name : "";
+  const message = (err && err.message) || "Voice failed";
+  if (name === "NotAllowedError" || name === "PermissionDeniedError" || /permission|not allowed|denied/i.test(message)) {
+    rememberMicDenied();
+    return { kind: "denied", message: micSettingsCopy() };
+  }
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+    return { kind: "missing", message: "No microphone found on this device." };
+  }
+  if (name === "NotReadableError" || name === "TrackStartError") {
+    return { kind: "busy", message: "Microphone is in use by another app. Close it and try again." };
+  }
+  return { kind: "other", message };
+}
 
 function authHeaders(extra = {}) {
   const headers = { ...extra };
@@ -158,6 +371,9 @@ function phoneUi() {
 function idleHint() {
   if (!state.openai) {
     return phoneUi() ? "Text still works." : "Text works now. Live voice needs OPENAI_API_KEY on the NAS — then tap the hearth.";
+  }
+  if (state.micPermission === "denied" || micStorageGet(MIC_STORAGE.denied) === "1") {
+    return phoneUi() ? "Mic blocked — check Settings." : "Microphone blocked. Enable it in browser or system settings, then tap the hearth.";
   }
   if (phoneUi()) return "Tap to talk.";
   const rt = state.realtime || {};
@@ -335,17 +551,35 @@ async function relayTool(event) {
   }
 }
 
+function abandonCallSetup(pc) {
+  try {
+    if (pc) {
+      for (const sender of pc.getSenders()) {
+        try {
+          pc.removeTrack(sender);
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      pc.close();
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  /* Keep the warm mic stream; only mute it. Stopping would re-prompt on iOS PWA. */
+  releaseMicStream({ hard: false });
+}
+
 async function startConversation() {
   const remote = $("remote-audio");
   const pc = new RTCPeerConnection();
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      channelCount: 1,
-    },
-  });
+  let stream;
+  try {
+    stream = await acquireMicStream();
+  } catch (err) {
+    pc.close();
+    throw err;
+  }
   for (const track of stream.getAudioTracks()) {
     pc.addTrack(track, stream);
   }
@@ -377,24 +611,22 @@ async function startConversation() {
     } catch (_) {
       /* ignore */
     }
-    stream.getTracks().forEach((t) => t.stop());
-    pc.close();
+    abandonCallSetup(pc);
     throw new Error(err.error || err.message || `realtime/calls ${sdpResponse.status}`);
   }
   if (path && path !== "webrtc-ga") {
-    stream.getTracks().forEach((t) => t.stop());
-    pc.close();
+    abandonCallSetup(pc);
     throw new Error(`unexpected realtime path ${path}`);
   }
   if (beta === "true") {
-    stream.getTracks().forEach((t) => t.stop());
-    pc.close();
+    abandonCallSetup(pc);
     throw new Error("beta realtime path is disabled");
   }
   const answer = await sdpResponse.text();
   await pc.setRemoteDescription({ type: "answer", sdp: answer });
   const callId = sdpResponse.headers.get("X-Hearth-Call-Id") || "";
   const sideband = sdpResponse.headers.get("X-Hearth-Sideband") || "";
+  hideMicPanels();
   const micTrack = stream.getAudioTracks()[0] || null;
   let bargeIn = null;
   if (micTrack && globalThis.HearthVad?.SpeechBargeIn) {
@@ -430,7 +662,20 @@ async function stopConversation() {
   if (!call) return;
   try {
     call.bargeIn && call.bargeIn.stop();
-    call.stream && call.stream.getTracks().forEach((t) => t.stop());
+    /* Detach from PC first so close() does not end the local MediaStreamTrack. */
+    if (call.pc) {
+      for (const sender of call.pc.getSenders()) {
+        try {
+          call.pc.removeTrack(sender);
+        } catch (_) {
+          /* ignore */
+        }
+      }
+    }
+    /* Mute; do not track.stop() — that forces a fresh getUserMedia prompt on iOS PWAs. */
+    if (call.stream) {
+      for (const track of call.stream.getAudioTracks()) track.enabled = false;
+    }
     call.pc && call.pc.close();
   } catch (_) {
     /* ignore */
@@ -448,11 +693,8 @@ async function stopConversation() {
   refresh();
 }
 
-$("orb").addEventListener("click", async () => {
-  if (state.call) {
-    await stopConversation();
-    return;
-  }
+async function beginVoiceFromUserGesture() {
+  hideMicPanels();
   $("orb").classList.add("hot");
   $("orb-label").textContent = "Connecting";
   $("hint").textContent = phoneUi() ? "Connecting…" : "Opening GA WebRTC session…";
@@ -461,9 +703,72 @@ $("orb").addEventListener("click", async () => {
   } catch (err) {
     $("orb").classList.remove("hot", "live");
     $("orb-label").textContent = "Tap to talk";
-    $("hint").textContent = idleHint();
-    appendLog("system", err.message || "Voice failed");
+    const classified = classifyMicError(err);
+    if (classified.kind === "denied") {
+      showMicDenied(classified.message);
+      appendLog("system", "Microphone permission denied.");
+    } else {
+      $("hint").textContent = idleHint();
+      appendLog("system", classified.message);
+    }
   }
+}
+
+async function handleOrbTap() {
+  if (state.call) {
+    await stopConversation();
+    return;
+  }
+  if (!$("mic-gate")?.classList.contains("hidden")) {
+    /* Second tap while gate is open = continue (same as the Continue button). */
+    await beginVoiceFromUserGesture();
+    return;
+  }
+  const permission = await queryMicPermission();
+  state.micPermission = permission;
+  if (permission === "granted" || permission === "prompt") {
+    micStorageClear(MIC_STORAGE.denied);
+  }
+  if (permission === "denied" || (permission === "unknown" && micStorageGet(MIC_STORAGE.denied) === "1")) {
+    showMicDenied();
+    return;
+  }
+  if (shouldShowMicGate(permission)) {
+    showMicGate();
+    $("orb-label").textContent = "Allow mic";
+    $("hint").textContent = phoneUi() ? "Mic needed once." : "Microphone access is required for live voice.";
+    return;
+  }
+  await beginVoiceFromUserGesture();
+}
+
+$("orb").addEventListener("click", () => {
+  handleOrbTap();
+});
+
+$("mic-gate-continue")?.addEventListener("click", async () => {
+  await beginVoiceFromUserGesture();
+});
+
+$("mic-gate-not-now")?.addEventListener("click", () => {
+  hideMicPanels();
+  micStorageSet(MIC_STORAGE.gateAt, String(Date.now()));
+  $("orb").classList.remove("hot", "live");
+  $("orb-label").textContent = "Tap to talk";
+  $("hint").textContent = idleHint();
+});
+
+$("mic-denied-dismiss")?.addEventListener("click", () => {
+  hideMicPanels();
+  $("orb").classList.remove("hot", "live");
+  $("orb-label").textContent = "Tap to talk";
+  $("hint").textContent = idleHint();
+});
+
+$("mic-denied-retry")?.addEventListener("click", async () => {
+  micStorageClear(MIC_STORAGE.denied);
+  state.micPermission = "unknown";
+  await beginVoiceFromUserGesture();
 });
 
 $("logout-btn").addEventListener("click", async () => {
@@ -475,12 +780,33 @@ $("logout-btn").addEventListener("click", async () => {
   bounceToLogin();
 });
 
+function onPageHide() {
+  /* Document is going away — release hardware. A warm mute is useless across navigations. */
+  if (state.call) {
+    try {
+      state.call.pc && state.call.pc.close();
+    } catch (_) {
+      /* ignore */
+    }
+    state.call = null;
+  }
+  releaseMicStream({ hard: true });
+}
+
+window.addEventListener("pagehide", onPageHide);
+
 async function boot() {
   if (window.HearthSettings) window.HearthSettings.mount();
   const ok = await refreshAccessToken();
   if (!ok) {
     bounceToLogin();
     return;
+  }
+  /* Permissions API only — never probe with getUserMedia on boot. */
+  state.micPermission = await queryMicPermission();
+  if (state.micPermission === "granted") {
+    micStorageSet(MIC_STORAGE.granted, "1");
+    micStorageClear(MIC_STORAGE.denied);
   }
   refresh();
   setInterval(refresh, 8000);
