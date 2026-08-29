@@ -52,6 +52,17 @@ def test_command_center_served():
         page = client.get("/")
         assert page.status_code == 200
         assert "Hearth" in page.text
+        assert 'id="remote-audio"' in page.text
+        assert "Tap to talk" in page.text
+        assert "Hold to speak" not in page.text
+        js = client.get("/static/app.js")
+        assert js.status_code == 200
+        assert "RTCPeerConnection" in js.text
+        assert "ScriptProcessor" not in js.text
+        assert "playPcm" not in js.text
+        assert "/api/chat" in js.text
+        assert "/api/realtime/calls" in js.text
+        assert "OpenAI-Beta" not in js.text
         css = client.get("/static/styles.css")
         assert css.status_code == 200
 
@@ -62,6 +73,7 @@ def test_voice_fallback_text_roundtrip():
             ready = ws.receive_json()
             assert ready["type"] == "session.ready"
             assert ready["mode"] == "fallback"
+            assert ready["path"] == "text-fallback"
             ws.send_json({"type": "input_text", "text": "list docker containers"})
             events = []
             for _ in range(12):

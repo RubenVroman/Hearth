@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from hearth.config import settings
+
 AgentStatus = Literal["idle", "listening", "thinking", "speaking", "tool"]
 VoiceMode = Literal["disconnected", "fallback", "live"]
 
@@ -35,6 +37,7 @@ class Runtime:
         self.agent_status: AgentStatus = "idle"
         self.voice_mode: VoiceMode = "disconnected"
         self.voice_reason: str = ""
+        self.voice_path: str = "disconnected"
         self.transcript: deque[TranscriptLine] = deque(maxlen=80)
         self.last_tools: deque[dict[str, Any]] = deque(maxlen=12)
         self.pending: PendingConfirm | None = None
@@ -51,8 +54,11 @@ class Runtime:
             "agent": self.agent_status,
             "voice": {
                 "mode": self.voice_mode,
+                "path": self.voice_path,
                 "reason": self.voice_reason,
                 "openai_live": self.openai_live,
+                "model": settings.openai_realtime_model if self.openai_live else "",
+                "beta": False,
             },
             "pending": None
             if self.pending is None

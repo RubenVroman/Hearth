@@ -12,7 +12,8 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 | --- | --- |
 | Agent loop + tool registry | Lights/AVR/TV via HA, *arr/Overseerr grab/request, Plex now-playing, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Dark, cinematic. |
-| `WS /ws/voice` | OpenAI Realtime live voice, or the same protocol with a working text fallback |
+| `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
+| `WS /ws/voice` | Text fallback only. Never the disabled beta Realtime websocket. |
 | `workspace/` | Sandboxed “build whatever I ask” directory. Not the whole NAS. |
 | `homeassistant` compose service | Official HA image, unconfigured, so the device layer exists on day one |
 
@@ -54,9 +55,9 @@ The compose file publishes `0.0.0.0` by default so Tailscale and LAN both work. 
 
 | Variable | Live vs stub |
 | --- | --- |
-| `OPENAI_API_KEY` | **Live** text agent (chat completions + tools) and Realtime voice. Empty → local intent router + text fallback on `/ws/voice`. |
+| `OPENAI_API_KEY` | **Live** text agent (chat completions + tools) and GA Realtime WebRTC voice. Empty → local intent router + text fallback on `/ws/voice`. |
 | `OPENAI_MODEL` | Chat model. Default `gpt-4o-mini`. |
-| `OPENAI_REALTIME_MODEL` | Realtime model. Default `gpt-realtime`. |
+| `OPENAI_REALTIME_MODEL` | Conversational Realtime model. Default `gpt-realtime-2.1` (ChatGPT-app equivalent). |
 | `HA_URL` | Default `http://homeassistant:8123` (compose DNS). |
 | `HA_TOKEN` | **Live** HA REST. Empty → mocked lights/scenes/Denon/LG. |
 | `PLEX_URL` | Existing Plex on the host. Default `http://host.docker.internal:32400`. |
@@ -80,22 +81,21 @@ Reach Plex on the existing stack:
 
 ## Voice
 
-`WS /ws/voice` is first-class.
+Live voice is the **GA OpenAI Realtime API over WebRTC** — the same family as ChatGPT Advanced Voice / GPT Realtime. It is **not** hold-to-talk, and it is **not** the old beta websocket.
 
-**Live** (key present, Realtime reachable): Hearth opens `wss://api.openai.com/v1/realtime`, sends `session.update` with house tools, streams PCM16 24 kHz, and executes `function_call` items locally (`ha_*`, `plex_*`, `radarr_*`, `sonarr_*`, `overseerr_*`, `workspace_*`, `docker_*`, `chief_of_staff`) before returning `function_call_output`.
+**Live** (key present): the browser opens `RTCPeerConnection`, POSTs SDP to Hearth `POST /api/realtime/calls`, and Hearth forwards a multipart `sdp` + `session` to `https://api.openai.com/v1/realtime/calls` with the NAS `OPENAI_API_KEY`. No `OpenAI-Beta` header. Mic uses browser AEC (`echoCancellation`) and remote audio plays through a hidden `<audio>` element so you can interrupt. House tools (`ha_*`, `plex_*`, `radarr_*`, `sonarr_*`, `overseerr_*`, `workspace_*`, `docker_*`, `chief_of_staff`) run on Hearth over a sideband `wss://api.openai.com/v1/realtime?call_id=…`.
 
-**Fallback** (no key, or Realtime connect failed): same client events still work.
+**Fallback** (`WS /ws/voice`, or no key): text only. Composer always uses `POST /api/chat`. Do not send PCM over that socket expecting live voice.
 
-| Client event | Meaning |
-| --- | --- |
-| `session.start` | Hello |
-| `input_text` | `{text, confirm?}` — runs the agent loop |
-| `input_audio.append` | `{audio}` base64 PCM16LE 24 kHz |
-| `input_audio.commit` | Live: commit to Realtime. Fallback: Whisper if a key exists, else ask for text |
-| `confirm` | Execute the pending destructive tool |
-| `response.cancel` | Interrupt |
+### How to tell it is the new path
 
-The UI hold-to-speak control uses this protocol. Text in the composer uses it too. Plug in `OPENAI_API_KEY` later — you do not rewrite the front door.
+- `GET /api/status` → `realtime.path === "webrtc-ga"`, `realtime.beta === false`, `realtime.model === "gpt-realtime-2.1"`
+- After a call: `voice.path === "webrtc-ga"`, `voice.mode === "live"`, `voice.beta === false`
+- `POST /api/realtime/calls` response headers: `X-Hearth-Realtime-Path: webrtc-ga`, `X-Hearth-Realtime-Beta: false`
+- Browser talks to Hearth, not `wss://api.openai.com/v1/realtime?model=…` with `OpenAI-Beta: realtime=v1` (that shape is disabled: `beta_api_shape_disabled` / close 4000)
+- UI: tap the hearth to start/stop a conversation. No “Hold to speak”. Playback is `<audio id="remote-audio">`, not ScriptProcessor PCM
+
+`POST /api/realtime/client_secrets` mints an ephemeral `ek_…` token (never the long-lived key). The live UI uses the unified server SDP path so the long-lived key stays on the NAS.
 
 ## Routing
 
@@ -203,7 +203,8 @@ For LAN discovery (Cast, some TVs), you may want host networking on the HA servi
 | Tool registry + agent loop | Live |
 | Local intent router (no API key) | Live — playing, lights, *arr/Overseerr grab, docker, workspace, CoS escalate |
 | OpenAI chat tools | Live when `OPENAI_API_KEY` is set |
-| Realtime voice WebSocket + tool execution | Live protocol; connects when the key works |
+| Realtime voice (GA WebRTC + sideband tools) | Live when `OPENAI_API_KEY` is set; UI is tap-to-talk duplex |
+| `/ws/voice` text fallback | Live protocol; not the disabled beta websocket |
 | Whisper/TTS on fallback | Live when a key is set but Realtime is down |
 | HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
 | Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |

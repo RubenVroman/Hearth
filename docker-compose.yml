@@ -13,7 +13,7 @@ services:
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
-      OPENAI_REALTIME_MODEL: ${OPENAI_REALTIME_MODEL:-gpt-realtime}
+      OPENAI_REALTIME_MODEL: ${OPENAI_REALTIME_MODEL:-gpt-realtime-2.1}
       HA_URL: ${HA_URL:-http://homeassistant:8123}
       HA_TOKEN: ${HA_TOKEN:-}
       PLEX_URL: ${PLEX_URL:-http://host.docker.internal:32400}

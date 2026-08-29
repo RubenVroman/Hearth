@@ -30,11 +30,9 @@ def session_update_payload(tools: list[dict[str, Any]]) -> dict[str, Any]:
             "output_modalities": ["audio"],
             "audio": {
                 "input": {
-                    "format": {"type": "audio/pcm", "rate": 24000},
                     "turn_detection": {"type": "semantic_vad"},
                 },
                 "output": {
-                    "format": {"type": "audio/pcm"},
                     "voice": settings.openai_tts_voice,
                 },
             },

@@ -39,12 +39,13 @@
       </aside>
 
       <section class="hearth">
-        <button type="button" id="orb" class="orb" aria-label="Hold to talk">
+        <audio id="remote-audio" autoplay playsinline></audio>
+        <button type="button" id="orb" class="orb" aria-label="Tap to talk">
           <span class="orb-ring"></span>
           <span class="orb-core"></span>
-          <span class="orb-label" id="orb-label">Hold to speak</span>
+          <span class="orb-label" id="orb-label">Tap to talk</span>
         </button>
-        <p class="hint" id="hint">Voice is the front door. Text still works.</p>
+        <p class="hint" id="hint">Tap for a live conversation. Interrupt anytime. Text still works.</p>
         <form id="composer" class="composer" autocomplete="off">
           <input
             id="line"

@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -21,6 +21,7 @@ from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.plex import plex
 from hearth.voice.gateway import voice_socket
+from hearth.voice import webrtc as realtime_rtc
 
 UI_DIR = Path(__file__).parent / "ui" / "static"
 _agent = AgentLoop()
@@ -94,6 +95,13 @@ async def status() -> dict[str, Any]:
         "owner": settings.owner,
         "version": __version__,
         "openai": settings.openai_configured,
+        "realtime": {
+            "path": "webrtc-ga",
+            "model": settings.openai_realtime_model,
+            "beta": False,
+            "calls": "/api/realtime/calls",
+            "client_secrets": "/api/realtime/client_secrets",
+        },
         "ha": ha_ping,
         "plex": {"configured": settings.plex_configured},
         "docker": {"socket": docker.live},
@@ -150,6 +158,63 @@ async def invoke(body: InvokeBody) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="unknown tool")
     result = await registry.call(body.tool, body.args)
     return result.as_dict()
+
+
+@app.post("/api/realtime/client_secrets")
+async def realtime_client_secrets() -> JSONResponse:
+    """Mint an ephemeral ek_ token (GA). Never returns the long-lived API key."""
+    result = await realtime_rtc.mint_client_secret()
+    status = 200 if result.get("ok") else (503 if not result.get("configured") else 502)
+    return JSONResponse(result, status_code=status)
+
+
+@app.post("/api/realtime/calls")
+async def realtime_calls(request: Request) -> Response:
+    """Unified GA WebRTC: browser SDP in, OpenAI SDP out. Tools run on a sideband."""
+    sdp = (await request.body()).decode("utf-8", errors="replace")
+    if not sdp.strip():
+        return JSONResponse({"error": "empty sdp", "path": "webrtc-ga"}, status_code=400)
+    result = await realtime_rtc.create_call(sdp)
+    if not result.get("ok"):
+        status = 503 if not result.get("configured") else 502
+        return JSONResponse(result, status_code=status)
+    return Response(
+        content=result["sdp"],
+        media_type="application/sdp",
+        headers={
+            "X-Hearth-Realtime-Path": "webrtc-ga",
+            "X-Hearth-Realtime-Model": settings.openai_realtime_model,
+            "X-Hearth-Call-Id": str(result.get("call_id") or ""),
+            "X-Hearth-Sideband": str(result.get("sideband") or ""),
+            "X-Hearth-Realtime-Beta": "false",
+        },
+    )
+
+
+@app.post("/api/realtime/calls/{call_id}/hangup")
+async def realtime_hangup(call_id: str) -> dict[str, Any]:
+    await realtime_rtc.hangup(call_id)
+    return {"ok": True, "path": "webrtc-ga", "call_id": call_id}
+
+
+class RealtimeToolBody(BaseModel):
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    call_id: str = ""
+    said: str = ""
+
+
+@app.post("/api/realtime/tools")
+async def realtime_tools(body: RealtimeToolBody) -> dict[str, Any]:
+    """House tools stay on Hearth. Browser only relays function_call events."""
+    args = dict(body.arguments)
+    result = await realtime_rtc.run_house_tool(body.name, args, said=body.said)
+    return {
+        "ok": result.get("ok", False),
+        "path": "webrtc-ga",
+        "call_id": body.call_id,
+        "output": result,
+    }
 
 
 @app.websocket("/ws/voice")

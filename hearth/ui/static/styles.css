@@ -195,8 +195,17 @@ body {
   border: 1px solid rgba(255, 206, 138, 0.28);
 }
 
-.orb.hot .orb-ring {
+.orb.hot .orb-ring,
+.orb.live .orb-ring {
   animation: pulse 1.4s ease-in-out infinite;
+}
+
+#remote-audio {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .orb-label {

@@ -1,10 +1,10 @@
 const $ = (id) => document.getElementById(id);
 
 const state = {
-  ws: null,
-  mode: "fallback",
-  recording: false,
   pending: null,
+  call: null,
+  openai: false,
+  realtime: { path: "webrtc-ga", model: "gpt-realtime-2.1", beta: false },
 };
 
 async function api(path, opts) {
@@ -102,17 +102,35 @@ function renderRooms(payload) {
   }
 }
 
+function idleHint() {
+  const rt = state.realtime || {};
+  if (!state.openai) {
+    return "Text works now. Live voice needs OPENAI_API_KEY on the NAS — then tap the hearth.";
+  }
+  return `Tap the hearth for a live conversation (${rt.model || "gpt-realtime-2.1"} · ${rt.path || "webrtc-ga"}). Interrupt anytime.`;
+}
+
 function renderStatus(status) {
   $("house").textContent = status.house || "VAULT";
   $("agent-pill").textContent = status.agent || "idle";
   const voice = status.voice || {};
-  $("voice-pill").textContent = `voice ${voice.mode || "off"}`;
-  $("voice-pill").classList.toggle("live", voice.mode === "live");
-  $("mode-pill").textContent = status.openai ? "openai" : "local";
+  const rt = status.realtime || {};
+  state.openai = Boolean(status.openai);
+  state.realtime = rt;
+  const live = Boolean(state.call) || voice.mode === "live";
+  $("voice-pill").textContent = live
+    ? `voice ${rt.path || voice.path || "webrtc-ga"}`
+    : `voice ${voice.mode || "off"}`;
+  $("voice-pill").classList.toggle("live", live);
+  $("mode-pill").textContent = rt.beta ? "beta" : status.openai ? "openai" : "local";
   state.pending = status.pending;
   $("confirm-btn").classList.toggle("hidden", !status.pending);
   if (status.pending) {
     $("confirm-btn").textContent = `Confirm ${status.pending.tool}`;
+  }
+  if (!state.call) {
+    $("hint").textContent = idleHint();
+    $("orb-label").textContent = "Tap to talk";
   }
 }
 
@@ -153,41 +171,16 @@ async function refresh() {
   renderRooms(rooms);
   if ($("log").childElementCount === 0) {
     for (const line of transcript.lines || []) {
+      if (line.kind === "delta") continue;
       appendLog(line.role, line.text);
     }
   }
 }
 
-function connectVoice() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/voice`);
-  state.ws = ws;
-  ws.addEventListener("message", (ev) => {
-    const event = JSON.parse(ev.data);
-    if (event.type === "session.ready") {
-      state.mode = event.mode;
-      $("hint").textContent =
-        event.mode === "live"
-          ? "Live Realtime. Hold the hearth to speak."
-          : event.reason || "Fallback protocol. Type, or hold to send audio once a key is set.";
-      $("orb-label").textContent = event.mode === "live" ? "Hold to speak" : "Hold / type";
-    }
-    if (event.type === "transcript.user") appendLog("you", event.text);
-    if (event.type === "transcript.assistant" && event.final) appendLog("hearth", event.text);
-    if (event.type === "audio.delta" && event.audio) playPcm(event.audio, event.sample_rate || 24000);
-    if (event.type === "status" && event.agent) $("agent-pill").textContent = event.agent;
-    if (event.type === "error") appendLog("system", event.message);
-    if (event.type === "tool.result") refresh();
-  });
-  ws.addEventListener("close", () => {
-    state.ws = null;
-    setTimeout(connectVoice, 1500);
-  });
-}
-
-function send(event) {
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify(event));
+function sendRealtime(event) {
+  const dc = state.call && state.call.dc;
+  if (dc && dc.readyState === "open") {
+    dc.send(JSON.stringify(event));
     return true;
   }
   return false;
@@ -200,113 +193,196 @@ $("composer").addEventListener("submit", async (ev) => {
   if (!text) return;
   input.value = "";
   appendLog("you", text);
-  if (!send({ type: "input_text", text })) {
-    await talk(text);
-    refresh();
+  if (
+    sendRealtime({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text }],
+      },
+    })
+  ) {
+    sendRealtime({ type: "response.create" });
+    return;
   }
+  await talk(text);
+  refresh();
 });
 
 $("confirm-btn").addEventListener("click", async () => {
-  if (send({ type: "confirm" })) return;
   await talk("confirm", true);
   refresh();
 });
 
-let media = {
-  ctx: null,
-  proc: null,
-  stream: null,
-};
+function onRealtimeEvent(event) {
+  const type = event.type;
+  if (type === "response.output_audio_transcript.done" || type === "response.audio_transcript.done") {
+    appendLog("hearth", event.transcript);
+  }
+  if (type === "conversation.item.input_audio_transcription.completed") {
+    appendLog("you", event.transcript);
+  }
+  if (type === "error") {
+    const message = event.error?.message || event.message || "realtime error";
+    appendLog("system", message);
+  }
+  if (state.call?.sidebandOk) return;
+  if (type !== "response.function_call_arguments.done") return;
+  relayTool(event);
+}
 
-async function startTalk() {
-  if (state.recording) return;
-  state.recording = true;
-  $("orb").classList.add("hot");
-  $("orb-label").textContent = "Listening";
+async function relayTool(event) {
+  let args = {};
   try {
-    media.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    media.ctx = new AudioContext();
-    const source = media.ctx.createMediaStreamSource(media.stream);
-    const proc = media.ctx.createScriptProcessor(4096, 1, 1);
-    media.proc = proc;
-    proc.onaudioprocess = (e) => {
-      const input = e.inputBuffer.getChannelData(0);
-      const pcm = downsample(input, media.ctx.sampleRate, 24000);
-      const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-      let bin = "";
-      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-      send({ type: "input_audio.append", audio: btoa(bin) });
-    };
-    source.connect(proc);
-    proc.connect(media.ctx.destination);
+    args = JSON.parse(event.arguments || "{}");
+  } catch (_) {
+    args = {};
+  }
+  try {
+    const out = await api("/api/realtime/tools", {
+      method: "POST",
+      body: JSON.stringify({
+        name: event.name,
+        arguments: args,
+        call_id: event.call_id || "",
+      }),
+    });
+    sendRealtime({
+      type: "conversation.item.create",
+      item: {
+        type: "function_call_output",
+        call_id: event.call_id,
+        output: JSON.stringify(out.output || out),
+      },
+    });
+    sendRealtime({ type: "response.create" });
+    refresh();
   } catch (err) {
-    appendLog("system", `Mic unavailable: ${err.message}`);
-    state.recording = false;
-    $("orb").classList.remove("hot");
+    appendLog("system", `Tool failed: ${err.message}`);
   }
 }
 
-function stopTalk() {
-  if (!state.recording) return;
-  state.recording = false;
-  $("orb").classList.remove("hot");
-  $("orb-label").textContent = "Hold to speak";
+async function startConversation() {
+  const remote = $("remote-audio");
+  const pc = new RTCPeerConnection();
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+    },
+  });
+  for (const track of stream.getAudioTracks()) {
+    pc.addTrack(track, stream);
+  }
+  pc.ontrack = (ev) => {
+    remote.srcObject = ev.streams[0];
+    remote.play().catch(() => {});
+  };
+  const dc = pc.createDataChannel("oai-events");
+  dc.addEventListener("message", (ev) => {
+    try {
+      onRealtimeEvent(JSON.parse(ev.data));
+    } catch (_) {
+      /* ignore non-json */
+    }
+  });
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  const sdpResponse = await fetch("/api/realtime/calls", {
+    method: "POST",
+    body: offer.sdp,
+    headers: { "Content-Type": "application/sdp" },
+  });
+  const path = sdpResponse.headers.get("X-Hearth-Realtime-Path") || "";
+  const beta = sdpResponse.headers.get("X-Hearth-Realtime-Beta") || "";
+  if (!sdpResponse.ok) {
+    let err = { error: `calls ${sdpResponse.status}` };
+    try {
+      err = await sdpResponse.json();
+    } catch (_) {
+      /* ignore */
+    }
+    stream.getTracks().forEach((t) => t.stop());
+    pc.close();
+    throw new Error(err.error || err.message || `realtime/calls ${sdpResponse.status}`);
+  }
+  if (path && path !== "webrtc-ga") {
+    stream.getTracks().forEach((t) => t.stop());
+    pc.close();
+    throw new Error(`unexpected realtime path ${path}`);
+  }
+  if (beta === "true") {
+    stream.getTracks().forEach((t) => t.stop());
+    pc.close();
+    throw new Error("beta realtime path is disabled");
+  }
+  const answer = await sdpResponse.text();
+  await pc.setRemoteDescription({ type: "answer", sdp: answer });
+  const callId = sdpResponse.headers.get("X-Hearth-Call-Id") || "";
+  const sideband = sdpResponse.headers.get("X-Hearth-Sideband") || "";
+  state.call = {
+    pc,
+    dc,
+    stream,
+    callId,
+    sidebandOk: sideband === "ok" || sideband === "starting",
+  };
+  $("orb").classList.add("live", "hot");
+  $("orb").setAttribute("aria-label", "End conversation");
+  $("orb-label").textContent = "Listening";
+  $("hint").textContent = "Live WebRTC conversation. Talk over it — barge-in is on. Tap to hang up.";
+  $("voice-pill").textContent = "voice webrtc-ga";
+  $("voice-pill").classList.add("live");
+}
+
+async function stopConversation() {
+  const call = state.call;
+  state.call = null;
+  $("orb").classList.remove("live", "hot");
+  $("orb").setAttribute("aria-label", "Tap to talk");
+  $("orb-label").textContent = "Tap to talk";
+  $("hint").textContent = idleHint();
+  $("voice-pill").classList.remove("live");
+  if (!call) return;
   try {
-    media.proc && media.proc.disconnect();
-    media.stream && media.stream.getTracks().forEach((t) => t.stop());
-    media.ctx && media.ctx.close();
+    call.stream && call.stream.getTracks().forEach((t) => t.stop());
+    call.pc && call.pc.close();
   } catch (_) {
     /* ignore */
   }
-  send({ type: "input_audio.commit" });
-}
-
-function downsample(float32, fromRate, toRate) {
-  if (fromRate === toRate) {
-    const out = new Int16Array(float32.length);
-    for (let i = 0; i < float32.length; i++) {
-      const s = Math.max(-1, Math.min(1, float32[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  $("remote-audio").srcObject = null;
+  if (call.callId) {
+    try {
+      await fetch(`/api/realtime/calls/${encodeURIComponent(call.callId)}/hangup`, {
+        method: "POST",
+      });
+    } catch (_) {
+      /* ignore */
     }
-    return out;
   }
-  const ratio = fromRate / toRate;
-  const n = Math.round(float32.length / ratio);
-  const out = new Int16Array(n);
-  for (let i = 0; i < n; i++) {
-    const s = Math.max(-1, Math.min(1, float32[Math.floor(i * ratio)] || 0));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out;
+  refresh();
 }
 
-let outCtx = null;
-async function playPcm(b64, rate) {
-  const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  const samples = new Int16Array(raw.buffer, raw.byteOffset, Math.floor(raw.byteLength / 2));
-  if (!outCtx) outCtx = new AudioContext({ sampleRate: rate });
-  const buffer = outCtx.createBuffer(1, samples.length, rate);
-  const data = buffer.getChannelData(0);
-  for (let i = 0; i < samples.length; i++) data[i] = samples[i] / 0x8000;
-  const src = outCtx.createBufferSource();
-  src.buffer = buffer;
-  src.connect(outCtx.destination);
-  src.start();
-}
-
-const orb = $("orb");
-orb.addEventListener("mousedown", startTalk);
-orb.addEventListener("mouseup", stopTalk);
-orb.addEventListener("mouseleave", () => state.recording && stopTalk());
-orb.addEventListener("touchstart", (e) => {
-  e.preventDefault();
-  startTalk();
-});
-orb.addEventListener("touchend", (e) => {
-  e.preventDefault();
-  stopTalk();
+$("orb").addEventListener("click", async () => {
+  if (state.call) {
+    await stopConversation();
+    return;
+  }
+  $("orb").classList.add("hot");
+  $("orb-label").textContent = "Connecting";
+  $("hint").textContent = "Opening GA WebRTC session…";
+  try {
+    await startConversation();
+  } catch (err) {
+    $("orb").classList.remove("hot", "live");
+    $("orb-label").textContent = "Tap to talk";
+    $("hint").textContent = idleHint();
+    appendLog("system", err.message || "Voice failed");
+  }
 });
 
-connectVoice();
 refresh();
 setInterval(refresh, 8000);
