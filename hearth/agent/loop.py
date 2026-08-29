@@ -165,17 +165,50 @@ def _format_tool_reply(tools: list[dict[str, Any]]) -> str:
         name = tool.get("name", "tool")
         if tool.get("needs_confirm"):
             preview = tool.get("data", {}).get("would_call_with", {})
-            parts.append(f"{name} is destructive and waiting for confirm. Preview: {preview}")
+            parts.append(f"{name} is waiting for confirm. Preview: {preview}")
             continue
         if not tool.get("ok"):
             parts.append(f"{name} failed: {tool.get('data')}")
             continue
         data = tool.get("data") or {}
-        parts.append(f"{name}: {json.dumps(data, default=str)[:1200]}")
+        pretty = _pretty_tool(name, data)
+        parts.append(pretty if pretty else f"{name}: {json.dumps(data, default=str)[:1200]}")
     return "\n".join(parts)
 
 
-_PLAYING = re.compile(r"\b(now playing|what'?s (on|playing)|plex|now-playing)\b", re.I)
+def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
+    mock = " (mock)" if data.get("mode") == "mock" else ""
+    if name == "plex_now_playing":
+        sessions = data.get("sessions") or []
+        if not sessions:
+            return f"Nothing playing on Plex{mock}."
+        lines = []
+        for session in sessions:
+            title = session.get("title") or "Untitled"
+            player = session.get("player") or "a player"
+            state = session.get("state") or "idle"
+            lines.append(f"{title} on {player} — {state}{mock}.")
+        return " ".join(lines)
+    if name == "ha_list_entities":
+        states = data.get("states") or []
+        if not states:
+            return f"No matching HA entities{mock}."
+        bits = []
+        for row in states[:12]:
+            label = (row.get("attributes") or {}).get("friendly_name") or row.get("entity_id")
+            bits.append(f"{label}: {row.get('state')}")
+        return f"House{mock}: " + "; ".join(bits)
+    if name == "docker_ps":
+        containers = data.get("containers") or []
+        names = [c.get("name") or c.get("id") for c in containers]
+        return f"Containers{mock}: " + ", ".join(str(n) for n in names)
+    if name == "ha_call_service":
+        entity = (data.get("entity") or {}).get("entity_id") or data.get("entity")
+        return f"Done{mock}: {entity} is {(data.get('entity') or {}).get('state', 'updated')}."
+    return None
+
+
+_PLAYING = re.compile(r"\b(now playing|what'?s (on|playing)|what is playing|plex|now-playing)\b", re.I)
 _DOCKER = re.compile(r"\b(docker|containers?)\b", re.I)
 _LIGHTS = re.compile(r"\b(lights?|scenes?|rooms?|home assistant|denon|webos|tv)\b", re.I)
 _WORKSPACE = re.compile(r"\b(workspace|skills?)\b", re.I)

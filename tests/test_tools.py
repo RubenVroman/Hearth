@@ -63,9 +63,8 @@ async def test_workspace_skill_echo_loaded():
 
 
 async def test_intent_router_now_playing():
-    plan = route_intent("what's playing on plex")
-    assert plan is not None
-    assert plan["tool"] == "plex_now_playing"
+    assert route_intent("what's playing on plex")["tool"] == "plex_now_playing"
+    assert route_intent("what is playing")["tool"] == "plex_now_playing"
 
 
 async def test_docker_stop_needs_confirm():
