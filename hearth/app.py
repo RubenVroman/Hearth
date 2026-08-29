@@ -16,6 +16,7 @@ from hearth.agent.registry import registry
 from hearth.config import settings
 from hearth.runtime import runtime
 from hearth.tools.builtin import register_builtin_tools
+from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.plex import plex
@@ -33,6 +34,9 @@ async def lifespan(_app: FastAPI):
     await ha.aclose()
     await plex.aclose()
     await docker.aclose()
+    await radarr.aclose()
+    await sonarr.aclose()
+    await overseerr.aclose()
 
 
 app = FastAPI(

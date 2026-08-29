@@ -91,6 +91,90 @@ MOCK_DOCKER_CONTAINERS: list[dict[str, Any]] = [
 ]
 
 
+MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
+    {
+        "title": "Dune: Part Two",
+        "year": 2024,
+        "tmdbId": 693134,
+        "overview": "Paul Atreides unites with Chani and the Fremen.",
+        "status": "released",
+    },
+    {
+        "title": "The Brutalist",
+        "year": 2024,
+        "tmdbId": 974950,
+        "overview": "A Hungarian-born Jewish architect starts over in America.",
+        "status": "released",
+    },
+]
+
+MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
+    {
+        "title": "Severance",
+        "year": 2022,
+        "tvdbId": 371980,
+        "overview": "Mark Scout leads a team whose memories are split.",
+        "status": "continuing",
+    },
+    {
+        "title": "Slow Horses",
+        "year": 2022,
+        "tvdbId": 397382,
+        "overview": "Misfit spies at MI5's Slough House.",
+        "status": "continuing",
+    },
+]
+
+MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
+    {"id": 693134, "mediaType": "movie", "title": "Dune: Part Two", "year": 2024},
+    {"id": 95396, "mediaType": "tv", "title": "Severance", "year": 2022},
+]
+
+
+class MockPipeline:
+    """In-memory Radarr / Sonarr / Overseerr so grab/request works without keys."""
+
+    def __init__(self) -> None:
+        self.radarr_queue: list[dict[str, Any]] = []
+        self.sonarr_queue: list[dict[str, Any]] = []
+        self.overseerr_queue: list[dict[str, Any]] = []
+
+    def search_radarr(self, query: str) -> list[dict[str, Any]]:
+        return _filter_title(MOCK_RADARR_LOOKUP, query)
+
+    def search_sonarr(self, query: str) -> list[dict[str, Any]]:
+        return _filter_title(MOCK_SONARR_LOOKUP, query)
+
+    def search_overseerr(self, query: str) -> list[dict[str, Any]]:
+        return _filter_title(MOCK_OVERSEERR_RESULTS, query)
+
+    def add_radarr(self, item: dict[str, Any]) -> dict[str, Any]:
+        queued = {**item, "queued": True}
+        self.radarr_queue.append(queued)
+        return queued
+
+    def add_sonarr(self, item: dict[str, Any]) -> dict[str, Any]:
+        queued = {**item, "queued": True}
+        self.sonarr_queue.append(queued)
+        return queued
+
+    def request_overseerr(self, item: dict[str, Any]) -> dict[str, Any]:
+        queued = {**item, "requested": True}
+        self.overseerr_queue.append(queued)
+        return queued
+
+
+def _filter_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    needle = (query or "").strip().lower()
+    if not needle:
+        return deepcopy(items[:5])
+    hits = [deepcopy(item) for item in items if needle in str(item.get("title", "")).lower()]
+    return hits or [deepcopy(items[0]) | {"title": items[0]["title"], "matched": "fallback"}]
+
+
+pipeline = MockPipeline()
+
+
 class MockHouse:
     """Mutable in-memory house so mocked lights actually toggle in the UI."""
 

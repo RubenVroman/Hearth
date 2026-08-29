@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Lights/scenes/AVR/TV via HA, Plex now-playing/search, workspace files/skills, docker inspect |
+| Agent loop + tool registry | Lights/AVR/TV via HA, *arr/Overseerr grab/request, Plex now-playing, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Dark, cinematic. |
 | `WS /ws/voice` | OpenAI Realtime live voice, or the same protocol with a working text fallback |
 | `workspace/` | Sandboxed “build whatever I ask” directory. Not the whole NAS. |
@@ -61,6 +61,12 @@ The compose file publishes `0.0.0.0` by default so Tailscale and LAN both work. 
 | `HA_TOKEN` | **Live** HA REST. Empty → mocked lights/scenes/Denon/LG. |
 | `PLEX_URL` | Existing Plex on the host. Default `http://host.docker.internal:32400`. |
 | `PLEX_TOKEN` | **Live** Plex sessions/search. Empty → mocked now-playing. |
+| `RADARR_URL` / `RADARR_API_KEY` | **Live** movie search/add. Default URL `http://host.docker.internal:7878`. Empty key → fixtures. |
+| `SONARR_URL` / `SONARR_API_KEY` | **Live** series search/add. Default `http://host.docker.internal:8989`. |
+| `OVERSEERR_URL` / `OVERSEERR_API_KEY` | **Live** request front door. Default `http://host.docker.internal:5055`. |
+| `HEARTH_COS_WEBHOOK` | **Live** Chief of Staff POST. Empty → tool returns “not configured” (not fake success). |
+| `HEARTH_COS_WEBHOOK_KEY` | Optional. Sent as `Authorization: Bearer <key>`. |
+| `HEARTH_COS_REPO` | Default `RubenVroman/Hearth`. |
 | `DOCKER_SOCKET` | Read-only socket is mounted. If missing → mocked container list (plex/sonarr/…/gluetun). |
 | `WORKSPACE_PATH` | Inside the container, `/app/workspace`. |
 | `HEARTH_MOCK_IF_UNCONFIGURED` | Default `true`. If a live call fails, fall back to fixtures instead of dying. |
@@ -76,7 +82,7 @@ Reach Plex on the existing stack:
 
 `WS /ws/voice` is first-class.
 
-**Live** (key present, Realtime reachable): Hearth opens `wss://api.openai.com/v1/realtime`, sends `session.update` with house tools, streams PCM16 24 kHz, and executes `function_call` items locally (`ha_*`, `plex_*`, `workspace_*`, `docker_*`) before returning `function_call_output`.
+**Live** (key present, Realtime reachable): Hearth opens `wss://api.openai.com/v1/realtime`, sends `session.update` with house tools, streams PCM16 24 kHz, and executes `function_call` items locally (`ha_*`, `plex_*`, `radarr_*`, `sonarr_*`, `overseerr_*`, `workspace_*`, `docker_*`, `chief_of_staff`) before returning `function_call_output`.
 
 **Fallback** (no key, or Realtime connect failed): same client events still work.
 
@@ -91,18 +97,54 @@ Reach Plex on the existing stack:
 
 The UI hold-to-speak control uses this protocol. Text in the composer uses it too. Plug in `OPENAI_API_KEY` later — you do not rewrite the front door.
 
+## Routing
+
+Hearth does the house itself. Everything else goes to Chief of Staff.
+
+**Do it yourself**
+
+- Lights, scenes, Denon, LG TV → Home Assistant tools
+- What's playing → Plex (playback only)
+- Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
+- Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
+- “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
+
+**Call Chief of Staff** (`chief_of_staff`)
+
+- Repo / code / PR / git / “add a weather skill to the repo” — Hearth never edits GitHub
+- Anything it cannot do yet (e.g. “connect to Discord”) — it must not pretend it connected
+- Gridways / kanban / boards / “open tasks on project X” — Hearth has no Gridways; CoS + the Gridways agent do
+- Calendar, GitHub/GitLab org work, teammate agents
+
+Webhook payload:
+
+```json
+{
+  "source": "hearth",
+  "task": "…",
+  "repo": "RubenVroman/Hearth",
+  "confirm": true,
+  "said": "original user text"
+}
+```
+
+Auth: `Authorization: Bearer <HEARTH_COS_WEBHOOK_KEY>` when the key is set. Writes still default to dry-run until `confirm=true` (voice or UI confirm is enough). If `HEARTH_COS_WEBHOOK` is empty, the tool says it is not configured.
+
 ## Tools
 
 Destructive tools **default to dry-run** unless `confirm=true`:
 
 - `ha_call_service` — lights, scenes, `media_player` (Denon, LG)
+- `radarr_add` / `sonarr_add` / `overseerr_request`
 - `workspace_write` / `workspace_delete`
 - `docker_stop`
+- `chief_of_staff`
 
 Read-only / inspect:
 
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`
+- `radarr_search`, `sonarr_search`, `overseerr_search`
 - `workspace_list`, `workspace_read`
 - `docker_ps`, `docker_inspect`
 
@@ -140,7 +182,7 @@ cp .env.example .env
 python -m hearth
 ```
 
-Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire.
+Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should dry-run `radarr_add`.
 
 ## Home Assistant devices
 
@@ -159,11 +201,12 @@ For LAN discovery (Cast, some TVs), you may want host networking on the HA servi
 | --- | --- |
 | FastAPI runtime + UI + compose (incl. HA) | Live |
 | Tool registry + agent loop | Live |
-| Local intent router (no API key) | Live — “what’s playing”, lights, docker, workspace |
+| Local intent router (no API key) | Live — playing, lights, *arr/Overseerr grab, docker, workspace, CoS escalate |
 | OpenAI chat tools | Live when `OPENAI_API_KEY` is set |
 | Realtime voice WebSocket + tool execution | Live protocol; connects when the key works |
 | Whisper/TTS on fallback | Live when a key is set but Realtime is down |
-| HA / Plex / Docker backends | Live with tokens/socket; otherwise fixtures |
+| HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
+| Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |
 | HA onboarding, TV/AVR pairing | Yours — service is included unconfigured |
 | Auth | Optional `HEARTH_TOKEN` only; trust the LAN/Tailscale |
 | SMB / public internet | Not exposed. Don’t add it. |

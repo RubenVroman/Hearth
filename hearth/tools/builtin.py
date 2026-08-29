@@ -4,6 +4,8 @@ from typing import Any
 
 from hearth.agent.registry import ToolSpec, registry
 from hearth.tools import files as workspace_files
+from hearth.tools.arr import overseerr, radarr, sonarr
+from hearth.tools.cos import cos_configured, escalate, not_configured_message
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.plex import plex
@@ -85,6 +87,41 @@ async def _ws_delete(args: dict[str, Any]) -> dict[str, Any]:
     if not path:
         return {"ok": False, "error": "path required"}
     return workspace_files.delete_file(path)
+
+
+async def _chief_of_staff(args: dict[str, Any]) -> dict[str, Any]:
+    return await escalate(args)
+
+
+async def _radarr_search(args: dict[str, Any]) -> dict[str, Any]:
+    return await radarr.search(str(args.get("query") or ""))
+
+
+async def _radarr_add(args: dict[str, Any]) -> dict[str, Any]:
+    tmdb = args.get("tmdbId")
+    return await radarr.add(str(args.get("query") or ""), tmdb_id=int(tmdb) if tmdb else None)
+
+
+async def _sonarr_search(args: dict[str, Any]) -> dict[str, Any]:
+    return await sonarr.search(str(args.get("query") or ""))
+
+
+async def _sonarr_add(args: dict[str, Any]) -> dict[str, Any]:
+    tvdb = args.get("tvdbId")
+    return await sonarr.add(str(args.get("query") or ""), tvdb_id=int(tvdb) if tvdb else None)
+
+
+async def _overseerr_search(args: dict[str, Any]) -> dict[str, Any]:
+    return await overseerr.search(str(args.get("query") or ""))
+
+
+async def _overseerr_request(args: dict[str, Any]) -> dict[str, Any]:
+    media_id = args.get("mediaId")
+    return await overseerr.request(
+        str(args.get("query") or ""),
+        media_id=int(media_id) if media_id else None,
+        media_type=str(args.get("mediaType") or "") or None,
+    )
 
 
 def register_builtin_tools() -> None:
@@ -227,7 +264,7 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="workspace_write",
-            description="Write a file in the workspace. Use skills/name.py to add a tool. Destructive: dry-run unless confirm=true.",
+            description="Write a file in the VAULT workspace sandbox only — not the git repo. For repo/PR/feature work call chief_of_staff. Destructive: dry-run unless confirm=true.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -256,6 +293,132 @@ def register_builtin_tools() -> None:
                 "required": ["path"],
             },
             handler=_ws_delete,
+            destructive=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="chief_of_staff",
+            description=(
+                "Escalate work Hearth cannot do to Chief of Staff: repo/code/PR/git, new features "
+                "(Discord, integrations), Gridways/kanban/boards/tasks on a project, calendar, "
+                "GitHub/GitLab org work, teammate agents. Hearth must NOT edit GitHub or pretend "
+                "it connected. Destructive: dry-run unless confirm=true (voice/UI confirm is enough)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Clear instruction for Chief of Staff (what to change).",
+                    },
+                    "said": {
+                        "type": "string",
+                        "description": "Original user utterance, verbatim.",
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "owner/name. Defaults to RubenVroman/Hearth.",
+                    },
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["task"],
+            },
+            handler=_chief_of_staff,
+            destructive=True,
+            configured=cos_configured,
+            not_configured=not_configured_message(),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="radarr_search",
+            description="Search Radarr for a movie to download. Use this (not Plex) when grabbing a film.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            handler=_radarr_search,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="radarr_add",
+            description="Add a movie to the Radarr download queue. Destructive: dry-run unless confirm=true. Say you'll grab it in Radarr.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "tmdbId": {"type": "integer"},
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["query"],
+            },
+            handler=_radarr_add,
+            destructive=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="sonarr_search",
+            description="Search Sonarr for a TV series. Use this (not Plex) when grabbing a show.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            handler=_sonarr_search,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="sonarr_add",
+            description="Add a series to the Sonarr download queue. Destructive: dry-run unless confirm=true. Say you'll grab it in Sonarr.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "tvdbId": {"type": "integer"},
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["query"],
+            },
+            handler=_sonarr_add,
+            destructive=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="overseerr_search",
+            description="Search Overseerr, the request front door for movies and TV on VAULT.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+            handler=_overseerr_search,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="overseerr_request",
+            description="Request a movie or show via Overseerr (feeds Radarr/Sonarr). Destructive: dry-run unless confirm=true.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "mediaId": {"type": "integer"},
+                    "mediaType": {"type": "string", "description": "movie or tv"},
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["query"],
+            },
+            handler=_overseerr_request,
             destructive=True,
         )
     )

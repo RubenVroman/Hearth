@@ -104,6 +104,9 @@ class AgentLoop:
                 runtime.agent_status = "tool"
                 for tc in msg.tool_calls:
                     args = _parse_args(tc.function.arguments)
+                    if tc.function.name == "chief_of_staff":
+                        args.setdefault("said", user_text)
+                        args.setdefault("task", user_text)
                     result = await self.tools.call(tc.function.name, args)
                     used.append(result.as_dict())
                     messages.append(
@@ -131,10 +134,9 @@ class AgentLoop:
         used: list[dict[str, Any]] = []
         if plan is None:
             reply = (
-                "I can drive the house from here — lights, Denon, LG TV via Home Assistant, "
-                "Plex now-playing, workspace files, and docker inspect. "
-                "Say what's playing, list lights, or list containers. "
-                "Plug in OPENAI_API_KEY for a live language model; the tool registry is already on."
+                "I can drive the house — lights, Denon, LG TV, grab movies in Radarr or shows in "
+                "Sonarr, request via Overseerr, Plex now-playing, workspace, docker inspect. "
+                "Repo, Gridways, Discord, calendar, and anything I can't do yet go to Chief of Staff."
             )
             runtime.note("assistant", reply)
             return {"reply": reply, "mode": "local", "tools": used}
@@ -165,10 +167,15 @@ def _format_tool_reply(tools: list[dict[str, Any]]) -> str:
         name = tool.get("name", "tool")
         if tool.get("needs_confirm"):
             preview = tool.get("data", {}).get("would_call_with", {})
-            parts.append(f"{name} is waiting for confirm. Preview: {preview}")
+            spoken = _confirm_line(name, preview)
+            parts.append(spoken)
             continue
         if not tool.get("ok"):
-            parts.append(f"{name} failed: {tool.get('data')}")
+            data = tool.get("data") or {}
+            if name == "chief_of_staff" and data.get("error"):
+                parts.append(str(data["error"]))
+                continue
+            parts.append(f"{name} failed: {data}")
             continue
         data = tool.get("data") or {}
         pretty = _pretty_tool(name, data)
@@ -205,16 +212,93 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     if name == "ha_call_service":
         entity = (data.get("entity") or {}).get("entity_id") or data.get("entity")
         return f"Done{mock}: {entity} is {(data.get('entity') or {}).get('state', 'updated')}."
+    if name == "chief_of_staff":
+        if data.get("configured") is False:
+            return str(data.get("error") or "Chief of Staff is not configured.")
+        repo = data.get("repo") or (data.get("payload") or {}).get("repo")
+        if data.get("escalated"):
+            return f"Escalated to Chief of Staff for {repo}."
+        if data.get("would_send") or data.get("payload"):
+            target = repo or "the repo"
+            return f"I'll ask Chief of Staff to handle that for {target}."
+        return None
+    if name == "radarr_search":
+        titles = ", ".join(
+            f"{r.get('title')} ({r.get('year')})" for r in (data.get("results") or [])[:4] if r.get("title")
+        )
+        return f"Radarr{mock} found: {titles or 'nothing'}."
+    if name == "radarr_add":
+        added = data.get("added") or {}
+        return f"I'll grab {added.get('title') or 'that'} in Radarr{mock}."
+    if name == "sonarr_search":
+        titles = ", ".join(
+            f"{r.get('title')} ({r.get('year')})" for r in (data.get("results") or [])[:4] if r.get("title")
+        )
+        return f"Sonarr{mock} found: {titles or 'nothing'}."
+    if name == "sonarr_add":
+        added = data.get("added") or {}
+        return f"I'll grab {added.get('title') or 'that'} in Sonarr{mock}."
+    if name == "overseerr_search":
+        titles = ", ".join(
+            f"{r.get('title')} ({r.get('year')})" for r in (data.get("results") or [])[:4] if r.get("title")
+        )
+        return f"Overseerr{mock} found: {titles or 'nothing'}."
+    if name == "overseerr_request":
+        item = data.get("requested") or {}
+        return f"I'll request {item.get('title') or 'that'} in Overseerr{mock}."
     return None
 
 
-_PLAYING = re.compile(r"\b(now playing|what'?s (on|playing)|what is playing|plex|now-playing)\b", re.I)
+def _confirm_line(name: str, preview: dict[str, Any]) -> str:
+    if name == "chief_of_staff":
+        task = preview.get("task") or preview.get("said") or "that"
+        return f"I'll ask Chief of Staff to handle that: {task}. Confirm to send."
+    if name == "radarr_add":
+        return f"I'll grab {preview.get('query') or 'that'} in Radarr. Confirm to add."
+    if name == "sonarr_add":
+        return f"I'll grab {preview.get('query') or 'that'} in Sonarr. Confirm to add."
+    if name == "overseerr_request":
+        return f"I'll request {preview.get('query') or 'that'} in Overseerr. Confirm to send."
+    return f"{name} is waiting for confirm. Preview: {preview}"
+
+
+_PLAYING = re.compile(r"\b(now playing|what'?s (on|playing)|what is playing|now-playing)\b", re.I)
+_PLEX_ONLY = re.compile(r"\bplex\b", re.I)
 _DOCKER = re.compile(r"\b(docker|containers?)\b", re.I)
 _LIGHTS = re.compile(r"\b(lights?|scenes?|rooms?|home assistant|denon|webos|tv)\b", re.I)
 _WORKSPACE = re.compile(r"\b(workspace|skills?)\b", re.I)
 _TURN_ON = re.compile(r"\bturn on\s+(.+)$", re.I)
 _TURN_OFF = re.compile(r"\bturn off\s+(.+)$", re.I)
 _INSPECT = re.compile(r"\binspect\s+(\S+)", re.I)
+_MOVIE = re.compile(r"\b(movie|film|radarr)\b", re.I)
+_SERIES = re.compile(r"\b(show|series|season|episode|sonarr)\b", re.I)
+_OVERSEERR = re.compile(r"\b(overseerr|request)\b", re.I)
+_GRAB = re.compile(
+    r"\b(download|grab|snatch|request|get me)\b"
+    r"|\badd .{0,80}\b(to|in) (radarr|sonarr|overseerr|the library|the queue)\b",
+    re.I,
+)
+_CONNECT = re.compile(r"\bconnect(?: me)? to\s+(.+)", re.I)
+_HOUSE_CONNECT = re.compile(r"\b(denon|avr|tv|lg|plex|home assistant|\bha\b|light)\b", re.I)
+_COS = re.compile(
+    r"("
+    r"\bgithub\b|\bgitlab\b|"
+    r"\bpull requests?\b|\bmerge requests?\b|"
+    r"\bopen a pr\b|\bcreate a pr\b|\bmake a pr\b|\bopen a pull request\b|"
+    r"\bthe repo\b|\bthis repo\b|\bhearth repo\b|"
+    r"\bto the repo\b|\bin the repo\b|"
+    r"\bchange the repo\b|\bupdate the repo\b|\bedit the repo\b|"
+    r"\bfix (this|it) in hearth\b|"
+    r"\badd a feature\b|"
+    r"\bdeploy to git\b|\bpush to git\b|\bgit push\b|"
+    r"\bcommit (this|that|the|to)\b|"
+    r"\bdiscord\b|\bslack\b|\btelegram\b|"
+    r"\bgridways\b|\bkanban\b|\bproject board\b|\bopen tasks\b|\btasks on project\b|"
+    r"\bcalendar\b|\bschedule a meeting\b|"
+    r"\bteammate agents?\b|\bother agents?\b"
+    r")",
+    re.I,
+)
 
 
 def route_intent(text: str) -> dict[str, Any] | None:
@@ -223,6 +307,26 @@ def route_intent(text: str) -> dict[str, Any] | None:
     if not raw:
         return None
 
+    if _COS.search(raw):
+        return {
+            "tool": "chief_of_staff",
+            "args": {"task": raw, "said": raw, "repo": "RubenVroman/Hearth"},
+        }
+    connect = _CONNECT.search(raw)
+    if connect and not _HOUSE_CONNECT.search(connect.group(1)):
+        return {
+            "tool": "chief_of_staff",
+            "args": {"task": raw, "said": raw, "repo": "RubenVroman/Hearth"},
+        }
+    if _GRAB.search(raw):
+        query = _media_query(raw)
+        if _OVERSEERR.search(raw):
+            return {"tool": "overseerr_request", "args": {"query": query or raw}}
+        if _SERIES.search(raw) and not _MOVIE.search(raw):
+            return {"tool": "sonarr_add", "args": {"query": query or raw}}
+        if _MOVIE.search(raw):
+            return {"tool": "radarr_add", "args": {"query": query or raw}}
+        return {"tool": "overseerr_request", "args": {"query": query or raw}}
     m = _TURN_ON.search(raw)
     if m:
         entity = _guess_entity(m.group(1), on=True)
@@ -234,7 +338,7 @@ def route_intent(text: str) -> dict[str, Any] | None:
     m = _INSPECT.search(raw)
     if m:
         return {"tool": "docker_inspect", "args": {"container": m.group(1)}}
-    if _PLAYING.search(raw):
+    if _PLAYING.search(raw) or (_PLEX_ONLY.search(raw) and not _GRAB.search(raw)):
         return {"tool": "plex_now_playing", "args": {}}
     if _DOCKER.search(raw):
         return {"tool": "docker_ps", "args": {}}
@@ -269,6 +373,20 @@ def _guess_entity(phrase: str, *, on: bool) -> dict[str, Any]:
     else:
         service = "turn_on" if on else "turn_off"
     return {"domain": domain, "service": service, "entity_id": entity}
+
+
+_MEDIA_NOISE = re.compile(
+    r"\b(please|can you|could you|download|grab|snatch|request|get me|add|"
+    r"the movie|the film|the show|the series|a movie|a show|"
+    r"to radarr|in radarr|to sonarr|in sonarr|on overseerr|via overseerr|"
+    r"to the library|to the queue|for me)\b",
+    re.I,
+)
+
+
+def _media_query(text: str) -> str:
+    cleaned = _MEDIA_NOISE.sub(" ", text)
+    return re.sub(r"\s+", " ", cleaned).strip(" .?!")
 
 
 # Re-export for tests / app

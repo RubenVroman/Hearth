@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable
 from hearth.runtime import PendingConfirm, runtime
 
 Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+ConfiguredFn = Callable[[], bool]
 
 
 @dataclass
@@ -16,6 +17,8 @@ class ToolSpec:
     handler: Handler
     destructive: bool = False
     source: str = "builtin"
+    configured: ConfiguredFn | None = None
+    not_configured: str = ""
 
 
 @dataclass
@@ -94,6 +97,16 @@ class ToolRegistry:
         if spec is None:
             return ToolResult(name=name, ok=False, data={"error": f"unknown tool {name}"})
 
+        if spec.configured is not None and not spec.configured():
+            message = spec.not_configured or f"{name} is not configured"
+            result = ToolResult(
+                name=name,
+                ok=False,
+                data={"ok": False, "configured": False, "error": message},
+            )
+            runtime.last_tools.append(result.as_dict())
+            return result
+
         if spec.destructive:
             confirm = bool(args.get("confirm"))
             dry_run = args.get("dry_run")
@@ -133,7 +146,8 @@ class ToolRegistry:
         if spec.destructive:
             runtime.pending = None
         payload = data if isinstance(data, dict) else {"result": data}
-        result = ToolResult(name=name, ok=True, data=payload)
+        ok = not (isinstance(payload, dict) and payload.get("ok") is False)
+        result = ToolResult(name=name, ok=ok, data=payload)
         runtime.last_tools.append(result.as_dict())
         return result
 

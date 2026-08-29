@@ -26,6 +26,27 @@ def test_health_and_chat_calls_plex_tool():
         assert playing.json()["sessions"][0]["title"] == "Dune: Part Two"
 
 
+def test_chat_repo_work_calls_chief_of_staff_not_github():
+    with TestClient(app) as client:
+        chat = client.post("/api/chat", json={"message": "add a weather skill to the repo"})
+        assert chat.status_code == 200
+        body = chat.json()
+        assert body["tools"]
+        assert body["tools"][0]["name"] == "chief_of_staff"
+        assert body["tools"][0]["name"] != "workspace_write"
+        assert "not configured" in body["reply"].lower() or body["tools"][0].get("data", {}).get("configured") is False
+
+
+def test_chat_download_movie_uses_radarr():
+    with TestClient(app) as client:
+        chat = client.post("/api/chat", json={"message": "download the movie Dune"})
+        assert chat.status_code == 200
+        body = chat.json()
+        assert body["tools"][0]["name"] == "radarr_add"
+        assert body["tools"][0]["needs_confirm"] is True
+        assert "Radarr" in body["reply"]
+
+
 def test_command_center_served():
     with TestClient(app) as client:
         page = client.get("/")

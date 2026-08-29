@@ -36,7 +36,19 @@ class Settings(BaseSettings):
     plex_url: str = Field(default="http://host.docker.internal:32400", alias="PLEX_URL")
     plex_token: str = Field(default="", alias="PLEX_TOKEN")
 
+    radarr_url: str = Field(default="http://host.docker.internal:7878", alias="RADARR_URL")
+    radarr_api_key: str = Field(default="", alias="RADARR_API_KEY")
+    sonarr_url: str = Field(default="http://host.docker.internal:8989", alias="SONARR_URL")
+    sonarr_api_key: str = Field(default="", alias="SONARR_API_KEY")
+    overseerr_url: str = Field(default="http://host.docker.internal:5055", alias="OVERSEERR_URL")
+    overseerr_api_key: str = Field(default="", alias="OVERSEERR_API_KEY")
+
     docker_socket: str = Field(default="/var/run/docker.sock", alias="DOCKER_SOCKET")
+
+    # Chief of Staff escalate (repo/code/PR). Empty webhook = not configured.
+    cos_webhook: str = Field(default="", alias="HEARTH_COS_WEBHOOK")
+    cos_webhook_key: str = Field(default="", alias="HEARTH_COS_WEBHOOK_KEY")
+    cos_repo: str = Field(default="RubenVroman/Hearth", alias="HEARTH_COS_REPO")
 
     @property
     def openai_configured(self) -> bool:
@@ -49,6 +61,18 @@ class Settings(BaseSettings):
     @property
     def plex_configured(self) -> bool:
         return bool(self.plex_token.strip())
+
+    @property
+    def radarr_configured(self) -> bool:
+        return bool(self.radarr_api_key.strip())
+
+    @property
+    def sonarr_configured(self) -> bool:
+        return bool(self.sonarr_api_key.strip())
+
+    @property
+    def overseerr_configured(self) -> bool:
+        return bool(self.overseerr_api_key.strip())
 
 
 settings = Settings()
