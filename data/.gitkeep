@@ -1,0 +1,1 @@
+# Persistent SQLite (auth + house memory). Compose bind-mounts this directory.

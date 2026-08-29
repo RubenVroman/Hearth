@@ -10,6 +10,7 @@ from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
+from hearth.memory.tools import register_memory_tools
 
 
 async def _ha_list(args: dict[str, Any]) -> dict[str, Any]:
@@ -423,3 +424,4 @@ def register_builtin_tools() -> None:
         )
     )
     load_workspace_skills()
+    register_memory_tools()

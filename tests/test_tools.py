@@ -86,6 +86,12 @@ async def test_intent_grab_movie_uses_radarr_not_plex():
     assert "Dune" in plan["args"]["query"]
 
 
+def test_intent_remember_does_not_hit_github():
+    plan = route_intent("remember that I like the living room dim")
+    assert plan["tool"] == "memory_remember"
+    assert "dim" in plan["args"]["value"]
+
+
 async def test_intent_grab_show_uses_sonarr():
     plan = route_intent("grab the show Severance")
     assert plan["tool"] == "sonarr_add"
