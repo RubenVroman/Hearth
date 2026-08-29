@@ -20,6 +20,7 @@ services:
       HA_AVR_ENTITY: ${HA_AVR_ENTITY:-media_player.denon_avr_x3700h}
       PLEX_URL: ${PLEX_URL:-http://host.docker.internal:32400}
       PLEX_TOKEN: ${PLEX_TOKEN:-}
+      PLEX_DEFAULT_PLAYER: ${PLEX_DEFAULT_PLAYER:-}
       RADARR_URL: ${RADARR_URL:-http://host.docker.internal:7878}
       RADARR_API_KEY: ${RADARR_API_KEY:-}
       SONARR_URL: ${SONARR_URL:-http://host.docker.internal:8989}

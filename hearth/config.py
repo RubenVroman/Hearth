@@ -48,6 +48,8 @@ class Settings(BaseSettings):
 
     plex_url: str = Field(default="http://host.docker.internal:32400", alias="PLEX_URL")
     plex_token: str = Field(default="", alias="PLEX_TOKEN")
+    # Optional default Plex client name / substring (e.g. "Apple TV", "LG", "Living Room").
+    plex_default_player: str = Field(default="", alias="PLEX_DEFAULT_PLAYER")
 
     radarr_url: str = Field(default="http://host.docker.internal:7878", alias="RADARR_URL")
     radarr_api_key: str = Field(default="", alias="RADARR_API_KEY")
