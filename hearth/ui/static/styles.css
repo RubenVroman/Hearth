@@ -265,6 +265,8 @@ input,
   letter-spacing: 0.22em;
   text-transform: uppercase;
   color: var(--muted);
+  text-align: center;
+  white-space: nowrap;
 }
 
 .hint {
@@ -545,6 +547,7 @@ input,
     flex-direction: column;
     flex: 1;
     min-height: 0;
+    width: 100%;
     overflow-x: hidden;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
@@ -556,11 +559,16 @@ input,
 
   .hearth {
     order: 1;
-    flex: 0 0 auto;
-    height: 100%;
+    flex: 1 0 auto;
+    width: 100%;
+    min-width: 0;
     min-height: 100%;
+    height: auto;
     position: relative;
-    justify-content: flex-start;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
     padding-top: 0;
   }
 
@@ -584,40 +592,50 @@ input,
   }
 
   .orb {
-    position: absolute;
-    left: 50%;
-    top: 50%;
+    position: relative;
+    left: auto;
+    top: auto;
+    transform: none;
     width: min(72vw, 280px);
     height: min(72vw, 280px);
-    transform: translate(-50%, -50%);
   }
 
   .orb-core {
     inset: 16%;
   }
 
-  .hint {
-    position: absolute;
-    left: 50%;
-    top: calc(50% + (min(72vw, 280px) / 2) + 6px);
-    transform: translateX(-50%);
-    margin: 0;
-    font-size: 13px;
-    max-width: calc(100% - 32px);
+  .orb-label {
+    left: 0;
+    right: 0;
     text-align: center;
+    white-space: nowrap;
+  }
+
+  .hint {
+    position: static;
+    left: auto;
+    top: auto;
+    transform: none;
+    margin: 8px 0 0;
+    font-size: 13px;
+    max-width: 100%;
+    width: 100%;
+    text-align: center;
+    white-space: nowrap;
   }
 
   .composer-dock {
     position: fixed;
     left: 0;
     right: 0;
-    bottom: 0;
+    bottom: var(--keyboard-inset);
     z-index: 30;
     width: 100%;
+    max-width: none;
     align-items: stretch;
     padding: 0 max(16px, var(--safe-right)) var(--dock-safe-bottom) max(16px, var(--safe-left));
     background: var(--bg);
-    transform: translateY(calc(-1 * var(--keyboard-inset)));
+    transform: none;
   }
 
   .composer-dock::before {

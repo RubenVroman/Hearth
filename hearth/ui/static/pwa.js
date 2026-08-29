@@ -1,7 +1,15 @@
 (function () {
   const root = document.documentElement;
 
+  function isTyping() {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA";
+  }
+
   function keyboardInset() {
+    if (!isTyping()) return 0;
     const viewport = window.visualViewport;
     if (!viewport) return 0;
     return Math.max(0, window.innerHeight - (viewport.height + viewport.offsetTop));
