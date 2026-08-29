@@ -21,9 +21,10 @@ from typing import Any
 import httpx
 from websockets.asyncio.client import connect as ws_connect
 
-from hearth.agent.prompts import SYSTEM_PROMPT
+from hearth.agent.prompts import compose_system_prompt, compose_system_prompt_async
 from hearth.agent.registry import registry
 from hearth.config import settings
+from hearth.memory import store as memory_store
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
 from hearth.voice.vad import audio_input_config
@@ -50,7 +51,7 @@ def openai_auth_headers(*, json_body: bool = False) -> dict[str, str]:
     return headers
 
 
-def session_config() -> dict[str, Any]:
+def session_config(*, query: str | None = None, instructions: str | None = None) -> dict[str, Any]:
     """GA session shape. ChatGPT-app voice: gpt-realtime-2.1 + speech-aware VAD.
 
     ``noise_reduction`` runs before server VAD so TV/HVAC energy is less likely
@@ -59,13 +60,17 @@ def session_config() -> dict[str, Any]:
 
     Input ``transcription`` is required for
     ``conversation.item.input_audio_transcription.completed`` so the phone UI
-    can show what the user said. This is live-session display only — it does
-    not change house memory pipelines.
+    can show what the user said. Spoken turns also refresh the memory slice
+    injected into Realtime ``instructions`` (same retrieval as text chat).
     """
+    text = instructions or compose_system_prompt(
+        query if query is not None else runtime.latest_user(),
+        include_recent_turns=True,
+    )
     return {
         "type": "realtime",
         "model": settings.openai_realtime_model,
-        "instructions": SYSTEM_PROMPT,
+        "instructions": text,
         "output_modalities": ["audio"],
         "audio": {
             "input": audio_input_config(),
@@ -100,6 +105,13 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
         payload.setdefault("said", said or json.dumps(payload))
     result = await registry.call(name, payload)
     return result.as_dict()
+
+
+def _persist_voice_turn(role: str, text: str) -> None:
+    try:
+        memory_store.persist_turn(role, text, channel="voice")
+    except Exception:  # noqa: BLE001
+        return
 
 
 def client_secret_body() -> dict[str, Any]:
@@ -195,6 +207,7 @@ class Sideband:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("assistant", text)
+                _persist_voice_turn("assistant", text)
         elif etype in {
             "conversation.item.input_audio_transcription.completed",
             "conversation.item.audio_transcription.completed",
@@ -202,6 +215,8 @@ class Sideband:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("user", text)
+                _persist_voice_turn("user", text)
+                await self._refresh_memory(text)
         elif etype == "response.function_call_arguments.done":
             await self._run_function_call(
                 event.get("name") or "",
@@ -267,6 +282,18 @@ class Sideband:
             runtime.voice_reason = f"close_of_call:{result.get('reason', 'close_of_call')}"
             return
         await self._ws.send(dumps({"type": "response.create"}))
+
+    async def _refresh_memory(self, query: str) -> None:
+        """Re-inject a retrieved memory slice after each spoken turn (Realtime hook)."""
+        if self._ws is None:
+            return
+        try:
+            instructions = await compose_system_prompt_async(query, include_recent_turns=True)
+            await self._ws.send(
+                dumps({"type": "session.update", "session": session_config(instructions=instructions)})
+            )
+        except Exception:  # noqa: BLE001
+            return
 
 
 _sidebands: dict[str, Sideband] = {}

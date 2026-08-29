@@ -460,9 +460,39 @@ function renderRooms(payload) {
   }
   setEmpty("lights-block", lights.childElementCount === 0);
   setEmpty("scenes-block", scenes.childElementCount === 0);
-  setEmpty("rail-rooms", lights.childElementCount === 0 && scenes.childElementCount === 0);
+  setEmpty("rail-rooms", lights.childElementCount === 0 && scenes.childElementCount === 0 && ($("memory-list")?.childElementCount || 0) === 0);
   setEmpty("media-block", media.childElementCount === 0);
   setEmpty("rail-media", $("now-playing-block")?.classList.contains("is-empty") && media.childElementCount === 0);
+}
+
+function renderMemory(payload) {
+  const list = $("memory-list");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const pref of payload.preferences || []) {
+    const li = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = `${pref.key || ""}: ${pref.value || ""}`;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "memory-forget";
+    btn.textContent = "Forget";
+    btn.addEventListener("click", () =>
+      api("/api/memory/forget", {
+        method: "POST",
+        body: JSON.stringify({ key: pref.key || "", confirm: true }),
+      }).then(refresh)
+    );
+    li.appendChild(label);
+    li.appendChild(btn);
+    list.appendChild(li);
+  }
+  setEmpty("memory-block", list.childElementCount === 0);
+  const roomsEmpty =
+    ($("lights")?.childElementCount || 0) === 0 &&
+    ($("scenes")?.childElementCount || 0) === 0 &&
+    list.childElementCount === 0;
+  setEmpty("rail-rooms", roomsEmpty);
 }
 
 function phoneUi() {
@@ -549,15 +579,17 @@ async function talk(message, confirm = false) {
 }
 
 async function refresh() {
-  const [status, playing, rooms, transcript] = await Promise.all([
+  const [status, playing, rooms, transcript, memory] = await Promise.all([
     api("/api/status"),
     api("/api/now-playing"),
     api("/api/rooms"),
     api("/api/transcript"),
+    api("/api/memory"),
   ]);
   renderStatus(status);
   renderNowPlaying(playing);
   renderRooms(rooms);
+  renderMemory(memory);
   if ($("log").childElementCount === 0) {
     for (const line of transcript.lines || []) {
       if (line.kind === "delta") continue;

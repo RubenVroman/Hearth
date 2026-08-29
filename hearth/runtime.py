@@ -143,5 +143,11 @@ class Runtime:
             "widgets": self.list_widgets(),
         }
 
+    def latest_user(self) -> str:
+        for line in reversed(self.transcript):
+            if line.role == "user" and line.text:
+                return line.text
+        return ""
+
 
 runtime = Runtime()

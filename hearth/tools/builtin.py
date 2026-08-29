@@ -13,6 +13,7 @@ from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
 from hearth.tools.thuisbezorgd import thuisbezorgd
 from hearth.tools.weather import fetch_weather
+from hearth.memory.tools import register_memory_tools
 
 
 async def _ha_list(args: dict[str, Any]) -> dict[str, Any]:
@@ -775,3 +776,4 @@ def register_builtin_tools() -> None:
         )
     )
     load_workspace_skills()
+    register_memory_tools()

@@ -83,6 +83,7 @@ def test_client_secrets_mints_ephemeral_ek_token(client, monkeypatch):
     audio_in = captured["json"]["session"]["audio"]["input"]
     assert audio_in["transcription"]["model"] == "gpt-4o-mini-transcribe"
     assert audio_in["turn_detection"]["type"] == "semantic_vad"
+    assert "memory_remember" in captured["json"]["session"]["instructions"]
 
 
 def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
@@ -197,6 +198,20 @@ def test_realtime_tools_run_on_hearth(client):
     assert body["path"] == "webrtc-ga"
     assert body["output"]["name"] == "plex_now_playing"
     assert "Dune" in str(body["output"])
+
+
+def test_session_config_includes_memory_slice(monkeypatch):
+    from hearth.memory.store import remember_preference
+    from hearth.voice import webrtc as realtime_rtc
+
+    remember_preference("coffee", "Pour-over in the morning")
+    cfg = realtime_rtc.session_config(query="coffee")
+    assert cfg["type"] == "realtime"
+    assert "Pour-over in the morning" in cfg["instructions"]
+    assert "Retrieved house memory" in cfg["instructions"]
+    names = {tool["name"] for tool in cfg["tools"]}
+    assert "memory_search" in names
+    assert "memory_forget" in names
 
 
 def test_secret_value_reads_ga_and_nested_shapes():

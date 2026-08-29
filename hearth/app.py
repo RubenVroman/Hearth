@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +18,10 @@ from hearth.auth.db import init_db
 from hearth.auth.gate import http_authorized, is_public_path, ws_authorized
 from hearth.auth.routers import auth_router
 from hearth.config import settings
+from hearth.memory.prune import prune_loop
+from hearth.memory.retrieve import search as memory_search, status_snapshot as memory_status_snapshot
+from hearth.memory.store import export_snapshot, forget as memory_forget_row, init_memory_db, remember_preference
+from hearth.memory.tools import register_memory_tools
 from hearth.runtime import runtime
 from hearth.tools.builtin import register_builtin_tools
 from hearth.tools.arr import overseerr, radarr, sonarr
@@ -35,11 +39,23 @@ _agent = AgentLoop()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    import asyncio
+
     settings.workspace_path.mkdir(parents=True, exist_ok=True)
     init_db()
     bootstrap_admin()
+    init_memory_db()
     register_builtin_tools()
+    register_memory_tools()
+    stop_prune = asyncio.Event()
+    prune_task = asyncio.create_task(prune_loop(stop_prune))
     yield
+    stop_prune.set()
+    prune_task.cancel()
+    try:
+        await prune_task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
     await ha.aclose()
     await plex.aclose()
     await docker.aclose()
@@ -127,6 +143,7 @@ async def status() -> dict[str, Any]:
         "docker": {"socket": docker.live},
         "tools": registry.names(),
         "workspace": str(settings.workspace_path.resolve()),
+        "memory": memory_status_snapshot(),
     }
 
 
@@ -206,6 +223,92 @@ async def invoke(body: InvokeBody) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="unknown tool")
     result = await registry.call(body.tool, body.args)
     return {**result.as_dict(), "widgets": runtime.list_widgets()}
+
+
+class MemoryRememberBody(BaseModel):
+    key: str = ""
+    value: str = ""
+    text: str = ""
+    category: str = "general"
+
+
+class MemoryForgetBody(BaseModel):
+    key: str = ""
+    id: str = ""
+    confirm: bool = False
+
+
+class MemoryPurgeBody(BaseModel):
+    kind: str = "all"
+    confirm: bool = False
+
+
+@app.get("/api/memory")
+async def memory_get() -> dict[str, Any]:
+    snap = memory_status_snapshot()
+    from hearth.memory.store import list_preferences, recent_house_events
+
+    snap["preferences"] = list_preferences(limit=40)
+    snap["house_events"] = recent_house_events(limit=12)
+    return snap
+
+
+@app.get("/api/memory/search")
+async def memory_search_api(q: str = Query(default="", min_length=0)) -> dict[str, Any]:
+    hits = await memory_search(q) if q.strip() else []
+    return {"query": q, "hits": hits}
+
+
+@app.post("/api/memory/remember")
+async def memory_remember_api(body: MemoryRememberBody) -> dict[str, Any]:
+    value = (body.value or body.text).strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="value required")
+    row = remember_preference(body.key or value, value, category=body.category or "general")
+    return row
+
+
+@app.post("/api/memory/forget")
+async def memory_forget_api(body: MemoryForgetBody) -> dict[str, Any]:
+    if not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm=true required to forget. Destructive memory writes default to dry-run.",
+        )
+    result = memory_forget_row(pref_id=body.id, key=body.key)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "not found")
+    return result
+
+
+@app.post("/api/memory/export")
+async def memory_export_api(confirm: bool = False) -> dict[str, Any]:
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm=true required to export. Memory export is gated like other destructive tools.",
+        )
+    return export_snapshot()
+
+
+@app.post("/api/memory/purge")
+async def memory_purge_api(body: MemoryPurgeBody) -> dict[str, Any]:
+    if not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm=true required to purge.",
+        )
+    from hearth.memory.store import purge
+
+    kind = (body.kind or "all").lower()
+    return purge(
+        conversations=kind in {"all", "conversations", "session", "sessions"},
+        house_events=kind in {"all", "events", "house", "house_events"},
+        preferences=kind in {"all", "preferences", "prefs"},
+    )
+
+
+@app.post("/api/realtime/client_secrets")
 
 
 @app.post("/api/realtime/client_secrets")

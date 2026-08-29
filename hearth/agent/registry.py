@@ -147,6 +147,7 @@ class ToolRegistry:
                 payload = result.as_dict()
                 runtime.last_tools.append(payload)
                 widget_bus.publish_tool(payload)
+                _offer_memory(spec, result)
                 return result
             args["confirm"] = True
             args["dry_run"] = False
@@ -168,7 +169,17 @@ class ToolRegistry:
         payload = result.as_dict()
         runtime.last_tools.append(payload)
         widget_bus.publish_tool(payload)
+        _offer_memory(spec, result)
         return result
+
+
+def _offer_memory(spec: ToolSpec, result: ToolResult) -> None:
+    try:
+        from hearth.memory.events import on_tool_result
+
+        on_tool_result(spec, result)
+    except Exception:  # noqa: BLE001 — memory must not break tools
+        return
 
 
 registry = ToolRegistry()

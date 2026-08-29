@@ -38,6 +38,13 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "hearth_delivery_city", "")
     monkeypatch.setattr(settings, "weather_force_mock", True)
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
+    monkeypatch.setattr(settings, "memory_db_path", tmp_path / "hearth-memory.db")
+    monkeypatch.setattr(settings, "memory_enabled", True)
+    monkeypatch.setattr(settings, "memory_store_conversations", True)
+    monkeypatch.setattr(settings, "memory_store_house_events", False)
+    monkeypatch.setattr(settings, "memory_embeddings", False)
+    monkeypatch.setattr(settings, "memory_inject", True)
+    monkeypatch.setattr(settings, "memory_prune_interval_minutes", 0)
     monkeypatch.setattr(settings, "app_secret_key", TEST_APP_SECRET)
     monkeypatch.setattr(settings, "algorithm", "HS256")
     monkeypatch.setattr(settings, "access_token_expire_minutes", 30)
@@ -64,6 +71,10 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runtime.last_tools.clear()
     runtime.transcript.clear()
     runtime.agent_status = "idle"
+    from hearth.memory.store import init_memory_db, reset_memory
+
+    reset_memory()
+    init_memory_db()
     register_builtin_tools()
     return tmp_path
 

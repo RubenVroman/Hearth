@@ -19,7 +19,7 @@ def pcm16_to_wav(pcm: bytes, sample_rate: int = 24000) -> bytes:
 
 
 def session_update_payload(tools: list[dict[str, Any]]) -> dict[str, Any]:
-    from hearth.agent.prompts import SYSTEM_PROMPT
+    from hearth.agent.prompts import compose_system_prompt
     from hearth.voice.vad import audio_input_config
 
     return {
@@ -27,7 +27,7 @@ def session_update_payload(tools: list[dict[str, Any]]) -> dict[str, Any]:
         "session": {
             "type": "realtime",
             "model": settings.openai_realtime_model,
-            "instructions": SYSTEM_PROMPT,
+            "instructions": compose_system_prompt(),
             "output_modalities": ["audio"],
             "audio": {
                 "input": audio_input_config(),

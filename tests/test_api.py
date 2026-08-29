@@ -80,6 +80,8 @@ def test_command_center_served(client):
     assert "X-Auth-Token" in js.text
     assert "widget-stack" in page.text
     assert "renderWidgets" in js.text
+    assert "/api/memory" in js.text
+    assert 'id="memory-block"' in page.text
     css = client.get("/static/styles.css")
     assert css.status_code == 200
 

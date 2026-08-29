@@ -23,6 +23,32 @@ class Settings(BaseSettings):
 
     workspace_path: Path = Field(default=Path("./workspace"), alias="WORKSPACE_PATH")
     auth_db_path: Path = Field(default=Path("./data/hearth-auth.db"), alias="HEARTH_AUTH_DB")
+    memory_db_path: Path = Field(default=Path("./data/hearth-memory.db"), alias="HEARTH_MEMORY_DB")
+    memory_enabled: bool = Field(default=True, alias="HEARTH_MEMORY_ENABLED")
+    memory_store_conversations: bool = Field(default=True, alias="HEARTH_MEMORY_STORE_CONVERSATIONS")
+    memory_store_house_events: bool = Field(default=False, alias="HEARTH_MEMORY_STORE_HOUSE_EVENTS")
+    memory_house_event_sample: float = Field(default=1.0, alias="HEARTH_MEMORY_HOUSE_EVENT_SAMPLE")
+    memory_embeddings: bool = Field(default=True, alias="HEARTH_MEMORY_EMBEDDINGS")
+    memory_embedding_model: str = Field(
+        default="text-embedding-3-small",
+        alias="HEARTH_MEMORY_EMBEDDING_MODEL",
+    )
+    memory_inject: bool = Field(default=True, alias="HEARTH_MEMORY_INJECT")
+    memory_retention_days: int = Field(default=90, alias="HEARTH_MEMORY_RETENTION_DAYS")
+    memory_house_event_retention_days: int = Field(
+        default=30,
+        alias="HEARTH_MEMORY_HOUSE_EVENT_RETENTION_DAYS",
+    )
+    memory_preference_retention_days: int = Field(
+        default=0,
+        alias="HEARTH_MEMORY_PREFERENCE_RETENTION_DAYS",
+    )
+    memory_summarize_after: int = Field(default=16, alias="HEARTH_MEMORY_SUMMARIZE_AFTER")
+    memory_retrieve_k: int = Field(default=6, alias="HEARTH_MEMORY_RETRIEVE_K")
+    memory_session_idle_minutes: int = Field(default=240, alias="HEARTH_MEMORY_SESSION_IDLE_MINUTES")
+    memory_prune_interval_minutes: int = Field(default=60, alias="HEARTH_MEMORY_PRUNE_INTERVAL_MINUTES")
+    memory_max_turns: int = Field(default=20000, alias="HEARTH_MEMORY_MAX_TURNS")
+    memory_max_house_events: int = Field(default=5000, alias="HEARTH_MEMORY_MAX_HOUSE_EVENTS")
 
     app_secret_key: str = Field(default="", alias="APP_SECRET_KEY")
     algorithm: str = Field(default="HS256", alias="ALGORITHM")
