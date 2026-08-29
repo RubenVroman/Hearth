@@ -161,7 +161,7 @@ function idleHint() {
   }
   if (phoneUi()) return "Tap to talk.";
   const rt = state.realtime || {};
-  return `Tap the hearth for a live conversation (${rt.model || "gpt-realtime-2.1"} · ${rt.path || "webrtc-ga"}). Interrupt anytime.`;
+  return `Tap the hearth for a live conversation (${rt.model || "gpt-realtime-2.1"} · ${rt.path || "webrtc-ga"}). Real speech interrupts; noise should not.`;
 }
 
 function renderStatus(status) {
@@ -273,6 +273,9 @@ $("confirm-btn").addEventListener("click", async () => {
 
 function onRealtimeEvent(event) {
   const type = event.type;
+  if (state.call?.bargeIn) {
+    state.call.bargeIn.noteRealtimeEvent(type);
+  }
   if (type === "response.output_audio_transcript.done" || type === "response.audio_transcript.done") {
     appendLog("hearth", event.transcript);
   }
@@ -379,17 +382,26 @@ async function startConversation() {
   await pc.setRemoteDescription({ type: "answer", sdp: answer });
   const callId = sdpResponse.headers.get("X-Hearth-Call-Id") || "";
   const sideband = sdpResponse.headers.get("X-Hearth-Sideband") || "";
+  const micTrack = stream.getAudioTracks()[0] || null;
+  let bargeIn = null;
+  if (micTrack && globalThis.HearthVad?.SpeechBargeIn) {
+    bargeIn = new HearthVad.SpeechBargeIn(micTrack, stream);
+    await bargeIn.start();
+  }
   state.call = {
     pc,
     dc,
     stream,
     callId,
     sidebandOk: sideband === "ok" || sideband === "starting",
+    bargeIn,
   };
   $("orb").classList.add("live", "hot");
   $("orb").setAttribute("aria-label", "End conversation");
   $("orb-label").textContent = "Listening";
-  $("hint").textContent = phoneUi() ? "Listening. Tap to hang up." : "Live WebRTC conversation. Talk over it — barge-in is on. Tap to hang up.";
+  $("hint").textContent = phoneUi()
+    ? "Listening. Speak to interrupt — background noise is ignored. Tap to hang up."
+    : "Live WebRTC conversation. Real speech interrupts; TV/HVAC noise should not. Tap to hang up.";
   $("voice-pill").textContent = "voice webrtc-ga";
   $("voice-pill").classList.add("live");
 }
@@ -404,6 +416,7 @@ async function stopConversation() {
   $("voice-pill").classList.remove("live");
   if (!call) return;
   try {
+    call.bargeIn && call.bargeIn.stop();
     call.stream && call.stream.getTracks().forEach((t) => t.stop());
     call.pc && call.pc.close();
   } catch (_) {
