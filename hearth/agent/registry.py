@@ -127,6 +127,31 @@ class ToolRegistry:
                         return result
                     plan = planned if isinstance(planned, dict) else {"result": planned}
                     if plan.get("ok") is False:
+                        if plan.get("needs_client") and plan.get("retryable"):
+                            # Keep the play intent so UI/voice can retry after Plex opens.
+                            runtime.pending = PendingConfirm(
+                                tool=name,
+                                args=args,
+                                preview=f"{name} awaiting client: {preview_args}",
+                                reason="awaiting_client",
+                            )
+                            result = ToolResult(
+                                name=name,
+                                ok=False,
+                                needs_confirm=True,
+                                dry_run=True,
+                                data={
+                                    **plan,
+                                    "tool": name,
+                                    "would_call_with": preview_args,
+                                    "hint": (
+                                        "Open Plex on the target client, then confirm / "
+                                        "Try again — Hearth will re-detect and start."
+                                    ),
+                                },
+                            )
+                            runtime.last_tools.append(result.as_dict())
+                            return result
                         runtime.pending = None
                         result = ToolResult(name=name, ok=False, data=plan)
                         runtime.last_tools.append(result.as_dict())
@@ -144,6 +169,7 @@ class ToolRegistry:
                     tool=name,
                     args=args,
                     preview=f"{name} {preview_args}",
+                    reason="confirm",
                 )
                 result = ToolResult(
                     name=name,
@@ -164,10 +190,34 @@ class ToolRegistry:
             runtime.last_tools.append(result.as_dict())
             return result
 
-        if spec.destructive:
-            runtime.pending = None
         payload = data if isinstance(data, dict) else {"result": data}
         ok = not (isinstance(payload, dict) and payload.get("ok") is False)
+
+        if spec.destructive:
+            if (
+                isinstance(payload, dict)
+                and payload.get("needs_client")
+                and payload.get("retryable")
+            ):
+                # Confirm/play still waiting for a client — keep retry pending.
+                keep_args = {k: v for k, v in args.items() if k not in {"confirm", "dry_run"}}
+                runtime.pending = PendingConfirm(
+                    tool=name,
+                    args=keep_args,
+                    preview=f"{name} awaiting client: {keep_args}",
+                    reason="awaiting_client",
+                )
+                result = ToolResult(
+                    name=name,
+                    ok=False,
+                    needs_confirm=True,
+                    dry_run=False,
+                    data=payload,
+                )
+                runtime.last_tools.append(result.as_dict())
+                return result
+            runtime.pending = None
+
         result = ToolResult(name=name, ok=ok, data=payload)
         runtime.last_tools.append(result.as_dict())
         return result

@@ -78,16 +78,30 @@ async def _plex_play(args: dict[str, Any]) -> dict[str, Any]:
         offset_ms = int(offset)
     except (TypeError, ValueError):
         offset_ms = 0
+    wait = args.get("wait_for_client")
+    if wait is None:
+        wait = True
+    wait_timeout = args.get("wait_timeout_s")
+    try:
+        wait_timeout_s = float(wait_timeout) if wait_timeout is not None else None
+    except (TypeError, ValueError):
+        wait_timeout_s = None
     return await plex.play(
         str(args.get("query") or ""),
         player=str(args.get("player") or "") or None,
         rating_key=rating,
         offset_ms=offset_ms,
+        wait_for_client=bool(wait),
+        wait_timeout_s=wait_timeout_s,
     )
 
 
 async def _plex_play_preview(args: dict[str, Any]) -> dict[str, Any]:
-    """Dry-run resolve: title + client + already-playing, without playMedia."""
+    """Dry-run resolve: title + client + already-playing, without playMedia.
+
+    Does not wait for offline clients — returns needs_client + keeps pending so
+    confirm / Try again can re-poll once Plex is open on the Apple TV.
+    """
     rating = args.get("ratingKey") or args.get("rating_key")
     offset = args.get("offset_ms") or args.get("offset") or 0
     try:
@@ -99,6 +113,7 @@ async def _plex_play_preview(args: dict[str, Any]) -> dict[str, Any]:
         player=str(args.get("player") or "") or None,
         rating_key=rating,
         offset_ms=offset_ms,
+        wait_for_client=False,
     )
 
 
@@ -333,6 +348,8 @@ def register_builtin_tools() -> None:
                 "Searches the library (asks when multiple titles match), resolves the player "
                 "(named hint, else active/recent session, else PLEX_DEFAULT_PLAYER, else "
                 "Apple TV/LG/living room, else the only client), then playMedia via the PMS. "
+                "If no clients are online, guides the user to open Plex and keeps the play "
+                "ready for confirm / Try again (confirm re-polls briefly for the client). "
                 "Destructive: dry-run unless confirm=true. Confirm also covers switching away "
                 "from whatever is already playing. If the title is not in the library, say so "
                 "clearly — do not silently grab it in Radarr."
@@ -355,6 +372,13 @@ def register_builtin_tools() -> None:
                     "offset_ms": {
                         "type": "integer",
                         "description": "Start offset in milliseconds (default 0)",
+                    },
+                    "wait_for_client": {
+                        "type": "boolean",
+                        "description": (
+                            "On confirm, re-poll for online clients briefly (default true). "
+                            "Dry-run never waits."
+                        ),
                     },
                     "confirm": {"type": "boolean"},
                     "dry_run": {"type": "boolean"},
