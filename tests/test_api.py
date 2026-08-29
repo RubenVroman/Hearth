@@ -39,6 +39,29 @@ def test_chat_download_movie_uses_radarr(client):
     assert "Radarr" in body["reply"]
 
 
+def test_media_inventory_endpoint(client):
+    response = client.get("/api/media")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["tv"]["entity_id"] == "media_player.lg_webos_tv"
+    assert body["avr"]["ok"] is True
+    assert body["plex"]["sessions"]
+    assert "speak" in body
+    status = client.get("/api/status")
+    assert status.status_code == 200
+    assert "radarr" in status.json()
+    assert status.json()["ha"]["tv_entity"] == "media_player.lg_webos_tv"
+
+
+def test_chat_turn_on_tv_uses_media_control(client):
+    chat = client.post("/api/chat", json={"message": "turn on the TV"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "ha_media_control"
+    assert body["tools"][0]["needs_confirm"] is True
+
+
 def test_command_center_served(client):
     page = client.get("/")
     assert page.status_code == 200

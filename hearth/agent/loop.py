@@ -212,6 +212,13 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     if name == "ha_call_service":
         entity = (data.get("entity") or {}).get("entity_id") or data.get("entity")
         return f"Done{mock}: {entity} is {(data.get('entity') or {}).get('state', 'updated')}."
+    if name == "house_media":
+        return str(data.get("speak") or f"House media{mock}.")
+    if name == "ha_media_control":
+        spoken = data.get("speak")
+        if spoken:
+            return f"Done{mock}: {spoken}"
+        return f"Done{mock}: {data.get('device')} {data.get('action')} on {data.get('entity_id')}."
     if name == "chief_of_staff":
         if data.get("configured") is False:
             return str(data.get("error") or "Chief of Staff is not configured.")
@@ -259,16 +266,34 @@ def _confirm_line(name: str, preview: dict[str, Any]) -> str:
         return f"I'll grab {preview.get('query') or 'that'} in Sonarr. Confirm to add."
     if name == "overseerr_request":
         return f"I'll request {preview.get('query') or 'that'} in Overseerr. Confirm to send."
+    if name == "ha_media_control":
+        device = preview.get("device") or "device"
+        action = preview.get("action") or "control"
+        return f"I'll {action.replace('_', ' ')} the {device}. Confirm to run."
     return f"{name} is waiting for confirm. Preview: {preview}"
 
 
 _PLAYING = re.compile(r"\b(now playing|what'?s (on|playing)|what is playing|now-playing)\b", re.I)
+_MEDIA_STATUS = re.compile(
+    r"\b(house media|media status|media inventory|what'?s on the (tv|avr|denon)|"
+    r"is the (tv|avr|denon) on|avr status|tv status)\b",
+    re.I,
+)
 _PLEX_ONLY = re.compile(r"\bplex\b", re.I)
 _DOCKER = re.compile(r"\b(docker|containers?)\b", re.I)
-_LIGHTS = re.compile(r"\b(lights?|scenes?|rooms?|home assistant|denon|webos|tv)\b", re.I)
+_LIGHTS = re.compile(r"\b(lights?|scenes?|rooms?|home assistant)\b", re.I)
 _WORKSPACE = re.compile(r"\b(workspace|skills?)\b", re.I)
 _TURN_ON = re.compile(r"\bturn on\s+(.+)$", re.I)
 _TURN_OFF = re.compile(r"\bturn off\s+(.+)$", re.I)
+_VOLUME = re.compile(
+    r"\b(?:set\s+)?(?:the\s+)?(tv|lg|avr|denon|receiver)?\s*volume\s*(?:to\s*)?(\d{1,3})%?",
+    re.I,
+)
+_MUTE = re.compile(r"\b(un)?mute\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\b", re.I)
+_SOURCE = re.compile(
+    r"\b(?:set|switch)\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\s+(?:to\s+|source\s+|input\s+)(.+)$",
+    re.I,
+)
 _INSPECT = re.compile(r"\binspect\s+(\S+)", re.I)
 _MOVIE = re.compile(r"\b(movie|film|radarr)\b", re.I)
 _SERIES = re.compile(r"\b(show|series|season|episode|sonarr)\b", re.I)
@@ -327,14 +352,41 @@ def route_intent(text: str) -> dict[str, Any] | None:
         if _MOVIE.search(raw):
             return {"tool": "radarr_add", "args": {"query": query or raw}}
         return {"tool": "overseerr_request", "args": {"query": query or raw}}
+    if _MEDIA_STATUS.search(raw):
+        return {"tool": "house_media", "args": {}}
+    mute = _MUTE.search(raw)
+    if mute:
+        device = _media_device(mute.group(2))
+        action = "unmute" if mute.group(1) else "volume_mute"
+        return {"tool": "ha_media_control", "args": {"device": device, "action": action}}
+    vol = _VOLUME.search(raw)
+    if vol:
+        device = _media_device(vol.group(1) or "avr")
+        return {
+            "tool": "ha_media_control",
+            "args": {
+                "device": device,
+                "action": "volume_set",
+                "volume_level": int(vol.group(2)),
+            },
+        }
+    source = _SOURCE.search(raw)
+    if source:
+        device = _media_device(source.group(1))
+        return {
+            "tool": "ha_media_control",
+            "args": {
+                "device": device,
+                "action": "select_source",
+                "source": source.group(2).strip(" ."),
+            },
+        }
     m = _TURN_ON.search(raw)
     if m:
-        entity = _guess_entity(m.group(1), on=True)
-        return {"tool": "ha_call_service", "args": entity}
+        return _turn_plan(m.group(1), on=True)
     m = _TURN_OFF.search(raw)
     if m:
-        entity = _guess_entity(m.group(1), on=False)
-        return {"tool": "ha_call_service", "args": entity}
+        return _turn_plan(m.group(1), on=False)
     m = _INSPECT.search(raw)
     if m:
         return {"tool": "docker_inspect", "args": {"container": m.group(1)}}
@@ -349,8 +401,30 @@ def route_intent(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _media_device(phrase: str | None) -> str:
+    name = (phrase or "").strip().lower()
+    if name in {"tv", "lg", "webos", "television"}:
+        return "tv"
+    return "avr"
+
+
+def _turn_plan(phrase: str, *, on: bool) -> dict[str, Any]:
+    cleaned = re.sub(r"^(the|my|our)\s+", "", phrase.strip(), flags=re.I).lower().rstrip(".")
+    media_tokens = ("tv", "lg", "webos", "television", "avr", "denon", "receiver", "amp")
+    if any(token in cleaned.split() or cleaned == token for token in media_tokens) or cleaned in {
+        "lg tv", "webos tv", "lg webos tv", "denon avr",
+    }:
+        device = "tv" if any(t in cleaned for t in ("tv", "lg", "webos", "television")) else "avr"
+        return {
+            "tool": "ha_media_control",
+            "args": {"device": device, "action": "turn_on" if on else "turn_off"},
+        }
+    entity = _guess_entity(cleaned, on=on)
+    return {"tool": "ha_call_service", "args": entity}
+
+
 def _guess_entity(phrase: str, *, on: bool) -> dict[str, Any]:
-    name = phrase.strip().lower().rstrip(".")
+    name = re.sub(r"^(the|my|our)\s+", "", phrase.strip(), flags=re.I).lower().rstrip(".")
     mapping = {
         "living room": "light.living_room",
         "living room lights": "light.living_room",

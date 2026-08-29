@@ -42,6 +42,9 @@ class Settings(BaseSettings):
 
     ha_url: str = Field(default="http://homeassistant:8123", alias="HA_URL")
     ha_token: str = Field(default="", alias="HA_TOKEN")
+    # Optional overrides after HA pairing (entity_ids differ per install).
+    ha_tv_entity: str = Field(default="media_player.lg_webos_tv", alias="HA_TV_ENTITY")
+    ha_avr_entity: str = Field(default="media_player.denon_avr_x3700h", alias="HA_AVR_ENTITY")
 
     plex_url: str = Field(default="http://host.docker.internal:32400", alias="PLEX_URL")
     plex_token: str = Field(default="", alias="PLEX_TOKEN")
