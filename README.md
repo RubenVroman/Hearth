@@ -83,6 +83,8 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `PLEX_URL` | Existing Plex on the host. Default `http://host.docker.internal:32400`. |
 | `PLEX_TOKEN` | **Live** Plex sessions/search/clients/play. Empty → mocked now-playing + library/play fixtures. |
 | `PLEX_DEFAULT_PLAYER` | Optional default client name substring (e.g. `Apple TV`) when “the TV” is ambiguous. |
+| `PLEX_CLIENT_WAIT_SECONDS` | On confirm/play with no online clients, re-poll `/clients` this long (default `12`). |
+| `PLEX_CLIENT_POLL_INTERVAL` | Seconds between client re-polls while waiting (default `1.5`). |
 | `RADARR_URL` / `RADARR_API_KEY` | **Live** movie search/add. Default URL `http://host.docker.internal:7878`. Empty key → fixtures. |
 | `SONARR_URL` / `SONARR_API_KEY` | **Live** series search/add. Default `http://host.docker.internal:8989`. |
 | `OVERSEERR_URL` / `OVERSEERR_API_KEY` | **Live** request front door. Default `http://host.docker.internal:5055`. |
@@ -131,7 +133,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - LG TV / Denon AVR power, volume, source → `ha_media_control` (prefer over raw `ha_call_service`)
 - House media snapshot (TV + AVR + Plex) → `house_media` or `GET /api/media`
 - What's playing → `plex_now_playing`
-- Play a specific library title on Apple TV / LG / living-room Plex → `plex_play` (optional `plex_search` / `plex_clients`). Starts playback on the client via the Plex Media Server remote API — not HA `play_media` on the webOS entity. Prefers the active/recent Plex client when no player is named; asks when titles or clients are ambiguous; confirm covers switching away from whatever is already playing.
+- Play a specific library title on Apple TV / LG / living-room Plex → `plex_play` (optional `plex_search` / `plex_clients`). Starts playback on the client via the Plex Media Server remote API — not HA `play_media` on the webOS entity. Prefers the active/recent Plex client when no player is named; asks when titles or clients are ambiguous; confirm covers switching away from whatever is already playing. If no clients are online, Hearth keeps the play ready, tells you to open Plex on the Apple TV / target, and **Try again** / confirm re-polls briefly until the client appears.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr

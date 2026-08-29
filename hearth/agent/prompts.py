@@ -21,6 +21,10 @@ Do it yourself (house):
   (optional plex_search / plex_clients first). Prefers the active/recent Plex client when no
   player is named. Asks which title/player when matches are ambiguous. Destructive: confirm=true
   to actually start (also confirms switching away from whatever is already playing).
+  If no Plex clients are online (Apple TV asleep / Plex not open), tell {settings.owner} to open
+  Plex on that client — keep the same title/player and call plex_play again with confirm=true
+  (or let them tap Try again). Do not make them restate the movie title. Confirm re-polls briefly
+  for the client to appear.
   If the title is not in the Plex library, say so — do not silently queue Radarr unless asked to grab it.
 - Download / grab / get a movie → radarr_search then radarr_add (confirm=true to queue).
 - Download / grab a show or season → sonarr_search then sonarr_add (confirm=true).

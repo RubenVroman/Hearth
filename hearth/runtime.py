@@ -29,6 +29,8 @@ class PendingConfirm:
     args: dict[str, Any]
     preview: str
     ts: str = field(default_factory=_now)
+    # "confirm" = normal dry-run; "awaiting_client" = plex_play waiting for Plex to open.
+    reason: str = "confirm"
 
 
 class Runtime:
@@ -67,6 +69,7 @@ class Runtime:
                 "args": self.pending.args,
                 "preview": self.pending.preview,
                 "ts": self.pending.ts,
+                "reason": self.pending.reason,
             },
             "last_tools": list(self.last_tools),
         }

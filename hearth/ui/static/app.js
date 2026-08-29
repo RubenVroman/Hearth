@@ -180,7 +180,11 @@ function renderStatus(status) {
   state.pending = status.pending;
   $("confirm-btn").classList.toggle("hidden", !status.pending);
   if (status.pending) {
-    $("confirm-btn").textContent = `Confirm ${status.pending.tool}`;
+    if (status.pending.reason === "awaiting_client") {
+      $("confirm-btn").textContent = "Try again — Plex is open";
+    } else {
+      $("confirm-btn").textContent = `Confirm ${status.pending.tool}`;
+    }
   }
   if (!state.call) {
     $("hint").textContent = idleHint();
