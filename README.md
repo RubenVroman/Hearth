@@ -148,7 +148,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - LG TV / Denon AVR power, volume, source → `ha_media_control` (prefer over raw `ha_call_service`)
 - House media snapshot (TV + AVR + Plex) → `house_media` or `GET /api/media`
 - What's playing → `plex_now_playing`
-- Play a specific library title on Apple TV / LG / living-room Plex → `plex_play` (optional `plex_search` / `plex_clients`). Starts playback on the client via the Plex Media Server remote API — not HA `play_media` on the webOS entity.
+- Play a specific library title on Apple TV / LG / living-room Plex → `plex_play` (optional `plex_search` / `plex_clients`). Starts playback on the client via the Plex Media Server remote API — not HA `play_media` on the webOS entity. Prefers the active/recent Plex client when no player is named; asks when titles or clients are ambiguous; confirm covers switching away from whatever is already playing.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
