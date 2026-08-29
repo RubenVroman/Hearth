@@ -276,6 +276,61 @@ input,
   text-align: center;
 }
 
+.mic-panel {
+  width: min(420px, 100%);
+  margin: 0 0 18px;
+  padding: 16px 18px 14px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(18, 14, 10, 0.88);
+  text-align: left;
+}
+
+.mic-panel-title {
+  margin: 0 0 8px;
+  font-family: Fraunces, serif;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.mic-panel-copy {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.mic-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.mic-panel-primary,
+.mic-panel-secondary {
+  border-radius: 999px;
+  padding: 10px 16px;
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.mic-panel-primary {
+  border: 1px solid rgba(224, 138, 58, 0.5);
+  background: rgba(224, 138, 58, 0.12);
+  color: var(--ember-2);
+}
+
+.mic-panel-secondary {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+}
+
 .composer-dock {
   display: flex;
   flex-direction: column;
@@ -622,6 +677,29 @@ input,
     width: 100%;
     text-align: center;
     white-space: nowrap;
+  }
+
+  .mic-panel {
+    width: 100%;
+    margin: 10px 0 0;
+    padding: 14px 16px 12px;
+    border-radius: 16px;
+  }
+
+  .mic-panel-title {
+    font-size: 17px;
+  }
+
+  .mic-panel-copy {
+    font-size: 13px;
+  }
+
+  .mic-panel-primary,
+  .mic-panel-secondary {
+    min-height: 44px;
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    padding: 10px 16px;
   }
 
   .composer-dock {
