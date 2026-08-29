@@ -495,9 +495,11 @@ function renderStatus(status) {
   $("voice-pill").classList.toggle("live", live);
   $("mode-pill").textContent = rt.beta ? "beta" : status.openai ? "openai" : "local";
   state.pending = status.pending;
-  $("confirm-btn").classList.toggle("hidden", !status.pending);
+  const confirmBtn = $("confirm-btn");
+  confirmBtn.classList.toggle("hidden", !status.pending);
+  document.querySelector(".composer-dock")?.classList.toggle("has-confirm", Boolean(status.pending));
   if (status.pending) {
-    $("confirm-btn").textContent = `Confirm ${status.pending.tool}`;
+    confirmBtn.textContent = `Confirm ${status.pending.tool}`;
   }
   if (Array.isArray(status.widgets)) {
     renderWidgets(status.widgets);
