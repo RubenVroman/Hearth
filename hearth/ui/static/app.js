@@ -662,7 +662,11 @@ function renderStatus(status) {
   confirmBtn.classList.toggle("hidden", !status.pending);
   document.querySelector(".composer-dock")?.classList.toggle("has-confirm", Boolean(status.pending));
   if (status.pending) {
-    confirmBtn.textContent = `Confirm ${status.pending.tool}`;
+    if (status.pending.reason === "awaiting_client") {
+      confirmBtn.textContent = "Try again — Plex is open";
+    } else {
+      confirmBtn.textContent = `Confirm ${status.pending.tool}`;
+    }
   }
   if (Array.isArray(status.widgets)) {
     renderWidgets(status.widgets);

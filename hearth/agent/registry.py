@@ -138,6 +138,33 @@ class ToolRegistry:
                         return result
                     plan = planned if isinstance(planned, dict) else {"result": planned}
                     if plan.get("ok") is False:
+                        if plan.get("needs_client") and plan.get("retryable"):
+                            # Keep the play intent so UI/voice can retry after Plex opens.
+                            runtime.pending = PendingConfirm(
+                                tool=name,
+                                args=preview_args,
+                                preview=f"{name} awaiting client: {preview_args}",
+                                reason="awaiting_client",
+                            )
+                            result = ToolResult(
+                                name=name,
+                                ok=False,
+                                needs_confirm=True,
+                                dry_run=True,
+                                data={
+                                    **plan,
+                                    "tool": name,
+                                    "would_call_with": preview_args,
+                                    "hint": (
+                                        "Open Plex on the target client, then confirm / "
+                                        "Try again — Hearth will re-detect and start."
+                                    ),
+                                },
+                            )
+                            payload = result.as_dict()
+                            runtime.last_tools.append(payload)
+                            widget_bus.publish_tool(payload)
+                            return result
                         runtime.pending = None
                         result = ToolResult(name=name, ok=False, data=plan)
                         payload = result.as_dict()
@@ -165,6 +192,7 @@ class ToolRegistry:
                     tool=name,
                     args=args,
                     preview=f"{name} {preview_args}",
+                    reason="confirm",
                 )
                 result = ToolResult(
                     name=name,
@@ -190,10 +218,37 @@ class ToolRegistry:
             widget_bus.publish_tool(payload)
             return result
 
-        if spec.destructive:
-            runtime.pending = None
         payload_data = data if isinstance(data, dict) else {"result": data}
         ok = not (isinstance(payload_data, dict) and payload_data.get("ok") is False)
+
+        if (
+            isinstance(payload_data, dict)
+            and payload_data.get("needs_client")
+            and payload_data.get("retryable")
+        ):
+            # Play waiting for a client — keep retry pending (works for lenient plex_play too).
+            keep_args = {k: v for k, v in args.items() if k not in {"confirm", "dry_run"}}
+            runtime.pending = PendingConfirm(
+                tool=name,
+                args=keep_args,
+                preview=f"{name} awaiting client: {keep_args}",
+                reason="awaiting_client",
+            )
+            result = ToolResult(
+                name=name,
+                ok=False,
+                needs_confirm=True,
+                dry_run=not bool(args.get("confirm")),
+                data=payload_data,
+            )
+            payload = result.as_dict()
+            runtime.last_tools.append(payload)
+            widget_bus.publish_tool(payload)
+            _offer_memory(spec, result)
+            return result
+
+        if spec.destructive or (runtime.pending is not None and runtime.pending.tool == name):
+            runtime.pending = None
         result = ToolResult(name=name, ok=ok, data=payload_data)
         payload = result.as_dict()
         runtime.last_tools.append(payload)

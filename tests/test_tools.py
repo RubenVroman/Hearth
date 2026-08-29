@@ -409,6 +409,128 @@ async def test_plex_play_missing_title_skips_confirm_chip():
     assert result.data.get("in_library") is False
 
 
+async def test_plex_play_no_clients_keeps_retry_pending(monkeypatch):
+    """Empty client list → clear Apple TV guidance + Try-again pending (no restate title)."""
+    from hearth.runtime import runtime
+    from hearth.tools.plex import plex as plex_client
+
+    async def _empty_clients():
+        return {"mode": "mock", "clients": []}
+
+    monkeypatch.setattr(plex_client, "clients", _empty_clients)
+    runtime.pending = None
+    result = await registry.call(
+        "plex_play",
+        {"query": "The Endless", "player": "Apple TV"},
+    )
+    assert not result.ok
+    assert result.needs_confirm
+    assert result.dry_run
+    assert result.data.get("needs_client") is True
+    assert result.data.get("retryable") is True
+    assert "Apple TV" in result.data["speak"]
+    assert "Open the Plex app" in result.data["speak"]
+    assert runtime.pending is not None
+    assert runtime.pending.tool == "plex_play"
+    assert runtime.pending.reason == "awaiting_client"
+    assert runtime.pending.args.get("query") == "The Endless"
+    assert "Apple" in str(runtime.pending.args.get("player") or "")
+
+
+async def test_plex_play_confirm_waits_then_plays_when_client_appears(monkeypatch):
+    """Confirm path re-polls; once Apple TV comes online, playback starts."""
+    from hearth.config import settings
+    from hearth.fixtures import MOCK_PLEX_CLIENTS
+    from hearth.runtime import runtime
+    from hearth.tools.plex import plex as plex_client
+
+    calls = {"n": 0}
+
+    async def _clients_then_apple():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"mode": "mock", "clients": []}
+        return {"mode": "mock", "clients": list(MOCK_PLEX_CLIENTS)}
+
+    async def _no_sessions():
+        return {"mode": "mock", "sessions": []}
+
+    monkeypatch.setattr(settings, "plex_client_wait_seconds", 1.0)
+    monkeypatch.setattr(settings, "plex_client_poll_interval", 0.05)
+    monkeypatch.setattr(plex_client, "clients", _clients_then_apple)
+    monkeypatch.setattr(plex_client, "now_playing", _no_sessions)
+    runtime.pending = None
+
+    result = await registry.call(
+        "plex_play",
+        {"query": "The Endless", "player": "Apple TV", "confirm": True},
+    )
+    assert result.ok
+    assert result.data.get("played") is True
+    assert result.data["client"]["name"] == "Apple TV"
+    assert calls["n"] >= 2
+    assert (result.data.get("waited_s") or 0) > 0
+    assert runtime.pending is None
+
+
+async def test_plex_play_confirm_still_waiting_keeps_pending(monkeypatch):
+    """If confirm wait times out with no clients, keep awaiting_client pending."""
+    from hearth.config import settings
+    from hearth.runtime import runtime
+    from hearth.tools.plex import plex as plex_client
+
+    async def _empty_clients():
+        return {"mode": "mock", "clients": []}
+
+    monkeypatch.setattr(settings, "plex_client_wait_seconds", 0.3)
+    monkeypatch.setattr(settings, "plex_client_poll_interval", 0.05)
+    monkeypatch.setattr(plex_client, "clients", _empty_clients)
+    runtime.pending = None
+
+    result = await registry.call(
+        "plex_play",
+        {"query": "The Endless", "player": "Apple TV", "confirm": True},
+    )
+    assert not result.ok
+    assert result.needs_confirm
+    assert result.data.get("needs_client") is True
+    assert "watching for" in result.data["speak"]
+    assert runtime.pending is not None
+    assert runtime.pending.reason == "awaiting_client"
+
+
+async def test_status_exposes_awaiting_client_reason(client, monkeypatch):
+    from hearth.tools.plex import plex as plex_client
+
+    async def _empty_clients():
+        return {"mode": "mock", "clients": []}
+
+    monkeypatch.setattr(plex_client, "clients", _empty_clients)
+    chat = client.post(
+        "/api/chat",
+        json={"message": "play The Endless on the Apple TV"},
+    )
+    assert chat.status_code == 200
+    body = chat.json()
+    assert "Apple TV" in body["reply"] or "Plex" in body["reply"]
+    status = client.get("/api/status")
+    assert status.status_code == 200
+    pending = status.json().get("pending")
+    assert pending is not None
+    assert pending["reason"] == "awaiting_client"
+    assert pending["tool"] == "plex_play"
+
+
+async def test_ui_try_again_label_for_awaiting_client():
+    from pathlib import Path
+
+    app_js = Path("hearth/ui/static/app.js").read_text(encoding="utf-8")
+    assert 'reason === "awaiting_client"' in app_js
+    assert "Try again — Plex is open" in app_js
+    sw = Path("hearth/ui/static/sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v9" in sw
+
+
 async def test_plex_play_live_proxies_play_media(monkeypatch):
     """Live path: identity + clients + playQueue + PMS-proxied playMedia."""
     import httpx

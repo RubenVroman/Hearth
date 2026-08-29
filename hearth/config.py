@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     plex_token: str = Field(default="", alias="PLEX_TOKEN")
     # Optional default Plex client name / substring (e.g. "Apple TV", "LG", "Living Room").
     plex_default_player: str = Field(default="", alias="PLEX_DEFAULT_PLAYER")
+    # When play/confirm finds no clients, re-poll /clients for this long (seconds).
+    plex_client_wait_seconds: float = Field(default=12.0, alias="PLEX_CLIENT_WAIT_SECONDS")
+    plex_client_poll_interval: float = Field(default=1.5, alias="PLEX_CLIENT_POLL_INTERVAL")
 
     radarr_url: str = Field(default="http://host.docker.internal:7878", alias="RADARR_URL")
     radarr_api_key: str = Field(default="", alias="RADARR_API_KEY")

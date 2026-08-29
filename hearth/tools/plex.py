@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -180,8 +182,15 @@ class Plex:
         player: str | None = None,
         rating_key: str | int | None = None,
         offset_ms: int = 0,
+        wait_for_client: bool = False,
+        wait_timeout_s: float | None = None,
     ) -> dict[str, Any]:
-        """Resolve library item + target client without starting playback."""
+        """Resolve library item + target client without starting playback.
+
+        When no Plex clients are online and ``wait_for_client`` is true (confirm/play),
+        re-poll ``/clients`` until one appears or the wait budget runs out.
+        Dry-run preview leaves wait off so the user gets immediate guidance.
+        """
         title_query = (query or "").strip()
         if not title_query and rating_key is None:
             return {
@@ -201,7 +210,47 @@ class Plex:
         clients_result = await self.clients()
         clients = clients_result.get("clients") or []
         resolved = _resolve_client(clients, player, sessions=sessions)
+        waited_s = 0.0
+
+        if (
+            not resolved.get("ok")
+            and resolved.get("error") == "no Plex clients available"
+            and wait_for_client
+        ):
+            timeout = (
+                float(wait_timeout_s)
+                if wait_timeout_s is not None
+                else float(settings.plex_client_wait_seconds)
+            )
+            polled = await self._poll_for_clients(player=player, timeout_s=timeout)
+            waited_s = float(polled.get("waited_s") or 0)
+            clients = polled.get("clients") or clients
+            clients_result = polled.get("clients_result") or clients_result
+            if polled.get("ok"):
+                resolved = polled["resolved"]
+                sessions = polled.get("sessions") or sessions
+            else:
+                return _no_clients_result(
+                    player=player,
+                    item=item,
+                    mode=clients_result.get("mode") or item_result.get("mode"),
+                    waited_s=waited_s,
+                    clients=clients,
+                    sessions=sessions,
+                )
+
         if not resolved.get("ok"):
+            if resolved.get("error") == "no Plex clients available":
+                return _no_clients_result(
+                    player=player,
+                    item=item,
+                    mode=clients_result.get("mode")
+                    or item_result.get("mode")
+                    or playing.get("mode"),
+                    waited_s=waited_s,
+                    clients=clients,
+                    sessions=sessions,
+                )
             return {
                 **resolved,
                 "mode": clients_result.get("mode") or item_result.get("mode") or playing.get("mode"),
@@ -225,7 +274,61 @@ class Plex:
             "sessions": sessions,
             "already_playing": already,
             "candidates": item_result.get("candidates"),
+            "waited_s": waited_s,
             "speak": speak,
+        }
+
+    async def _poll_for_clients(
+        self,
+        *,
+        player: str | None,
+        timeout_s: float,
+    ) -> dict[str, Any]:
+        """Re-query Plex clients until one is controllable or the wait budget ends."""
+        timeout = max(0.0, float(timeout_s))
+        interval = max(0.2, float(settings.plex_client_poll_interval))
+        start = time.monotonic()
+        clients: list[dict[str, Any]] = []
+        clients_result: dict[str, Any] = {"clients": []}
+        sessions: list[dict[str, Any]] = []
+
+        while True:
+            elapsed = time.monotonic() - start
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+            clients_result = await self.clients()
+            clients = clients_result.get("clients") or []
+            playing = await self.now_playing()
+            sessions = playing.get("sessions") or []
+            resolved = _resolve_client(clients, player, sessions=sessions)
+            if resolved.get("ok"):
+                return {
+                    "ok": True,
+                    "resolved": resolved,
+                    "clients": clients,
+                    "clients_result": clients_result,
+                    "sessions": sessions,
+                    "waited_s": time.monotonic() - start,
+                }
+            # Clients online but hint mismatch / ambiguity — stop waiting.
+            if clients and resolved.get("error") != "no Plex clients available":
+                return {
+                    "ok": True,
+                    "resolved": resolved,
+                    "clients": clients,
+                    "clients_result": clients_result,
+                    "sessions": sessions,
+                    "waited_s": time.monotonic() - start,
+                }
+
+        return {
+            "ok": False,
+            "clients": clients,
+            "clients_result": clients_result,
+            "sessions": sessions,
+            "waited_s": time.monotonic() - start,
         }
 
     async def play(
@@ -235,6 +338,8 @@ class Plex:
         player: str | None = None,
         rating_key: str | int | None = None,
         offset_ms: int = 0,
+        wait_for_client: bool = True,
+        wait_timeout_s: float | None = None,
     ) -> dict[str, Any]:
         """Search (or use ratingKey), resolve a client, start playback via PMS-proxied playMedia."""
         plan = await self.resolve_play(
@@ -242,6 +347,8 @@ class Plex:
             player=player,
             rating_key=rating_key,
             offset_ms=offset_ms,
+            wait_for_client=wait_for_client,
+            wait_timeout_s=wait_timeout_s,
         )
         if not plan.get("ok"):
             return plan
@@ -275,6 +382,7 @@ class Plex:
                 "resolved": plan.get("resolved"),
                 "offset_ms": offset,
                 "already_playing": plan.get("already_playing"),
+                "waited_s": plan.get("waited_s") or 0,
                 "speak": speak,
             }
 
@@ -325,6 +433,7 @@ class Plex:
                 "offset_ms": offset,
                 "playQueueID": play_queue_id,
                 "already_playing": plan.get("already_playing"),
+                "waited_s": plan.get("waited_s") or 0,
                 "speak": speak,
             }
         except Exception as exc:  # noqa: BLE001
@@ -577,9 +686,9 @@ def _resolve_client(
         return {
             "ok": False,
             "error": "no Plex clients available",
-            "speak": (
-                "No Plex clients are online. Open Plex on the Apple TV or LG TV, then try again."
-            ),
+            "needs_client": True,
+            "retryable": True,
+            "speak": _no_clients_speak(player),
             "ambiguous": False,
         }
 
@@ -762,6 +871,63 @@ def _ambiguous(clients: list[dict[str, Any]], hint: str) -> dict[str, Any]:
         "error": f"multiple Plex clients match {hint!r}",
         "clients": clients,
         "speak": f"Which player? I see {listed}.",
+    }
+
+
+def _client_target_label(player: str | None) -> str:
+    """Human label for the client we're waiting on."""
+    hint = (player or "").strip()
+    if not hint:
+        hint = (settings.plex_default_player or "").strip()
+    low = hint.lower()
+    if not hint or low in {"tv", "the tv", "television"}:
+        return "the Apple TV or LG TV"
+    if "apple" in low:
+        return "the Apple TV"
+    if "lg" in low or "webos" in low:
+        return "the LG TV"
+    if low in {"living room", "livingroom"}:
+        return "the living-room TV"
+    return hint
+
+
+def _no_clients_speak(player: str | None, *, waited_s: float = 0) -> str:
+    target = _client_target_label(player)
+    if waited_s > 0:
+        secs = max(1, int(round(waited_s)))
+        return (
+            f"Still no Plex client on {target} after watching for {secs} seconds. "
+            f"Open the Plex app there, then tap Try again or say confirm — "
+            f"I still have the play ready."
+        )
+    return (
+        f"Plex isn't open on {target} yet. Open the Plex app there — "
+        f"I'll keep the play ready. Tap Try again (or say confirm) once it's up."
+    )
+
+
+def _no_clients_result(
+    *,
+    player: str | None,
+    item: dict[str, Any] | None = None,
+    mode: str | None = None,
+    waited_s: float = 0,
+    clients: list[dict[str, Any]] | None = None,
+    sessions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "no Plex clients available",
+        "needs_client": True,
+        "retryable": True,
+        "awaiting_client": _client_target_label(player),
+        "waited_s": waited_s,
+        "ambiguous": False,
+        "speak": _no_clients_speak(player, waited_s=waited_s),
+        "item": item,
+        "clients": clients or [],
+        "sessions": sessions or [],
+        "mode": mode,
     }
 
 
