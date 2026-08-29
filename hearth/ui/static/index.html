@@ -39,6 +39,9 @@
         <span class="pill" id="agent-pill">idle</span>
         <span class="pill" id="voice-pill">voice off</span>
         <span class="pill dim" id="mode-pill">fallback</span>
+        <button type="button" id="settings-btn" class="pill-btn" aria-haspopup="dialog" aria-controls="settings-sheet">
+          Look
+        </button>
         <button type="button" id="logout-btn" class="pill-btn">Log out</button>
       </div>
     </header>
@@ -100,7 +103,32 @@
       </section>
     </main>
 
+    <div
+      id="settings-sheet"
+      class="settings-sheet hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      aria-hidden="true"
+    >
+      <button type="button" id="settings-backdrop" class="settings-backdrop" aria-label="Close settings"></button>
+      <div class="settings-panel" id="settings-panel">
+        <header class="settings-head">
+          <div>
+            <p class="kicker">Hearth</p>
+            <h2 id="settings-title">Look &amp; feel</h2>
+          </div>
+          <button type="button" id="settings-close" class="pill-btn settings-close">Done</button>
+        </header>
+        <div id="settings-body" class="settings-body"></div>
+        <footer class="settings-foot">
+          <button type="button" id="settings-reset" class="settings-reset">Reset to Hearth defaults</button>
+        </footer>
+      </div>
+    </div>
+
     <script src="/static/pwa.js"></script>
+    <script src="/static/settings.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>
