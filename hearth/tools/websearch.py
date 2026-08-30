@@ -56,7 +56,7 @@ _SECRET_HINT = re.compile(
     r"authorized_keys|id_rsa|\.env|htpasswd)\b|"
     r"file://|"
     r"javascript:|"
-    r"(?i)https?://("
+    r"https?://("
     r"localhost\b|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|::1\b|"
     r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
     r"192\.168\.\d{1,3}\.\d{1,3}|"
