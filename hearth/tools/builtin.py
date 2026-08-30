@@ -318,7 +318,10 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="ha_call_service",
-            description="Call a Home Assistant service (lights, scenes, Denon, LG TV). Destructive: defaults to dry-run unless confirm=true.",
+            description=(
+                "Call a Home Assistant service (lights, scenes, Denon, LG TV). "
+                "Runs immediately — no confirm step for routine house control."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -335,7 +338,6 @@ def register_builtin_tools() -> None:
                 "required": ["domain", "service", "entity_id"],
             },
             handler=_ha_call,
-            destructive=True,
         )
     )
     registry.register(
@@ -355,7 +357,7 @@ def register_builtin_tools() -> None:
             name="ha_media_control",
             description=(
                 "Control the LG webOS TV or Denon AVR via Home Assistant media_player services. "
-                "Prefer this over raw ha_call_service for TV/AVR. Destructive: dry-run unless confirm=true. "
+                "Prefer this over raw ha_call_service for TV/AVR. Runs immediately — no confirm step. "
                 "device=tv|avr; action=turn_on|turn_off|volume_set|volume_mute|unmute|volume_up|"
                 "volume_down|select_source|play_media|media_play|media_pause|media_stop."
             ),
@@ -381,7 +383,6 @@ def register_builtin_tools() -> None:
                 "required": ["device", "action"],
             },
             handler=_ha_media,
-            destructive=True,
         )
     )
     registry.register(
@@ -432,9 +433,8 @@ def register_builtin_tools() -> None:
                 "Searches the library (asks when multiple titles match), resolves the player "
                 "(named hint, else active/recent session, else PLEX_DEFAULT_PLAYER, else "
                 "Apple TV/LG/living room, else the only client), then playMedia via the PMS. "
-                "Destructive: dry-run unless confirm=true. Confirm also covers switching away "
-                "from whatever is already playing. If the title is not in the library, say so "
-                "clearly — do not silently grab it in Radarr."
+                "Runs immediately — including switching away from whatever is already playing. "
+                "If the title is not in the library, say so clearly — do not silently grab it in Radarr."
             ),
             parameters={
                 "type": "object",
@@ -462,7 +462,6 @@ def register_builtin_tools() -> None:
             },
             handler=_plex_play,
             preview_handler=_plex_play_preview,
-            destructive=True,
         )
     )
     registry.register(
@@ -488,7 +487,10 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="docker_stop",
-            description="Stop a Docker container. Destructive: dry-run unless confirm=true.",
+            description=(
+                "Stop a Docker container. High-risk: dry-run unless confirm=true "
+                "(voice/UI confirm)."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -528,7 +530,10 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="workspace_write",
-            description="Write a file in the VAULT workspace sandbox only — not the git repo. For repo/PR/feature work call chief_of_staff. Destructive: dry-run unless confirm=true.",
+            description=(
+                "Write a file in the VAULT workspace sandbox only — not the git repo. "
+                "For repo/PR/feature work call chief_of_staff. Runs immediately in the sandbox."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -540,13 +545,15 @@ def register_builtin_tools() -> None:
                 "required": ["path", "content"],
             },
             handler=_ws_write,
-            destructive=True,
         )
     )
     registry.register(
         ToolSpec(
             name="workspace_delete",
-            description="Delete a workspace file. Destructive: dry-run unless confirm=true. Cannot leave the workspace.",
+            description=(
+                "Delete a workspace file. Irreversible: dry-run unless confirm=true. "
+                "Cannot leave the workspace."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -567,7 +574,7 @@ def register_builtin_tools() -> None:
                 "Escalate work Hearth cannot do to Chief of Staff: repo/code/PR/git, new features "
                 "(Discord, integrations), Gridways/kanban/boards/tasks on a project, calendar, "
                 "GitHub/GitLab org work, teammate agents. Hearth must NOT edit GitHub or pretend "
-                "it connected. Destructive: dry-run unless confirm=true (voice/UI confirm is enough)."
+                "it connected. Call immediately when asked — no confirm step."
             ),
             parameters={
                 "type": "object",
@@ -590,7 +597,6 @@ def register_builtin_tools() -> None:
                 "required": ["task"],
             },
             handler=_chief_of_staff,
-            destructive=True,
             configured=cos_configured,
             not_configured=not_configured_message(),
         )
@@ -610,7 +616,10 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="radarr_add",
-            description="Add a movie to the Radarr download queue. Destructive: dry-run unless confirm=true. Say you'll grab it in Radarr.",
+            description=(
+                "Add a movie to the Radarr download queue. Runs immediately — say you'll grab it "
+                "in Radarr."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -622,7 +631,6 @@ def register_builtin_tools() -> None:
                 "required": ["query"],
             },
             handler=_radarr_add,
-            destructive=True,
         )
     )
     registry.register(
@@ -640,7 +648,10 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="sonarr_add",
-            description="Add a series to the Sonarr download queue. Destructive: dry-run unless confirm=true. Say you'll grab it in Sonarr.",
+            description=(
+                "Add a series to the Sonarr download queue. Runs immediately — say you'll grab it "
+                "in Sonarr."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -652,7 +663,6 @@ def register_builtin_tools() -> None:
                 "required": ["query"],
             },
             handler=_sonarr_add,
-            destructive=True,
         )
     )
     registry.register(
@@ -670,7 +680,9 @@ def register_builtin_tools() -> None:
     registry.register(
         ToolSpec(
             name="overseerr_request",
-            description="Request a movie or show via Overseerr (feeds Radarr/Sonarr). Destructive: dry-run unless confirm=true.",
+            description=(
+                "Request a movie or show via Overseerr (feeds Radarr/Sonarr). Runs immediately."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -683,7 +695,6 @@ def register_builtin_tools() -> None:
                 "required": ["query"],
             },
             handler=_overseerr_request,
-            destructive=True,
         )
     )
     registry.register(
@@ -756,7 +767,7 @@ def register_builtin_tools() -> None:
         ToolSpec(
             name="thuisbezorgd_order",
             description=(
-                "Place the current Thuisbezorgd cart. Spends money — destructive: dry-run unless "
+                "Place the current Thuisbezorgd cart. Spends money — always dry-run unless "
                 "confirm=true. Before confirm, preview shows restaurant, items, price, and delivery "
                 "address. No auto-reorder. Live paid submit only when THUISBEZORGD_API_KEY + session "
                 "are configured; otherwise confirm places a fixture order only."

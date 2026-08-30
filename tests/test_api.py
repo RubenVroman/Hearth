@@ -35,7 +35,7 @@ def test_chat_download_movie_uses_radarr(client):
     assert chat.status_code == 200
     body = chat.json()
     assert body["tools"][0]["name"] == "radarr_add"
-    assert body["tools"][0]["needs_confirm"] is True
+    assert body["tools"][0]["needs_confirm"] is False
     assert "Radarr" in body["reply"]
 
 
@@ -59,7 +59,8 @@ def test_chat_turn_on_tv_uses_media_control(client):
     assert chat.status_code == 200
     body = chat.json()
     assert body["tools"][0]["name"] == "ha_media_control"
-    assert body["tools"][0]["needs_confirm"] is True
+    assert body["tools"][0]["needs_confirm"] is False
+    assert body["tools"][0]["ok"] is True
 
 
 def test_command_center_served(client):

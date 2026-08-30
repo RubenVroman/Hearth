@@ -670,9 +670,9 @@ def _plan_speak(
         current_label = f"{show} — {current}" if show else current
         return (
             f"{base} {current_label} is currently "
-            f"{already.get('state') or 'playing'} there — confirm to switch."
+            f"{already.get('state') or 'playing'} there — switching."
         )
-    return f"{base} Confirm to start."
+    return base
 
 
 def _ambiguous_titles(

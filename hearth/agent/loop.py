@@ -394,27 +394,6 @@ def _confirm_line(
     data = data or {}
     if plan is None and isinstance(data.get("plan"), dict):
         plan = data.get("plan")
-    if name == "chief_of_staff":
-        task = preview.get("task") or preview.get("said") or "that"
-        return f"I'll ask Chief of Staff to handle that: {task}. Confirm to send."
-    if name == "radarr_add":
-        return f"I'll grab {preview.get('query') or 'that'} in Radarr. Confirm to add."
-    if name == "sonarr_add":
-        return f"I'll grab {preview.get('query') or 'that'} in Sonarr. Confirm to add."
-    if name == "overseerr_request":
-        return f"I'll request {preview.get('query') or 'that'} in Overseerr. Confirm to send."
-    if name == "ha_media_control":
-        device = preview.get("device") or "device"
-        action = preview.get("action") or "control"
-        return f"I'll {action.replace('_', ' ')} the {device}. Confirm to run."
-    if name == "plex_play":
-        if plan and plan.get("speak"):
-            return str(plan["speak"])
-        if data.get("speak"):
-            return str(data["speak"])
-        query = preview.get("query") or "that"
-        player = preview.get("player") or "the TV"
-        return f"I'll play {query} on {player}. Confirm to start."
     if name == "thuisbezorgd_order":
         summary = data.get("summary")
         if summary:
@@ -430,6 +409,12 @@ def _confirm_line(
         return "I'll export a redacted memory snapshot into the workspace. Confirm to write it."
     if name == "memory_purge":
         return f"I'll purge house memory ({preview.get('kind') or 'all'}). Confirm to delete it."
+    if name == "workspace_delete":
+        path = preview.get("path") or "that file"
+        return f"I'll delete {path} from the workspace. Confirm to remove it."
+    if name == "docker_stop":
+        container = preview.get("container") or "that container"
+        return f"I'll stop Docker container {container}. Confirm to stop it."
     return f"{name} is waiting for confirm. Preview: {preview}"
 
 

@@ -40,10 +40,11 @@ def test_in_progress_action_widget_for_radarr(client):
     chat = client.post("/api/chat", json={"message": "download the movie Dune"})
     assert chat.status_code == 200
     body = chat.json()
-    assert body["tools"][0]["needs_confirm"] is True
+    assert body["tools"][0]["needs_confirm"] is False
     action = next(w for w in body["widgets"] if w["kind"] == "action" and "Grabbing" in w["title"])
-    assert action["status"] == "pending"
-    assert "Waiting for confirm" in action["detail"]
+    assert action["status"] == "done"
+    assert "Waiting for confirm" not in (action.get("detail") or "")
+    assert "Queued in Radarr" in (action.get("detail") or "")
 
 
 def test_dismiss_widget(client):

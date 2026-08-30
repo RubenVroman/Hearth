@@ -273,7 +273,7 @@ async def memory_forget_api(body: MemoryForgetBody) -> dict[str, Any]:
     if not body.confirm:
         raise HTTPException(
             status_code=400,
-            detail="confirm=true required to forget. Destructive memory writes default to dry-run.",
+            detail="confirm=true required to forget. Memory deletes default to dry-run.",
         )
     result = memory_forget_row(pref_id=body.id, key=body.key)
     if not result.get("ok"):
@@ -286,7 +286,7 @@ async def memory_export_api(confirm: bool = False) -> dict[str, Any]:
     if not confirm:
         raise HTTPException(
             status_code=400,
-            detail="confirm=true required to export. Memory export is gated like other destructive tools.",
+            detail="confirm=true required to export. Memory export is gated like other high-risk tools.",
         )
     return export_snapshot()
 
