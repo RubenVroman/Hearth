@@ -60,8 +60,8 @@ def session_config(*, query: str | None = None, instructions: str | None = None)
 
     Input ``transcription`` is required for
     ``conversation.item.input_audio_transcription.completed`` so the phone UI
-    can show what the user said. Spoken turns also refresh the memory slice
-    injected into Realtime ``instructions`` (same retrieval as text chat).
+    can show what the user said when Conversation is expanded. Spoken turns also
+    refresh the memory slice injected into Realtime ``instructions``.
     """
     text = instructions or compose_system_prompt(
         query if query is not None else runtime.latest_user(),
@@ -73,8 +73,7 @@ def session_config(*, query: str | None = None, instructions: str | None = None)
         "instructions": text,
         "output_modalities": ["audio"],
         "audio": {
-            "input": audio_input_config(),
-            "output": {
+            "input": audio_input_config(),            "output": {
                 "voice": settings.openai_tts_voice,
             },
         },
@@ -207,8 +206,7 @@ class Sideband:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("assistant", text)
-                _persist_voice_turn("assistant", text)
-        elif etype in {
+                _persist_voice_turn("assistant", text)        elif etype in {
             "conversation.item.input_audio_transcription.completed",
             "conversation.item.audio_transcription.completed",
         }:

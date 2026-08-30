@@ -166,9 +166,28 @@ def test_phone_transcript_shows_user_and_assistant_roles():
     assert "input_audio_transcription.completed" in app_js
     css = (UI / "styles.css").read_text(encoding="utf-8")
     assert 'li[data-role="you"]' in css
-    assert "max-height: min(30vh, 200px)" in css
+    assert ".transcript-details[open]" in css
     assert ".rail-media" in css and "z-index: 0" in css
 
+def test_conversation_is_collapsed_until_opened():
+    """Transcript stays out of the way; expand only via the Conversation control."""
+    index_html = (UI / "index.html").read_text(encoding="utf-8")
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+    app_js = (UI / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="transcript-details"' in index_html
+    assert 'class="transcript-toggle"' in index_html
+    assert "<details" in index_html
+    assert 'id="log"' in index_html
+    # Must start collapsed (no open attribute on details).
+    assert "transcript-details" in index_html
+    assert 'open="' not in index_html.split('id="transcript-details"')[1].split(">")[0]
+    assert ".transcript.is-empty" in css
+    assert ".transcript-details[open]" in css
+    assert "displayRole" in app_js
+    assert "input_audio_transcription.completed" in app_js
+    assert 'appendLog("you"' in app_js
+    assert 'appendLog("hearth"' in app_js
 
 def test_realtime_session_enables_user_input_transcription():
     from hearth.voice.webrtc import session_config

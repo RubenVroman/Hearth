@@ -85,7 +85,6 @@ def test_client_secrets_mints_ephemeral_ek_token(client, monkeypatch):
     assert audio_in["turn_detection"]["type"] == "semantic_vad"
     assert "memory_remember" in captured["json"]["session"]["instructions"]
 
-
 def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "sk-test-hearth")
     captured: dict = {}

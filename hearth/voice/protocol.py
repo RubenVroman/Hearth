@@ -30,8 +30,7 @@ def session_update_payload(tools: list[dict[str, Any]]) -> dict[str, Any]:
             "instructions": compose_system_prompt(),
             "output_modalities": ["audio"],
             "audio": {
-                "input": audio_input_config(),
-                "output": {
+                "input": audio_input_config(),                "output": {
                     "voice": settings.openai_tts_voice,
                 },
             },
