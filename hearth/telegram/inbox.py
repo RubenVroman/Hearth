@@ -20,6 +20,7 @@ from hearth.telegram.intent import (
     looks_like_chatter,
     looks_like_concrete_title,
     looks_like_confirm_yes,
+    looks_like_media_ask,
     search_title_grounded,
     subject_matches_user_title,
     titles_match,
@@ -666,7 +667,26 @@ class TelegramInbox:
     ) -> InboxResult | None:
         hits = list(catalog_hits or [])
         if intent.action == "ignore":
-            return InboxResult(handled=True, reply="")
+            # Belt-and-suspenders: media asks must never go silent.
+            if looks_like_chatter(view.text) or not looks_like_media_ask(view.text):
+                return InboxResult(handled=True, reply="")
+            if intent.search_title.strip():
+                intent = IntentDecision(
+                    action="search",
+                    search_title=intent.search_title,
+                    year=intent.year,
+                    media_kind=intent.media_kind,
+                    confidence=intent.confidence,
+                    source=intent.source,
+                )
+            else:
+                return InboxResult(
+                    handled=True,
+                    reply=(
+                        "Which movie or series did you mean? "
+                        "Send the title if you know it."
+                    ),
+                )
         if intent.action == "clarify":
             # Unique close catalog hit → request that tmdb id (never list-less 1–N).
             if hits and (

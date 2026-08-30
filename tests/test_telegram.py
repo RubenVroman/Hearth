@@ -2109,31 +2109,82 @@ def test_parse_model_json_never_defaults_to_reply_1_1():
         candidate_count=1,
     )
     assert parsed is not None
-    assert parsed.action == "clarify"
-    assert "1–1" not in parsed.clarify_question
-    assert "1-1" not in parsed.clarify_question
-    assert "reply 1" not in parsed.clarify_question.lower()
+    assert "1–1" not in (parsed.clarify_question or "")
+    assert "1-1" not in (parsed.clarify_question or "")
+    assert "reply 1" not in (parsed.clarify_question or "").lower()
 
+    # Live VAULT shape: model echoed the template with empty offered / count=0.
     sanitized = _parse_model_json(
         '{"action":"clarify","clarify_question":"Which one — reply 1–1, '
         "'all of them', or a clearer title?\","
         '"confidence":0.7}',
-        candidate_count=1,
-    )
-    assert sanitized is not None
-    assert "1–1" not in sanitized.clarify_question
-    assert "reply 1" not in sanitized.clarify_question.lower()
-
-    empty = _parse_model_json(
-        '{"action":"clarify","confidence":0.7}',
         candidate_count=0,
     )
-    assert empty is not None
-    assert "reply 1" not in empty.clarify_question.lower()
+    assert sanitized is not None
+    assert sanitized.action in {"clarify", "search"}
+    assert "1–1" not in (sanitized.clarify_question or "")
+    assert "reply 1" not in (sanitized.clarify_question or "").lower()
+
+    # Clarify + guess → promote to search so inbox asks yes/no.
+    guessed = _parse_model_json(
+        '{"action":"clarify","clarify_question":"Which one — reply 1–1, '
+        "'all of them', or a clearer title?\","
+        '"search_title":"Alien","year":1979,"media_kind":"movie","confidence":0.7}',
+        candidate_count=0,
+    )
+    assert guessed is not None
+    assert guessed.action == "search"
+    assert guessed.search_title == "Alien"
+    assert guessed.year == 1979
+    assert "1–1" not in (guessed.clarify_question or "")
+
+    # Phantom single candidate + list-less clarify → guess that title.
+    phantom = _parse_model_json(
+        '{"action":"clarify","clarify_question":"Which one — reply 1–1, '
+        "'all of them', or a clearer title?\","
+        '"confidence":0.7}',
+        candidate_count=1,
+        candidates=[{"title": "Alien", "year": 1979, "mediaType": "movie"}],
+    )
+    assert phantom is not None
+    assert phantom.action == "search"
+    assert phantom.search_title == "Alien"
+    assert phantom.year == 1979
+
+
+def test_parse_model_json_ignore_media_ask_not_silent():
+    from hearth.telegram.intent import _parse_model_json
+
+    ignored = _parse_model_json(
+        '{"action":"ignore","confidence":0.9}',
+        candidate_count=0,
+        user_message="The coolest sci-fi you can fins",
+    )
+    assert ignored is not None
+    assert ignored.action != "ignore"
+    assert ignored.action in {"clarify", "search"}
+
+    with_guess = _parse_model_json(
+        '{"action":"ignore","search_title":"Dune","year":2021,'
+        '"media_kind":"movie","confidence":0.9}',
+        candidate_count=0,
+        user_message="The coolest sci-fi you can fins",
+    )
+    assert with_guess is not None
+    assert with_guess.action == "search"
+    assert with_guess.search_title == "Dune"
+
+    chatter = _parse_model_json(
+        '{"action":"ignore","confidence":1.0}',
+        candidate_count=0,
+        user_message="lol",
+    )
+    assert chatter is not None
+    assert chatter.action == "ignore"
 
 
 def test_looks_like_concrete_title_plot_vs_named():
-    from hearth.telegram.intent import looks_like_concrete_title
+    from hearth.telegram.intent import looks_like_concrete_title, looks_like_media_ask
 
     assert not looks_like_concrete_title("Old horror movie on a spaceship")
     assert not looks_like_concrete_title("The coolest sci-fi you can fins")
@@ -2141,6 +2192,10 @@ def test_looks_like_concrete_title_plot_vs_named():
     assert looks_like_concrete_title(
         "The fall and rise of reggie dinkins with daniel radcliff"
     )
+    assert looks_like_media_ask("The coolest sci-fi you can fins")
+    assert looks_like_media_ask("Old horror movie on a spaceship")
+    assert not looks_like_media_ask("lol")
+    assert not looks_like_media_ask("thanks")
 
 
 @pytest.mark.asyncio
@@ -2368,3 +2423,115 @@ async def test_inbox_plot_guess_yes_queues_no_means_next_clue(
     assert len(pipeline.overseerr_queue) == before
     assert "1–1" not in no.reply
     assert "Alien" not in no.reply or "clue" in no.reply.lower() or "?" in no.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_live_vault_listless_1_1_with_empty_offered_guesses_alien(
+    inbox: TelegramInbox, monkeypatch
+):
+    """VAULT evidence: offered empty, bot still said reply 1–1 — ban + guess-ask."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    alien = {
+        "title": "Alien",
+        "year": 1979,
+        "tmdbId": 348,
+        "mediaId": 348,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "alien" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [alien]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    # Exact live clarify string; empty candidates / empty offered.
+    assert inbox.memory.offered(-1001) == []
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": (
+                "Which one — reply 1–1, 'all of them', or a clearer title?"
+            ),
+            "search_title": "Alien",
+            "year": 1979,
+            "media_kind": "movie",
+            "confidence": 0.7,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("Old horror movie on a spaceship", message_id=730)
+    )
+    assert result.grabbed is False
+    assert result.reply
+    assert "1–1" not in result.reply
+    assert "reply 1–1" not in result.reply.lower()
+    assert "Alien" in result.reply
+    assert "Did you mean" in result.reply or "?" in result.reply
+    assert inbox.memory.offered(-1001)  # confirm stores the guess
+    assert "Alien" in str(inbox.memory.offered(-1001)[0].get("title") or "")
+
+
+@pytest.mark.asyncio
+async def test_inbox_coolest_sci_fi_typo_not_silent_guess_and_ask(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live: 'The coolest sci-fi you can fins' stored no bot reply — must guess-ask."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    dune = {
+        "title": "Dune",
+        "year": 2021,
+        "tmdbId": 438631,
+        "mediaId": 438631,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "dune" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [dune]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    # Model wrongly ignores a plot/typo ask (live silence path).
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "ignore",
+            "search_title": "Dune",
+            "year": 2021,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("The coolest sci-fi you can fins", message_id=731)
+    )
+    assert result.reply, "plot/typo ask must not be silent"
+    assert result.grabbed is False
+    assert "1–1" not in result.reply
+    assert "Dune" in result.reply
+    assert "Did you mean" in result.reply or "?" in result.reply
+
+    # Pure ignore with no guess still must reply (useful question), not silence.
+    inbox.reset()
+    _patch_openai_intent(
+        monkeypatch,
+        {"action": "ignore", "confidence": 0.95},
+    )
+    again = await inbox.handle_message(
+        _msg("The coolest sci-fi you can fins", message_id=732)
+    )
+    assert again.reply
+    assert again.grabbed is False
+    assert "1–1" not in again.reply

@@ -148,6 +148,10 @@ _SYSTEM = (
     "Actor/artist names and misspellings are clues for you — never refuse because "
     "of spelling. If unsure which title and you have no good guess, action=clarify "
     "once with a useful question (never 'reply 1–1' / list-less 1–N). "
+    "NEVER action=ignore for plot/vibe/description asks or title typos "
+    "(e.g. 'coolest sci-fi you can fins', 'old horror movie on a spaceship') — "
+    "always action=search with your best catalog guess so the bot can ask "
+    "yes/no. Ignore is only for pure chatter/emoji/meta with no media ask. "
     "Actions: passthrough, ignore, clarify, pick, pick_many, search. "
     "search sets search_title (and year when known; select_all=true for whole "
     "series/trilogy). Catalog year wins later — still include your best year. "
@@ -326,6 +330,22 @@ def looks_like_confirm_yes(text: str) -> bool:
     return bool(_CONFIRM_YES.match(raw))
 
 
+def looks_like_media_ask(text: str) -> bool:
+    """True for title/plot/vibe asks that must never be silently ignored."""
+    raw = (text or "").strip()
+    if not raw or looks_like_chatter(raw):
+        return False
+    if _CATALOG_ID.search(raw) or _URLISH.search(raw) or is_explicit_title_year(raw):
+        return True
+    if looks_like_concrete_title(raw):
+        return True
+    # Plot / vibe / descriptive (incl. typos) — anything that is not chatter
+    # and has enough substance to be a media request.
+    if len(raw) >= 10 and re.search(r"[A-Za-zÀ-ÿ]", raw):
+        return True
+    return False
+
+
 def _default_clarify_question(candidate_count: int) -> str:
     """Never emit list-less 1–N wording when fewer than 2 candidates exist."""
     if candidate_count >= 2:
@@ -334,6 +354,17 @@ def _default_clarify_question(candidate_count: int) -> str:
             "'all of them', or a clearer title?"
         )
     return "Which movie or series did you mean? Send the title if you know it."
+
+
+def _year_from_candidate(row: dict[str, Any]) -> int | None:
+    year = row.get("year")
+    try:
+        year_i = int(year) if year not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+    if year_i is not None and 1900 <= year_i <= 2100:
+        return year_i
+    return None
 
 
 def instant_pick_decision(
@@ -769,14 +800,57 @@ def _parse_model_json(
                 confidence=confidence,
                 media_kind=media_kind,
             )
-    if action == "clarify":
-        if not clarify:
-            clarify = _default_clarify_question(candidate_count)
-        elif clarify_wants_numbered_list(clarify) and candidate_count < 2:
-            # Ban list-less "reply 1–1" / "1–N" forever when no real menu exists.
-            clarify = (
+
+    # Plot/vibe/title asks must never be silently ignored (live: "coolest sci-fi
+    # you can fins" stored no bot reply). Promote to search/clarify instead.
+    if action == "ignore" and looks_like_media_ask(user_message):
+        if search_title:
+            action = "search"
+        else:
+            action = "clarify"
+            clarify = clarify or (
                 "Which movie or series did you mean? Send the title if you know it."
             )
+
+    # Ban list-less "reply 1–N" / "1–1" forever when fewer than 2 real candidates.
+    # Live VAULT: offered was empty but the default template still fired with
+    # candidate_count=1 (or the model echoed "reply 1–1"). Prefer guess→ask.
+    if action == "clarify":
+        listless = (not clarify) or clarify_wants_numbered_list(clarify)
+        if candidate_count < 2 and listless:
+            phantom = None
+            rows = list(candidates or [])
+            if len(rows) == 1:
+                phantom = rows[0]
+            if search_title:
+                # Have a guess — inbox will ask "Did you mean …?" before queueing.
+                action = "search"
+                clarify = ""
+            elif phantom and str(phantom.get("title") or "").strip():
+                search_title = str(phantom.get("title") or "").strip()[:200]
+                if year is None:
+                    year = _year_from_candidate(phantom)
+                kind = str(
+                    phantom.get("mediaType") or phantom.get("media_kind") or ""
+                ).strip().lower()
+                if kind in {"movie", "tv"}:
+                    media_kind = kind
+                action = "search"
+                clarify = ""
+            else:
+                clarify = _default_clarify_question(0)
+        elif not clarify:
+            clarify = _default_clarify_question(candidate_count)
+        elif clarify_wants_numbered_list(clarify) and candidate_count < 2:
+            clarify = _default_clarify_question(0)
+
+    # Absolute last line of defense: never return list-less 1–N wording.
+    if clarify and clarify_wants_numbered_list(clarify) and candidate_count < 2:
+        if search_title:
+            action = "search"
+            clarify = ""
+        else:
+            clarify = _default_clarify_question(0)
 
     return IntentDecision(
         action=action,  # type: ignore[arg-type]
@@ -863,6 +937,7 @@ __all__ = [
     "looks_like_chatter",
     "looks_like_concrete_title",
     "looks_like_confirm_yes",
+    "looks_like_media_ask",
     "looks_like_collection_request",
     "looks_like_contextual_followup",
     "looks_like_descriptive_ask",
