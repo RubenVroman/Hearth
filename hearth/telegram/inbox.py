@@ -21,6 +21,7 @@ from hearth.telegram.intent import (
     looks_like_concrete_title,
     looks_like_confirm_yes,
     looks_like_media_ask,
+    looks_like_recommend_ask,
     search_title_grounded,
     subject_matches_user_title,
     titles_match,
@@ -173,6 +174,18 @@ class TelegramInbox:
                 or (pending.media_kind if pending and pending.media_kind in {"movie", "tv"} else ""),
                 offered=offered if offered is not None else (pending.options if pending else None),
             )
+        # Queued titles join rejected memory so "another one" / find-one guesses
+        # do not re-offer Alien / Event Horizon after they were just queued.
+        if result.grabbed:
+            queued: list[str] = []
+            if result.title:
+                queued.append(result.title)
+            for title in result.titles or []:
+                text = str(title or "").strip()
+                if text:
+                    queued.append(text)
+            if queued:
+                self.memory.remember_rejected(view.chat_id, queued)
         return result
 
     def _titles_from_options(self, options: list[dict[str, Any]] | None) -> list[str]:
@@ -253,17 +266,21 @@ class TelegramInbox:
             normalize_title(t) for t in (rejected_titles or []) if str(t).strip()
         }
         if rejected_norm:
-            rows = [
-                row
-                for row in rows
-                if normalize_title(str(row.get("title") or "")) not in rejected_norm
-                and not any(
-                    normalize_title(str(row.get("title") or "")) in r
-                    or r in normalize_title(str(row.get("title") or ""))
-                    for r in rejected_norm
-                    if r
+            # Keep rows the user is naming again (re-queue / same title ask).
+            # Still drop rejects for plot/recommend turns where seed is unrelated.
+            kept: list[dict[str, Any]] = []
+            for row in rows:
+                title_n = normalize_title(str(row.get("title") or ""))
+                rejected_hit = title_n in rejected_norm or any(
+                    (title_n in r or r in title_n) for r in rejected_norm if r
                 )
-            ]
+                if rejected_hit and not (
+                    titles_match(str(row.get("title") or ""), raw)
+                    or (seed_norm and (seed_norm in title_n or title_n in seed_norm))
+                ):
+                    continue
+                kept.append(row)
+            rows = kept
         return rows
     def _dedupe_choices(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Collapse indistinguishable options (same title+year+kind+id).
@@ -683,8 +700,12 @@ class TelegramInbox:
                 return InboxResult(
                     handled=True,
                     reply=(
-                        "Which movie or series did you mean? "
-                        "Send the title if you know it."
+                        "Want another in that vibe? Any year, actor, or other clue?"
+                        if looks_like_recommend_ask(view.text)
+                        else (
+                            "Which movie or series did you mean? "
+                            "Send the title if you know it."
+                        )
                     ),
                 )
         if intent.action == "clarify":
@@ -729,13 +750,23 @@ class TelegramInbox:
                 }
                 return self._ask_guess_confirm(view, row, query=intent.search_title)
             question = intent.clarify_question or (
-                "Which movie or series did you mean? Send the title if you know it."
+                "Want another in that vibe? Any year, actor, or other clue?"
+                if looks_like_recommend_ask(view.text)
+                else "Which movie or series did you mean? Send the title if you know it."
             )
             # Never emit list-less "reply 1–N" / "1–1".
             if clarify_wants_numbered_list(question):
                 question = (
-                    "Which movie or series did you mean? Send the title if you know it."
+                    "Want another in that vibe? Any year, actor, or other clue?"
+                    if looks_like_recommend_ask(view.text)
+                    else "Which movie or series did you mean? Send the title if you know it."
                 )
+            # Recommend/find-one must never demand the user already knows the title.
+            if (
+                looks_like_recommend_ask(view.text)
+                and "send the title if you know it" in question.lower()
+            ):
+                question = "Want another in that vibe? Any year, actor, or other clue?"
             # Never re-stick a rejected 1–N list after a clarify pivot.
             if pending is None:
                 self.pending.pop(view.chat_id, None)
@@ -939,9 +970,10 @@ class TelegramInbox:
         *,
         query: str = "",
         media_kind_hint: str = "",
+        skip_rate: bool = False,
     ) -> InboxResult:
         """Queue a known Overseerr/TMDB row by id — no fuzzy title re-search."""
-        if not self.rate.allow():
+        if not skip_rate and not self.rate.allow():
             return InboxResult(handled=True, reply=format_rate_limited())
         kind = str(
             media_kind_hint
@@ -1003,7 +1035,15 @@ class TelegramInbox:
         del self.pending[view.chat_id]
 
         if len(picks) == 1:
-            return await self._grab(view, self._synthetic_from_pick(pending, picks[0]), exact=True)
+            # Always grab THIS pending row's title/year/tmdbId — never a fresh
+            # fuzzy search that could land on a different catalog hit.
+            return await self._grab_catalog_row(
+                view,
+                picks[0],
+                query=str(picks[0].get("title") or pending.query or ""),
+                media_kind_hint=pending.media_kind,
+                skip_rate=True,
+            )
 
         queued_titles: list[str] = []
         via = "Overseerr"

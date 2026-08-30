@@ -2535,3 +2535,409 @@ async def test_inbox_coolest_sci_fi_typo_not_silent_guess_and_ask(
     assert again.reply
     assert again.grabbed is False
     assert "1–1" not in again.reply
+
+
+# --- elongated yes + recommend follow-up (live Telegram 2026-08-31) ----------
+
+
+def test_looks_like_confirm_yes_accepts_elongated_and_thumbs():
+    from hearth.telegram.intent import looks_like_confirm_yes, instant_pick_decision
+
+    for text in (
+        "yes",
+        "Yes!",
+        "yess",
+        "Yesss",
+        "yessss",
+        "yeess",
+        "yeahhh",
+        "yup",
+        "yep",
+        "ja",
+        "jaaa",
+        "jawel",
+        "klopt",
+        "juist",
+        "that's it",
+        "that's the one",
+        "doe maar",
+        "go ahead",
+        "👍",
+    ):
+        assert looks_like_confirm_yes(text), text
+
+    for text in ("no", "no not that", "another one", "Event Horizon", "y"):
+        assert not looks_like_confirm_yes(text), text
+
+    row = [{"title": "Event Horizon", "year": 1997, "tmdbId": 8413}]
+    for text in ("Yesss", "yess", "yes!", "jaaa", "👍"):
+        decision = instant_pick_decision(text, row)
+        assert decision is not None
+        assert decision.action == "pick"
+        assert decision.indices == [1]
+
+
+def test_looks_like_recommend_ask_and_not_title():
+    from hearth.telegram.intent import (
+        looks_like_concrete_title,
+        looks_like_media_ask,
+        looks_like_recommend_ask,
+    )
+
+    for text in (
+        "Do you know another one?",
+        "Another horror in space",
+        "I don't know, find one",
+        "surprise me",
+        "more like that",
+        "another one",
+        "find one",
+    ):
+        assert looks_like_recommend_ask(text), text
+        assert looks_like_media_ask(text), text
+        assert not looks_like_concrete_title(text), text
+
+    assert not looks_like_recommend_ask("Another Earth")
+    assert looks_like_concrete_title("Another Earth")
+
+
+def test_parse_model_json_recommend_never_send_title_fallback():
+    from hearth.telegram.intent import _parse_model_json
+
+    for msg in (
+        "Do you know another one?",
+        "Another horror in space",
+        "I don't know, find one",
+    ):
+        empty = _parse_model_json(
+            '{"action":"clarify","confidence":0.7}',
+            candidate_count=0,
+            user_message=msg,
+        )
+        assert empty is not None
+        assert "send the title if you know it" not in (empty.clarify_question or "").lower()
+
+        ignored = _parse_model_json(
+            '{"action":"ignore","confidence":0.9}',
+            candidate_count=0,
+            user_message=msg,
+        )
+        assert ignored is not None
+        assert ignored.action in {"clarify", "search"}
+        assert "send the title if you know it" not in (ignored.clarify_question or "").lower()
+
+        guessed = _parse_model_json(
+            '{"action":"clarify","search_title":"Life","year":2017,'
+            '"media_kind":"movie","confidence":0.7}',
+            candidate_count=0,
+            user_message=msg,
+            rejected_titles=["Alien", "Event Horizon"],
+        )
+        assert guessed is not None
+        assert guessed.action == "search"
+        assert guessed.search_title == "Life"
+        assert guessed.year == 2017
+
+
+@pytest.mark.asyncio
+async def test_inbox_yesss_confirms_pending_event_horizon_not_die_ruckkehr(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: Yesss missed confirm → pivoted → queued Die Rückkehr."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    event_horizon = {
+        "title": "Event Horizon",
+        "year": 1997,
+        "tmdbId": 8413,
+        "mediaId": 8413,
+        "mediaType": "movie",
+    }
+    die_ruckkehr = {
+        "title": "Die Rückkehr",
+        "year": 2026,
+        "tmdbId": 999001,
+        "mediaId": 999001,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "event" in q or "horizon" in q or "8413" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [event_horizon]}
+        # Tempting wrong hit if fuzzy search runs on "Yesss" / model pivot.
+        return {"mode": "mock", "service": "overseerr", "results": [die_ruckkehr]}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # If confirm misses, the model hop would search "Yesss" and grab Die Rückkehr.
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Die Rückkehr",
+            "year": 2026,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+
+    option = {
+        "title": "Event Horizon",
+        "year": 1997,
+        "mediaType": "movie",
+        "tmdbId": 8413,
+        "mediaId": 8413,
+    }
+    for i, text in enumerate(("Yesss", "yess", "yes!", "jaaa")):
+        pipeline.overseerr_queue.clear()
+        overseerr_requests.clear()
+        inbox.pending[-1001] = PendingDisambiguation(
+            chat_id=-1001,
+            options=[dict(option)],
+            media_kind="movie",
+            query="Event Horizon",
+            created_message_id=800 + i,
+            last_bot_reply="Did you mean Event Horizon (1997)?",
+        )
+        inbox.memory.set_subject(
+            -1001, "Event Horizon", media_kind="movie", offered=[dict(option)]
+        )
+        before_calls = len(calls)
+        yes = await inbox.handle_message(_msg(text, message_id=801 + i))
+        assert yes.grabbed is True, (text, yes.reply)
+        assert "Event Horizon" in yes.reply
+        assert "1997" in yes.reply
+        assert "Die Rückkehr" not in yes.reply
+        assert "Alien" not in yes.reply
+        assert overseerr_requests
+        assert overseerr_requests[-1]["media_id"] == 8413
+        assert len(calls) == before_calls  # instant — no model hop
+        assert pipeline.overseerr_queue
+
+
+@pytest.mark.asyncio
+async def test_inbox_plain_yes_still_confirms_guess(inbox: TelegramInbox, monkeypatch):
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    event_horizon = {
+        "title": "Event Horizon",
+        "year": 1997,
+        "tmdbId": 8413,
+        "mediaId": 8413,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "event" in q or "horizon" in q or "8413" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [event_horizon]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Event Horizon",
+            "year": 1997,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    ask = await inbox.handle_message(_msg("horror on a spaceship", message_id=810))
+    assert "Event Horizon" in ask.reply
+    yes = await inbox.handle_message(_msg("yes", message_id=811))
+    assert yes.grabbed is True
+    assert "Event Horizon" in yes.reply
+    assert overseerr_requests[-1]["media_id"] == 8413
+
+
+@pytest.mark.asyncio
+async def test_inbox_no_not_that_still_rejects_guess(inbox: TelegramInbox, monkeypatch):
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    event_horizon = {
+        "title": "Event Horizon",
+        "year": 1997,
+        "tmdbId": 8413,
+        "mediaId": 8413,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "event" in q or "horizon" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [event_horizon]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "search",
+                "search_title": "Event Horizon",
+                "year": 1997,
+                "media_kind": "movie",
+                "confidence": 0.9,
+            },
+            {
+                "action": "clarify",
+                "clarify_question": "Ok — any other clue (year, actor)?",
+                "confidence": 0.8,
+            },
+        ],
+    )
+    ask = await inbox.handle_message(_msg("old horror on a spaceship", message_id=820))
+    assert "Event Horizon" in ask.reply
+    before = len(pipeline.overseerr_queue)
+    no = await inbox.handle_message(_msg("no not that", message_id=821))
+    assert no.grabbed is False
+    assert len(pipeline.overseerr_queue) == before
+    assert "Queued" not in no.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_another_horror_followups_guess_not_send_title(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: after wrong queue, 'another one' / find-one got empty-title fallback."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    event_horizon = {
+        "title": "Event Horizon",
+        "year": 1997,
+        "tmdbId": 8413,
+        "mediaId": 8413,
+        "mediaType": "movie",
+    }
+    alien = {
+        "title": "Alien",
+        "year": 1979,
+        "tmdbId": 348,
+        "mediaId": 348,
+        "mediaType": "movie",
+    }
+    life = {
+        "title": "Life",
+        "year": 2017,
+        "tmdbId": 395992,
+        "mediaId": 395992,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "life" in q or "395992" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [life]}
+        if "event" in q or "horizon" in q or "8413" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [event_horizon]}
+        if "alien" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [alien]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    # Seed: Alien was queued earlier; Event Horizon confirm then Yesss.
+    inbox.memory.record_user(-1001, "Yes!")
+    inbox.memory.record_bot(
+        -1001,
+        "Queued Alien (1979) via Overseerr.",
+        search_title="Alien",
+        media_kind="movie",
+        offered=[],
+    )
+    inbox.memory.remember_rejected(-1001, ["Alien"])
+    assert "Alien" in inbox.memory.rejected(-1001)
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Event Horizon",
+            "year": 1997,
+            "media_kind": "movie",
+            "confidence": 0.92,
+        },
+    )
+    ask = await inbox.handle_message(
+        _msg("Ok, another old horror movie on a spaceship", message_id=830)
+    )
+    assert "Event Horizon" in ask.reply
+    yes = await inbox.handle_message(_msg("Yesss", message_id=831))
+    assert yes.grabbed is True
+    assert "Event Horizon" in yes.reply
+    rejected = {t.lower() for t in inbox.memory.rejected(-1001)}
+    assert "alien" in rejected
+    assert "event horizon" in rejected
+
+    followups = (
+        "Do you know another one?",
+        "Another horror in space",
+        "I don't know, find one",
+    )
+    for i, text in enumerate(followups):
+        calls = _patch_openai_intent(
+            monkeypatch,
+            {
+                "action": "search",
+                "search_title": "Life",
+                "year": 2017,
+                "media_kind": "movie",
+                "confidence": 0.88,
+            },
+        )
+        result = await inbox.handle_message(_msg(text, message_id=840 + i))
+        assert result.grabbed is False, (text, result.reply)
+        assert "Did you mean" in result.reply or "?" in result.reply
+        assert "Life" in result.reply
+        assert "2017" in result.reply
+        assert "Send the title if you know it" not in result.reply
+        assert "Alien" not in result.reply
+        assert "Event Horizon" not in result.reply
+        # Rejected list must reach the model so it does not re-offer prior titles.
+        assert calls
+        import json as _json
+
+        payload = _json.loads(calls[0]["messages"][1]["content"])
+        rejected_payload = [
+            str(t).lower() for t in (payload.get("rejected_titles") or [])
+        ]
+        assert any("alien" in t for t in rejected_payload)
+        assert any("event horizon" in t for t in rejected_payload)
+        # Clear pending so next follow-up is not an instant yes on Life.
+        inbox.pending.pop(-1001, None)
+        inbox.memory.clear_offered(-1001)

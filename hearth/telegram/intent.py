@@ -62,15 +62,41 @@ _YEAR_PAREN = re.compile(r"\(\s*((?:19|20)\d{2})\s*\)")
 _CATALOG_ID = re.compile(r"\btt\d{7,}|\btmdb:\d+|\btvdb:\d+", re.I)
 _URLISH = re.compile(r"https?://", re.I)
 _ORDINAL_PICK = re.compile(r"^\s*#?\s*([1-9])\s*$")
+# Elongated enthusiasm counts: yesss, yeahhh, jaaa, yeess, …
 _CONFIRM_YES = re.compile(
     r"^\s*(?:"
-    r"yes|yep|yeah|yup|sure|correct|right|"
+    r"y+e+s+|y+e+a+h+|y+e+p+|y+u+p+|su+re+|correct|right|"
     r"that(?:'s| is|s)?\s+(?:it|the\s+one|correct|right)|"
-    r"ja|jawel|klopt|juist|"
+    r"j+a+|jawel|klopt|juist|"
     r"dat\s+is\s+(?:hem|die|het|correct)|"
     r"doe\s+(?:maar|die)|"
     r"go\s+ahead"
     r")\s*[.!?]*\s*$",
+    re.I,
+)
+_CONFIRM_THUMBS = re.compile(
+    r"^\s*👍[\U0001F3FB-\U0001F3FF]?\uFE0F?\s*[.!?]*\s*$"
+)
+# "another one" / "find one" / "surprise me" — bot must guess, not demand a title.
+# Do NOT match bare "Another Earth"-style title asks.
+_RECOMMEND_ASK = re.compile(
+    r"(?:"
+    r"\bdo you know another\b|"
+    r"\banother\s+one\b|"
+    r"^\s*another\s*[.!?]*\s*$|"
+    r"\banother\s+.+\b(?:horror|space|sci-?fi|spaceship|vibe|like|old|classic)\b|"
+    r"\bfind(?:\s+me)?\s+(?:one|another|something)\b|"
+    r"\bi don'?t know,?\s*find\b|"
+    r"\bsurprise me\b|"
+    r"\bmore like that\b|"
+    r"\b(?:same|that)\s+vibe\b|"
+    r"\brecommend\b|"
+    r"\bsuggest(?:\s+(?:one|something|another))?\b|"
+    r"\bpick(?:\s+me)?\s+(?:one|another)\b|"
+    r"\bnog\s+(?:een(?:tje)?|iets)\b|"
+    r"\bken je nog\b|"
+    r"\bzoek\s+maar\b"
+    r")",
     re.I,
 )
 _STOP_TOKENS = frozenset(
@@ -145,10 +171,17 @@ _SYSTEM = (
     "before queueing — do not invent a numbered 1–N menu. Do not echo the "
     "plot as search_title. Do not reuse subject_title when the user clearly "
     "named or described a different title. "
+    "Follow-ups that ask YOU to pick/find another title in the recent vibe "
+    "('another one', 'do you know another', 'another horror in space', "
+    "'I don't know, find one', 'surprise me', 'more like that') are media asks: "
+    "always action=search with a NEW catalog title that is NOT in "
+    "rejected_titles and not the last queued/subject title. Never answer with "
+    "'send the title if you know it' — the user is asking you to guess. "
     "Actor/artist names and misspellings are clues for you — never refuse because "
     "of spelling. If unsure which title and you have no good guess, action=clarify "
     "once with a useful question (never 'reply 1–1' / list-less 1–N). "
-    "NEVER action=ignore for plot/vibe/description asks or title typos "
+    "NEVER action=ignore for plot/vibe/description asks, recommend/find-one "
+    "follow-ups, or title typos "
     "(e.g. 'coolest sci-fi you can fins', 'old horror movie on a spaceship') — "
     "always action=search with your best catalog guess so the bot can ask "
     "yes/no. Ignore is only for pure chatter/emoji/meta with no media ask. "
@@ -248,6 +281,9 @@ def looks_like_concrete_title(text: str) -> bool:
     raw = (text or "").strip()
     if not raw or looks_like_chatter(raw):
         return False
+    # "another one" / "find one" are recommend asks — never treat as a title.
+    if looks_like_recommend_ask(raw):
+        return False
     if _CATALOG_ID.search(raw) or _URLISH.search(raw):
         return False
     if is_explicit_title_year(raw):
@@ -323,11 +359,27 @@ def is_explicit_title_year(text: str) -> bool:
 
 
 def looks_like_confirm_yes(text: str) -> bool:
-    """True for short yes / that's it confirmations of a single guess."""
+    """True for short yes / that's it confirmations of a single guess.
+
+    Accepts elongated enthusiasm (yesss, yeahhh, jaaa) and 👍 when a 1-item
+    guess-confirm is pending.
+    """
     raw = (text or "").strip()
     if not raw or len(raw) > 40:
         return False
+    if _CONFIRM_THUMBS.match(raw):
+        return True
     return bool(_CONFIRM_YES.match(raw))
+
+
+def looks_like_recommend_ask(text: str) -> bool:
+    """True when the user asks the bot to find/pick another title (not name one)."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 120:
+        return False
+    if looks_like_chatter(raw) or looks_like_confirm_yes(raw):
+        return False
+    return bool(_RECOMMEND_ASK.search(raw))
 
 
 def looks_like_media_ask(text: str) -> bool:
@@ -335,6 +387,8 @@ def looks_like_media_ask(text: str) -> bool:
     raw = (text or "").strip()
     if not raw or looks_like_chatter(raw):
         return False
+    if looks_like_recommend_ask(raw):
+        return True
     if _CATALOG_ID.search(raw) or _URLISH.search(raw) or is_explicit_title_year(raw):
         return True
     if looks_like_concrete_title(raw):
@@ -765,18 +819,29 @@ def _parse_model_json(
             clarify_question=clarify or "Which titles should I queue?",
             confidence=confidence,
         )
+    recommend = looks_like_recommend_ask(user_message)
+    soft_recommend_clarify = (
+        "Want another in that vibe? Any year, actor, or other clue?"
+    )
+
     if action == "search":
         if not search_title:
             return IntentDecision(
                 action="clarify",
-                clarify_question=clarify or "Which series or title should I search for?",
+                clarify_question=clarify
+                or (soft_recommend_clarify if recommend else "Which series or title should I search for?"),
                 confidence=confidence,
+                media_kind=media_kind,
             )
         if search_title.strip().lower() in rejected_norm:
             return IntentDecision(
                 action="clarify",
                 clarify_question=clarify
-                or "Which movie did you mean instead? Send another title or clue.",
+                or (
+                    soft_recommend_clarify
+                    if recommend
+                    else "Which movie did you mean instead? Send another title or clue."
+                ),
                 confidence=confidence,
                 media_kind=media_kind,
             )
@@ -793,23 +858,32 @@ def _parse_model_json(
                 media_kind=media_kind,
             )
         if confidence < MIN_RESOLVE_CONFIDENCE:
-            return IntentDecision(
-                action="clarify",
-                clarify_question=clarify
-                or "Which movie or series did you mean? Send the title if you know it.",
-                confidence=confidence,
-                media_kind=media_kind,
-            )
+            # Recommend/find-one: keep the guess so inbox can ask "Did you mean …?".
+            if not (recommend and search_title):
+                return IntentDecision(
+                    action="clarify",
+                    clarify_question=clarify
+                    or (
+                        soft_recommend_clarify
+                        if recommend
+                        else "Which movie or series did you mean? "
+                        "Send the title if you know it."
+                    ),
+                    confidence=confidence,
+                    media_kind=media_kind,
+                )
 
     # Plot/vibe/title asks must never be silently ignored (live: "coolest sci-fi
     # you can fins" stored no bot reply). Promote to search/clarify instead.
     if action == "ignore" and looks_like_media_ask(user_message):
-        if search_title:
+        if search_title and search_title.strip().lower() not in rejected_norm:
             action = "search"
         else:
             action = "clarify"
             clarify = clarify or (
-                "Which movie or series did you mean? Send the title if you know it."
+                soft_recommend_clarify
+                if recommend
+                else "Which movie or series did you mean? Send the title if you know it."
             )
 
     # Ban list-less "reply 1–N" / "1–1" forever when fewer than 2 real candidates.
@@ -822,35 +896,73 @@ def _parse_model_json(
             rows = list(candidates or [])
             if len(rows) == 1:
                 phantom = rows[0]
-            if search_title:
+            usable_guess = (
+                search_title
+                and search_title.strip().lower() not in rejected_norm
+            )
+            if usable_guess:
                 # Have a guess — inbox will ask "Did you mean …?" before queueing.
                 action = "search"
                 clarify = ""
             elif phantom and str(phantom.get("title") or "").strip():
-                search_title = str(phantom.get("title") or "").strip()[:200]
-                if year is None:
-                    year = _year_from_candidate(phantom)
-                kind = str(
-                    phantom.get("mediaType") or phantom.get("media_kind") or ""
-                ).strip().lower()
-                if kind in {"movie", "tv"}:
-                    media_kind = kind
-                action = "search"
-                clarify = ""
+                phantom_title = str(phantom.get("title") or "").strip()[:200]
+                if phantom_title.strip().lower() not in rejected_norm:
+                    search_title = phantom_title
+                    if year is None:
+                        year = _year_from_candidate(phantom)
+                    kind = str(
+                        phantom.get("mediaType") or phantom.get("media_kind") or ""
+                    ).strip().lower()
+                    if kind in {"movie", "tv"}:
+                        media_kind = kind
+                    action = "search"
+                    clarify = ""
+                else:
+                    clarify = (
+                        soft_recommend_clarify
+                        if recommend
+                        else _default_clarify_question(0)
+                    )
             else:
-                clarify = _default_clarify_question(0)
+                # Recommend/find-one must never demand the user already knows the
+                # title (live: "Do you know another one?" → empty-title fallback).
+                clarify = (
+                    soft_recommend_clarify
+                    if recommend
+                    else _default_clarify_question(0)
+                )
         elif not clarify:
-            clarify = _default_clarify_question(candidate_count)
+            clarify = (
+                soft_recommend_clarify
+                if recommend
+                else _default_clarify_question(candidate_count)
+            )
         elif clarify_wants_numbered_list(clarify) and candidate_count < 2:
-            clarify = _default_clarify_question(0)
+            clarify = (
+                soft_recommend_clarify if recommend else _default_clarify_question(0)
+            )
 
     # Absolute last line of defense: never return list-less 1–N wording.
     if clarify and clarify_wants_numbered_list(clarify) and candidate_count < 2:
-        if search_title:
+        if search_title and search_title.strip().lower() not in rejected_norm:
             action = "search"
             clarify = ""
         else:
-            clarify = _default_clarify_question(0)
+            clarify = (
+                soft_recommend_clarify if recommend else _default_clarify_question(0)
+            )
+
+    # Recommend/find-one: never leave the empty-title "if you know it" template.
+    if (
+        recommend
+        and action == "clarify"
+        and "send the title if you know it" in (clarify or "").lower()
+    ):
+        if search_title and search_title.strip().lower() not in rejected_norm:
+            action = "search"
+            clarify = ""
+        else:
+            clarify = soft_recommend_clarify
 
     return IntentDecision(
         action=action,  # type: ignore[arg-type]
@@ -938,6 +1050,7 @@ __all__ = [
     "looks_like_concrete_title",
     "looks_like_confirm_yes",
     "looks_like_media_ask",
+    "looks_like_recommend_ask",
     "looks_like_collection_request",
     "looks_like_contextual_followup",
     "looks_like_descriptive_ask",
