@@ -105,6 +105,12 @@ class Settings(BaseSettings):
     weather_place: str = Field(default="Home", alias="HEARTH_WEATHER_PLACE")
     weather_force_mock: bool = Field(default=False, alias="HEARTH_WEATHER_MOCK")
 
+    # Glass overlay smart auto-hide (conversation context + idle).
+    # Fresh: always show after a panel update. Idle: soft-hide when talk goes quiet.
+    # Client uses a short grace before fading on unrelated turns (see app.js).
+    overlay_fresh_seconds: int = Field(default=12, alias="HEARTH_OVERLAY_FRESH_SECONDS")
+    overlay_idle_seconds: int = Field(default=55, alias="HEARTH_OVERLAY_IDLE_SECONDS")
+
     # Chief of Staff escalate (repo/code/PR). Empty webhook = not configured.
     cos_webhook: str = Field(default="", alias="HEARTH_COS_WEBHOOK")
     cos_webhook_key: str = Field(default="", alias="HEARTH_COS_WEBHOOK_KEY")

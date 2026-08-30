@@ -35,13 +35,12 @@ def new_id(prefix: str = "w") -> str:
 
 
 def start_turn(message: str) -> Widget | None:
-    """New user turn — fade movie/TV overlays so they don't linger forever.
+    """New user turn — keep overlays in memory; relevance soft-hides in the UI.
 
-    Weather stays (sticky). If this turn's tools publish media again, the
-    overlay reappears with fresh art.
+    Hard-deleting here would prevent reappear when talk returns to on-screen
+    content. Context is re-evaluated on the next widgets/status payload.
     """
     _ = message
-    runtime.dismiss_widget("media")
     return None
 
 
@@ -392,7 +391,7 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
             body=body,
             detail=" · ".join(detail_parts),
             data={"tool": name, "item": item},
-            # Not sticky — start_turn dismisses so overlays fade as chat progresses.
+            # Soft-hide keeps this in memory for reappear; hard X still deletes.
             sticky=False,
         )
     )
