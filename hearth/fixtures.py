@@ -81,6 +81,8 @@ MOCK_PLEX_SESSIONS: dict[str, Any] = {
                 "summary": "Paul Atreides unites with Chani and the Fremen while seeking revenge against the conspirators who destroyed his family.",
                 "duration": 16600000,
                 "viewOffset": 4920000,
+                "tmdbId": 693134,
+                "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
                 "Player": {
                     "title": "Apple TV",
                     "state": "playing",
@@ -107,6 +109,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 8.8,
         "Guid": [{"id": "tmdb://693134"}, {"id": "imdb://tt15239678"}],
         "tmdbId": 693134,
+        "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
     },
     {
         "title": "The Endless",
@@ -120,6 +123,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 6.5,
         "Guid": [{"id": "tmdb://430231"}, {"id": "imdb://tt3986820"}],
         "tmdbId": 430231,
+        "posterPath": "/uVHPBTLb6Sj1Eso9HzyBAOMRheM.jpg",
     },
     {
         "title": "The Brutalist",
@@ -133,6 +137,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 7.9,
         "Guid": [{"id": "tmdb://974950"}],
         "tmdbId": 974950,
+        "posterPath": "/7seqaCaaXDNUHOx4DqwpoOH8pPa.jpg",
     },
     # Two exact-title editions so ambiguous library matches can be tested.
     {
@@ -147,6 +152,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 8.3,
         "Guid": [{"id": "tmdb://949"}],
         "tmdbId": 949,
+        "posterPath": "/gKaePbkEkaqvMtw74EyhhkfCKKh.jpg",
     },
     {
         "title": "Heat",
@@ -160,6 +166,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 5.7,
         "Guid": [{"id": "tmdb://10784"}],
         "tmdbId": 10784,
+        "posterPath": "/fMhOeJ2TvuY46iYGmsowhgRXfnr.jpg",
     },
     {
         "title": "Hide and Seek",
@@ -178,6 +185,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "tmdbId": 95396,
         "season": 1,
         "episode": 1,
+        "posterPath": "/pPHpeI2X1qEd1CS1SeyrdhZ4qnT.jpg",
     },
 ]
 
@@ -239,6 +247,7 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "tmdbId": 693134,
         "overview": "Paul Atreides unites with Chani and the Fremen.",
         "status": "released",
+        "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
     },
     {
         "title": "The Brutalist",
@@ -246,6 +255,7 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "tmdbId": 974950,
         "overview": "A Hungarian-born Jewish architect starts over in America.",
         "status": "released",
+        "posterPath": "/7seqaCaaXDNUHOx4DqwpoOH8pPa.jpg",
     },
     {
         "title": "The Endless",
@@ -253,6 +263,7 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "tmdbId": 430231,
         "overview": "Two brothers return to a UFO death cult.",
         "status": "released",
+        "posterPath": "/uVHPBTLb6Sj1Eso9HzyBAOMRheM.jpg",
     },
 ]
 
@@ -263,6 +274,7 @@ MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
         "tvdbId": 371980,
         "overview": "Mark Scout leads a team whose memories are split.",
         "status": "continuing",
+        "posterPath": "/pPHpeI2X1qEd1CS1SeyrdhZ4qnT.jpg",
     },
     {
         "title": "Slow Horses",
@@ -274,8 +286,20 @@ MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
 ]
 
 MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
-    {"id": 693134, "mediaType": "movie", "title": "Dune: Part Two", "year": 2024},
-    {"id": 95396, "mediaType": "tv", "title": "Severance", "year": 2022},
+    {
+        "id": 693134,
+        "mediaType": "movie",
+        "title": "Dune: Part Two",
+        "year": 2024,
+        "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
+    },
+    {
+        "id": 95396,
+        "mediaType": "tv",
+        "title": "Severance",
+        "year": 2022,
+        "posterPath": "/pPHpeI2X1qEd1CS1SeyrdhZ4qnT.jpg",
+    },
 ]
 
 

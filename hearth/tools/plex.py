@@ -647,9 +647,10 @@ def _item_summary(m: dict[str, Any]) -> dict[str, Any]:
         "summary": summary[:400] if summary else "",
         "contentRating": m.get("contentRating"),
         "rating": rating,
-        "thumb": bool(rating_key),
+        "thumb": bool(rating_key or tmdb or m.get("posterPath")),
         "Guid": m.get("Guid"),
         "tmdbId": int(tmdb) if tmdb is not None else None,
+        "posterPath": m.get("posterPath"),
         "season": int(season) if season is not None else None,
         "episode": int(episode) if episode is not None else None,
     }
@@ -703,6 +704,8 @@ def _sessions(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "ratingKey": str(rating_key) if rating_key is not None else None,
                 "summary": summary[:400] if summary else "",
                 "thumb": bool(rating_key),
+                "tmdbId": item.get("tmdbId"),
+                "posterPath": item.get("posterPath"),
             }
         )
     return out
