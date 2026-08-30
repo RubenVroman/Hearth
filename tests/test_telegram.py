@@ -423,6 +423,221 @@ async def test_inbox_numeric_pick_still_works_with_franchise(inbox: TelegramInbo
     assert "Chamber" in pick.reply or "2002" in pick.reply or "Harry Potter" in pick.reply
 
 
+# --- descriptive / plot-to-title resolution ---------------------------------
+
+
+def test_looks_like_descriptive_ask_harry_potter_example():
+    from hearth.telegram.intent import looks_like_descriptive_ask
+
+    assert looks_like_descriptive_ask(
+        "a movie about a boy with glasses who is a wizard"
+    )
+    assert looks_like_descriptive_ask(
+        "tv show about a chemistry teacher who cooks meth"
+    )
+    # Concrete titles / links / picks skip the descriptive hop.
+    assert not looks_like_descriptive_ask("Annihilation (2018)")
+    assert not looks_like_descriptive_ask("Harry Potter")
+    assert not looks_like_descriptive_ask("2")
+    assert not looks_like_descriptive_ask("https://www.imdb.com/title/tt2798920/")
+    assert not looks_like_descriptive_ask("tt2798920")
+    assert not looks_like_descriptive_ask("all of them")
+
+
+def _patch_openai_intent(monkeypatch, payload: dict):
+    """Stub AsyncOpenAI chat.completions.create with a fixed JSON payload."""
+    import json as _json
+
+    from hearth.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "openai_api_key", "sk-test-not-a-real-key")
+    monkeypatch.setattr(_settings, "openai_model", "gpt-4o-mini")
+
+    class _Msg:
+        content = _json.dumps(payload)
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    calls: list[dict] = []
+
+    class _Completions:
+        @staticmethod
+        async def create(**kwargs):
+            calls.append(kwargs)
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            self.chat = _Chat()
+
+    monkeypatch.setattr("openai.AsyncOpenAI", _Client)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_interpret_descriptive_resolves_harry_potter(monkeypatch):
+    from hearth.telegram.intent import interpret_intent
+
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Harry Potter",
+            "media_kind": "movie",
+            "confidence": 0.93,
+        },
+    )
+    decision = await interpret_intent(
+        "a movie about a boy with glasses who is a wizard"
+    )
+    assert decision.action == "search"
+    assert decision.search_title == "Harry Potter"
+    assert decision.media_kind == "movie"
+    assert decision.source == "openai"
+    assert calls
+    # System prompt + user JSON only — never leak the stub key into the payload.
+    user_content = calls[0]["messages"][1]["content"]
+    assert "sk-test" not in user_content
+    assert "sk-test" not in calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_interpret_obvious_title_skips_model(monkeypatch):
+    from hearth.telegram.intent import interpret_intent
+
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "search", "search_title": "SHOULD_NOT_RUN", "confidence": 0.99},
+    )
+    decision = await interpret_intent("Annihilation")
+    assert decision.action == "passthrough"
+    assert decision.source == "skip"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_inbox_descriptive_wizard_resolves_to_harry_potter(
+    inbox: TelegramInbox, monkeypatch
+):
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Harry Potter",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("a movie about a boy with glasses who is a wizard", message_id=200)
+    )
+    assert result.grabbed is False
+    assert "Which one" in result.reply
+    assert "Harry Potter" in result.reply or "Sorcerer" in result.reply
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert "Harry Potter" in pending.query or all(
+        "Harry Potter" in str(row.get("title") or "") for row in pending.options[:3]
+    )
+    assert "sk-test" not in result.reply
+    assert "OPENAI" not in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_literal_title_still_passthrough(inbox: TelegramInbox, monkeypatch):
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "search", "search_title": "WRONG", "confidence": 0.99},
+    )
+    result = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=210))
+    assert result.grabbed is True
+    assert "Brutalist" in result.reply
+    assert calls == []  # year + concrete title → no intent hop
+
+
+@pytest.mark.asyncio
+async def test_inbox_catalog_link_still_passthrough(inbox: TelegramInbox, monkeypatch):
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "search", "search_title": "WRONG", "confidence": 0.99},
+    )
+    result = await inbox.handle_message(
+        _msg("https://www.themoviedb.org/movie/974950-the-brutalist", message_id=211)
+    )
+    assert result.grabbed is True
+    assert "Brutalist" in result.reply
+    assert calls == []
+    assert "sk-test" not in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_descriptive_unsure_clarifies(inbox: TelegramInbox, monkeypatch):
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": "Did you mean a specific title?",
+            "confidence": 0.4,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("a movie about someone who does something vague", message_id=220)
+    )
+    assert result.grabbed is False
+    assert "Did you mean" in result.reply or "Which" in result.reply
+    assert len(pipeline.radarr_queue) == 0
+    assert "sk-test" not in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_descriptive_low_confidence_search_clarifies(
+    inbox: TelegramInbox, monkeypatch
+):
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Maybe This",
+            "confidence": 0.3,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("a film about a kid who finds a magic school", message_id=221)
+    )
+    assert result.grabbed is False
+    assert len(pipeline.radarr_queue) == 0
+    assert "title" in result.reply.lower() or "Which" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_followups_still_work_with_descriptive_layer(
+    inbox: TelegramInbox, monkeypatch
+):
+    # Ensure franchise follow-ups from PR #36 are unchanged even with OpenAI stubbed.
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "pick_many",
+            "indices": [1, 2, 3],
+            "select_all": True,
+            "confidence": 0.9,
+        },
+    )
+    ask = await inbox.handle_message(_msg("Harry Potter", message_id=230))
+    assert "Which one" in ask.reply
+    # High-confidence heuristic for "all of them" skips the model.
+    all_of = await inbox.handle_message(_msg("all of them", message_id=231))
+    assert all_of.grabbed is True
+    assert len(pipeline.radarr_queue) >= 3
+
+
 def test_status_endpoint_includes_telegram(client, monkeypatch):
     monkeypatch.setattr(settings, "telegram_bot_token", "")
     monkeypatch.setattr(settings, "telegram_chat_ids", "")

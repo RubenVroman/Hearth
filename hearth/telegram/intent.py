@@ -2,7 +2,9 @@
 
 Uses ``settings.openai_model`` (default gpt-4o-mini) when OPENAI_API_KEY is set.
 Falls back to small heuristics so follow-ups still work without a live call.
-Never invents downloads: unsure → clarify; clear catalog titles still passthrough.
+Also resolves vague plot/character descriptions to a catalog search title when
+the model is configured. Never invents downloads: unsure → clarify; clear
+catalog titles / links still passthrough.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ IntentAction = Literal[
 
 MAX_CANDIDATES = 12
 MAX_BATCH = 10
+MIN_RESOLVE_CONFIDENCE = 0.55
 
 _FOLLOWUP_ALL = re.compile(
     r"\b("
@@ -99,14 +102,82 @@ _ORDINAL_MAP = {
     "3": 3,
 }
 
+_DESCRIPTIVE_MARKERS = re.compile(
+    r"\b("
+    r"(?:movie|film|show|series|tv(?:\s+show)?)\s+"
+    r"(?:about|with|where|featuring|involving|of)|"
+    r"about\s+(?:a|an|the)\b|"
+    r"(?:where|in\s+which)\s+(?:a|an|the|he|she|they|someone|people)\b|"
+    r"(?:boy|girl|man|woman|kid|child|teenager|wizard|detective|robot|alien|"
+    r"cop|doctor|teacher|student|orphan)\s+(?:with|who|that)\b|"
+    r"who\s+(?:is|was|has|can|wears|lives)\b|"
+    r"(?:based\s+on|remake\s+of|adaptation\s+of)\b|"
+    r"(?:something|anything)\s+(?:like|about)\b|"
+    r"(?:that|the)\s+(?:one|movie|film|show|series)\s+(?:about|with|where)\b"
+    r")",
+    re.I,
+)
+_YEAR_PAREN = re.compile(r"\(\s*(?:19|20)\d{2}\s*\)")
+_SEASON_MARK = re.compile(r"\bS\d{1,2}E\d{1,3}\b|\bseason\s+\d+\b", re.I)
+_CATALOG_ID = re.compile(r"\btt\d{7,}|\btmdb:\d+|\btvdb:\d+", re.I)
+_URLISH = re.compile(r"https?://", re.I)
+_FUNCTION_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "about",
+        "with",
+        "who",
+        "whom",
+        "where",
+        "which",
+        "that",
+        "from",
+        "into",
+        "over",
+        "under",
+        "between",
+        "like",
+        "for",
+        "of",
+        "in",
+        "on",
+        "to",
+        "and",
+        "or",
+        "is",
+        "was",
+        "are",
+        "were",
+        "has",
+        "have",
+        "had",
+        "can",
+        "could",
+        "would",
+        "should",
+        "movie",
+        "film",
+        "show",
+        "series",
+        "tv",
+    }
+)
+
 _SYSTEM = (
     "You interpret short Telegram messages for a house movie/TV download bot. "
     "Return JSON only. Prefer clarify over wrong downloads. "
-    "Never invent titles or ids not listed in candidates. "
+    "When candidates are listed: pick/pick_many with 1-based indices only — "
+    "never invent titles or ids not listed in candidates. "
+    "When candidates are empty and the message describes a plot, character, or "
+    "premise instead of naming a title: set action=search with search_title to "
+    "the well-known catalog title (franchise/series name is OK), and media_kind "
+    "movie or tv when clear. If unsure which title, action=clarify with a short question. "
+    "Do not echo the plot description as search_title. "
     "Actions: passthrough, ignore, clarify, pick, pick_many, search. "
-    "pick/pick_many use 1-based indices into candidates. "
     "search sets search_title (and select_all=true for whole series/trilogy). "
-    "If the user clearly names a new unrelated title, passthrough."
+    "If the user clearly names a concrete title, passthrough."
 )
 
 
@@ -116,6 +187,7 @@ class IntentDecision:
     indices: list[int] = field(default_factory=list)
     search_title: str = ""
     select_all: bool = False
+    media_kind: str = ""
     clarify_question: str = ""
     confidence: float = 0.0
     source: str = "heuristic"
@@ -144,6 +216,29 @@ def looks_like_collection_request(text: str) -> bool:
     if _FOLLOWUP_ALL.search(raw):
         return True
     return bool(_COLLECTION_HINT.search(raw))
+
+
+def looks_like_descriptive_ask(text: str) -> bool:
+    """True for plot/character descriptions — not concrete catalog titles/links."""
+    raw = (text or "").strip()
+    if not raw or len(raw) < 12 or len(raw) > 200:
+        return False
+    if looks_like_followup(raw):
+        return False
+    if _YEAR_PAREN.search(raw) or _SEASON_MARK.search(raw):
+        return False
+    if _CATALOG_ID.search(raw) or _URLISH.search(raw):
+        return False
+    if not re.search(r"[A-Za-zÀ-ÿ]", raw):
+        return False
+    if _DESCRIPTIVE_MARKERS.search(raw):
+        return True
+    words = re.findall(r"[A-Za-zÀ-ÿ']+", raw)
+    if len(words) >= 6:
+        function_hits = sum(1 for w in words if w.lower() in _FUNCTION_WORDS)
+        if function_hits >= 3:
+            return True
+    return False
 
 
 def _candidate_blob(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -284,6 +379,9 @@ def heuristic_intent(
     collection = _heuristic_collection_search(raw)
     if collection is not None:
         return collection
+    # Without a model we must not invent a title from a plot description.
+    if looks_like_descriptive_ask(raw):
+        return IntentDecision(action="passthrough", confidence=0.35, source="heuristic")
     return IntentDecision(action="passthrough", confidence=0.4)
 
 
@@ -300,8 +398,13 @@ async def interpret_intent(
     if not raw:
         return IntentDecision(action="ignore", confidence=1.0)
 
-    should_run = force or bool(candidates) or looks_like_followup(raw) or looks_like_collection_request(
-        raw
+    descriptive = looks_like_descriptive_ask(raw)
+    should_run = (
+        force
+        or bool(candidates)
+        or looks_like_followup(raw)
+        or looks_like_collection_request(raw)
+        or descriptive
     )
     if not should_run:
         return IntentDecision(action="passthrough", confidence=1.0, source="skip")
@@ -328,6 +431,7 @@ async def interpret_intent(
             "pending_query": redact(pending_query)[:120] if pending_query else "",
             "last_bot_reply": redact(last_bot_reply)[:400] if last_bot_reply else "",
             "candidates": _candidate_blob(candidates or []),
+            "descriptive_ask": descriptive and not candidates,
         }
         response = await client.chat.completions.create(
             model=settings.openai_model,
@@ -343,15 +447,23 @@ async def interpret_intent(
             temperature=0,
         )
         drafted = (response.choices[0].message.content or "").strip()
-        parsed = _parse_model_json(drafted, candidate_count=len(candidates or []))
+        parsed = _parse_model_json(
+            drafted,
+            candidate_count=len(candidates or []),
+            descriptive_ask=descriptive and not candidates,
+        )
         if parsed is None:
             return heuristic if heuristic.action != "passthrough" else IntentDecision(
-                action="clarify" if candidates else "passthrough",
+                action="clarify" if candidates or descriptive else "passthrough",
                 clarify_question=(
                     f"Which one — reply 1–{min(3, len(candidates or []))}, "
                     "'all of them', or a clearer title?"
                     if candidates
-                    else ""
+                    else (
+                        "Which movie or series did you mean? Send the title if you know it."
+                        if descriptive
+                        else ""
+                    )
                 ),
                 confidence=0.4,
                 source="openai_fallback",
@@ -363,7 +475,12 @@ async def interpret_intent(
         return heuristic
 
 
-def _parse_model_json(raw: str, *, candidate_count: int) -> IntentDecision | None:
+def _parse_model_json(
+    raw: str,
+    *,
+    candidate_count: int,
+    descriptive_ask: bool = False,
+) -> IntentDecision | None:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -404,6 +521,9 @@ def _parse_model_json(raw: str, *, candidate_count: int) -> IntentDecision | Non
     search_title = str(data.get("search_title") or data.get("title") or "").strip()[:200]
     select_all = bool(data.get("select_all"))
     clarify = str(data.get("clarify_question") or data.get("question") or "").strip()[:400]
+    media_kind = str(data.get("media_kind") or data.get("kind") or "").strip().lower()
+    if media_kind not in {"movie", "tv"}:
+        media_kind = ""
 
     if action in {"pick", "pick_many"} and not indices and select_all and candidate_count:
         indices = list(range(1, min(candidate_count, MAX_BATCH) + 1))
@@ -427,12 +547,24 @@ def _parse_model_json(raw: str, *, candidate_count: int) -> IntentDecision | Non
             clarify_question=clarify or "Which titles should I queue?",
             confidence=confidence,
         )
-    if action == "search" and not search_title:
-        return IntentDecision(
-            action="clarify",
-            clarify_question=clarify or "Which series or title should I search for?",
-            confidence=confidence,
-        )
+    if action == "search":
+        if not search_title:
+            return IntentDecision(
+                action="clarify",
+                clarify_question=clarify or "Which series or title should I search for?",
+                confidence=confidence,
+            )
+        # Never treat an unresolved plot sentence as a catalog title.
+        if looks_like_descriptive_ask(search_title) or (
+            descriptive_ask and confidence < MIN_RESOLVE_CONFIDENCE
+        ):
+            return IntentDecision(
+                action="clarify",
+                clarify_question=clarify
+                or "Which movie or series did you mean? Send the title if you know it.",
+                confidence=confidence,
+                media_kind=media_kind,
+            )
     if action == "clarify" and not clarify:
         clarify = (
             f"Which one — reply 1–{min(3, candidate_count)}, 'all of them', or a clearer title?"
@@ -445,6 +577,7 @@ def _parse_model_json(raw: str, *, candidate_count: int) -> IntentDecision | Non
         indices=indices,
         search_title=search_title,
         select_all=select_all,
+        media_kind=media_kind,
         clarify_question=clarify,
         confidence=confidence,
     )
@@ -454,8 +587,10 @@ __all__ = [
     "IntentDecision",
     "MAX_BATCH",
     "MAX_CANDIDATES",
+    "MIN_RESOLVE_CONFIDENCE",
     "heuristic_intent",
     "interpret_intent",
     "looks_like_collection_request",
+    "looks_like_descriptive_ask",
     "looks_like_followup",
 ]
