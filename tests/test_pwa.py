@@ -78,8 +78,9 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "min-height: 28vh" not in css
     # Phone: first viewport is the listening sphere alone; chrome is below the fold.
     assert ".hearth-hero" in css
-    assert "min-height: 100dvh" in css
-    assert "min-height: 100svh" in css
+    assert "--phone-fold: 100dvh" in css
+    assert "--phone-fold: 100svh" in css
+    assert "min-height: var(--phone-fold)" in css
     assert "phone-rest-anchor" in css
     assert 'class="hearth-hero"' in index_html
     assert 'class="phone-rest-anchor"' in index_html
@@ -91,7 +92,7 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "order: 0" in css
     assert "margin-bottom: 8px" in css
     assert "has-confirm" in (UI / "app.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v8" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v9" in (UI / "sw.js").read_text(encoding="utf-8")
     assert 'id="logout-btn"' in index_html
     assert 'id="agent-pill"' in index_html
     assert 'id="settings-btn"' in index_html
@@ -109,7 +110,7 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "localStorage" in settings_js
     assert ".settings-sheet" in css
     assert 'html[data-theme="ash"]' in css
-    assert "hearth-shell-v8" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v9" in (UI / "sw.js").read_text(encoding="utf-8")
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200
@@ -122,12 +123,31 @@ def test_phone_orb_owns_first_viewport_alone():
     index_html = (UI / "index.html").read_text(encoding="utf-8")
     assert 'class="hearth-hero"' in index_html
     assert 'id="orb"' in index_html
-    # Hero is a full phone screen; header is parked at 100dvh (second screen).
-    assert ".hearth-hero" in css and "min-height: 100svh" in css
-    assert ".top" in css and "top: 100svh" in css
+    # Hero is a full phone screen; header is parked at the measured fold (second screen).
+    assert ".hearth-hero" in css and "min-height: var(--phone-fold)" in css
+    assert ".top" in css and "top: var(--phone-fold)" in css
+    assert "--phone-fold: 100svh" in css
     # Fixed dock/widgets over the sphere are gone on phone.
     assert "bottom: calc(var(--dock-space) + var(--keyboard-inset) + 10px)" not in css
     assert ".composer-dock:focus-within" in css
+
+
+def test_phone_fold_resyncs_on_orientation_change():
+    """Ask the House must settle immediately after rotate — not after a second resize."""
+    pwa = (UI / "pwa.js").read_text(encoding="utf-8")
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+    assert "--phone-fold" in pwa
+    assert "syncPhoneFold" in pwa
+    assert "afterOrientation" in pwa
+    assert 'addEventListener("orientationchange"' in pwa
+    assert "screen.orientation" in pwa
+    assert "requestAnimationFrame" in pwa
+    assert 'addEventListener("pageshow"' in pwa
+    assert "min-height: var(--phone-fold)" in css
+    assert "top: var(--phone-fold)" in css
+    # Do not freeze the fold to a stale height while the keyboard is open.
+    assert "isTyping" in pwa
+    assert "hearth-shell-v9" in (UI / "sw.js").read_text(encoding="utf-8")
 
 
 def test_orb_focus_outline_is_circular():
