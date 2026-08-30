@@ -138,6 +138,7 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
         "mediaId": media_id,
         "tmdbId": media_id,
         "inLibrary": _in_library(item),
+        "overview": (item.get("overview") or item.get("summary") or "")[:180],
         "posterPath": _poster_path(item),
     }
     if item.get("matched"):

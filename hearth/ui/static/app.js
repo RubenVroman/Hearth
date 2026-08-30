@@ -903,10 +903,36 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
       </div>`
     );
   }
+  const links = item.links && typeof item.links === "object" ? item.links : null;
+  const tmdbLink = links && links.tmdb ? String(links.tmdb) : "";
+  const imdbLink = links && links.imdb ? String(links.imdb) : "";
+  if (active && (tmdbLink || imdbLink)) {
+    const linkBits = [];
+    if (tmdbLink) {
+      linkBits.push(
+        `<a class="info-media-link" href="${escapeHtml(tmdbLink)}" target="_blank" rel="noopener noreferrer">TMDB</a>`
+      );
+    }
+    if (imdbLink) {
+      linkBits.push(
+        `<a class="info-media-link" href="${escapeHtml(imdbLink)}" target="_blank" rel="noopener noreferrer">IMDb</a>`
+      );
+    }
+    bits.push(`<p class="info-media-links">${linkBits.join(" · ")}</p>`);
+  }
+  const kicker =
+    item.skeleton
+      ? "Mentioned"
+      : item.pending
+        ? "Ready to play"
+        : item.source === "suggest"
+          ? "Suggested"
+          : "Library";
   const classes = [
     "info-media-card",
     active ? "is-active" : "is-recessed",
     item.skeleton ? "is-skeleton" : "",
+    item.source === "suggest" ? "is-suggest" : "",
     stackIndex === 0 && active ? "is-front" : "",
     !active ? "is-selectable" : "",
   ]
@@ -923,9 +949,7 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
       <div class="info-media">
         ${poster}
         <div class="info-media-copy">
-          <p class="info-kicker">${
-            item.skeleton ? "Mentioned" : item.pending ? "Ready to play" : "Library"
-          }</p>
+          <p class="info-kicker">${kicker}</p>
           <h2 class="info-title"${labelled ? ' id="info-title"' : ""}>${escapeHtml(title)}</h2>
           ${meta ? `<p class="info-meta">${meta}</p>` : ""}
           ${bits.join("")}

@@ -636,6 +636,46 @@ def test_intent_sci_fi_movies_uses_plex_browse_genre():
         assert plan["args"]["type"] == "movie", phrase
 
 
+def test_intent_suggest_movies_uses_suggest_titles():
+    from hearth.agent.loop import route_intent
+
+    for phrase in (
+        "suggest some movies",
+        "recommend some sci-fi movies",
+        "what should we watch",
+        "movie recommendations",
+    ):
+        plan = route_intent(phrase)
+        assert plan is not None, phrase
+        assert plan["tool"] == "suggest_titles", phrase
+
+    show = route_intent("Can you show them on the UI?")
+    assert show is not None
+    assert show["tool"] == "suggest_titles"
+
+    # Library genre browse must not be stolen by suggestions.
+    library = route_intent("what sci-fi movies do we have")
+    assert library["tool"] == "plex_browse_genre"
+
+
+async def test_suggest_titles_resolves_metadata_without_keys_in_payload():
+    result = await registry.call(
+        "suggest_titles",
+        {"titles": ["Dune: Part Two", "The Endless"], "limit": 2},
+    )
+    assert result.ok
+    assert not result.needs_confirm
+    rows = result.data.get("results") or []
+    assert len(rows) == 2
+    assert rows[0].get("title")
+    assert rows[0].get("tmdbId")
+    assert (rows[0].get("links") or {}).get("tmdb", "").startswith("https://www.themoviedb.org/")
+    blob = str(result.as_dict()).lower()
+    assert "api_key" not in blob
+    assert "x-api-key" not in blob
+    assert "bearer " not in blob
+
+
 async def test_plex_browse_genre_lists_genres_when_empty():
     result = await registry.call("plex_browse_genre", {"genre": ""})
     assert result.ok
@@ -954,7 +994,7 @@ async def test_ui_try_again_label_for_awaiting_client():
     assert 'reason === "awaiting_client"' in app_js
     assert "Try again — Plex is open" in app_js
     sw = Path("hearth/ui/static/sw.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v15" in sw
+    assert "hearth-shell-v16" in sw
 
 
 async def test_plex_play_live_proxies_play_media(monkeypatch):
@@ -1093,6 +1133,7 @@ def test_confirmation_policy_marks_only_high_risk_tools():
         "chief_of_staff",
         "workspace_write",
         "web_search",
+        "suggest_titles",
     }
     gated = {
         "thuisbezorgd_order",

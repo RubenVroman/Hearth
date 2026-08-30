@@ -163,7 +163,8 @@ class AgentLoop:
                 "I can drive the house — lights, Denon, LG TV, play titles in Infuse on the "
                 "Apple TV (or Plex on LG), grab movies in Radarr or shows in Sonarr, check "
                 "download progress, request "
-                "via Overseerr, order food on Thuisbezorgd, live web search, Plex now-playing, "
+                "via Overseerr, suggest movie cards on the glass UI, order food on Thuisbezorgd, "
+                "live web search, Plex now-playing, "
                 "workspace, docker inspect. Repo, Gridways, Discord, calendar, and anything I "
                 "can't do yet go to Chief of Staff."
             )
@@ -383,6 +384,19 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     if name == "overseerr_request":
         item = data.get("requested") or {}
         return f"I'll request {item.get('title') or 'that'} in Overseerr{mock}."
+    if name == "suggest_titles":
+        spoken = data.get("speak")
+        if spoken:
+            return spoken if mock == "" else f"{spoken.rstrip('.')}" + mock + "."
+        results = data.get("results") or []
+        if not results:
+            return f"No suggestion cards{mock}."
+        titles = ", ".join(
+            f"{r.get('title')} ({r.get('year')})" if r.get("year") else str(r.get("title"))
+            for r in results[:4]
+            if r.get("title")
+        )
+        return f"On screen{mock}: {titles}."
     if name == "thuisbezorgd_restaurants":
         return str(data.get("speak") or f"Thuisbezorgd restaurants{mock}.")
     if name == "thuisbezorgd_menu":
@@ -578,6 +592,26 @@ _WEB_SEARCH = re.compile(
     r")\b",
     re.I,
 )
+_SUGGEST_TITLES = re.compile(
+    r"\b("
+    r"(?:suggest|recommend)(?:\s+[\w'’-]+){0,6}\s+(?:movies?|films?|shows?|series|titles?)|"
+    r"movie recommendations?|film recommendations?|"
+    r"what should (?:we|i) watch|"
+    r"any (?:good )?(?:movie|film|show) (?:ideas?|recs?|recommendations?)|"
+    r"give me (?:some )?(?:movie|film|show) (?:ideas?|recs?|suggestions?)"
+    r")\b",
+    re.I,
+)
+_SHOW_SUGGESTIONS_UI = re.compile(
+    r"\b("
+    r"show (?:them|those|these|it|the(?:se|m)?(?: titles?| movies?| films?| shows?)?)"
+    r"\s+(?:on (?:the )?(?:ui|screen|overlay|display|glass)|here)|"
+    r"put (?:them|those|these)\s+on\s+(?:the )?(?:ui|screen|overlay|display)|"
+    r"display (?:them|those|these|the titles?)(?:\s+on (?:the )?(?:ui|screen|overlay))?|"
+    r"can you show (?:them|those|these)(?:\s+on (?:the )?(?:ui|screen))?"
+    r")\b",
+    re.I,
+)
 _ABOUT_MEDIA = re.compile(
     r"\b(?:"
     r"tell me about|what(?:'s| is| about)|"
@@ -762,6 +796,9 @@ def route_intent(text: str) -> dict[str, Any] | None:
     genre_plan = _plex_genre_plan(raw)
     if genre_plan is not None:
         return genre_plan
+    suggest_plan = _suggest_titles_plan(raw)
+    if suggest_plan is not None:
+        return suggest_plan
     if _MEDIA_STATUS.search(raw):
         return {"tool": "house_media", "args": {}}
     mute = _MUTE.search(raw)
@@ -827,8 +864,15 @@ def _plex_genre_plan(raw: str) -> dict[str, Any] | None:
     match = _PLEX_GENRE_BROWSE.search(raw)
     if not match:
         return None
-    # Don't steal play / grab / download-progress phrasing.
-    if _GRAB.search(raw) or _PLAY_ON_TV.search(raw) or _PLAY_TITLE.search(raw) or _DOWNLOAD_PROGRESS.search(raw):
+    # Don't steal play / grab / download-progress / recommendation phrasing.
+    if (
+        _GRAB.search(raw)
+        or _PLAY_ON_TV.search(raw)
+        or _PLAY_TITLE.search(raw)
+        or _DOWNLOAD_PROGRESS.search(raw)
+        or _SUGGEST_TITLES.search(raw)
+        or _SHOW_SUGGESTIONS_UI.search(raw)
+    ):
         return None
 
     genre = (
@@ -876,6 +920,81 @@ def _plex_genre_plan(raw: str) -> dict[str, Any] | None:
     if re.fullmatch(r"sci[\-\s]?fi|scifi|science\s+fiction", genre, flags=re.I):
         genre = "Science Fiction"
     return {"tool": "plex_browse_genre", "args": {"genre": genre, "type": media_type}}
+
+
+def _titles_from_transcript() -> list[str]:
+    """Pull recent title-like phrases from assistant turns (for 'show them on the UI')."""
+    from hearth.tools.suggest import parse_title_list
+
+    lines = list(runtime.transcript)
+    for line in reversed(lines):
+        if line.role != "assistant":
+            continue
+        text = (line.text or "").strip()
+        if not text:
+            continue
+        parsed = parse_title_list(text)
+        # Keep only items that look like real titles (not prose leftovers).
+        cleaned = [
+            t
+            for t in parsed
+            if t
+            and not re.match(r"^(top picks?|on screen|here)\b", t, re.I)
+            and len(t) <= 80
+        ]
+        if len(cleaned) >= 2:
+            return cleaned[:6]
+        years = re.findall(
+            r"([A-Z][^(\n]{1,60}?)\s*\((\d{4})\)",
+            text,
+        )
+        if len(years) >= 2:
+            out = []
+            for title, year in years[:6]:
+                bit = re.sub(r"^\d+[\).\]]\s*", "", title).strip(" .\"'-•·:")
+                bit = re.sub(r"^(?:top picks?|recommendations?)\s*:?\s*", "", bit, flags=re.I)
+                if bit:
+                    out.append(f"{bit.strip()} ({year})")
+            if len(out) >= 2:
+                return out
+    return []
+
+
+def _suggest_titles_plan(raw: str) -> dict[str, Any] | None:
+    """Route recommendation / show-on-UI asks to suggest_titles (glass overlay)."""
+    if _GRAB.search(raw) or _PLAY_ON_TV.search(raw) or _PLAY_TITLE.search(raw):
+        return None
+    if _DOWNLOAD_PROGRESS.search(raw) or _PLEX_GENRES_LIST.search(raw):
+        return None
+
+    media_type = "movie"
+    if re.search(r"\b(tv shows?|series|tv series|sonarr)\b", raw, re.I) and not _MOVIE.search(raw):
+        media_type = "show"
+    elif _SERIES.search(raw) and not _MOVIE.search(raw):
+        # Avoid matching the verb in "show them on the UI".
+        if not re.search(r"\bshow\s+(?:them|those|these|it|me)\b", raw, re.I):
+            media_type = "show"
+    if _SHOW_SUGGESTIONS_UI.search(raw):
+        titles = _titles_from_transcript()
+        if titles:
+            return {"tool": "suggest_titles", "args": {"titles": titles, "type": media_type}}
+        # No prior list — still open a short default suggestion pack.
+        return {
+            "tool": "suggest_titles",
+            "args": {"query": "movie recommendations", "type": media_type},
+        }
+
+    if not _SUGGEST_TITLES.search(raw):
+        return None
+
+    # "suggest sci-fi movies" — keep the mood in query for pack selection.
+    query = re.sub(
+        r"^\s*(?:please\s+)?(?:can you\s+|could you\s+)?",
+        "",
+        raw,
+        flags=re.I,
+    ).strip(" .?!")
+    return {"tool": "suggest_titles", "args": {"query": query, "type": media_type}}
 
 
 def _about_media_plan(raw: str) -> dict[str, Any] | None:

@@ -20,6 +20,7 @@ _MEDIA_TOOLS = {
     "radarr_search",
     "sonarr_search",
     "overseerr_search",
+    "suggest_titles",
 }
 
 _DOWNLOAD_TOOLS = {
@@ -301,10 +302,17 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
     if row.get("tmdbId") is None and row.get("mediaId") is not None:
         row = {**row, "tmdbId": row.get("mediaId")}
     art = _art_fields(row)
+    raw_type = str(row.get("type") or row.get("mediaType") or "movie").lower()
+    if raw_type in {"tv", "show", "series"}:
+        media_type = "show"
+    elif raw_type in {"movie", "film"}:
+        media_type = "movie"
+    else:
+        media_type = raw_type or "movie"
     item = {
-        "id": _media_item_id({**row, **art, "title": title}),
+        "id": _media_item_id({**row, **art, "title": title, "type": media_type}),
         "title": title,
-        "type": row.get("type") or row.get("mediaType") or "movie",
+        "type": media_type,
         "year": row.get("year"),
         "show": row.get("show") or row.get("grandparentTitle"),
         "summary": row.get("summary") or row.get("overview") or "",
@@ -320,6 +328,11 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
         item["state"] = row.get("state")
     if row.get("pending"):
         item["pending"] = True
+    links = row.get("links") if isinstance(row.get("links"), dict) else None
+    if links:
+        item["links"] = {
+            k: str(v) for k, v in links.items() if k in {"tmdb", "imdb"} and v
+        }
     return item
 
 
@@ -376,7 +389,14 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
         }
         item = _normalize_media_item(row, source="infuse")
         return [item] if item else []
-    if name in {"plex_search", "plex_browse_genre", "radarr_search", "sonarr_search", "overseerr_search"}:
+    if name in {
+        "plex_search",
+        "plex_browse_genre",
+        "radarr_search",
+        "sonarr_search",
+        "overseerr_search",
+        "suggest_titles",
+    }:
         results = data.get("results") or []
         if not results:
             return []
@@ -386,10 +406,17 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
             "radarr_search": "radarr",
             "sonarr_search": "sonarr",
             "overseerr_search": "overseerr",
+            "suggest_titles": "suggest",
         }.get(name, "media")
         default_type = "movie" if "radarr" in name or name == "plex_browse_genre" else "show"
         if name == "plex_browse_genre" and str(data.get("media_type") or "").lower() == "show":
             default_type = "show"
+        if name == "suggest_titles":
+            asked_type = str(data.get("media_type") or "").lower()
+            if asked_type in {"tv", "show"}:
+                default_type = "show"
+            else:
+                default_type = "movie"
         out = []
         for hit in results[:_SEARCH_HIT_CAP]:
             if not isinstance(hit, dict):

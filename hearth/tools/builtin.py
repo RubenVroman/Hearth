@@ -15,6 +15,7 @@ from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
 from hearth.tools.thuisbezorgd import thuisbezorgd
 from hearth.tools.weather import fetch_weather
+from hearth.tools.suggest import suggest_titles
 from hearth.tools.websearch import web_search
 
 
@@ -368,6 +369,11 @@ async def _get_weather(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _web_search(args: dict[str, Any]) -> dict[str, Any]:
     return await web_search(args)
+
+
+async def _suggest_titles(args: dict[str, Any]) -> dict[str, Any]:
+    return await suggest_titles(args)
+
 
 async def _end_call(args: dict[str, Any]) -> dict[str, Any]:
     """Signal close-of-call. Sideband / client tear down the live WebRTC session."""
@@ -1043,6 +1049,47 @@ def register_builtin_tools() -> None:
                 "required": ["query"],
             },
             handler=_overseerr_search,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="suggest_titles",
+            description=(
+                "Show a list of suggested movie/TV titles on the house glass overlay "
+                "(posters, year, short blurb, TMDB link). Use when recommending titles, "
+                "after web-sourced movie ideas, or when asked to 'show them on the UI / screen'. "
+                "Pass titles=[...] when you already have names; or query= for a freeform "
+                "recommendation mood (e.g. 'mind-bending sci-fi'). Resolves metadata via "
+                "Overseerr / Radarr / Sonarr server-side — never invent posters. Prefer this "
+                "over speaking a long list with no overlay. For titles already in the Plex "
+                "library by genre, prefer plex_browse_genre instead."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "titles": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Explicit title list, e.g. ['Dune: Part Two', 'Arrival']",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Optional mood/theme when titles are unknown, or a "
+                            "comma/newline-separated title list"
+                        ),
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "movie, tv, or any (default any)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max cards to show (default 4, max 6)",
+                    },
+                },
+            },
+            handler=_suggest_titles,
         )
     )
     registry.register(

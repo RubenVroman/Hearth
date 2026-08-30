@@ -48,7 +48,7 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v15" in sw.text
+    assert "hearth-shell-v16" in sw.text
     assert "info-infuse-btn" in js.text
     assert "playActiveInInfuse" in js.text
     assert "focusMediaById" in js.text
@@ -56,6 +56,9 @@ def test_command_center_includes_info_overlay(client):
     assert "setRefreshInterval" in js.text
     assert ".info-infuse-btn" in css.text
     assert ".info-media-card.is-selectable" in css.text
+    assert ".info-media-link" in css.text
+    assert "Suggested" in js.text
+    assert "info-media-link" in js.text
 
 
 def test_weather_ask_surfaces_weather_overlay(client):
@@ -237,6 +240,53 @@ def test_sci_fi_genre_browse_surfaces_media_stack(client):
     assert alias.status_code == 200
     assert alias.json()["tools"][0]["name"] == "plex_browse_genre"
     assert alias.json()["tools"][0]["data"]["genre"] == "Science Fiction"
+
+
+def test_suggest_titles_surfaces_media_overlay(client):
+    """General recommendations publish suggestion cards (not chat-only)."""
+    chat = client.post("/api/chat", json={"message": "suggest some sci-fi movies"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "suggest_titles"
+    media = next(w for w in body["widgets"] if w["kind"] == "media")
+    items = media["data"].get("items") or []
+    assert len(items) >= 2
+    assert all(row.get("source") == "suggest" for row in items)
+    active = media["data"]["item"]
+    assert active.get("title")
+    assert active.get("tmdbId") or active.get("skeleton")
+    if active.get("tmdbId"):
+        links = active.get("links") or {}
+        assert "tmdb" in links
+        assert links["tmdb"].startswith("https://www.themoviedb.org/")
+
+    # Explicit title list via API (same overlay path, keys stay server-side).
+    api = client.post(
+        "/api/media/suggest",
+        json={"titles": ["Dune: Part Two", "The Endless", "Severance"], "limit": 3},
+    )
+    assert api.status_code == 200
+    payload = api.json()
+    assert payload["ok"] is True
+    assert len(payload["results"]) == 3
+    assert any(w["kind"] == "media" for w in payload["widgets"])
+    assert "api" not in str(payload).lower() or "api_key" not in str(payload).lower()
+
+
+def test_show_them_on_ui_uses_prior_suggestion_titles(client):
+    """Follow-up 'show them on the UI' resolves prior spoken titles into cards."""
+    runtime.note(
+        "assistant",
+        "Top picks: 1. Dune: Part Two (2024) 2. The Endless (2017) 3. Annihilation (2018)",
+    )
+    chat = client.post("/api/chat", json={"message": "Can you show them on the UI?"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "suggest_titles"
+    media = next(w for w in body["widgets"] if w["kind"] == "media")
+    titles = {row.get("title") for row in (media["data"].get("items") or [])}
+    assert "Dune: Part Two" in titles
+    assert "The Endless" in titles or "Annihilation" in titles
 
 
 def test_empty_genre_list_does_not_publish_media_overlay(client):
