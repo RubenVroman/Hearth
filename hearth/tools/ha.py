@@ -434,6 +434,7 @@ class HomeAssistant:
     ) -> dict[str, Any]:
         """Control one media device, retry the write, then verify real state."""
         action = (action or "").strip().lower()
+        role = self._device_role(device)
         resolved = await self.resolve_device_state(device)
         entity_id = str(resolved.get("entity_id") or self.entity_for(device))
         if not resolved.get("ok") and action not in {"turn_on", "on", "power_on"}:
@@ -467,9 +468,20 @@ class HomeAssistant:
             }
 
         after, verified = await self._verify_media_state(entity_id, service, data)
+        fallback: dict[str, Any] | None = None
+        if role == "apple_tv" and verified is False and service in {"turn_on", "turn_off"}:
+            fallback = await self._apple_tv_remote_power(entity_id, service)
+            if fallback.get("ok"):
+                after, verified = await self._verify_media_state(entity_id, service, data)
+
+        accepted = bool(result.get("accepted", result.get("ok"))) or bool(
+            fallback and fallback.get("accepted")
+        )
+        verified_ok = verified is not False
         out: dict[str, Any] = {
-            "ok": True,
-            "device": self._device_role(device),
+            "ok": verified_ok,
+            "accepted": accepted,
+            "device": role,
             "action": action,
             "entity_id": entity_id,
             "service": f"{domain}.{service}",
@@ -480,9 +492,54 @@ class HomeAssistant:
             "verified": verified,
             "attempts": result.get("attempts", 1),
         }
+        if fallback is not None:
+            out["fallback"] = fallback
         if verified is False:
-            out["warning"] = "Home Assistant accepted the command but the new state was not observed yet"
+            message = "Home Assistant accepted the command, but the requested state was not observed"
+            out["warning"] = message
+            out["error"] = message
         return out
+
+    async def _apple_tv_remote_power(
+        self,
+        media_entity_id: str,
+        service: str,
+    ) -> dict[str, Any]:
+        """Use Apple TV's HA remote entity when media-player power does not take."""
+        object_id = media_entity_id.split(".", 1)[-1]
+        preferred = f"remote.{object_id}"
+        direct = await self.get_state(preferred)
+        remote_entity_id: str | None = preferred if direct.get("ok") else None
+        resolved_by = "matching_entity_id"
+        if remote_entity_id is None:
+            found = await self.resolve_entity(object_id, domains=["remote"])
+            if found.get("ok"):
+                remote_entity_id = str(found.get("entity_id") or "") or None
+                resolved_by = str(found.get("resolved") or "friendly_name")
+        if remote_entity_id is None:
+            return {
+                "ok": False,
+                "accepted": False,
+                "error": "No matching Home Assistant remote entity was found for Apple TV",
+            }
+
+        command = "wakeup" if service == "turn_on" else "suspend"
+        result = await self.call_service(
+            "remote",
+            "send_command",
+            remote_entity_id,
+            {"command": command},
+        )
+        return {
+            "ok": bool(result.get("ok")),
+            "accepted": bool(result.get("accepted", result.get("ok"))),
+            "entity_id": remote_entity_id,
+            "resolved": resolved_by,
+            "service": "remote.send_command",
+            "command": command,
+            "result": result,
+            "error": result.get("error"),
+        }
 
     async def _verify_media_state(
         self,
@@ -638,17 +695,29 @@ class HomeAssistant:
             if _domain(str(row.get("entity_id") or "")) in _MEDIA_DOMAINS
         ]
         for role in ("avr", "tv", "apple_tv"):
-            matched = max(
-                media_rows,
-                key=lambda row: self._media_match_score(role, row),
-                default=None,
+            configured = self.entity_for(role)
+            matched = next(
+                (
+                    row
+                    for row in media_rows
+                    if str(row.get("entity_id") or "").lower() == configured.lower()
+                ),
+                None,
             )
+            exact = matched is not None
+            if matched is None:
+                matched = max(
+                    media_rows,
+                    key=lambda row: self._media_match_score(role, row),
+                    default=None,
+                )
             score = self._media_match_score(role, matched) if matched else 0
+            found = bool(matched and (exact or score > 0))
             key_media[role] = {
-                "configured_entity_id": self.entity_for(role),
-                "found": bool(matched and score > 0),
-                "entity": matched if matched and score > 0 else None,
-                "reachable": bool(matched and score > 0 and _state_reachable(matched)),
+                "configured_entity_id": configured,
+                "found": found,
+                "entity": matched if found else None,
+                "reachable": bool(found and matched and _state_reachable(matched)),
             }
         health = "healthy" if not unavailable else "degraded"
         shown = rows[: max(1, min(int(limit), 1000))]

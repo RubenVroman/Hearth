@@ -1044,11 +1044,28 @@ def _play_title_clean(text: str) -> str:
 
 def _turn_plan(phrase: str, *, on: bool) -> dict[str, Any]:
     cleaned = re.sub(r"^(the|my|our)\s+", "", phrase.strip(), flags=re.I).lower().rstrip(".")
-    media_tokens = ("tv", "lg", "webos", "television", "avr", "denon", "receiver", "amp")
+    apple_tv_names = {"apple tv", "apple_tv", "appletv", "atv", "living room apple tv"}
+    media_tokens = (
+        "tv",
+        "lg",
+        "webos",
+        "television",
+        "avr",
+        "denon",
+        "receiver",
+        "amp",
+        "atv",
+        "appletv",
+    )
     if any(token in cleaned.split() or cleaned == token for token in media_tokens) or cleaned in {
-        "lg tv", "webos tv", "lg webos tv", "denon avr",
+        "lg tv", "webos tv", "lg webos tv", "denon avr", *apple_tv_names,
     }:
-        device = "tv" if any(t in cleaned for t in ("tv", "lg", "webos", "television")) else "avr"
+        if cleaned in apple_tv_names or "apple tv" in cleaned:
+            device = "apple_tv"
+        elif any(t in cleaned for t in ("tv", "lg", "webos", "television")):
+            device = "tv"
+        else:
+            device = "avr"
         return {
             "tool": "ha_media_control",
             "args": {"device": device, "action": "turn_on" if on else "turn_off"},

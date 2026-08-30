@@ -176,11 +176,12 @@ async def media_control(
     if role != requested_role:
         result["routed_via"] = "avr"
         result["controlled_entity_id"] = result.get("entity_id")
-    result["speak"] = speak_player(state, label=label) if state else (
-        f"{label}: {action} via {result.get('entity_id')}."
-        if result.get("ok")
-        else str(result.get("error") or f"{label} control failed.")
-    )
+    if not result.get("ok"):
+        result["speak"] = str(result.get("error") or f"{label} control failed.")
+    elif state:
+        result["speak"] = speak_player(state, label=label)
+    else:
+        result["speak"] = f"{label}: {action} via {result.get('entity_id')}."
     return result
 
 

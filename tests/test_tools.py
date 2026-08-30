@@ -56,6 +56,118 @@ async def test_house_network_inventory_checks_media_and_every_entity():
     assert "media_player" in result.data["domains"]
 
 
+async def test_network_inventory_prefers_exact_configured_apple_tv(monkeypatch):
+    from hearth.config import settings
+    from hearth.tools.ha import HomeAssistant
+
+    client = HomeAssistant()
+    states = [
+        {
+            "entity_id": "media_player.living_room_living_room",
+            "state": "off",
+            "attributes": {"friendly_name": "Living Room"},
+        }
+    ]
+
+    async def _states(_domain=None):
+        return {"ok": True, "mode": "live", "states": states}
+
+    monkeypatch.setattr(settings, "ha_apple_tv_entity", "media_player.living_room_living_room")
+    monkeypatch.setattr(client, "list_states", _states)
+    result = await client.network_inventory()
+    apple_tv = result["key_media"]["apple_tv"]
+    assert apple_tv["found"] is True
+    assert apple_tv["reachable"] is True
+    assert apple_tv["entity"]["entity_id"] == "media_player.living_room_living_room"
+
+
+async def test_apple_tv_power_uses_remote_fallback_and_verifies(monkeypatch):
+    from hearth.tools.ha import HomeAssistant
+
+    client = HomeAssistant()
+    calls: list[tuple[str, str, str, dict | None]] = []
+    checks = iter(
+        [
+            ({"entity_id": "media_player.apple_tv", "state": "off"}, False),
+            ({"entity_id": "media_player.apple_tv", "state": "idle"}, True),
+        ]
+    )
+
+    async def _resolve(_device: str):
+        return {
+            "ok": True,
+            "mode": "live",
+            "entity_id": "media_player.apple_tv",
+            "state": {"entity_id": "media_player.apple_tv", "state": "off"},
+        }
+
+    async def _call(domain: str, service: str, entity_id: str, data=None):
+        calls.append((domain, service, entity_id, data))
+        return {"ok": True, "accepted": True, "mode": "live", "attempts": 1}
+
+    async def _verify(_entity_id: str, _service: str, _data: dict):
+        return next(checks)
+
+    async def _state(entity_id: str):
+        return {
+            "ok": entity_id == "remote.apple_tv",
+            "mode": "live",
+            "state": {"entity_id": entity_id, "state": "off"},
+        }
+
+    monkeypatch.setattr(client, "resolve_device_state", _resolve)
+    monkeypatch.setattr(client, "call_service", _call)
+    monkeypatch.setattr(client, "_verify_media_state", _verify)
+    monkeypatch.setattr(client, "get_state", _state)
+    result = await client.media_control("apple_tv", "turn_on")
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert result["fallback"]["command"] == "wakeup"
+    assert calls == [
+        ("media_player", "turn_on", "media_player.apple_tv", None),
+        ("remote", "send_command", "remote.apple_tv", {"command": "wakeup"}),
+    ]
+
+
+async def test_unverified_media_command_is_not_reported_as_success(monkeypatch):
+    from hearth.tools.ha import HomeAssistant
+
+    client = HomeAssistant()
+
+    async def _resolve(_device: str):
+        return {
+            "ok": True,
+            "mode": "live",
+            "entity_id": "media_player.apple_tv",
+            "state": {"entity_id": "media_player.apple_tv", "state": "off"},
+        }
+
+    async def _call(_domain: str, _service: str, _entity_id: str, _data=None):
+        return {"ok": True, "accepted": True, "mode": "live", "attempts": 1}
+
+    async def _verify(_entity_id: str, _service: str, _data: dict):
+        return {"entity_id": "media_player.apple_tv", "state": "off"}, False
+
+    async def _state(entity_id: str):
+        return {
+            "ok": entity_id == "remote.apple_tv",
+            "mode": "live",
+            "state": {"entity_id": entity_id, "state": "off"},
+        }
+
+    monkeypatch.setattr(client, "resolve_device_state", _resolve)
+    monkeypatch.setattr(client, "call_service", _call)
+    monkeypatch.setattr(client, "_verify_media_state", _verify)
+    monkeypatch.setattr(client, "get_state", _state)
+    result = await client.media_control("apple_tv", "turn_on")
+
+    assert result["accepted"] is True
+    assert result["ok"] is False
+    assert result["verified"] is False
+    assert "not observed" in result["error"]
+
+
 async def test_smart_device_control_resolves_friendly_name():
     result = await registry.call(
         "ha_device_control",
@@ -422,6 +534,19 @@ async def test_intent_turn_on_the_tv_uses_ha_media_control():
     assert plan["tool"] == "ha_media_control"
     assert plan["args"]["device"] == "tv"
     assert plan["args"]["action"] == "turn_on"
+
+
+def test_intent_apple_tv_power_does_not_target_lg_tv():
+    turn_on = route_intent("turn on the Apple TV")
+    turn_off = route_intent("turn off Apple TV")
+    assert turn_on == {
+        "tool": "ha_media_control",
+        "args": {"device": "apple_tv", "action": "turn_on"},
+    }
+    assert turn_off == {
+        "tool": "ha_media_control",
+        "args": {"device": "apple_tv", "action": "turn_off"},
+    }
 
 
 async def test_intent_avr_volume_and_house_media():
