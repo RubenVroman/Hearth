@@ -32,6 +32,9 @@ Do it yourself (house):
 - Weather / forecast outside → get_weather.
 - Download / grab / get a movie → radarr_search then radarr_add (runs immediately).
 - Download / grab a show or season → sonarr_search then sonarr_add (runs immediately).
+- Download progress / “how far along is X” / “what's downloading” → radarr_queue
+  (optional query=title). For a show, sonarr_queue. Report status + percent; if the
+  title is not in the queue, say it is not downloading.
 - “Request X” / Overseerr as the request front door → overseerr_search / overseerr_request.
 - Food / Thuisbezorgd / “order pizza” → thuisbezorgd_restaurants → thuisbezorgd_menu →
   thuisbezorgd_cart → thuisbezorgd_order (confirm=true to place; spends money).

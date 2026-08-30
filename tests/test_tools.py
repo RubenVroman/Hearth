@@ -184,6 +184,114 @@ async def test_radarr_add_still_accepts_confirm_flag():
     assert result.data["added"]["title"]
 
 
+def test_queue_percent_mapping():
+    from hearth.tools.arr import normalize_download_status, queue_percent, summarize_queue_item
+
+    assert queue_percent(8_000_000_000, 2_000_000_000) == 75.0
+    assert queue_percent(10_000_000_000, 10_000_000_000) == 0.0
+    assert queue_percent(100, 0) == 100.0
+    assert queue_percent(0, 0) == 100.0
+    assert queue_percent(None, 1) is None
+    assert queue_percent("bad", 1) is None
+
+    downloading = summarize_queue_item(
+        {
+            "title": "Annihilation",
+            "status": "downloading",
+            "trackedDownloadState": "downloading",
+            "size": 8_000_000_000,
+            "sizeleft": 2_000_000_000,
+            "timeleft": "00:25:00",
+            "indexer": "MockIndexer",
+            "quality": {"quality": {"name": "Bluray-1080p"}},
+        },
+        service="radarr",
+    )
+    assert downloading["status"] == "downloading"
+    assert downloading["percent"] == 75.0
+    assert downloading["quality"] == "Bluray-1080p"
+
+    assert (
+        normalize_download_status(
+            {"status": "paused", "trackedDownloadState": "downloading"}
+        )
+        == "paused"
+    )
+    assert (
+        normalize_download_status(
+            {"status": "completed", "trackedDownloadState": "importing"}
+        )
+        == "importing"
+    )
+    assert (
+        normalize_download_status(
+            {"status": "failed", "trackedDownloadState": "failed"}
+        )
+        == "failed"
+    )
+
+
+async def test_radarr_queue_lists_active_downloads_with_percent():
+    result = await registry.call("radarr_queue", {})
+    assert result.ok
+    assert result.data["mode"] == "mock"
+    downloads = result.data["downloads"]
+    assert downloads
+    titles = {row["title"] for row in downloads}
+    assert "Annihilation" in titles
+    anni = next(row for row in downloads if row["title"] == "Annihilation")
+    assert anni["status"] == "downloading"
+    assert anni["percent"] == 75.0
+    assert "annihilation" in result.data["speak"].lower()
+    assert "75" in result.data["speak"]
+
+
+async def test_radarr_queue_lookup_by_title():
+    hit = await registry.call("radarr_queue", {"query": "Annihilation"})
+    assert hit.ok
+    assert hit.data["found"] is True
+    assert len(hit.data["downloads"]) == 1
+    assert hit.data["downloads"][0]["title"] == "Annihilation"
+    assert hit.data["downloads"][0]["percent"] == 75.0
+
+    miss = await registry.call("radarr_queue", {"title": "Not A Real Movie"})
+    assert miss.ok
+    assert miss.data["found"] is False
+    assert miss.data["downloads"] == []
+    assert "not downloading" in miss.data["speak"].lower()
+
+
+async def test_radarr_queue_empty(monkeypatch):
+    from hearth.fixtures import pipeline
+
+    monkeypatch.setattr(pipeline, "radarr_downloads", [])
+    result = await registry.call("radarr_queue", {})
+    assert result.ok
+    assert result.data["downloads"] == []
+    assert "nothing downloading" in result.data["speak"].lower()
+
+
+async def test_intent_download_progress_routes_to_radarr_queue():
+    listed = route_intent("What's downloading right now?")
+    assert listed["tool"] == "radarr_queue"
+    assert listed["args"] == {}
+
+    titled = route_intent("How far along is Annihilation?")
+    assert titled["tool"] == "radarr_queue"
+    assert titled["args"]["query"].lower() == "annihilation"
+
+    progress = route_intent("Download progress for Annihilation")
+    assert progress["tool"] == "radarr_queue"
+    assert "annihilation" in progress["args"]["query"].lower()
+
+    show = route_intent("How far along is the Severance episode download?")
+    assert show["tool"] == "sonarr_queue"
+
+    # Grab intents must still add, not report progress.
+    grab = route_intent("download the movie Dune")
+    assert grab["tool"] == "radarr_add"
+
+
 async def test_house_media_inventory_speaks_tv_avr_plex():
     result = await registry.call("house_media", {})
     assert result.ok

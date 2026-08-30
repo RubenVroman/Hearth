@@ -221,6 +221,10 @@ async def _radarr_add(args: dict[str, Any]) -> dict[str, Any]:
     return await radarr.add(str(args.get("query") or ""), tmdb_id=int(tmdb) if tmdb else None)
 
 
+async def _radarr_queue(args: dict[str, Any]) -> dict[str, Any]:
+    return await radarr.queue(str(args.get("query") or args.get("title") or ""))
+
+
 async def _sonarr_search(args: dict[str, Any]) -> dict[str, Any]:
     return await sonarr.search(str(args.get("query") or ""))
 
@@ -228,6 +232,10 @@ async def _sonarr_search(args: dict[str, Any]) -> dict[str, Any]:
 async def _sonarr_add(args: dict[str, Any]) -> dict[str, Any]:
     tvdb = args.get("tvdbId")
     return await sonarr.add(str(args.get("query") or ""), tvdb_id=int(tvdb) if tvdb else None)
+
+
+async def _sonarr_queue(args: dict[str, Any]) -> dict[str, Any]:
+    return await sonarr.queue(str(args.get("query") or args.get("title") or ""))
 
 
 async def _overseerr_search(args: dict[str, Any]) -> dict[str, Any]:
@@ -772,6 +780,29 @@ def register_builtin_tools() -> None:
     )
     registry.register(
         ToolSpec(
+            name="radarr_queue",
+            description=(
+                "Radarr download progress: list active downloads or look up one title. "
+                "Returns status (queued/downloading/paused/importing/stalled/completed/failed), "
+                "percent complete, time left, quality/indexer when available. "
+                "Use for “how far along is Annihilation”, “what's downloading”, "
+                "“download progress for X”. Pass query/title to filter; omit for the full queue."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional movie title to look up in the download queue.",
+                    },
+                    "title": {"type": "string", "description": "Alias for query."},
+                },
+            },
+            handler=_radarr_queue,
+        )
+    )
+    registry.register(
+        ToolSpec(
             name="sonarr_search",
             description="Search Sonarr for a TV series. Use this (not Plex) when grabbing a show.",
             parameters={
@@ -800,6 +831,26 @@ def register_builtin_tools() -> None:
                 "required": ["query"],
             },
             handler=_sonarr_add,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="sonarr_queue",
+            description=(
+                "Sonarr download progress for TV: list active downloads or look up one title. "
+                "Same fields as radarr_queue. Use when the ask is clearly about a show/series."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional series/episode title to look up.",
+                    },
+                    "title": {"type": "string", "description": "Alias for query."},
+                },
+            },
+            handler=_sonarr_queue,
         )
     )
     registry.register(

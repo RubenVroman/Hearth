@@ -9,6 +9,18 @@ import httpx
 from hearth.config import settings
 from hearth.fixtures import pipeline
 
+# Spoken / tool statuses for active *arr downloads.
+DOWNLOAD_STATUSES = (
+    "queued",
+    "downloading",
+    "paused",
+    "importing",
+    "stalled",
+    "completed",
+    "failed",
+    "unknown",
+)
+
 
 def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -41,6 +53,159 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
         "mediaType": item.get("mediaType"),
         "mediaId": item.get("id"),
     }
+
+
+def queue_percent(size: Any, sizeleft: Any) -> float | None:
+    """Percent complete from Radarr/Sonarr size + sizeleft (0–100, one decimal)."""
+    try:
+        if size is None or sizeleft is None:
+            return None
+        total = float(size)
+        left = float(sizeleft)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return 100.0 if left <= 0 else None
+    done = ((total - left) / total) * 100.0
+    return round(max(0.0, min(100.0, done)), 1)
+
+
+def _status_messages_text(item: dict[str, Any]) -> str:
+    messages = item.get("statusMessages") or []
+    bits: list[str] = []
+    for row in messages:
+        if isinstance(row, dict):
+            bits.append(str(row.get("title") or ""))
+            for msg in row.get("messages") or []:
+                bits.append(str(msg))
+        else:
+            bits.append(str(row))
+    return " ".join(bits).lower()
+
+
+def normalize_download_status(item: dict[str, Any]) -> str:
+    """Map *arr queue fields → queued/downloading/paused/importing/stalled/completed/failed/unknown."""
+    status = str(item.get("status") or "").strip().lower()
+    state = str(item.get("trackedDownloadState") or "").strip().lower()
+    tracked = str(item.get("trackedDownloadStatus") or "").strip().lower()
+    messages = _status_messages_text(item)
+
+    if state in {"failed", "failedpending"} or status == "failed":
+        return "failed"
+    if status == "paused" or state == "paused":
+        return "paused"
+    if state in {"importpending", "importing"}:
+        return "importing"
+    if state == "imported" or (status == "completed" and state in {"", "downloaded"}):
+        return "completed"
+    if "stall" in messages or (tracked == "warning" and "stall" in (status + state + messages)):
+        return "stalled"
+    if status in {"queued", "delay"} or state in {"queued"}:
+        return "queued"
+    if status == "downloading" or state == "downloading":
+        if "stall" in messages:
+            return "stalled"
+        return "downloading"
+    if status == "completed":
+        return "completed"
+    if status in DOWNLOAD_STATUSES:
+        return status
+    return "unknown"
+
+
+def _download_title(item: dict[str, Any]) -> str:
+    title = item.get("title")
+    if title:
+        return str(title)
+    movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+    series = item.get("series") if isinstance(item.get("series"), dict) else {}
+    episode = item.get("episode") if isinstance(item.get("episode"), dict) else {}
+    for candidate in (
+        movie.get("title"),
+        series.get("title"),
+        episode.get("title"),
+    ):
+        if candidate:
+            return str(candidate)
+    return ""
+
+
+def _quality_name(item: dict[str, Any]) -> str | None:
+    quality = item.get("quality")
+    if not isinstance(quality, dict):
+        return str(quality) if quality else None
+    inner = quality.get("quality")
+    if isinstance(inner, dict) and inner.get("name"):
+        return str(inner["name"])
+    if quality.get("name"):
+        return str(quality["name"])
+    return None
+
+
+def summarize_queue_item(item: dict[str, Any], *, service: str) -> dict[str, Any]:
+    size = item.get("size")
+    sizeleft = item.get("sizeleft")
+    percent = queue_percent(size, sizeleft)
+    title = _download_title(item)
+    status = normalize_download_status(item)
+    return {
+        "title": title or None,
+        "status": status,
+        "percent": percent,
+        "size": size,
+        "sizeleft": sizeleft,
+        "timeleft": item.get("timeleft"),
+        "indexer": item.get("indexer"),
+        "quality": _quality_name(item),
+        "downloadClient": item.get("downloadClient"),
+        "errorMessage": item.get("errorMessage"),
+        "service": service,
+    }
+
+
+def title_matches_download(item: dict[str, Any], title: str) -> bool:
+    needle = (title or "").strip().lower()
+    if not needle:
+        return True
+    haystacks = [_download_title(item).lower()]
+    movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+    series = item.get("series") if isinstance(item.get("series"), dict) else {}
+    for extra in (movie.get("title"), series.get("title"), item.get("title")):
+        if extra:
+            haystacks.append(str(extra).lower())
+    return any(needle in hay for hay in haystacks if hay)
+
+
+def speak_queue(
+    downloads: list[dict[str, Any]],
+    *,
+    title: str = "",
+    service: str = "radarr",
+    mock: bool = False,
+) -> str:
+    label = "Radarr" if service == "radarr" else "Sonarr"
+    mock_bit = " (mock)" if mock else ""
+    needle = (title or "").strip()
+    if needle and not downloads:
+        return f"{needle} is not downloading in {label}{mock_bit}."
+    if not downloads:
+        return f"Nothing downloading in {label}{mock_bit}."
+    parts: list[str] = []
+    for row in downloads[:6]:
+        name = row.get("title") or "Untitled"
+        status = row.get("status") or "unknown"
+        percent = row.get("percent")
+        bit = f"{name} is {status}"
+        if percent is not None:
+            bit += f", {percent:g}% complete"
+        timeleft = row.get("timeleft")
+        if timeleft and status == "downloading":
+            bit += f", about {timeleft} left"
+        parts.append(bit)
+    joined = "; ".join(parts)
+    if needle and len(downloads) == 1:
+        return f"{joined}{mock_bit}."
+    return f"{label}{mock_bit}: {joined}."
 
 
 class StarrClient:
@@ -210,6 +375,73 @@ class StarrClient:
         if not rows:
             raise RuntimeError(f"{self.kind} has no quality profile")
         return int(rows[0]["id"])
+
+    async def queue(self, title: str = "") -> dict[str, Any]:
+        """Active download queue with status + percent complete (optional title filter)."""
+        title = (title or "").strip()
+        if not self.live:
+            raw = (
+                pipeline.list_radarr_downloads(title)
+                if self.kind == "radarr"
+                else pipeline.list_sonarr_downloads(title)
+            )
+            downloads = [summarize_queue_item(row, service=self.kind) for row in raw]
+            return {
+                "mode": "mock",
+                "service": self.kind,
+                "query": title or None,
+                "downloads": downloads,
+                "found": bool(downloads) if title else None,
+                "speak": speak_queue(downloads, title=title, service=self.kind, mock=True),
+            }
+
+        client = await self._http()
+        params: dict[str, Any] = {"page": 1, "pageSize": 100}
+        if self.kind == "radarr":
+            params["includeUnknownMovieItems"] = "true"
+            params["includeMovie"] = "true"
+        else:
+            params["includeUnknownSeriesItems"] = "true"
+            params["includeSeries"] = "true"
+        try:
+            response = await client.get("/api/v3/queue", params=params)
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                rows = payload.get("records") or []
+            elif isinstance(payload, list):
+                rows = payload
+            else:
+                rows = []
+            if title:
+                rows = [row for row in rows if title_matches_download(row, title)]
+            downloads = [summarize_queue_item(row, service=self.kind) for row in rows]
+            return {
+                "mode": "live",
+                "service": self.kind,
+                "query": title or None,
+                "downloads": downloads,
+                "found": bool(downloads) if title else None,
+                "speak": speak_queue(downloads, title=title, service=self.kind, mock=False),
+            }
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                raw = (
+                    pipeline.list_radarr_downloads(title)
+                    if self.kind == "radarr"
+                    else pipeline.list_sonarr_downloads(title)
+                )
+                downloads = [summarize_queue_item(row, service=self.kind) for row in raw]
+                return {
+                    "mode": "mock",
+                    "service": self.kind,
+                    "query": title or None,
+                    "error": str(exc),
+                    "downloads": downloads,
+                    "found": bool(downloads) if title else None,
+                    "speak": speak_queue(downloads, title=title, service=self.kind, mock=True),
+                }
+            raise
 
 
 class Overseerr:

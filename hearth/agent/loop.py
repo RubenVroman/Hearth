@@ -161,7 +161,8 @@ class AgentLoop:
         if plan is None:
             reply = (
                 "I can drive the house — lights, Denon, LG TV, play titles in Infuse on the "
-                "Apple TV (or Plex on LG), grab movies in Radarr or shows in Sonarr, request "
+                "Apple TV (or Plex on LG), grab movies in Radarr or shows in Sonarr, check "
+                "download progress, request "
                 "via Overseerr, order food on Thuisbezorgd, Plex now-playing, workspace, docker "
                 "inspect. Repo, Gridways, Discord, calendar, and anything I can't do yet go to "
                 "Chief of Staff."
@@ -333,6 +334,12 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     if name == "radarr_add":
         added = data.get("added") or {}
         return f"I'll grab {added.get('title') or 'that'} in Radarr{mock}."
+    if name in {"radarr_queue", "sonarr_queue"}:
+        spoken = data.get("speak")
+        if spoken:
+            return str(spoken)
+        label = "Radarr" if name == "radarr_queue" else "Sonarr"
+        return f"No {label} queue update{mock}."
     if name == "sonarr_search":
         titles = ", ".join(
             f"{r.get('title')} ({r.get('year')})" for r in (data.get("results") or [])[:4] if r.get("title")
@@ -520,6 +527,26 @@ _INSPECT = re.compile(r"\binspect\s+(\S+)", re.I)
 _MOVIE = re.compile(r"\b(movie|film|radarr)\b", re.I)
 _SERIES = re.compile(r"\b(show|series|season|episode|sonarr)\b", re.I)
 _OVERSEERR = re.compile(r"\b(overseerr|request)\b", re.I)
+_DOWNLOAD_PROGRESS = re.compile(
+    r"\b("
+    r"how far along|"
+    r"download progress|download status|queue (?:status|progress)|"
+    r"what(?:'s| is) downloading|anything downloading|"
+    r"(?:is|how(?:'s| is)) .{0,60}\bdownloading\b|"
+    r"(?:check|show|get) (?:the )?(?:download|radarr|sonarr)(?: progress|status|queue)?"
+    r")\b",
+    re.I,
+)
+_DOWNLOAD_PROGRESS_TITLE = re.compile(
+    r"(?:"
+    r"how far along (?:is |with )?(?:the )?(?:download (?:of |for )?)?|"
+    r"download progress (?:for |on |of )|"
+    r"(?:check|show|get) (?:the )?(?:download|queue)(?: progress|status)? (?:for |on |of )|"
+    r"is (?:the )?(?:download (?:of |for )?)?|"
+    r"how(?:'s| is) (?:the )?(?:download (?:of |for )?)?"
+    r")(.+?)(?:\s+downloading)?$",
+    re.I,
+)
 _GRAB = re.compile(
     r"\b(download|grab|snatch|request|get me)\b"
     r"|\badd .{0,80}\b(to|in) (radarr|sonarr|overseerr|the library|the queue)\b",
@@ -598,6 +625,9 @@ def route_intent(text: str) -> dict[str, Any] | None:
     if remember:
         rest = remember.group(1).strip(" .?!")
         return {"tool": "memory_remember", "args": {"text": rest, "value": rest, "key": rest}}
+    progress = _download_progress_plan(raw)
+    if progress:
+        return progress
     if _GRAB.search(raw):
         query = _media_query(raw)
         if _OVERSEERR.search(raw):
@@ -696,7 +726,7 @@ def _about_media_plan(raw: str) -> dict[str, Any] | None:
     # Avoid stealing pure weather / food / light questions that also matched softly.
     if _WEATHER.search(raw) or _FOOD.search(raw) or _LIGHTS.search(raw) or _DOCKER.search(raw):
         return None
-    if _GRAB.search(raw) or _PLAY_ON_TV.search(raw):
+    if _GRAB.search(raw) or _PLAY_ON_TV.search(raw) or _DOWNLOAD_PROGRESS.search(raw):
         return None
     match = _ABOUT_MEDIA_TITLE.search(raw)
     if not match:
@@ -715,6 +745,55 @@ def _about_media_plan(raw: str) -> dict[str, Any] | None:
     if _MOVIE.search(raw) or _SERIES.search(raw) or _PLEX_ONLY.search(raw) or len(title.split()) <= 6:
         return {"tool": "plex_search", "args": {"query": title}}
     return None
+
+
+def _download_progress_plan(raw: str) -> dict[str, Any] | None:
+    """Route download progress / “how far along” asks to radarr_queue / sonarr_queue."""
+    if not _DOWNLOAD_PROGRESS.search(raw):
+        return None
+    # Don't steal an explicit grab/add (“download the movie Dune”).
+    if re.search(r"\b(grab|snatch|get me|add )\b", raw, re.I) and not re.search(
+        r"\b(how far|progress|status|what(?:'s| is) downloading)\b",
+        raw,
+        re.I,
+    ):
+        return None
+    if re.search(
+        r"\b(download|grab|snatch|get me)\b.+\b(movie|film|show|series|season)\b",
+        raw,
+        re.I,
+    ) and not re.search(r"\b(how far|progress|status|what(?:'s| is) downloading)\b", raw, re.I):
+        return None
+
+    title = ""
+    match = _DOWNLOAD_PROGRESS_TITLE.search(raw)
+    if match:
+        title = _play_title_clean(match.group(1))
+        title = re.sub(
+            r"\b(the )?(movie|film|show|series|download|progress|status|right now|atm|currently)\b",
+            " ",
+            title,
+            flags=re.I,
+        )
+        title = re.sub(r"\s+", " ", title).strip(" .?!'\"")
+        if title.lower() in {
+            "",
+            "it",
+            "that",
+            "this",
+            "something",
+            "everything",
+            "anything",
+            "now",
+            "right now",
+        }:
+            title = ""
+
+    tool = "sonarr_queue" if _SERIES.search(raw) and not _MOVIE.search(raw) else "radarr_queue"
+    args: dict[str, Any] = {}
+    if title:
+        args["query"] = title
+    return {"tool": tool, "args": args}
 
 
 def _food_plan(text: str) -> dict[str, Any]:
