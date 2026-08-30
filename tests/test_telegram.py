@@ -444,6 +444,26 @@ def test_looks_like_descriptive_ask_harry_potter_example():
     assert not looks_like_descriptive_ask("all of them")
 
 
+def test_looks_like_descriptive_ask_dutch_plot_phrases():
+    """Live Waterloo Movies failures — Dutch must hit the model, not literal Radarr."""
+    from hearth.telegram.intent import looks_like_descriptive_ask
+
+    dutch_wizard = (
+        "Ben je nu wat slimmer? Ik zoek die film met die bebrilde tovenaar."
+    )
+    dutch_ring = (
+        "Ok, nog een poging. Die film met dat mannetje met harige voeten "
+        "die een ring kapot moet maken."
+    )
+    assert looks_like_descriptive_ask(dutch_wizard)
+    assert looks_like_descriptive_ask(dutch_ring)
+    assert looks_like_descriptive_ask("film met die bebrilde tovenaar")
+    assert looks_like_descriptive_ask("ik zoek die film met die bebrilde tovenaar")
+    assert looks_like_descriptive_ask("die serie over een chemieleraar")
+    # Year / short title still passthrough.
+    assert not looks_like_descriptive_ask("Annihilation (2018)")
+
+
 def _patch_openai_intent(monkeypatch, payload: dict):
     """Stub AsyncOpenAI chat.completions.create with a fixed JSON payload."""
     import json as _json
@@ -548,6 +568,85 @@ async def test_inbox_descriptive_wizard_resolves_to_harry_potter(
     )
     assert "sk-test" not in result.reply
     assert "OPENAI" not in result.reply
+
+
+def _wrap_radarr_search(monkeypatch) -> list[str]:
+    """Capture Radarr search queries so tests can forbid raw Dutch plot strings."""
+    from hearth.telegram import inbox as inbox_mod
+
+    queries: list[str] = []
+    original = inbox_mod.radarr.search
+
+    async def _capture(query: str, *args, **kwargs):
+        queries.append(str(query))
+        return await original(query, *args, **kwargs)
+
+    monkeypatch.setattr(inbox_mod.radarr, "search", _capture)
+    return queries
+
+
+@pytest.mark.asyncio
+async def test_inbox_dutch_wizard_resolves_not_literal_title(
+    inbox: TelegramInbox, monkeypatch
+):
+    dutch = "Ben je nu wat slimmer? Ik zoek die film met die bebrilde tovenaar."
+    queries = _wrap_radarr_search(monkeypatch)
+    openai_calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Harry Potter",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    result = await inbox.handle_message(_msg(dutch, message_id=240))
+    assert openai_calls, "Dutch plot ask must call gpt-4o-mini"
+    user_payload = openai_calls[0]["messages"][1]["content"]
+    assert "bebrilde tovenaar" in user_payload  # full message to the model
+    assert "Harry Potter" in result.reply or "Sorcerer" in result.reply or "Which one" in result.reply
+    # Never search Radarr with the raw Dutch sentence / plot fragment.
+    for q in queries:
+        assert "bebrilde" not in q.lower()
+        assert "tovenaar" not in q.lower()
+        assert "Ben je nu" not in q
+    assert any("Harry Potter" in q for q in queries) or "Harry Potter" in (
+        inbox.pending.get(-1001).query if inbox.pending.get(-1001) else ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbox_dutch_ring_resolves_not_entire_sentence(
+    inbox: TelegramInbox, monkeypatch
+):
+    dutch = (
+        "Ok, nog een poging. Die film met dat mannetje met harige voeten "
+        "die een ring kapot moet maken."
+    )
+    queries = _wrap_radarr_search(monkeypatch)
+    openai_calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Lord of the Rings",
+            "media_kind": "movie",
+            "confidence": 0.94,
+        },
+    )
+    result = await inbox.handle_message(_msg(dutch, message_id=241))
+    assert openai_calls
+    user_payload = openai_calls[0]["messages"][1]["content"]
+    assert "harige voeten" in user_payload
+    assert "Ok, nog een poging" in user_payload  # conversational filler stays for the model
+    for q in queries:
+        assert "harige" not in q.lower()
+        assert "mannetje" not in q.lower()
+        assert "poging" not in q.lower()
+        assert dutch not in q
+    assert result.grabbed is False or "Lord" in result.reply or "Ring" in result.reply
+    # Fixture lookup may miss LOTR — either disambiguation, queued, or not-found on resolved title.
+    assert "harige voeten" not in result.reply.lower()
+    assert "nog een poging" not in result.reply.lower()
 
 
 @pytest.mark.asyncio

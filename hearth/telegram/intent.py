@@ -102,10 +102,35 @@ _ORDINAL_MAP = {
     "3": 3,
 }
 
+# Media nouns shared across house languages (EN + NL; "serie" is Dutch singular).
+_MEDIA_NOUN = r"(?:movies?|films?|shows?|series|serie|tv(?:\s+shows?)?)"
+# Linkers after a media noun — English plus Dutch met/over/van/voor (and a few
+# common EU prepositions). Prefer this over a huge per-language keyword list.
+_MEDIA_PREP = (
+    r"(?:about|with|where|featuring|involving|of|"
+    r"met|over|van|voor|"
+    r"sur|avec|mit|di|para)"
+)
+_MEDIA_WORDS = frozenset(
+    {
+        "movie",
+        "movies",
+        "film",
+        "films",
+        "show",
+        "shows",
+        "series",
+        "serie",
+        "tv",
+    }
+)
 _DESCRIPTIVE_MARKERS = re.compile(
     r"\b("
-    r"(?:movie|film|show|series|tv(?:\s+show)?)\s+"
-    r"(?:about|with|where|featuring|involving|of)|"
+    # "film met …", "movie about …", "serie over …", "show with …"
+    rf"{_MEDIA_NOUN}\s+{_MEDIA_PREP}\b|"
+    # "die film met", "that movie about", "deze serie over"
+    rf"(?:that|the|this|those|die|dat|deze|dit|een)\s+{_MEDIA_NOUN}"
+    rf"(?:\s+{_MEDIA_PREP})?\b|"
     r"about\s+(?:a|an|the)\b|"
     r"(?:where|in\s+which)\s+(?:a|an|the|he|she|they|someone|people)\b|"
     r"(?:boy|girl|man|woman|kid|child|teenager|wizard|detective|robot|alien|"
@@ -113,7 +138,7 @@ _DESCRIPTIVE_MARKERS = re.compile(
     r"who\s+(?:is|was|has|can|wears|lives)\b|"
     r"(?:based\s+on|remake\s+of|adaptation\s+of)\b|"
     r"(?:something|anything)\s+(?:like|about)\b|"
-    r"(?:that|the)\s+(?:one|movie|film|show|series)\s+(?:about|with|where)\b"
+    rf"(?:that|the)\s+(?:one|movie|film|show|series|serie)\s+{_MEDIA_PREP}\b"
     r")",
     re.I,
 )
@@ -123,6 +148,7 @@ _CATALOG_ID = re.compile(r"\btt\d{7,}|\btmdb:\d+|\btvdb:\d+", re.I)
 _URLISH = re.compile(r"https?://", re.I)
 _FUNCTION_WORDS = frozenset(
     {
+        # English
         "a",
         "an",
         "the",
@@ -157,10 +183,45 @@ _FUNCTION_WORDS = frozenset(
         "could",
         "would",
         "should",
+        # Dutch articles / demonstratives / light prepositions (house language)
+        "de",
+        "het",
+        "een",
+        "die",
+        "dat",
+        "deze",
+        "dit",
+        "met",
+        "van",
+        "voor",
+        "naar",
+        "bij",
+        "aan",
+        "uit",
+        "op",
+        "ik",
+        "je",
+        "jij",
+        "hij",
+        "zij",
+        "we",
+        "wij",
+        "ze",
+        "en",
+        "of",
+        "maar",
+        "moet",
+        "wil",
+        "kan",
+        "nog",
+        "nu",
+        "wat",
+        # Shared media tokens
         "movie",
         "film",
         "show",
         "series",
+        "serie",
         "tv",
     }
 )
@@ -219,7 +280,12 @@ def looks_like_collection_request(text: str) -> bool:
 
 
 def looks_like_descriptive_ask(text: str) -> bool:
-    """True for plot/character descriptions — not concrete catalog titles/links."""
+    """True for plot/character descriptions — not concrete catalog titles/links.
+
+    Language-agnostic bias: media noun + preposition (EN *with/about*, NL *met/over*,
+    …), long clauses that mention film/movie/serie, or enough function words.
+    Never hardcodes franchise titles — the model resolves those.
+    """
     raw = (text or "").strip()
     if not raw or len(raw) < 12 or len(raw) > 200:
         return False
@@ -234,8 +300,12 @@ def looks_like_descriptive_ask(text: str) -> bool:
     if _DESCRIPTIVE_MARKERS.search(raw):
         return True
     words = re.findall(r"[A-Za-zÀ-ÿ']+", raw)
+    lowered = [w.lower() for w in words]
+    # Long clause naming a media type (no year/imdb) → let the model resolve.
+    if len(words) >= 8 and any(w in _MEDIA_WORDS for w in lowered):
+        return True
     if len(words) >= 6:
-        function_hits = sum(1 for w in words if w.lower() in _FUNCTION_WORDS)
+        function_hits = sum(1 for w in lowered if w in _FUNCTION_WORDS)
         if function_hits >= 3:
             return True
     return False
