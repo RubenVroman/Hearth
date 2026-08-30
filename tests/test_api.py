@@ -76,6 +76,12 @@ def test_media_inventory_endpoint(client):
     assert status.json()["ha"]["apple_tv_entity"] == "media_player.apple_tv"
     assert status.json()["ha"]["apple_tv_player"] == "infuse"
 
+    network = client.get("/api/network")
+    assert network.status_code == 200
+    assert network.json()["key_media"]["avr"]["reachable"] is True
+    assert network.json()["key_media"]["tv"]["reachable"] is True
+    assert network.json()["key_media"]["apple_tv"]["reachable"] is True
+
 
 def test_plex_genre_library_endpoints(client):
     genres = client.get("/api/plex/genres")

@@ -330,6 +330,14 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         return f"Done{mock}: {entity} is {(data.get('entity') or {}).get('state', 'updated')}."
     if name == "house_media":
         return str(data.get("speak") or f"House media{mock}.")
+    if name == "house_network":
+        return str(data.get("speak") or f"House network{mock}: {data.get('health', 'unknown')}.")
+    if name == "media_activity":
+        return str(data.get("speak") or f"Media activity{mock}: {data.get('activity', 'done')}.")
+    if name == "ha_device_control":
+        state = data.get("state") or {}
+        label = (state.get("attributes") or {}).get("friendly_name") or data.get("entity_id")
+        return f"Done{mock}: {label or data.get('device')} is {state.get('state', 'updated')}."
     if name == "ha_media_control":
         spoken = data.get("speak")
         if spoken:
@@ -510,6 +518,18 @@ _INFUSE_TRANSPORT = re.compile(
 _MEDIA_STATUS = re.compile(
     r"\b(house media|media status|media inventory|what'?s on the (tv|avr|denon|apple\s*tv)|"
     r"is the (tv|avr|denon|apple\s*tv) on|avr status|tv status)\b",
+    re.I,
+)
+_NETWORK_STATUS = re.compile(
+    r"\b(network (?:status|inventory|devices?|connections?|health)|"
+    r"what(?:'s| is) (?:connected|on (?:the|my|our) network)|"
+    r"connected devices?|all (?:home assistant|house|network) (?:devices?|entities)|"
+    r"check (?:all )?(?:the )?(?:devices?|connections?))\b",
+    re.I,
+)
+_MEDIA_ACTIVITY = re.compile(
+    r"\b(?:watch|use|start|prepare|switch to)\s+(?:the\s+)?(apple\s*tv|atv|tv|television)\b"
+    r"|\b(?:turn|switch|power)\s+(?:the\s+)?(?:whole\s+)?(?:media|tv)\s+(chain\s+)?off\b",
     re.I,
 )
 _PLEX_CLIENTS = re.compile(
@@ -699,6 +719,18 @@ def route_intent(text: str) -> dict[str, Any] | None:
         if _MOVIE.search(raw):
             return {"tool": "radarr_add", "args": {"query": query or raw}}
         return {"tool": "overseerr_request", "args": {"query": query or raw}}
+    if _NETWORK_STATUS.search(raw):
+        return {"tool": "house_network", "args": {}}
+    activity = _MEDIA_ACTIVITY.search(raw)
+    if activity:
+        lower_activity = raw.lower()
+        if " off" in lower_activity:
+            target = "off"
+        elif "apple" in lower_activity or "atv" in lower_activity:
+            target = "apple_tv"
+        else:
+            target = "tv"
+        return {"tool": "media_activity", "args": {"activity": target}}
     transport = _infuse_transport_plan(raw)
     if transport:
         return transport
@@ -1021,8 +1053,10 @@ def _turn_plan(phrase: str, *, on: bool) -> dict[str, Any]:
             "tool": "ha_media_control",
             "args": {"device": device, "action": "turn_on" if on else "turn_off"},
         }
-    entity = _guess_entity(cleaned, on=on)
-    return {"tool": "ha_call_service", "args": entity}
+    return {
+        "tool": "ha_device_control",
+        "args": {"device": cleaned, "action": "turn_on" if on else "turn_off"},
+    }
 
 
 def _guess_entity(phrase: str, *, on: bool) -> dict[str, Any]:

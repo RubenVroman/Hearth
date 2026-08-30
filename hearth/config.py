@@ -76,6 +76,20 @@ class Settings(BaseSettings):
         default="media_player.apple_tv",
         alias="HA_APPLE_TV_ENTITY",
     )
+    # Live HA calls are retried and writes are verified. These deliberately live
+    # in Hearth rather than relying only on TCP retries: an accepted service call
+    # can still leave a slow TV/receiver in the old state for a few seconds.
+    ha_request_retries: int = Field(default=3, alias="HA_REQUEST_RETRIES")
+    ha_retry_base_seconds: float = Field(default=0.25, alias="HA_RETRY_BASE_SECONDS")
+    ha_verify_timeout_seconds: float = Field(default=6.0, alias="HA_VERIFY_TIMEOUT_SECONDS")
+    ha_verify_poll_interval: float = Field(default=0.4, alias="HA_VERIFY_POLL_INTERVAL")
+    ha_entity_cache_seconds: float = Field(default=45.0, alias="HA_ENTITY_CACHE_SECONDS")
+    # The Denon is the switching/audio hub. Activity commands wake the chain in
+    # order and route its input before playback is sent to the Apple TV.
+    receiver_centric: bool = Field(default=True, alias="HEARTH_RECEIVER_CENTRIC")
+    ha_avr_apple_tv_source: str = Field(default="Media Player", alias="HA_AVR_APPLE_TV_SOURCE")
+    ha_avr_tv_source: str = Field(default="TV Audio", alias="HA_AVR_TV_SOURCE")
+    ha_media_settle_seconds: float = Field(default=0.5, alias="HA_MEDIA_SETTLE_SECONDS")
     # Prefer Infuse (Firecore) over the Plex tvOS app when playing on Apple TV.
     # Set to "plex" to keep the Plex-client playMedia path as the default.
     apple_tv_player: str = Field(default="infuse", alias="HEARTH_APPLE_TV_PLAYER")

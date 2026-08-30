@@ -3,19 +3,19 @@ from __future__ import annotations
 from typing import Any
 
 from hearth.agent.registry import ToolSpec, registry
+from hearth.memory.tools import register_memory_tools
 from hearth.tools import files as workspace_files
 from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.cos import cos_configured, escalate, not_configured_message
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.infuse import infuse
-from hearth.tools.media import house_media_inventory, media_control
+from hearth.tools.media import house_media_inventory, media_activity, media_control
 from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
 from hearth.tools.thuisbezorgd import thuisbezorgd
 from hearth.tools.weather import fetch_weather
 from hearth.tools.websearch import web_search
-from hearth.memory.tools import register_memory_tools
 
 
 async def _ha_list(args: dict[str, Any]) -> dict[str, Any]:
@@ -41,6 +41,31 @@ async def _ha_call(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _house_media(_args: dict[str, Any]) -> dict[str, Any]:
     return await house_media_inventory()
+
+
+async def _house_network(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        limit = int(args.get("limit") or 250)
+    except (TypeError, ValueError):
+        limit = 250
+    return await ha.network_inventory(limit=limit)
+
+
+async def _ha_device_control(args: dict[str, Any]) -> dict[str, Any]:
+    device = str(args.get("device") or "")
+    action = str(args.get("action") or "")
+    if not device or not action:
+        return {"ok": False, "error": "device and action required"}
+    return await ha.control_entity(
+        device,
+        action,
+        domain=str(args.get("domain") or "") or None,
+        value=args.get("value"),
+    )
+
+
+async def _media_activity(args: dict[str, Any]) -> dict[str, Any]:
+    return await media_activity(str(args.get("activity") or ""))
 
 
 async def _ha_media(args: dict[str, Any]) -> dict[str, Any]:
@@ -463,6 +488,77 @@ def register_builtin_tools() -> None:
             ),
             parameters={"type": "object", "properties": {}},
             handler=_house_media,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_network",
+            description=(
+                "Inventory every entity Home Assistant currently represents on the house network, "
+                "including reachability, unavailable devices, controllable domains, and dedicated "
+                "Denon/LG/Apple TV connection checks. Use for network/device/connectivity audits."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum entity rows to return (summary always covers all).",
+                    }
+                },
+            },
+            handler=_house_network,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="ha_device_control",
+            description=(
+                "Resolve any routine Home Assistant device by entity id or friendly name and control "
+                "it. Supports lights, switches, fans, covers, climate, media, remotes, scenes, "
+                "scripts, buttons and vacuums. Never guess an entity id; ambiguous names are returned."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "device": {"type": "string", "description": "Friendly name or entity_id."},
+                    "action": {
+                        "type": "string",
+                        "description": (
+                            "turn_on, turn_off, toggle, brightness, open, close, stop, "
+                            "set_temperature, set_percentage, activate, press, start, return_to_base"
+                        ),
+                    },
+                    "domain": {"type": "string", "description": "Optional domain disambiguation."},
+                    "value": {
+                        "type": "number",
+                        "description": "Optional brightness %, temperature, or fan percentage.",
+                    },
+                },
+                "required": ["device", "action"],
+            },
+            handler=_ha_device_control,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="media_activity",
+            description=(
+                "Prepare or stop the receiver-centric living-room chain. apple_tv wakes Denon, LG, "
+                "selects the Denon Apple TV input, then wakes Apple TV; tv selects TV Audio; off "
+                "powers Apple TV, LG, then Denon down. Runs immediately."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "activity": {
+                        "type": "string",
+                        "enum": ["apple_tv", "tv", "off"],
+                    }
+                },
+                "required": ["activity"],
+            },
+            handler=_media_activity,
         )
     )
     registry.register(

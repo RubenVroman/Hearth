@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from hearth.config import settings
@@ -46,10 +47,12 @@ def _pipeline_status() -> dict[str, Any]:
 
 async def house_media_inventory() -> dict[str, Any]:
     """Single snapshot: LG TV, Denon AVR, Apple TV, Plex now-playing, backend wiring."""
-    tv = await ha.resolve_device_state("tv")
-    avr = await ha.resolve_device_state("avr")
-    apple_tv = await ha.resolve_device_state("apple_tv")
-    playing = await plex.now_playing()
+    tv, avr, apple_tv, playing = await asyncio.gather(
+        ha.resolve_device_state("tv"),
+        ha.resolve_device_state("avr"),
+        ha.resolve_device_state("apple_tv"),
+        plex.now_playing(),
+    )
     sessions = playing.get("sessions") or []
 
     tv_state = tv.get("state") if tv.get("ok") else None
@@ -136,7 +139,23 @@ async def media_control(
     media_content_type: str | None = None,
     is_volume_muted: bool | None = None,
 ) -> dict[str, Any]:
-    role = _device_role(device)
+    requested_role = _device_role(device)
+    role = requested_role
+    volume_actions = {
+        "volume",
+        "volume_set",
+        "set_volume",
+        "volume_mute",
+        "mute",
+        "volume_unmute",
+        "unmute",
+        "volume_up",
+        "volume_down",
+    }
+    # The Denon owns living-room audio. Route TV/Apple-TV volume commands to it
+    # so a natural "turn the TV down" does not hit a disabled television output.
+    if settings.receiver_centric and role in {"tv", "apple_tv"} and action.lower() in volume_actions:
+        role = "avr"
     result = await ha.media_control(
         role,
         action,
@@ -147,17 +166,35 @@ async def media_control(
         is_volume_muted=is_volume_muted,
     )
     state = result.get("state")
-    role = _device_role(device)
-    if role == "apple_tv":
+    if requested_role == "apple_tv":
         label = "Apple TV"
-    elif role == "tv":
+    elif requested_role == "tv":
         label = "LG webOS TV"
     else:
         label = "Denon AVR"
-    result["device"] = role
+    result["device"] = requested_role
+    if role != requested_role:
+        result["routed_via"] = "avr"
+        result["controlled_entity_id"] = result.get("entity_id")
     result["speak"] = speak_player(state, label=label) if state else (
         f"{label}: {action} via {result.get('entity_id')}."
         if result.get("ok")
         else str(result.get("error") or f"{label} control failed.")
     )
     return result
+
+
+async def media_activity(activity: str) -> dict[str, Any]:
+    """Receiver-aware living-room activities used by voice and playback."""
+    key = (activity or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if key in {"off", "power_off", "all_off", "good_night"}:
+        return await ha.power_off_media_path()
+    if key in {"apple_tv", "appletv", "atv", "infuse", "watch_apple_tv"}:
+        return await ha.activate_media_path("apple_tv")
+    if key in {"tv", "watch_tv", "television", "lg"}:
+        return await ha.activate_media_path("tv")
+    return {
+        "ok": False,
+        "error": "activity must be apple_tv, tv, or off",
+        "speak": "I can prepare Apple TV, television, or turn the media chain off.",
+    }

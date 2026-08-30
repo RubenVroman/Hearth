@@ -7,6 +7,8 @@
 #
 # HA is the device layer. Hearth talks to HA over the REST API; it does not
 # speak webOS, Denon, or Infuse protocol itself. Infuse launches as:
+# The compose service uses host networking so HA's zeroconf/SSDP discovery can
+# actually receive Apple TV, webOS, Denon/HEOS, Cast and other LAN broadcasts.
 #   media_player.play_media
 #     media_content_type: url
 #     media_content_id: infuse://movie/{tmdb_id}?play

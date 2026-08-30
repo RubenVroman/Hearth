@@ -19,21 +19,23 @@ from hearth.auth.gate import http_authorized, is_public_path, ws_authorized
 from hearth.auth.routers import auth_router
 from hearth.config import settings
 from hearth.memory.prune import prune_loop
-from hearth.memory.retrieve import search as memory_search, status_snapshot as memory_status_snapshot
-from hearth.memory.store import export_snapshot, forget as memory_forget_row, init_memory_db, remember_preference
+from hearth.memory.retrieve import search as memory_search
+from hearth.memory.retrieve import status_snapshot as memory_status_snapshot
+from hearth.memory.store import export_snapshot, init_memory_db, remember_preference
+from hearth.memory.store import forget as memory_forget_row
 from hearth.memory.tools import register_memory_tools
 from hearth.runtime import runtime
-from hearth.tools.builtin import register_builtin_tools
+from hearth.telegram import telegram_inbox
 from hearth.tools.arr import overseerr, radarr, sonarr
+from hearth.tools.builtin import register_builtin_tools
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
 from hearth.tools.thuisbezorgd import thuisbezorgd
 from hearth.tools.websearch import selected_backend as web_search_backend
-from hearth.telegram import telegram_inbox
-from hearth.voice.gateway import voice_socket
 from hearth.voice import webrtc as realtime_rtc
+from hearth.voice.gateway import voice_socket
 
 UI_DIR = Path(__file__).parent / "ui" / "static"
 _agent = AgentLoop()
@@ -131,6 +133,7 @@ async def status() -> dict[str, Any]:
             "client_secrets": "/api/realtime/client_secrets",
         },
         "ha": {
+            **ha.diagnostics(),
             **ha_ping,
             "tv_entity": settings.ha_tv_entity,
             "avr_entity": settings.ha_avr_entity,
@@ -183,6 +186,12 @@ async def plex_library_by_genre(
 async def media_inventory() -> dict[str, Any]:
     """TV + AVR + Apple TV (HA) + Plex — speakable house media snapshot."""
     return await house_media_inventory()
+
+
+@app.get("/api/network")
+async def network_inventory(limit: int = Query(default=250, ge=1, le=1000)) -> dict[str, Any]:
+    """All HA-represented network entities plus reachability and key media links."""
+    return await ha.network_inventory(limit=limit)
 
 
 @app.get("/api/rooms")

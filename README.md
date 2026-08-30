@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Lights/AVR/TV/Apple TV via HA, Infuse play on ATV, *arr/Overseerr grab/request, Telegram drop-group inbox, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, Infuse play on ATV, *arr/Overseerr grab/request, Telegram drop-group inbox, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -77,11 +77,15 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `OPENAI_API_KEY` | **Live** text agent (chat completions + tools) and GA Realtime WebRTC voice. Also the default backend for the `web_search` house tool (Responses API hosted web search). Empty → local intent router + text fallback on `/ws/voice`. |
 | `OPENAI_MODEL` | Chat model. Default `gpt-4o-mini`. Also used for OpenAI-backed `web_search`. |
 | `OPENAI_REALTIME_MODEL` | Conversational Realtime model. Default `gpt-realtime-2.1` (ChatGPT-app equivalent). |
-| `HA_URL` | Default `http://homeassistant:8123` (compose DNS). |
+| `HA_URL` | Default `http://host.docker.internal:8123`; HA uses host networking for LAN mDNS/SSDP discovery. |
 | `HA_TOKEN` | **Live** HA REST. Empty → mocked lights/scenes/Denon/LG. |
 | `HA_TV_ENTITY` | LG webOS `media_player` entity_id. Default `media_player.lg_webos_tv`. Set after HA pairing if different. |
 | `HA_AVR_ENTITY` | Denon AVR entity_id. Default `media_player.denon_avr_x3700h`. |
 | `HA_APPLE_TV_ENTITY` | Apple TV `media_player` (HA apple_tv / pyatv). Default `media_player.apple_tv`. Required for Infuse. |
+| `HA_REQUEST_RETRIES` / `HA_RETRY_BASE_SECONDS` | Transient HA retry policy. Defaults `3` / `0.25`. Transport failures force a fresh connection. |
+| `HA_VERIFY_TIMEOUT_SECONDS` / `HA_VERIFY_POLL_INTERVAL` | Observe device state after writes instead of trusting HTTP acceptance alone. Defaults `6` / `0.4`. |
+| `HEARTH_RECEIVER_CENTRIC` | Default `true`. Media activities route through the Denon; TV/Apple-TV volume requests control the receiver. |
+| `HA_AVR_APPLE_TV_SOURCE` / `HA_AVR_TV_SOURCE` | Denon source names for the Apple TV and TV Audio activities. Defaults `Media Player` / `TV Audio`. |
 | `HEARTH_APPLE_TV_PLAYER` | `infuse` (default) or `plex`. Prefer Infuse over the Plex tvOS app for Apple TV. |
 | `INFUSE_APP_ID` | Optional Infuse bundle id. Default `com.firecore.infuse`. |
 | `PLEX_URL` | Existing Plex on the host. Default `http://host.docker.internal:32400`. |
@@ -104,7 +108,7 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HEARTH_COS_REPO` | Default `RubenVroman/Hearth`. |
 | `DOCKER_SOCKET` | Read-only socket is mounted. If missing → mocked container list (plex/sonarr/…/gluetun). |
 | `WORKSPACE_PATH` | Inside the container, `/app/workspace`. |
-| `HEARTH_MOCK_IF_UNCONFIGURED` | Default `true`. If a live call fails, fall back to fixtures instead of dying. |
+| `HEARTH_MOCK_IF_UNCONFIGURED` | Default `true`. Fixtures are used only when a backend is unconfigured. A configured live HA failure is never turned into fake success. |
 | `APP_SECRET_KEY` | Required to sign JWTs. Empty → nobody can log in. |
 | `HEARTH_ADMIN_EMAIL` / `HEARTH_ADMIN_PASSWORD` | Bootstrap first superuser if the users table is empty. Leave empty after that. |
 | `HEARTH_TOKEN` | Optional **machine** bypass (`X-Hearth-Token` header). Not a browser login. |
@@ -153,7 +157,10 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 **Do it yourself**
 
 - Lights, scenes → Home Assistant tools
+- Everything HA represents on the house network → `house_network` / `GET /api/network`; reports reachability, unavailable entities, domains, and explicit Denon/LG/Apple TV links
+- Any routine HA entity by friendly name → `ha_device_control` (lights, switches, fans, covers, climate, scenes, scripts, buttons, vacuums); ambiguous matches are returned instead of guessed
 - LG TV / Denon AVR / Apple TV power, volume, source, transport → `ha_media_control` (prefer over raw `ha_call_service`)
+- Receiver-centric “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; orders Denon → LG → Denon source → Apple TV and reports every failed step
 - House media snapshot (TV + AVR + Apple TV + Plex) → `house_media` or `GET /api/media`
 - What's playing on Plex → `plex_now_playing` (Infuse has **no** now-playing API)
 - Browse Plex library **by genre** (Animation, Comedy, …) → `plex_browse_genre` / `GET /api/plex/library?genre=Animation`. Speakable count + short title list. `GET /api/plex/genres` lists genres.
@@ -245,6 +252,11 @@ Gated APIs: `GET /api/memory`, `GET /api/memory/search`, `POST /api/memory/remem
 Empty `./data` → boot runs `init_memory_db()` and creates schema v1. Re-running is idempotent. Later bumps are numbered SQL in `hearth/memory/store.py` (`SCHEMA_VERSION` / `_MIGRATIONS`). No manual migration step on first deploy.
 
 ## Infuse on Apple TV
+
+Before every Infuse launch, Hearth prepares the receiver-centric media path. It retries transient
+Home Assistant failures, reconnects stale HTTP sockets, and verifies device state after accepted
+writes. If HA is configured but offline, Hearth reports the real failure; it never mutates fixtures
+and claims the living room changed.
 
 Ruben plays movies on the living-room **Apple TV in Infuse** (Firecore), not the Plex tvOS app. Plex `/clients` is often empty because Infuse is the player — so Hearth’s default Apple TV path is Infuse.
 

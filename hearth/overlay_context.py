@@ -37,6 +37,7 @@ _KIND_TOOLS: dict[str, frozenset[str]] = {
             "infuse_play",
             "infuse_transport",
             "house_media",
+            "media_activity",
         }
     ),
     "downloads": frozenset({"radarr_queue", "sonarr_queue"}),

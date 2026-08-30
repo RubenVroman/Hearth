@@ -14,10 +14,22 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       OPENAI_REALTIME_MODEL: ${OPENAI_REALTIME_MODEL:-gpt-realtime-2.1}
-      HA_URL: ${HA_URL:-http://homeassistant:8123}
+      # HA uses host networking so mDNS/SSDP can reliably see Apple TV, webOS,
+      # Denon/HEOS, Cast and other LAN devices. Hearth reaches it through the host.
+      HA_URL: ${HA_URL:-http://host.docker.internal:8123}
       HA_TOKEN: ${HA_TOKEN:-}
       HA_TV_ENTITY: ${HA_TV_ENTITY:-media_player.lg_webos_tv}
       HA_AVR_ENTITY: ${HA_AVR_ENTITY:-media_player.denon_avr_x3700h}
+      HA_APPLE_TV_ENTITY: ${HA_APPLE_TV_ENTITY:-media_player.apple_tv}
+      HA_REQUEST_RETRIES: ${HA_REQUEST_RETRIES:-3}
+      HA_RETRY_BASE_SECONDS: ${HA_RETRY_BASE_SECONDS:-0.25}
+      HA_VERIFY_TIMEOUT_SECONDS: ${HA_VERIFY_TIMEOUT_SECONDS:-6}
+      HA_VERIFY_POLL_INTERVAL: ${HA_VERIFY_POLL_INTERVAL:-0.4}
+      HA_ENTITY_CACHE_SECONDS: ${HA_ENTITY_CACHE_SECONDS:-45}
+      HEARTH_RECEIVER_CENTRIC: ${HEARTH_RECEIVER_CENTRIC:-true}
+      HA_AVR_APPLE_TV_SOURCE: ${HA_AVR_APPLE_TV_SOURCE:-Media Player}
+      HA_AVR_TV_SOURCE: ${HA_AVR_TV_SOURCE:-TV Audio}
+      HA_MEDIA_SETTLE_SECONDS: ${HA_MEDIA_SETTLE_SECONDS:-0.5}
       PLEX_URL: ${PLEX_URL:-http://host.docker.internal:32400}
       PLEX_TOKEN: ${PLEX_TOKEN:-}
       PLEX_DEFAULT_PLAYER: ${PLEX_DEFAULT_PLAYER:-}
@@ -83,22 +95,15 @@ services:
     image: homeassistant/home-assistant:stable
     container_name: hearth-ha
     restart: unless-stopped
-    # HA is the device layer (lights, Denon AVR-X3700H, LG webOS). This service
-    # is included unconfigured — complete onboarding on :8123 from LAN/Tailscale.
-    ports:
-      - "${HA_BIND:-0.0.0.0}:8123:8123"
+    # Host networking is required for dependable mDNS/SSDP discovery and local
+    # control of Apple TV, LG webOS, Denon/HEOS, Cast, Matter bridges, etc.
+    # Port 8123 is therefore exposed directly by HA on the NAS LAN/Tailscale.
+    network_mode: host
     volumes:
       - ./ha:/config
       - /etc/localtime:/etc/localtime:ro
     environment:
       TZ: ${TZ:-Europe/Brussels}
-    # For mDNS / Cast / HDMI-CEC discovery on the LAN, DSM Container Manager
-    # can use host networking. If you switch this on, comment out `ports:`
-    # and `networks:` for this service and set HA_URL=http://127.0.0.1:8123
-    # from hearth via host.docker.internal:8123 instead.
-    # network_mode: host
-    networks:
-      - hearth
     mem_limit: 1g
 
 networks:

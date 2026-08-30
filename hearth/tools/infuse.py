@@ -185,16 +185,17 @@ class Infuse:
         item = plan.get("item") or {}
         title = item.get("title") or query or f"TMDB {plan.get('tmdbId')}"
 
-        result = await ha.call_service(
-            "media_player",
+        # Wake and route Denon → LG → Apple TV before sending the deep link.
+        # A partial activity does not suppress play_media: that command may wake
+        # the Apple TV through CEC even when a preceding state check was stale.
+        activity = await ha.activate_media_path("apple_tv")
+        result = await ha.media_control(
+            "apple_tv",
             "play_media",
-            entity_id,
-            {
-                "media_content_id": deep_link,
-                "media_content_type": "url",
-            },
+            media_content_id=deep_link,
+            media_content_type="url",
         )
-        if result.get("ok") is False and not settings.mock_if_unconfigured:
+        if result.get("ok") is False:
             return {
                 "ok": False,
                 "mode": result.get("mode"),
@@ -202,6 +203,7 @@ class Infuse:
                 "item": item,
                 "deep_link": deep_link,
                 "entity_id": entity_id,
+                "activity": activity,
                 "speak": (
                     f"Couldn't open Infuse on the Apple TV: {result.get('error')}. "
                     "Check HA_APPLE_TV_ENTITY and that the Apple TV is awake."
@@ -221,6 +223,7 @@ class Infuse:
             "tmdb_source": plan.get("tmdb_source"),
             "deep_link": deep_link,
             "entity_id": entity_id,
+            "activity": activity,
             "result": result,
             "speak": speak,
         }
@@ -261,7 +264,7 @@ class Infuse:
             }
 
         entity_id = str(atv.get("entity_id") or settings.ha_apple_tv_entity)
-        result = await ha.call_service("media_player", service, entity_id)
+        result = await ha.media_control("apple_tv", service)
         label = {
             "media_play": "Playing",
             "media_pause": "Paused",

@@ -45,6 +45,84 @@ async def test_ha_call_service_turn_on():
     assert state.data["state"]["state"] == "on"
 
 
+async def test_house_network_inventory_checks_media_and_every_entity():
+    result = await registry.call("house_network", {})
+    assert result.ok
+    assert result.data["total"] >= 8
+    assert result.data["reachable"] == result.data["total"]
+    assert result.data["key_media"]["avr"]["reachable"] is True
+    assert result.data["key_media"]["tv"]["reachable"] is True
+    assert result.data["key_media"]["apple_tv"]["reachable"] is True
+    assert "media_player" in result.data["domains"]
+
+
+async def test_smart_device_control_resolves_friendly_name():
+    result = await registry.call(
+        "ha_device_control",
+        {"device": "Living room", "domain": "light", "action": "turn_off"},
+    )
+    assert result.ok
+    assert result.data["entity_id"] == "light.living_room"
+    assert result.data["state"]["state"] == "off"
+
+
+async def test_receiver_activity_prepares_whole_apple_tv_path():
+    result = await registry.call("media_activity", {"activity": "apple_tv"})
+    assert result.ok
+    assert result.data["receiver_centric"] is True
+    assert result.data["failed_steps"] == 0
+    services = [step.get("service") for step in result.data["steps"]]
+    assert services[:2] == ["media_player.turn_on", "media_player.turn_on"]
+    assert "media_player.select_source" in services
+    assert services[-1] == "media_player.turn_on"
+
+
+async def test_tv_volume_routes_to_receiver_in_receiver_centric_mode():
+    result = await registry.call(
+        "ha_media_control",
+        {"device": "tv", "action": "volume_set", "volume_level": 37},
+    )
+    assert result.ok
+    assert result.data["device"] == "tv"
+    assert result.data["routed_via"] == "avr"
+    assert result.data["controlled_entity_id"] == "media_player.denon_avr_x3700h"
+    assert result.data["state"]["attributes"]["volume_level"] == 0.37
+
+
+async def test_live_ha_failure_never_falls_back_to_mock(monkeypatch):
+    import httpx
+
+    from hearth.config import settings
+    from hearth.tools.ha import ha as ha_client
+
+    class OfflineClient:
+        async def post(self, _path, json=None):
+            raise httpx.ConnectError("receiver network unavailable")
+
+        async def get(self, _path):
+            raise httpx.ConnectError("receiver network unavailable")
+
+        async def aclose(self):
+            return None
+
+    offline = OfflineClient()
+
+    async def _offline_http():
+        return offline
+
+    monkeypatch.setattr(settings, "ha_token", "configured-live-token")
+    monkeypatch.setattr(settings, "ha_request_retries", 2)
+    monkeypatch.setattr(settings, "ha_retry_base_seconds", 0)
+    monkeypatch.setattr(ha_client, "_http", _offline_http)
+    result = await ha_client.call_service(
+        "media_player", "turn_on", "media_player.denon_avr_x3700h"
+    )
+    assert result["ok"] is False
+    assert result["mode"] == "live"
+    assert "network unavailable" in result["error"]
+    assert "entity" not in result
+
+
 async def test_workspace_blocks_path_escape(isolated_workspace):
     try:
         workspace_files.safe_path("../etc/passwd")
@@ -354,6 +432,16 @@ async def test_intent_avr_volume_and_house_media():
     assert vol["args"]["volume_level"] == 25
     assert route_intent("media status")["tool"] == "house_media"
     assert route_intent("is the TV on")["tool"] == "house_media"
+
+
+async def test_intent_network_inventory_and_receiver_activities():
+    assert route_intent("what is connected to my network")["tool"] == "house_network"
+    watch = route_intent("prepare the Apple TV")
+    assert watch["tool"] == "media_activity"
+    assert watch["args"]["activity"] == "apple_tv"
+    off = route_intent("turn the media chain off")
+    assert off["tool"] == "media_activity"
+    assert off["args"]["activity"] == "off"
 
 
 async def test_intent_mute_avr():

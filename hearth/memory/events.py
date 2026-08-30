@@ -14,6 +14,9 @@ from hearth.memory.redact import redact, redact_obj
 # Read/search tools are not house history. Memory tools would recurse.
 _NOTABLE = {
     "ha_call_service",
+    "ha_device_control",
+    "ha_media_control",
+    "media_activity",
     "radarr_add",
     "sonarr_add",
     "overseerr_request",
