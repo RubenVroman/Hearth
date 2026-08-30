@@ -1,4 +1,9 @@
-"""Progress status posts for titles queued by the Telegram inbox."""
+"""Progress status posts for titles queued by the Telegram inbox.
+
+Quiet policy: one early "started and healthy" ping once a download reaches
+~START_THRESHOLD percent, then silence until done / failed (or a manual
+status ask via radarr_queue / sonarr_queue elsewhere).
+"""
 
 from __future__ import annotations
 
@@ -11,7 +16,9 @@ from hearth.tools.arr import radarr, sonarr
 
 log = logging.getLogger("hearth.telegram")
 
-MILESTONES = (0, 25, 50, 75, 100)
+# Early healthy-start signal. Small threshold so we know the grab is moving
+# without spamming later percent ticks (10%, 25%, …).
+START_THRESHOLD = 5.0
 
 
 @dataclass
@@ -21,7 +28,6 @@ class TrackedGrab:
     service: str  # radarr | sonarr
     year: int | None = None
     started_at: float = field(default_factory=time.monotonic)
-    last_percent_bucket: int = -1
     last_status: str = ""
     announce_started: bool = False
     done: bool = False
@@ -80,15 +86,10 @@ def format_rate_limited() -> str:
     return "Too many requests in this group — try again in a minute."
 
 
-def percent_bucket(percent: float | None) -> int:
-    if percent is None:
-        return 0
-    value = float(percent)
-    chosen = 0
-    for mark in MILESTONES:
-        if value >= mark:
-            chosen = mark
-    return chosen
+def _as_percent(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 class ProgressTracker:
@@ -118,6 +119,7 @@ class ProgressTracker:
         send: Callable[[int, str], Awaitable[Any]],
         *,
         max_age_s: float = 6 * 3600,
+        start_threshold: float = START_THRESHOLD,
     ) -> None:
         now = time.monotonic()
         for item in list(self.active):
@@ -133,13 +135,14 @@ class ProgressTracker:
             downloads = payload.get("downloads") or []
             if not downloads:
                 # Not in queue anymore — treat as imported / done after we had progress.
-                if item.announce_started or item.last_percent_bucket >= 25:
+                if item.announce_started or item.last_status:
                     await send(item.chat_id, format_done(item.title))
                     item.done = True
                 continue
             row = downloads[0]
             status = str(row.get("status") or "unknown")
-            percent = row.get("percent")
+            percent = _as_percent(row.get("percent"))
+            item.last_status = status
             if status == "failed":
                 await send(item.chat_id, format_failed(item.title))
                 item.done = True
@@ -148,23 +151,8 @@ class ProgressTracker:
                 await send(item.chat_id, format_done(item.title))
                 item.done = True
                 continue
-            bucket = percent_bucket(percent if isinstance(percent, (int, float)) else None)
+            # One early healthy-start ping at ~threshold; no later percent spam.
             if not item.announce_started:
-                await send(
-                    item.chat_id,
-                    format_downloading(
-                        item.title,
-                        float(percent) if isinstance(percent, (int, float)) else None,
-                    ),
-                )
-                item.announce_started = True
-                item.last_percent_bucket = bucket
-                item.last_status = status
-                continue
-            if bucket > item.last_percent_bucket and bucket in {25, 50, 75}:
-                await send(
-                    item.chat_id,
-                    format_downloading(item.title, float(bucket)),
-                )
-                item.last_percent_bucket = bucket
-            item.last_status = status
+                if percent is not None and percent >= start_threshold:
+                    await send(item.chat_id, format_downloading(item.title, percent))
+                    item.announce_started = True
