@@ -230,6 +230,15 @@ input,
   padding-top: 12px;
 }
 
+/* Desktop: wrapper is transparent so orb stays in the hearth column. */
+.hearth-hero {
+  display: contents;
+}
+
+.phone-rest-anchor {
+  display: none;
+}
+
 .orb {
   position: relative;
   width: var(--orb-size);
@@ -783,17 +792,32 @@ input,
   body.app {
     display: flex;
     flex-direction: column;
-    height: 100dvh;
-    max-height: 100dvh;
-    overflow: hidden;
+    position: relative;
+    height: auto;
+    max-height: none;
+    min-height: 100dvh;
+    overflow-x: hidden;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
 
+  /*
+   * First phone screen is the listening sphere alone. Brand / Look / Log out
+   * sit at the start of the second screen (scroll down), not over the orb.
+   */
   .top {
+    position: absolute;
+    top: 100dvh;
+    top: 100svh;
+    left: 0;
+    right: 0;
+    z-index: 40;
     flex-shrink: 0;
     flex-wrap: nowrap;
     gap: 8px;
     align-items: center;
-    padding: calc(8px + var(--safe-top)) max(16px, var(--safe-right)) 4px max(16px, var(--safe-left));
+    padding: calc(8px + var(--safe-top)) max(16px, var(--safe-right)) 8px max(16px, var(--safe-left));
+    background: linear-gradient(180deg, var(--bg) 70%, transparent);
   }
 
   .mark {
@@ -823,21 +847,19 @@ input,
   .stage {
     display: flex;
     flex-direction: column;
-    flex: 1;
+    flex: 0 0 auto;
     min-height: 0;
     width: 100%;
-    overflow-x: hidden;
-    overflow-y: auto;
-    -webkit-overflow-scrolling: touch;
+    overflow: visible;
     gap: 10px;
-    padding: 0 max(16px, var(--safe-right)) calc(var(--dock-space) + var(--keyboard-inset)) max(16px, var(--safe-left));
+    padding: 0 max(16px, var(--safe-right)) calc(20px + var(--safe-bottom)) max(16px, var(--safe-left));
     grid-template-columns: none;
     grid-template-areas: none;
   }
 
   .hearth {
     order: 1;
-    flex: 1 0 auto;
+    flex: 0 0 auto;
     width: 100%;
     min-width: 0;
     min-height: 0;
@@ -846,17 +868,34 @@ input,
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
     padding-top: 0;
+    gap: 12px;
   }
 
-  /* Idle phone: orb owns the first screen. When conversation or house rails
-     appear, share leftover column space — never shrink below the orb. */
-  .stage:not(:has(#transcript:not(.is-empty))):not(:has(#rail-media:not(.is-empty))):not(
-      :has(#rail-rooms:not(.is-empty))
-    )
-    .hearth {
-    min-height: 100%;
+  /* Full first viewport: sphere only, centered. Scroll for the rest. */
+  .hearth-hero {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 100vw;
+    max-width: 100vw;
+    margin-left: calc(-1 * max(16px, var(--safe-left)));
+    margin-right: calc(-1 * max(16px, var(--safe-right)));
+    min-height: 100dvh;
+    min-height: 100svh;
+    padding: var(--safe-top) 0 var(--safe-bottom);
+    box-sizing: border-box;
+  }
+
+  /* Reserve room under the fold for the absolute .top bar at 100dvh. */
+  .phone-rest-anchor {
+    display: block;
+    flex-shrink: 0;
+    width: 100%;
+    height: calc(44px + var(--safe-top));
   }
 
   .orb {
@@ -923,12 +962,13 @@ input,
     white-space: nowrap;
   }
 
+  /* Orb label already says Tap to talk — keep hint with the scrolled chrome. */
   .hint {
     position: static;
     left: auto;
     top: auto;
     transform: none;
-    margin: 8px 0 0;
+    margin: 0;
     font-size: 13px;
     max-width: 100%;
     width: 100%;
@@ -937,10 +977,21 @@ input,
   }
 
   .mic-panel {
-    width: 100%;
-    margin: 10px 0 0;
+    width: min(420px, calc(100% - 8px));
+    margin: 0;
     padding: 14px 16px 12px;
     border-radius: 16px;
+  }
+
+  /* Permission copy may appear while still on the orb screen — overlay, don't push the sphere. */
+  .mic-panel:not(.hidden) {
+    position: fixed;
+    left: max(16px, var(--safe-left));
+    right: max(16px, var(--safe-right));
+    bottom: max(24px, calc(16px + var(--safe-bottom)));
+    z-index: 45;
+    width: auto;
+    margin: 0;
   }
 
   .mic-panel-title {
@@ -960,18 +1011,17 @@ input,
   }
 
   .widget-stack {
-    position: fixed;
-    left: max(16px, var(--safe-left));
-    right: max(16px, var(--safe-right));
-    bottom: calc(var(--dock-space) + var(--keyboard-inset) + 10px);
-    width: auto;
-    max-width: none;
+    position: relative;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    width: 100%;
+    max-width: min(360px, 100%);
     margin: 0;
-    z-index: 28;
-    max-height: min(36vh, 280px);
-    overflow-y: auto;
-    -webkit-overflow-scrolling: touch;
-    pointer-events: none;
+    z-index: 4;
+    max-height: none;
+    overflow: visible;
+    pointer-events: auto;
   }
 
   .widget-stack > .widget {
@@ -992,31 +1042,33 @@ input,
     min-height: 44px;
   }
 
+  /* Composer lives in the scroll flow under the orb — not pinned over it. */
   .composer-dock {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: var(--keyboard-inset);
-    z-index: 30;
+    position: relative;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    z-index: 5;
     width: 100%;
     max-width: none;
     align-items: stretch;
-    /* Ask the House hugs the bottom; confirm (when shown) stacks above it. */
-    padding: 0 max(16px, var(--safe-right)) var(--dock-safe-bottom) max(16px, var(--safe-left));
-    background: var(--bg);
+    padding: 0;
+    background: transparent;
     transform: none;
     min-height: 0;
   }
 
   .composer-dock::before {
-    content: "";
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 100%;
-    height: 20px;
-    pointer-events: none;
-    background: linear-gradient(180deg, transparent, var(--bg));
+    display: none;
+  }
+
+  /* While typing, keep Ask the House above the keyboard without covering the idle orb screen. */
+  .composer-dock:focus-within {
+    position: sticky;
+    bottom: var(--keyboard-inset);
+    z-index: 30;
+    padding: 8px 0 var(--dock-safe-bottom);
+    background: var(--bg);
   }
 
   .composer-dock .composer {

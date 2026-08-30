@@ -61,12 +61,15 @@
       </aside>
 
       <section class="hearth">
-        <audio id="remote-audio" autoplay playsinline></audio>
-        <button type="button" id="orb" class="orb" aria-label="Tap to talk">
-          <span class="orb-ring"></span>
-          <span class="orb-core"></span>
-          <span class="orb-label" id="orb-label">Tap to talk</span>
-        </button>
+        <div class="hearth-hero">
+          <audio id="remote-audio" autoplay playsinline></audio>
+          <button type="button" id="orb" class="orb" aria-label="Tap to talk">
+            <span class="orb-ring"></span>
+            <span class="orb-core"></span>
+            <span class="orb-label" id="orb-label">Tap to talk</span>
+          </button>
+        </div>
+        <div class="phone-rest-anchor" aria-hidden="true"></div>
         <p class="hint" id="hint">Tap to talk.</p>
         <div id="mic-gate" class="mic-panel hidden" role="dialog" aria-labelledby="mic-gate-title">
           <p class="mic-panel-title" id="mic-gate-title">Microphone for live voice</p>

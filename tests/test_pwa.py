@@ -76,15 +76,22 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert ".pills .pill" in css
     assert ".is-empty" in css
     assert "min-height: 28vh" not in css
-    # Phone transcript shares the column with house rails instead of overlapping.
-    assert ":has(#transcript:not(.is-empty))" in css
+    # Phone: first viewport is the listening sphere alone; chrome is below the fold.
+    assert ".hearth-hero" in css
+    assert "min-height: 100dvh" in css
+    assert "min-height: 100svh" in css
+    assert "phone-rest-anchor" in css
+    assert 'class="hearth-hero"' in index_html
+    assert 'class="phone-rest-anchor"' in index_html
+    # Composer/widgets are not pinned over the orb on phone.
+    assert ".composer-dock:focus-within" in css
     assert "isolation: isolate" in css
     # Phone: confirm stacks above Ask the House; hidden confirm must not reserve space.
     assert ".composer-dock .confirm" in css
     assert "order: 0" in css
     assert "margin-bottom: 8px" in css
     assert "has-confirm" in (UI / "app.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v7" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v8" in (UI / "sw.js").read_text(encoding="utf-8")
     assert 'id="logout-btn"' in index_html
     assert 'id="agent-pill"' in index_html
     assert 'id="settings-btn"' in index_html
@@ -102,12 +109,25 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "localStorage" in settings_js
     assert ".settings-sheet" in css
     assert 'html[data-theme="ash"]' in css
-    assert "hearth-shell-v7" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v8" in (UI / "sw.js").read_text(encoding="utf-8")
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200
     assert "/static/settings.js" in (UI / "sw.js").read_text(encoding="utf-8")
     assert "/static/vad.js" in (UI / "sw.js").read_text(encoding="utf-8")
+
+
+def test_phone_orb_owns_first_viewport_alone():
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+    index_html = (UI / "index.html").read_text(encoding="utf-8")
+    assert 'class="hearth-hero"' in index_html
+    assert 'id="orb"' in index_html
+    # Hero is a full phone screen; header is parked at 100dvh (second screen).
+    assert ".hearth-hero" in css and "min-height: 100svh" in css
+    assert ".top" in css and "top: 100svh" in css
+    # Fixed dock/widgets over the sphere are gone on phone.
+    assert "bottom: calc(var(--dock-space) + var(--keyboard-inset) + 10px)" not in css
+    assert ".composer-dock:focus-within" in css
 
 
 def test_orb_focus_outline_is_circular():
