@@ -18,4 +18,4 @@ def run(args: dict, ctx: dict) -> dict:
     return {"ok": True}
 ```
 
-The agent can write new skills here (`workspace_write` with `confirm=true`). Paths cannot leave this tree — the rest of the NAS is out of reach.
+The agent can write new skills here (`workspace_write` runs immediately in the sandbox). Paths cannot leave this tree — the rest of the NAS is out of reach.

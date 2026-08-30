@@ -148,7 +148,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - LG TV / Denon AVR power, volume, source → `ha_media_control` (prefer over raw `ha_call_service`)
 - House media snapshot (TV + AVR + Plex) → `house_media` or `GET /api/media`
 - What's playing → `plex_now_playing`
-- Play a specific library title on Apple TV / LG / living-room Plex → `plex_play` (optional `plex_search` / `plex_clients`). Starts playback on the client via the Plex Media Server remote API — not HA `play_media` on the webOS entity. Prefers the active/recent Plex client when no player is named; asks when titles or clients are ambiguous; confirm covers switching away from whatever is already playing.
+- Play a specific library title on Apple TV / LG / living-room Plex → `plex_play` (optional `plex_search` / `plex_clients`). Starts playback on the client via the Plex Media Server remote API — not HA `play_media` on the webOS entity. Prefers the active/recent Plex client when no player is named; asks when titles or clients are ambiguous; starts immediately (including switching away from whatever is already playing).
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
@@ -173,7 +173,9 @@ Webhook payload:
 }
 ```
 
-Auth: `Authorization: Bearer <HEARTH_COS_WEBHOOK_KEY>` when the key is set. Writes still default to dry-run until `confirm=true` (voice or UI confirm is enough). If `HEARTH_COS_WEBHOOK` is empty, the tool says it is not configured.
+Auth: `Authorization: Bearer <HEARTH_COS_WEBHOOK_KEY>` when the key is set. Escalation runs
+immediately when asked (no Hearth confirm step). If `HEARTH_COS_WEBHOOK` is empty, the tool
+says it is not configured.
 
 ## House memory
 
@@ -201,16 +203,24 @@ Empty `./data` → boot runs `init_memory_db()` and creates schema v1. Re-runnin
 
 ## Tools
 
-Destructive tools **default to dry-run** unless `confirm=true`:
+### Confirmation policy (lenient)
+
+Routine house actions **run immediately** — no second “confirm” step:
 
 - `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG)
 - `ha_media_control` — LG TV / Denon AVR turn_on/off, volume, source, play_media
 - `plex_play` — start a Plex library title on a Plex client (Apple TV / LG / …)
-- `radarr_add` / `sonarr_add` / `overseerr_request`
+- `radarr_add` / `sonarr_add` / `overseerr_request` — grab / request titles
+- `chief_of_staff` — escalate repo/feature/Gridways/calendar work
+- `workspace_write` — sandboxed VAULT writes (not git)
+- Searches, status, remember/list memory, food browse/cart
+
+High-risk / irreversible / paid actions **default to dry-run** until `confirm=true`
+(voice or UI Confirm chip):
+
 - `thuisbezorgd_order` — places the food cart (spends money)
-- `workspace_write` / `workspace_delete`
-- `docker_stop`
-- `chief_of_staff`
+- `workspace_delete` — irreversible sandbox delete
+- `docker_stop` — stops a house container
 - `memory_forget` / `memory_export` / `memory_purge`
 
 Read-only / inspect:
@@ -222,13 +232,14 @@ Read-only / inspect:
 - `thuisbezorgd_restaurants`, `thuisbezorgd_menu`, `thuisbezorgd_cart`, `thuisbezorgd_auth_status`
 - `workspace_list`, `workspace_read`
 - `docker_ps`, `docker_inspect`
-- `memory_remember` (write, not dry-run), `memory_search`, `memory_list`
+- `memory_remember` (write, not gated), `memory_search`, `memory_list`
 
-The command-center light tiles send `confirm=true` because a click is the confirmation.
+Command-center light tiles and Forget buttons may still send `confirm=true` — a click is the
+confirmation for those UI paths. Auth / house-token gating is unchanged.
 
 ### Workspace skills
 
-`workspace/skills/*.py` are loaded at boot and after a confirmed `workspace_write`. Example: `vault_echo`. Skills cannot see outside `workspace/`. Do not bind-mount `/volume1` here.
+`workspace/skills/*.py` are loaded at boot and after `workspace_write` to a skill file. Example: `vault_echo`. Skills cannot see outside `workspace/`. Do not bind-mount `/volume1` here.
 
 ## Layout
 
@@ -259,7 +270,7 @@ cp .env.example .env
 python -m hearth
 ```
 
-Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire. `{"message":"play The Endless on the Apple TV"}` dry-runs `plex_play` until confirm. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should dry-run `radarr_add`.
+Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire. `{"message":"play The Endless on the Apple TV"}` should start `plex_play` immediately. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should queue `radarr_add` immediately. `{"message":"forget that I like dim lights"}` / food checkout still dry-run until confirm.
 
 ## Home Assistant devices
 

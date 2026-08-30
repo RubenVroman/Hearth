@@ -131,7 +131,7 @@ def register_memory_tools() -> None:
     registry.register(
         ToolSpec(
             name="memory_forget",
-            description="Forget a stored preference by key or id. Destructive: dry-run unless confirm=true.",
+            description="Forget a stored preference by key or id. High-risk: dry-run unless confirm=true.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -182,7 +182,7 @@ def register_memory_tools() -> None:
             name="memory_export",
             description=(
                 "Export a redacted snapshot of house memory into the workspace. "
-                "Destructive/sensitive: dry-run unless confirm=true. Does not dump the store into the prompt."
+                "High-risk/sensitive: dry-run unless confirm=true. Does not dump the store into the prompt."
             ),
             parameters={
                 "type": "object",
@@ -200,7 +200,7 @@ def register_memory_tools() -> None:
             name="memory_purge",
             description=(
                 "Delete stored memory. kind=all|conversations|house_events|preferences. "
-                "Destructive: dry-run unless confirm=true."
+                "Irreversible: dry-run unless confirm=true."
             ),
             parameters={
                 "type": "object",

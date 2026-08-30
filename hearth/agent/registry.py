@@ -17,6 +17,9 @@ class ToolSpec:
     description: str
     parameters: dict[str, Any]
     handler: Handler
+    # When True, the registry dry-runs until confirm=true (UI/voice Confirm).
+    # Reserve for high-risk / irreversible / paid actions only — routine house
+    # tools (lights, play, grabs, CoS escalate, sandbox writes) auto-run.
     destructive: bool = False
     source: str = "builtin"
     configured: ConfiguredFn | None = None
@@ -145,7 +148,7 @@ class ToolRegistry:
                 preview: dict[str, Any] = {
                     "tool": name,
                     "would_call_with": preview_args,
-                    "hint": "Re-run with confirm=true to execute. Destructive tools default to dry-run.",
+                    "hint": "Re-run with confirm=true to execute. High-risk tools default to dry-run.",
                 }
                 if plan is not None:
                     preview["plan"] = plan

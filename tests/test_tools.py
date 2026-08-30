@@ -18,25 +18,25 @@ async def test_ha_list_includes_denon_and_lg():
     assert "media_player.lg_webos_tv" in ids
 
 
-async def test_destructive_ha_defaults_to_dry_run():
+async def test_ha_call_service_runs_without_confirm():
     result = await registry.call(
         "ha_call_service",
         {"domain": "light", "service": "turn_off", "entity_id": "light.living_room"},
     )
-    assert result.needs_confirm
-    assert result.dry_run
+    assert result.ok
+    assert not result.needs_confirm
+    assert not result.dry_run
     state = await registry.call("ha_get_state", {"entity_id": "light.living_room"})
-    assert state.data["state"]["state"] == "on"
+    assert state.data["state"]["state"] == "off"
 
 
-async def test_destructive_ha_runs_with_confirm():
+async def test_ha_call_service_turn_on():
     result = await registry.call(
         "ha_call_service",
         {
             "domain": "light",
             "service": "turn_on",
             "entity_id": "light.kitchen",
-            "confirm": True,
         },
     )
     assert result.ok
@@ -157,7 +157,6 @@ async def test_chief_of_staff_posts_when_configured(monkeypatch):
         {
             "task": "add a weather skill to Hearth",
             "said": "add a weather skill to the repo",
-            "confirm": True,
         },
     )
     assert result.ok
@@ -170,13 +169,15 @@ async def test_chief_of_staff_posts_when_configured(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer secret-token"
 
 
-async def test_radarr_add_defaults_to_dry_run():
+async def test_radarr_add_runs_without_confirm():
     result = await registry.call("radarr_add", {"query": "Dune"})
-    assert result.needs_confirm
-    assert result.dry_run
+    assert result.ok
+    assert not result.needs_confirm
+    assert not result.dry_run
+    assert result.data["added"]["title"]
 
 
-async def test_radarr_add_with_confirm_queues_mock():
+async def test_radarr_add_still_accepts_confirm_flag():
     result = await registry.call("radarr_add", {"query": "Dune", "confirm": True})
     assert result.ok
     assert not result.needs_confirm
@@ -195,21 +196,22 @@ async def test_house_media_inventory_speaks_tv_avr_plex():
     assert "plex" in speak or "dune" in speak
 
 
-async def test_ha_media_control_tv_defaults_to_dry_run():
+async def test_ha_media_control_tv_runs_without_confirm():
     result = await registry.call("ha_media_control", {"device": "tv", "action": "turn_off"})
-    assert result.needs_confirm
-    assert result.dry_run
+    assert result.ok
+    assert not result.needs_confirm
+    assert not result.dry_run
 
 
-async def test_ha_media_control_turns_tv_on_with_confirm():
+async def test_ha_media_control_turns_tv_on():
     off = await registry.call(
         "ha_media_control",
-        {"device": "tv", "action": "turn_off", "confirm": True},
+        {"device": "tv", "action": "turn_off"},
     )
     assert off.ok
     on = await registry.call(
         "ha_media_control",
-        {"device": "tv", "action": "turn_on", "confirm": True},
+        {"device": "tv", "action": "turn_on"},
     )
     assert on.ok
     assert on.data["entity_id"] == "media_player.lg_webos_tv"
@@ -219,7 +221,7 @@ async def test_ha_media_control_turns_tv_on_with_confirm():
 async def test_ha_media_control_sets_avr_volume():
     result = await registry.call(
         "ha_media_control",
-        {"device": "avr", "action": "volume_set", "volume_level": 40, "confirm": True},
+        {"device": "avr", "action": "volume_set", "volume_level": 40},
     )
     assert result.ok
     assert result.data["state"]["attributes"]["volume_level"] == 0.4
@@ -269,22 +271,21 @@ async def test_plex_clients_lists_apple_tv_and_lg():
     assert all(c.get("machineIdentifier") for c in result.data["clients"])
 
 
-async def test_plex_play_defaults_to_dry_run():
+async def test_plex_play_runs_without_confirm():
     result = await registry.call("plex_play", {"query": "The Endless", "player": "Apple TV"})
-    assert result.needs_confirm
-    assert result.dry_run
-    assert result.data.get("speak")
-    assert "The Endless" in result.data["speak"]
-    assert "Apple TV" in result.data["speak"]
-    # Fixture session is playing on Apple TV — dry-run should mention switching.
-    assert "Dune" in result.data["speak"]
-    assert result.data.get("plan", {}).get("already_playing", {}).get("title") == "Dune: Part Two"
+    assert result.ok
+    assert not result.needs_confirm
+    assert not result.dry_run
+    assert result.data["played"] is True
+    assert result.data["item"]["title"] == "The Endless"
+    assert result.data["client"]["name"] == "Apple TV"
+    assert "Playing The Endless" in result.data["speak"]
 
 
-async def test_plex_play_starts_on_apple_tv_with_confirm():
+async def test_plex_play_starts_on_apple_tv():
     result = await registry.call(
         "plex_play",
-        {"query": "The Endless", "player": "Apple TV", "confirm": True},
+        {"query": "The Endless", "player": "Apple TV"},
     )
     assert result.ok
     assert not result.needs_confirm
@@ -297,7 +298,7 @@ async def test_plex_play_starts_on_apple_tv_with_confirm():
 async def test_plex_play_missing_title_is_clear():
     result = await registry.call(
         "plex_play",
-        {"query": "Definitely Not In Library XYZ", "player": "Apple TV", "confirm": True},
+        {"query": "Definitely Not In Library XYZ", "player": "Apple TV"},
     )
     assert not result.ok
     assert result.data.get("in_library") is False
@@ -307,7 +308,7 @@ async def test_plex_play_missing_title_is_clear():
 async def test_plex_play_ambiguous_titles_ask_which():
     result = await registry.call(
         "plex_play",
-        {"query": "Heat", "player": "Apple TV", "confirm": True},
+        {"query": "Heat", "player": "Apple TV"},
     )
     assert not result.ok
     assert result.data.get("ambiguous_titles") is True
@@ -319,7 +320,7 @@ async def test_plex_play_ambiguous_titles_ask_which():
 async def test_plex_play_rating_key_disambiguates_title():
     result = await registry.call(
         "plex_play",
-        {"query": "Heat", "ratingKey": "3001", "player": "Apple TV", "confirm": True},
+        {"query": "Heat", "ratingKey": "3001", "player": "Apple TV"},
     )
     assert result.ok
     assert result.data["item"]["ratingKey"] == "3001"
@@ -330,7 +331,7 @@ async def test_plex_play_tv_prefers_active_client():
     """Vague 'tv' + an active session on Apple TV → use that client, not ask."""
     result = await registry.call(
         "plex_play",
-        {"query": "The Endless", "player": "tv", "confirm": True},
+        {"query": "The Endless", "player": "tv"},
     )
     assert result.ok
     assert result.data["client"]["name"] == "Apple TV"
@@ -346,7 +347,7 @@ async def test_plex_play_ambiguous_tv_without_sessions(monkeypatch):
     monkeypatch.setattr(plex_client, "now_playing", _no_sessions)
     result = await registry.call(
         "plex_play",
-        {"query": "The Endless", "player": "tv", "confirm": True},
+        {"query": "The Endless", "player": "tv"},
     )
     assert not result.ok
     assert result.data.get("ambiguous") is True
@@ -374,7 +375,7 @@ async def test_intent_plex_clients():
 async def test_plex_play_prefers_active_without_player():
     result = await registry.call(
         "plex_play",
-        {"query": "The Endless", "confirm": True},
+        {"query": "The Endless"},
     )
     assert result.ok
     assert result.data["client"]["name"] == "Apple TV"
@@ -392,13 +393,13 @@ async def test_plex_play_uses_default_player(monkeypatch):
     monkeypatch.setattr(plex_client, "now_playing", _no_sessions)
     result = await registry.call(
         "plex_play",
-        {"query": "The Endless", "confirm": True},
+        {"query": "The Endless"},
     )
     assert result.ok
     assert result.data["client"]["name"] == "Apple TV"
 
 
-async def test_plex_play_dry_run_missing_title_skips_confirm():
+async def test_plex_play_missing_title_skips_confirm_chip():
     result = await registry.call(
         "plex_play",
         {"query": "Definitely Not In Library XYZ", "player": "Apple TV"},
@@ -503,7 +504,7 @@ async def test_plex_play_live_proxies_play_media(monkeypatch):
 
     result = await registry.call(
         "plex_play",
-        {"query": "The Endless", "player": "Apple TV", "confirm": True},
+        {"query": "The Endless", "player": "Apple TV"},
     )
     assert result.ok
     assert result.data["mode"] == "live"
@@ -527,3 +528,32 @@ async def test_end_call_is_registered_and_not_destructive():
     public = {t["name"]: t for t in registry.list_public()}
     assert "end_call" in public
     assert public["end_call"]["destructive"] is False
+
+
+def test_confirmation_policy_marks_only_high_risk_tools():
+    """Routine house tools auto-run; high-risk / paid / irreversible still gate."""
+    public = {t["name"]: t for t in registry.list_public()}
+    auto = {
+        "ha_call_service",
+        "ha_media_control",
+        "plex_play",
+        "radarr_add",
+        "sonarr_add",
+        "overseerr_request",
+        "chief_of_staff",
+        "workspace_write",
+    }
+    gated = {
+        "thuisbezorgd_order",
+        "workspace_delete",
+        "docker_stop",
+        "memory_forget",
+        "memory_export",
+        "memory_purge",
+    }
+    for name in auto:
+        assert name in public, name
+        assert public[name]["destructive"] is False, name
+    for name in gated:
+        assert name in public, name
+        assert public[name]["destructive"] is True, name
