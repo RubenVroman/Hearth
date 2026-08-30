@@ -31,6 +31,8 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.db-journal
+data/telegram-chat-memory.json
+data/telegram-chat-memory.tmp
 !data/.gitkeep
 
 # Redacted memory exports written by memory_export
