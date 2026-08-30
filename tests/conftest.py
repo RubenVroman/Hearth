@@ -20,6 +20,7 @@ TEST_APP_SECRET = "test-app-secret-key-not-for-production-use"
 def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "workspace_path", tmp_path)
     monkeypatch.setattr(settings, "openai_api_key", "")
+    monkeypatch.setattr(settings, "openai_admin_key", "")
     monkeypatch.setattr(settings, "ha_token", "")
     monkeypatch.setattr(settings, "plex_token", "")
     monkeypatch.setattr(settings, "mock_if_unconfigured", True)

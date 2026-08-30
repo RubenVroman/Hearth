@@ -12,6 +12,8 @@ services:
     restart: unless-stopped
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Org Costs/Usage APIs only — Admin key, not used for chat/Realtime inference.
+      OPENAI_ADMIN_KEY: ${OPENAI_ADMIN_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       OPENAI_REALTIME_MODEL: ${OPENAI_REALTIME_MODEL:-gpt-realtime-2.1}
       # HA uses host networking so mDNS/SSDP can reliably see Apple TV, webOS,

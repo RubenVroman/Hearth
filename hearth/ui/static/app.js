@@ -1921,7 +1921,10 @@ function setRefreshInterval(ms) {
 }
 
 async function boot() {
-  if (window.HearthSettings) window.HearthSettings.mount();
+  if (window.HearthSettings) {
+    window.HearthSettings.mount();
+    window.HearthSettings.setSpendFetcher(() => api("/api/openai/spend?days=30"));
+  }
   bindInfoOverlay();
   const ok = await refreshAccessToken();
   if (!ok) {

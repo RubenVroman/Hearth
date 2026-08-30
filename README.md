@@ -75,6 +75,7 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | Variable | Live vs stub |
 | --- | --- |
 | `OPENAI_API_KEY` | **Live** text agent (chat completions + tools) and GA Realtime WebRTC voice. Also the default backend for the `web_search` house tool (Responses API hosted web search). Empty → local intent router + text fallback on `/ws/voice`. |
+| `OPENAI_ADMIN_KEY` | **Optional.** Admin API key for organization **Costs** + **Usage** monitors in Look → OpenAI spend. Project/inference keys cannot call `/v1/organization/costs` or `/usage/*`. Create at [Admin keys](https://platform.openai.com/settings/organization/admin-keys). Host `.env` only — never paste into the UI. |
 | `OPENAI_MODEL` | Chat model. Default `gpt-4o-mini`. Also used for OpenAI-backed `web_search`. |
 | `OPENAI_REALTIME_MODEL` | Conversational Realtime model. Default `gpt-realtime-2.1` (ChatGPT-app equivalent). |
 | `HA_URL` | Default `http://host.docker.internal:8123`; HA uses host networking for LAN mDNS/SSDP discovery. |
@@ -127,6 +128,28 @@ Reach Plex on the existing stack:
 
 - `PLEX_URL=http://host.docker.internal:32400` (compose sets `host-gateway`)
 - or the host LAN IP, e.g. `http://192.168.1.10:32400`
+
+## OpenAI spend monitor
+
+Look → **OpenAI spend** shows real usage/cost for the house app. The browser never sees API keys; Hearth proxies OpenAI server-side.
+
+| Source | What you get | Requirement |
+| --- | --- | --- |
+| `GET /v1/organization/costs` | Billed USD amounts (org Costs API) | `OPENAI_ADMIN_KEY` (Admin API key) |
+| `GET /v1/organization/usage/completions` | Token counts by model | `OPENAI_ADMIN_KEY` |
+| Hearth local ledger | Measured `usage` fields from Hearth’s own chat/embed/search calls | `OPENAI_API_KEY` (already used for inference) |
+| Official list pricing | Public per-model rates, labeled **not your invoice** | None (shipped reference) |
+
+**Security**
+
+- Secrets stay in the host `.env` on VAULT. Do not paste keys into the UI.
+- Admin keys are for organization management only — they cannot run chat/Realtime. Keep `OPENAI_API_KEY` for inference and `OPENAI_ADMIN_KEY` for spend reads.
+- If the admin key is missing or OpenAI rejects the call, the UI shows an explicit unavailable/error state. It never invents spend figures.
+- Local list-price math is labeled as a **local estimate** and only uses token counts OpenAI returned on Hearth’s own responses.
+
+**Setup:** add `OPENAI_ADMIN_KEY=…` to `.env`, recreate the container (`docker compose up -d`), open Look → OpenAI spend. Create the key at [platform.openai.com → Admin keys](https://platform.openai.com/settings/organization/admin-keys).
+
+API surface (auth required): `GET /api/openai/spend`, `/api/openai/costs`, `/api/openai/usage`, `/api/openai/pricing`.
 
 ## Voice
 

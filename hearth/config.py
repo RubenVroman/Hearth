@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     admin_password: str = Field(default="", alias="HEARTH_ADMIN_PASSWORD")
 
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    # Admin API key for organization Costs/Usage endpoints (not for model inference).
+    # Create at https://platform.openai.com/settings/organization/admin-keys
+    openai_admin_key: str = Field(default="", alias="OPENAI_ADMIN_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_realtime_model: str = Field(default="gpt-realtime-2.1", alias="OPENAI_REALTIME_MODEL")
     openai_tts_model: str = Field(default="gpt-4o-mini-tts", alias="OPENAI_TTS_MODEL")
@@ -189,6 +192,10 @@ class Settings(BaseSettings):
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key.strip())
+
+    @property
+    def openai_admin_configured(self) -> bool:
+        return bool(self.openai_admin_key.strip())
 
     @property
     def ha_configured(self) -> bool:

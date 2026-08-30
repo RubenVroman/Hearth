@@ -9,6 +9,7 @@ REDACTED = "[redacted]"
 
 _ASSIGN_KEYS = (
     "OPENAI_API_KEY",
+    "OPENAI_ADMIN_KEY",
     "HA_TOKEN",
     "PLEX_TOKEN",
     "RADARR_API_KEY",
@@ -30,6 +31,7 @@ _ASSIGN_KEYS = (
 
 _LIVE_ATTRS = (
     "openai_api_key",
+    "openai_admin_key",
     "ha_token",
     "plex_token",
     "radarr_api_key",
