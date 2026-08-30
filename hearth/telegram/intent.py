@@ -1,10 +1,12 @@
-"""Cheap movie-request intent layer for the Telegram inbox.
+"""Telegram movie-request intent — conversation-first.
 
-Uses ``settings.openai_model`` (default gpt-4o-mini) when OPENAI_API_KEY is set.
-Falls back to small heuristics so follow-ups still work without a live call.
-Also resolves vague plot/character descriptions to a catalog search title when
-the model is configured. Never invents downloads: unsure → clarify; clear
-catalog titles / links still passthrough.
+Instant path (no model) only when there is no reasonable doubt:
+catalog id/URL, explicit ``Title (YYYY)``, or a live numbered pick
+(``1``/``2``/``3``, ``all of them``, ``de eerste`` while a list is on screen).
+
+Everything else always calls a smart/fast model with the last ~8 turns of
+this chat. No keyword gates, no franchise/actor maps. Unsure → clarify;
+never invent a grab.
 """
 
 from __future__ import annotations
@@ -33,244 +35,53 @@ MAX_CANDIDATES = 12
 MAX_BATCH = 10
 MIN_RESOLVE_CONFIDENCE = 0.55
 
+# Telegram conversation hop: prefer gpt-4o. Honor OPENAI_MODEL when it is
+# already set to a named model other than mini (house UI keeps its own default).
+TELEGRAM_INTENT_MODEL = "gpt-4o"
+
 _FOLLOWUP_ALL = re.compile(
     r"\b("
     r"all(?:\s+of\s+(?:them|em|'em|it))?"
     r"|all\s+(?:the\s+)?(?:movies?|films?|ones?)"
     r"|every(?:one|thing)?"
-    r"|the\s+whole\s+(?:\w+\s+){0,6}(?:series|franchise|lot|thing|saga|collection)"
-    r"|the\s+entire\s+(?:\w+\s+){0,6}(?:series|franchise|saga|collection)"
-    r"|whole\s+series"
-    r"|entire\s+series"
-    r"|the\s+trilogy"
-    r"|full\s+series"
-    # Dutch house language
     r"|allemaal|alles"
-    r"|de\s+hele(?:\s+\w+){0,4}"
-    r"|de\s+trilogie|hele\s+trilogie|de\s+reeks"
     r")\b",
     re.I,
 )
 _FOLLOWUP_FIRST = re.compile(
-    r"\b("
-    r"(?:just\s+)?(?:the\s+)?first(?:\s+one)?|oldest|(?:the\s+)?1st(?:\s+one)?"
-    r"|(?:de\s+|het\s+)?eerste(?:\s+(?:een|één|one|film|movie))?"
-    r")\b",
-    re.I,
-)
-_FOLLOWUP_NEW = re.compile(
-    r"\b("
-    r"(?:the\s+)?(?:new|newest|latest|most\s+recent)(?:\s+one)?"
-    r"|(?:de\s+|het\s+)?(?:nieuwste|recente)(?:\s+(?:een|één|one|film|movie))?"
-    r")\b",
-    re.I,
-)
-_FOLLOWUP_LAST = re.compile(
-    r"\b("
-    r"(?:the\s+)?last(?:\s+one)?|(?:the\s+)?final(?:\s+one)?"
-    r"|(?:de\s+|het\s+)?laatste(?:\s+(?:een|één|one|film|movie))?"
-    r")\b",
-    re.I,
-)
-_ORDINAL = re.compile(
-    r"^\s*(?:(?:just|only)\s+)?(?:(?:the|de|het)\s+)?"
-    r"(?P<ord>first|second|third|1st|2nd|3rd|#?\s*[1-9]|one|two|three|"
-    r"eerste|tweede|derde)"
-    r"(?:\s+(?:one|een|één))?\s*$",
-    re.I,
-)
-# Short NL/EN replies that only make sense with recent chat context.
-_CONTEXTUAL_SHORT = re.compile(
-    r"^\s*("
-    r"ja|jawel|nee|yes|yep|yeah|sure|no|nope|"
-    r"die|dat|deze|dit|that|this|those|these|them|"
-    r"(?:nee\s+)?(?:de|het)\s+andere|"
-    r"the\s+other(?:\s+one)?"
+    r"^\s*(?:"
+    r"(?:just\s+)?(?:the\s+)?first(?:\s+one)?|"
+    r"(?:de\s+|het\s+)?eerste(?:\s+(?:een|één|one|film|movie))?"
     r")\s*[.!?]*\s*$",
     re.I,
 )
-_COLLECTION_SEARCH = re.compile(
-    r"^\s*(?:"
-    r"(?:download|get|grab|queue)\s+"
-    r")?"
-    r"(?:"
-    r"(?P<all>all|every|the\s+whole|the\s+entire|the\s+full)\s+"
-    r"(?:(?:of\s+)?(?:the\s+)?)?"
-    r")?"
-    r"(?P<title>.+?)"
-    r"(?:\s+(?:movies?|films?|trilogy|series|franchise|saga|collection))?"
-    r"\s*$",
-    re.I,
-)
-_COLLECTION_HINT = re.compile(
-    r"\b("
-    r"trilogy|franchise|saga|collection|trilogie|reeks|"
-    r"whole\s+(?:\w+\s+){0,6}(?:series|franchise|saga|collection)|"
-    r"entire\s+(?:\w+\s+){0,6}(?:series|franchise|saga|collection)|"
-    r"all\s+(?:the\s+)?(?:movies?|films?|ones?)|"
-    r"allemaal|de\s+hele|de\s+trilogie"
-    r")\b",
-    re.I,
-)
-_ORDINAL_MAP = {
-    "first": 1,
-    "1st": 1,
-    "one": 1,
-    "1": 1,
-    "eerste": 1,
-    "second": 2,
-    "2nd": 2,
-    "two": 2,
-    "2": 2,
-    "tweede": 2,
-    "third": 3,
-    "3rd": 3,
-    "three": 3,
-    "3": 3,
-    "derde": 3,
-}
-
-# Media nouns shared across house languages (EN + NL; "serie" is Dutch singular).
-_MEDIA_NOUN = r"(?:movies?|films?|shows?|series|serie|tv(?:\s+shows?)?)"
-# Linkers after a media noun — English plus Dutch met/over/van/voor (and a few
-# common EU prepositions). Prefer this over a huge per-language keyword list.
-_MEDIA_PREP = (
-    r"(?:about|with|where|featuring|involving|of|"
-    r"met|over|van|voor|"
-    r"sur|avec|mit|di|para)"
-)
-_MEDIA_WORDS = frozenset(
-    {
-        "movie",
-        "movies",
-        "film",
-        "films",
-        "show",
-        "shows",
-        "series",
-        "serie",
-        "tv",
-    }
-)
-_DESCRIPTIVE_MARKERS = re.compile(
-    r"\b("
-    # "film met …", "movie about …", "serie over …", "show with …"
-    rf"{_MEDIA_NOUN}\s+{_MEDIA_PREP}\b|"
-    # "die film met", "that movie about", "deze serie over"
-    rf"(?:that|the|this|those|die|dat|deze|dit|een)\s+{_MEDIA_NOUN}"
-    rf"(?:\s+{_MEDIA_PREP})?\b|"
-    r"about\s+(?:a|an|the)\b|"
-    r"(?:where|in\s+which)\s+(?:a|an|the|he|she|they|someone|people)\b|"
-    r"(?:boy|girl|man|woman|kid|child|teenager|wizard|detective|robot|alien|"
-    r"cop|doctor|teacher|student|orphan)\s+(?:with|who|that)\b|"
-    r"who\s+(?:is|was|has|can|wears|lives)\b|"
-    r"(?:based\s+on|remake\s+of|adaptation\s+of)\b|"
-    r"(?:something|anything)\s+(?:like|about)\b|"
-    rf"(?:that|the)\s+(?:one|movie|film|show|series|serie)\s+{_MEDIA_PREP}\b"
-    r")",
-    re.I,
-)
-_YEAR_PAREN = re.compile(r"\(\s*(?:19|20)\d{2}\s*\)")
-_SEASON_MARK = re.compile(r"\bS\d{1,2}E\d{1,3}\b|\bseason\s+\d+\b", re.I)
+_YEAR_PAREN = re.compile(r"\(\s*((?:19|20)\d{2})\s*\)")
 _CATALOG_ID = re.compile(r"\btt\d{7,}|\btmdb:\d+|\btvdb:\d+", re.I)
 _URLISH = re.compile(r"https?://", re.I)
-_FUNCTION_WORDS = frozenset(
-    {
-        # English
-        "a",
-        "an",
-        "the",
-        "about",
-        "with",
-        "who",
-        "whom",
-        "where",
-        "which",
-        "that",
-        "from",
-        "into",
-        "over",
-        "under",
-        "between",
-        "like",
-        "for",
-        "of",
-        "in",
-        "on",
-        "to",
-        "and",
-        "or",
-        "is",
-        "was",
-        "are",
-        "were",
-        "has",
-        "have",
-        "had",
-        "can",
-        "could",
-        "would",
-        "should",
-        # Dutch articles / demonstratives / light prepositions (house language)
-        "de",
-        "het",
-        "een",
-        "die",
-        "dat",
-        "deze",
-        "dit",
-        "met",
-        "van",
-        "voor",
-        "naar",
-        "bij",
-        "aan",
-        "uit",
-        "op",
-        "ik",
-        "je",
-        "jij",
-        "hij",
-        "zij",
-        "we",
-        "wij",
-        "ze",
-        "en",
-        "of",
-        "maar",
-        "moet",
-        "wil",
-        "kan",
-        "nog",
-        "nu",
-        "wat",
-        # Shared media tokens
-        "movie",
-        "film",
-        "show",
-        "series",
-        "serie",
-        "tv",
-    }
-)
+_ORDINAL_PICK = re.compile(r"^\s*#?\s*([1-9])\s*$")
 
 _SYSTEM = (
     "You interpret short Telegram messages for a house movie/TV download bot. "
     "Return JSON only. Prefer clarify over wrong downloads. "
-    "When recent_history is present, use it to resolve pronouns and follow-ups "
-    "(NL+EN: de eerste, die, ja, nee de andere, de trilogie, the first one, all of them). "
-    "subject_title is the last resolved franchise/title — keep using it until the user "
-    "clearly switches topic. "
-    "When candidates are listed: pick/pick_many with 1-based indices only — "
-    "never invent titles or ids not listed in candidates. "
-    "When candidates are empty and the message describes a plot, character, or "
-    "premise instead of naming a title: set action=search with search_title to "
-    "the well-known catalog title (franchise/series name is OK), and media_kind "
-    "movie or tv when clear. If unsure which title, action=clarify with a short question. "
-    "Do not echo the plot description as search_title. "
+    "You are in a multi-turn conversation: use recent_history (NL+EN) to resolve "
+    "plot descriptions, pronouns, corrections, actor/artist clues, and misspellings. "
+    "subject_title is the last resolved title — drop it when the user rejects it. "
+    "rejected_titles must NEVER be re-offered as search_title or implied picks. "
+    "When the user rejects the current/last suggestion (nee/niet die/not that/"
+    "no not X) and adds new clues, return action=search with a NEW search_title "
+    "from the original plot + new clues; do not ask them to pick 1–2 for a "
+    "rejected film. Bare nee/no with no new info → action=clarify with a short "
+    "useful question (not a 1–2 list). "
+    "When candidates are listed and the user clearly picks among them, use "
+    "pick/pick_many with 1-based indices only — never invent ids. "
+    "When candidates are empty: resolve plot/character/premise to search_title "
+    "(catalog title; franchise name OK). Do not echo the plot as search_title. "
+    "Actor/artist names and misspellings are clues for you — never refuse because "
+    "of spelling. If unsure which title, action=clarify; never invent a grab. "
     "Actions: passthrough, ignore, clarify, pick, pick_many, search. "
-    "search sets search_title (and select_all=true for whole series/trilogy). "
-    "If the user clearly names a concrete title, passthrough."
+    "search sets search_title (select_all=true for whole series/trilogy). "
+    "If the user clearly names a concrete catalog title with no ambiguity, "
+    "action=search with that title (or passthrough)."
 )
 
 
@@ -286,92 +97,98 @@ class IntentDecision:
     source: str = "heuristic"
 
 
-def looks_like_followup(text: str) -> bool:
+def telegram_intent_model() -> str:
+    """Model for the Telegram conversation hop (smart + fast, no new env key)."""
+    configured = (settings.openai_model or "").strip()
+    if configured and "mini" not in configured.lower():
+        return configured
+    return TELEGRAM_INTENT_MODEL
+
+
+def is_explicit_title_year(text: str) -> bool:
+    """True for unambiguous ``Title (YYYY)`` (optional trailing quality)."""
     raw = (text or "").strip()
-    if not raw or len(raw) > 120:
-        return False
-    if _FOLLOWUP_ALL.search(raw) or _FOLLOWUP_FIRST.search(raw):
-        return True
-    if _FOLLOWUP_NEW.search(raw) or _FOLLOWUP_LAST.search(raw):
-        return True
-    if _ORDINAL.match(raw):
-        return True
-    if _CONTEXTUAL_SHORT.match(raw):
-        return True
-    lowered = raw.lower()
-    return lowered in {
-        "all",
-        "both",
-        "those",
-        "these",
-        "them",
-        "yes",
-        "yep",
-        "yeah",
-        "sure",
-        "ja",
-        "jawel",
-        "nee",
-        "allemaal",
-        "alles",
-    }
-
-
-def looks_like_contextual_followup(text: str) -> bool:
-    """Short / ambiguous replies that need recent chat history (NL+EN)."""
-    raw = (text or "").strip()
-    if not raw or len(raw) > 80:
-        return False
-    if _YEAR_PAREN.search(raw) or _CATALOG_ID.search(raw) or _URLISH.search(raw):
-        return False
-    if looks_like_followup(raw) or looks_like_collection_request(raw):
-        return True
-    words = re.findall(r"[A-Za-zÀ-ÿ']+", raw)
-    # Very short utterances with history are almost never brand-new catalog titles.
-    return 1 <= len(words) <= 5
-
-
-def looks_like_collection_request(text: str) -> bool:
-    raw = (text or "").strip()
-    if not raw or len(raw) > 160:
-        return False
-    if not re.search(r"[A-Za-zÀ-ÿ]", raw):
-        return False
-    if _FOLLOWUP_ALL.search(raw):
-        return True
-    return bool(_COLLECTION_HINT.search(raw))
-
-
-def looks_like_descriptive_ask(text: str) -> bool:
-    """True for plot/character descriptions — not concrete catalog titles/links.
-
-    Language-agnostic bias: media noun + preposition (EN *with/about*, NL *met/over*,
-    …), long clauses that mention film/movie/serie, or enough function words.
-    Never hardcodes franchise titles — the model resolves those.
-    """
-    raw = (text or "").strip()
-    if not raw or len(raw) < 12 or len(raw) > 200:
-        return False
-    if looks_like_followup(raw):
-        return False
-    if _YEAR_PAREN.search(raw) or _SEASON_MARK.search(raw):
+    if not raw or len(raw) > 200:
         return False
     if _CATALOG_ID.search(raw) or _URLISH.search(raw):
         return False
-    if not re.search(r"[A-Za-zÀ-ÿ]", raw):
+    match = _YEAR_PAREN.search(raw)
+    if not match:
         return False
-    if _DESCRIPTIVE_MARKERS.search(raw):
-        return True
-    words = re.findall(r"[A-Za-zÀ-ÿ']+", raw)
-    lowered = [w.lower() for w in words]
-    # Long clause naming a media type (no year/imdb) → let the model resolve.
-    if len(words) >= 8 and any(w in _MEDIA_WORDS for w in lowered):
-        return True
-    if len(words) >= 6:
-        function_hits = sum(1 for w in lowered if w in _FUNCTION_WORDS)
-        if function_hits >= 3:
-            return True
-    return False
+    # Year must be the disambiguator — title text before the paren.
+    before = raw[: match.start()].strip(" -–—|,.")
+    after = raw[match.end() :].strip()
+    if not before or not re.search(r"[A-Za-zÀ-ÿ]", before):
+        return False
+    # Allow optional quality tokens after the year; reject extra clauses.
+    if after and not re.fullmatch(
+        r"(?:2160p|1080p|720p|480p|4k|uhd|hdr|dv|dolby\s*vision\s*)+",
+        after,
+        flags=re.I,
+    ):
+        return False
+    return True
+
+
+def instant_pick_decision(
+    text: str,
+    candidates: list[dict[str, Any]] | None,
+) -> IntentDecision | None:
+    """Live numbered-list shortcuts — only while candidates are on screen."""
+    raw = (text or "").strip()
+    if not raw or not candidates:
+        return None
+    n = len(candidates)
+    if n == 0:
+        return None
+
+    digit = _ORDINAL_PICK.match(raw)
+    if digit:
+        idx = int(digit.group(1))
+        if 1 <= idx <= n:
+            return IntentDecision(
+                action="pick",
+                indices=[idx],
+                confidence=1.0,
+                source="instant",
+            )
+        return IntentDecision(
+            action="clarify",
+            clarify_question=f"Pick a number from 1–{min(3, n)} (or say 'all of them').",
+            confidence=0.9,
+            source="instant",
+        )
+
+    if _FOLLOWUP_ALL.search(raw) and len(raw) <= 40:
+        return IntentDecision(
+            action="pick_many",
+            indices=list(range(1, min(n, MAX_BATCH) + 1)),
+            select_all=True,
+            confidence=1.0,
+            source="instant",
+        )
+
+    if _FOLLOWUP_FIRST.match(raw):
+        oldest = min(
+            range(n),
+            key=lambda i: _year_sort_key(candidates[i]) or 9999,
+        )
+        return IntentDecision(
+            action="pick",
+            indices=[oldest + 1],
+            confidence=1.0,
+            source="instant",
+        )
+
+    return None
+
+
+def _year_sort_key(row: dict[str, Any]) -> int:
+    year = row.get("year")
+    try:
+        return int(year)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _candidate_blob(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -389,134 +206,40 @@ def _candidate_blob(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def _year_sort_key(row: dict[str, Any]) -> int:
-    year = row.get("year")
-    try:
-        return int(year)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _heuristic_with_candidates(text: str, candidates: list[dict[str, Any]]) -> IntentDecision | None:
+def _offline_fallback(
+    text: str,
+    *,
+    candidates: list[dict[str, Any]] | None,
+    rejected_titles: list[str] | None,
+) -> IntentDecision:
+    """No API key: never invent titles from plots — clarify or instant pick."""
     raw = (text or "").strip()
-    n = len(candidates)
-    if n == 0:
-        return None
-
-    if _FOLLOWUP_ALL.search(raw) or raw.lower() in {"all", "both", "those", "these", "them"}:
-        return IntentDecision(
-            action="pick_many",
-            indices=list(range(1, min(n, MAX_BATCH) + 1)),
-            select_all=True,
-            confidence=0.9,
-            source="heuristic",
-        )
-
-    if _FOLLOWUP_NEW.search(raw):
-        newest = max(range(n), key=lambda i: _year_sort_key(candidates[i]))
-        return IntentDecision(action="pick", indices=[newest + 1], confidence=0.85)
-
-    if _FOLLOWUP_LAST.search(raw) and not _FOLLOWUP_FIRST.search(raw):
-        # "last" in franchise talk usually means final / newest; prefer newest year.
-        newest = max(range(n), key=lambda i: _year_sort_key(candidates[i]))
-        return IntentDecision(action="pick", indices=[newest + 1], confidence=0.7)
-
-    if _FOLLOWUP_FIRST.search(raw):
-        oldest = min(range(n), key=lambda i: _year_sort_key(candidates[i]) or 9999)
-        return IntentDecision(action="pick", indices=[oldest + 1], confidence=0.85)
-
-    ord_match = _ORDINAL.match(raw)
-    if ord_match:
-        token = re.sub(r"[^a-z0-9]", "", ord_match.group("ord").lower())
-        idx = _ORDINAL_MAP.get(token)
-        if idx is not None and 1 <= idx <= n:
-            return IntentDecision(action="pick", indices=[idx], confidence=0.9)
-        return IntentDecision(
-            action="clarify",
-            clarify_question=f"Pick a number from 1–{min(3, n)} (or say 'all of them').",
-            confidence=0.6,
-        )
-
-    if raw.lower() in {"yes", "yep", "yeah", "sure"}:
+    if not raw:
+        return IntentDecision(action="ignore", confidence=1.0, source="offline")
+    instant = instant_pick_decision(raw, candidates)
+    if instant is not None:
+        return instant
+    if candidates:
         return IntentDecision(
             action="clarify",
             clarify_question=(
-                f"Which one — reply 1–{min(3, n)}, "
-                "'all of them', 'the first one', or 'the new one'?"
+                "Which movie did you mean? Send the title, or reply with a number "
+                f"from the list (1–{min(3, len(candidates))})."
             ),
-            confidence=0.7,
+            confidence=0.4,
+            source="offline",
         )
-
-    return None
-
-
-def _heuristic_collection_search(text: str) -> IntentDecision | None:
-    raw = (text or "").strip()
-    if not looks_like_collection_request(raw):
-        return None
-    match = _COLLECTION_SEARCH.match(raw)
-    if not match:
-        return None
-    title = (match.group("title") or "").strip(" \"'`-–—")
-    title = re.sub(
-        r"\b(movies?|films?|trilogy|trilogie|series|serie|franchise|saga|collection|reeks)\b",
-        "",
-        title,
-        flags=re.I,
-    )
-    title = re.sub(r"\s+", " ", title).strip(" \"'`")
-    # Bare "de trilogie" / "all of them" with no franchise name — need chat subject.
-    if len(title) < 2 or title.lower() in {"de", "het", "the", "a", "an", "een"}:
-        return None
-    want_all = bool(match.group("all")) or bool(_FOLLOWUP_ALL.search(raw)) or bool(
-        _COLLECTION_HINT.search(raw)
-    )
-    if not want_all:
-        return None
+    rejected = ", ".join((rejected_titles or [])[:4])
+    extra = f" (not {rejected})" if rejected else ""
     return IntentDecision(
-        action="search",
-        search_title=title[:200],
-        select_all=True,
-        confidence=0.8,
-        source="heuristic",
+        action="clarify",
+        clarify_question=(
+            f"Which movie or series did you mean{extra}? "
+            "Send the title if you know it, or a bit more detail."
+        ),
+        confidence=0.4,
+        source="offline",
     )
-
-
-def heuristic_intent(
-    text: str,
-    *,
-    candidates: list[dict[str, Any]] | None = None,
-    pending_query: str = "",
-) -> IntentDecision:
-    """Local interpretation — used alone or as OpenAI fallback."""
-    del pending_query  # reserved for richer context; candidates carry the set
-    raw = (text or "").strip()
-    if not raw:
-        return IntentDecision(action="ignore", confidence=1.0)
-
-    if candidates:
-        decided = _heuristic_with_candidates(raw, candidates)
-        if decided is not None:
-            return decided
-        # Unrelated new title while pending → let normal parser grab it.
-        if looks_like_followup(raw):
-            return IntentDecision(
-                action="clarify",
-                clarify_question=(
-                    f"Not sure — reply 1–{min(3, len(candidates))}, "
-                    "'all of them', or send a specific title."
-                ),
-                confidence=0.5,
-            )
-        return IntentDecision(action="passthrough", confidence=0.5)
-
-    collection = _heuristic_collection_search(raw)
-    if collection is not None:
-        return collection
-    # Without a model we must not invent a title from a plot description.
-    if looks_like_descriptive_ask(raw):
-        return IntentDecision(action="passthrough", confidence=0.35, source="heuristic")
-    return IntentDecision(action="passthrough", confidence=0.4)
 
 
 async def interpret_intent(
@@ -529,90 +252,54 @@ async def interpret_intent(
     history: list[dict[str, Any]] | None = None,
     subject_title: str = "",
     subject_media_kind: str = "",
+    rejected_titles: list[str] | None = None,
 ) -> IntentDecision:
-    """Interpret a short user message. Cheap model; fail open to heuristic/clarify."""
+    """Interpret a user message. Always uses the model when configured.
+
+    ``force`` is retained for callers; non-empty text with history/candidates/
+    conversational content always hits the model. Instant catalog/year/pick
+    shortcuts are decided by the inbox *before* calling this.
+    """
+    del force  # inbox decides instant vs AI; this hop always models when keyed
     raw = (text or "").strip()
     if not raw:
         return IntentDecision(action="ignore", confidence=1.0)
 
-    descriptive = looks_like_descriptive_ask(raw)
-    has_history = bool(history)
-    contextual = has_history and looks_like_contextual_followup(raw)
-    should_run = (
-        force
-        or bool(candidates)
-        or looks_like_followup(raw)
-        or looks_like_collection_request(raw)
-        or descriptive
-        or contextual
-    )
-    if not should_run:
-        return IntentDecision(action="passthrough", confidence=1.0, source="skip")
-
-    heuristic = heuristic_intent(text, candidates=candidates, pending_query=pending_query)
-
-    # With chat history but no live candidates, a collection/follow-up like
-    # "de trilogie" / "all of them" should re-search the last subject.
-    if (
-        heuristic.action == "passthrough"
-        and has_history
-        and subject_title
-        and not candidates
-        and (
-            looks_like_collection_request(raw)
-            or bool(_FOLLOWUP_ALL.search(raw))
-            or bool(_FOLLOWUP_FIRST.search(raw))
-            or bool(_FOLLOWUP_NEW.search(raw))
-            or bool(_FOLLOWUP_LAST.search(raw))
-            or bool(_ORDINAL.match(raw))
-        )
-    ):
-        select_all = bool(_FOLLOWUP_ALL.search(raw) or looks_like_collection_request(raw))
-        if select_all:
-            heuristic = IntentDecision(
-                action="search",
-                search_title=subject_title[:200],
-                select_all=True,
-                media_kind=subject_media_kind if subject_media_kind in {"movie", "tv"} else "",
-                confidence=0.88,
-                source="heuristic",
-            )
-        else:
-            heuristic = IntentDecision(
-                action="clarify",
-                clarify_question=(
-                    "Which one — reply with a number, 'all of them', or a clearer title?"
-                ),
-                confidence=0.7,
-                source="heuristic",
-            )
+    # Live-list shortcuts stay local even when the model is available — they are
+    # the instant path (1/2/3, all of them, de eerste).
+    instant = instant_pick_decision(raw, candidates)
+    if instant is not None and instant.action in {"pick", "pick_many"}:
+        return instant
 
     if not settings.openai_configured:
-        return heuristic
-
-    # High-confidence local follow-ups skip the model hop (cost/latency).
-    if heuristic.source == "heuristic" and heuristic.confidence >= 0.85 and (
-        heuristic.action in {"pick", "pick_many", "ignore"}
-        or (heuristic.action == "search" and heuristic.select_all and heuristic.search_title)
-    ):
-        return heuristic
+        return _offline_fallback(
+            raw, candidates=candidates, rejected_titles=rejected_titles
+        )
 
     try:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(api_key=settings.openai_api_key)
+        rejected = [
+            redact(str(t))[:120]
+            for t in (rejected_titles or [])
+            if str(t).strip()
+        ][:12]
         payload = {
             "user_message": redact(raw)[:240],
             "pending_query": redact(pending_query)[:120] if pending_query else "",
             "last_bot_reply": redact(last_bot_reply)[:400] if last_bot_reply else "",
             "candidates": _candidate_blob(candidates or []),
-            "descriptive_ask": descriptive and not candidates,
+            "rejected_titles": rejected,
             "recent_history": history or [],
             "subject_title": redact(subject_title)[:120] if subject_title else "",
-            "subject_media_kind": subject_media_kind if subject_media_kind in {"movie", "tv"} else "",
+            "subject_media_kind": (
+                subject_media_kind if subject_media_kind in {"movie", "tv"} else ""
+            ),
         }
+        model = telegram_intent_model()
         response = await client.chat.completions.create(
-            model=settings.openai_model,
+            model=model,
             messages=[
                 {"role": "system", "content": _SYSTEM},
                 {
@@ -621,27 +308,20 @@ async def interpret_intent(
                 },
             ],
             response_format={"type": "json_object"},
-            max_tokens=180,
+            max_tokens=200,
             temperature=0,
         )
         drafted = (response.choices[0].message.content or "").strip()
         parsed = _parse_model_json(
             drafted,
             candidate_count=len(candidates or []),
-            descriptive_ask=descriptive and not candidates,
+            rejected_titles=rejected,
         )
         if parsed is None:
-            return heuristic if heuristic.action != "passthrough" else IntentDecision(
-                action="clarify" if candidates or descriptive or contextual else "passthrough",
+            return IntentDecision(
+                action="clarify",
                 clarify_question=(
-                    f"Which one — reply 1–{min(3, len(candidates or []))}, "
-                    "'all of them', or a clearer title?"
-                    if candidates
-                    else (
-                        "Which movie or series did you mean? Send the title if you know it."
-                        if descriptive or contextual
-                        else ""
-                    )
+                    "Which movie or series did you mean? Send the title if you know it."
                 ),
                 confidence=0.4,
                 source="openai_fallback",
@@ -650,14 +330,16 @@ async def interpret_intent(
         return parsed
     except Exception as exc:  # noqa: BLE001
         log.info("telegram intent openai failed: %s", redact(str(exc)))
-        return heuristic
+        return _offline_fallback(
+            raw, candidates=candidates, rejected_titles=rejected_titles
+        )
 
 
 def _parse_model_json(
     raw: str,
     *,
     candidate_count: int,
-    descriptive_ask: bool = False,
+    rejected_titles: list[str] | None = None,
 ) -> IntentDecision | None:
     try:
         data = json.loads(raw)
@@ -680,7 +362,6 @@ def _parse_model_json(
                 indices.append(num)
             elif not candidate_count and 1 <= num <= MAX_BATCH:
                 indices.append(num)
-    # de-dupe preserve order
     seen: set[int] = set()
     uniq: list[int] = []
     for num in indices:
@@ -702,6 +383,12 @@ def _parse_model_json(
     media_kind = str(data.get("media_kind") or data.get("kind") or "").strip().lower()
     if media_kind not in {"movie", "tv"}:
         media_kind = ""
+
+    rejected_norm = {
+        re.sub(r"\s+", " ", t).strip().lower()
+        for t in (rejected_titles or [])
+        if str(t).strip()
+    }
 
     if action in {"pick", "pick_many"} and not indices and select_all and candidate_count:
         indices = list(range(1, min(candidate_count, MAX_BATCH) + 1))
@@ -732,10 +419,15 @@ def _parse_model_json(
                 clarify_question=clarify or "Which series or title should I search for?",
                 confidence=confidence,
             )
-        # Never treat an unresolved plot sentence as a catalog title.
-        if looks_like_descriptive_ask(search_title) or (
-            descriptive_ask and confidence < MIN_RESOLVE_CONFIDENCE
-        ):
+        if search_title.strip().lower() in rejected_norm:
+            return IntentDecision(
+                action="clarify",
+                clarify_question=clarify
+                or "Which movie did you mean instead? Send another title or clue.",
+                confidence=confidence,
+                media_kind=media_kind,
+            )
+        if confidence < MIN_RESOLVE_CONFIDENCE:
             return IntentDecision(
                 action="clarify",
                 clarify_question=clarify
@@ -761,15 +453,78 @@ def _parse_model_json(
     )
 
 
+# --- Compatibility shims (not used as gates; kept so older imports/tests soft-fail) ---
+
+
+def looks_like_followup(text: str) -> bool:
+    """Deprecated as a gate — instant picks use ``instant_pick_decision``."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 120:
+        return False
+    if _FOLLOWUP_ALL.search(raw) or _FOLLOWUP_FIRST.match(raw):
+        return True
+    return raw.lower() in {
+        "all",
+        "both",
+        "yes",
+        "yep",
+        "yeah",
+        "sure",
+        "ja",
+        "jawel",
+        "nee",
+        "no",
+        "nope",
+        "allemaal",
+        "alles",
+    }
+
+
+def looks_like_contextual_followup(text: str) -> bool:
+    """Deprecated as a gate."""
+    raw = (text or "").strip()
+    return bool(raw) and len(raw) <= 80
+
+
+def looks_like_collection_request(text: str) -> bool:
+    """Deprecated as a gate."""
+    raw = (text or "").strip()
+    return bool(raw) and bool(_FOLLOWUP_ALL.search(raw))
+
+
+def looks_like_descriptive_ask(text: str) -> bool:
+    """Deprecated as a gate — plots always go to the model now."""
+    raw = (text or "").strip()
+    return bool(raw) and len(raw) >= 12 and not is_explicit_title_year(raw)
+
+
+def heuristic_intent(
+    text: str,
+    *,
+    candidates: list[dict[str, Any]] | None = None,
+    pending_query: str = "",
+) -> IntentDecision:
+    """Deprecated offline helper — prefer ``interpret_intent`` / instant picks."""
+    del pending_query
+    instant = instant_pick_decision(text, candidates)
+    if instant is not None:
+        return instant
+    return _offline_fallback(text, candidates=candidates, rejected_titles=None)
+
+
 __all__ = [
     "IntentDecision",
     "MAX_BATCH",
     "MAX_CANDIDATES",
     "MIN_RESOLVE_CONFIDENCE",
+    "TELEGRAM_INTENT_MODEL",
     "heuristic_intent",
+    "instant_pick_decision",
     "interpret_intent",
+    "is_explicit_title_year",
     "looks_like_collection_request",
     "looks_like_contextual_followup",
     "looks_like_descriptive_ask",
     "looks_like_followup",
+    "telegram_intent_model",
 ]

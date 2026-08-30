@@ -13,11 +13,9 @@ from hearth.telegram.intent import (
     MAX_BATCH,
     MAX_CANDIDATES,
     IntentDecision,
+    instant_pick_decision,
     interpret_intent,
-    looks_like_collection_request,
-    looks_like_contextual_followup,
-    looks_like_descriptive_ask,
-    looks_like_followup,
+    is_explicit_title_year,
 )
 from hearth.telegram.memory import ChatMemory
 from hearth.telegram.parse import (
@@ -156,6 +154,33 @@ class TelegramInbox:
             )
         return result
 
+    def _titles_from_options(self, options: list[dict[str, Any]] | None) -> list[str]:
+        titles: list[str] = []
+        seen: set[str] = set()
+        for row in options or []:
+            title = str(row.get("title") or "").strip()
+            if not title:
+                continue
+            key = title.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            titles.append(title)
+        return titles
+
+    def _is_instant_catalog(self, parsed: ParsedRequest, view: MessageView) -> bool:
+        """No-doubt grabs: catalog id/URL, Title (YYYY), or show + season marker."""
+        if parsed.kind != "request":
+            return False
+        if parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id:
+            return True
+        if parsed.year and parsed.title and is_explicit_title_year(view.text):
+            return True
+        # "Show S02E03" / "Show season 2" — concrete catalog ask, no model needed.
+        if parsed.title and parsed.season is not None:
+            return True
+        return False
+
     async def handle_message(self, message: dict[str, Any]) -> InboxResult:
         view, parsed = parse_message(
             message,
@@ -181,7 +206,7 @@ class TelegramInbox:
         if self.deduper.seen_message(view.chat_id, view.message_id):
             return InboxResult(handled=True, reply="")
 
-        # Disambiguation pick (1/2/3) for a pending prompt in this chat.
+        # Instant: bare 1/2/3 while a live list is pending.
         if parsed.kind == "disambiguation_pick":
             result = await self._handle_pick(view, parsed)
             return self._finish(view, result, record_user=True, user_text=view.text)
@@ -190,58 +215,16 @@ class TelegramInbox:
         history = self.memory.history_blob(view.chat_id)
         subject_title, subject_media_kind = self.memory.subject(view.chat_id)
         memory_offered = self.memory.offered(view.chat_id)
-        has_ids_or_year = bool(
-            parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id or parsed.year
-        )
-        concrete = parsed.kind == "request" and has_ids_or_year
+        rejected = list(self.memory.rejected(view.chat_id))
 
-        needs_intent = bool(pending) and (
-            looks_like_followup(view.text)
-            or parsed.kind == "ignore"
-            or (parsed.kind == "request" and not has_ids_or_year)
-        )
-        if not needs_intent and looks_like_collection_request(view.text):
-            needs_intent = True
-        if (
-            not needs_intent
-            and parsed.kind == "request"
-            and not has_ids_or_year
-            and looks_like_descriptive_ask(view.text)
-        ):
-            needs_intent = True
-        # Recent chat context: short NL/EN follow-ups must hit the model even
-        # when they are not English franchise phrases and pending expired.
-        if (
-            not needs_intent
-            and not concrete
-            and history
-            and looks_like_contextual_followup(view.text)
-            and parsed.kind in {"request", "ignore"}
-        ):
-            needs_intent = True
-
-        if needs_intent:
-            candidates = pending.options if pending else (memory_offered or None)
-            intent = await interpret_intent(
-                view.text,
-                candidates=candidates,
-                pending_query=(pending.query if pending else subject_title) or "",
-                last_bot_reply=(
-                    pending.last_bot_reply
-                    if pending
-                    else (history[-1]["text"] if history else "")
-                ),
-                force=bool(pending) or bool(history and looks_like_contextual_followup(view.text)),
-                history=history,
-                subject_title=subject_title,
-                subject_media_kind=subject_media_kind,
-            )
-            # Soft-revive pending from memory so pick/pick_many still work.
+        # Instant: all of them / de eerste only while a numbered list is on screen.
+        live_options = pending.options if pending else (memory_offered or None)
+        instant = instant_pick_decision(view.text, live_options)
+        if instant is not None and instant.action in {"pick", "pick_many"}:
             active_pending = pending
             if (
                 active_pending is None
-                and intent.action in {"pick", "pick_many"}
-                and intent.indices
+                and instant.indices
                 and memory_offered
             ):
                 active_pending = PendingDisambiguation(
@@ -254,20 +237,40 @@ class TelegramInbox:
                 )
                 self.pending[view.chat_id] = active_pending
             handled = await self._apply_intent(
-                view, parsed, intent, pending=active_pending
+                view, parsed, instant, pending=active_pending
             )
             if handled is not None:
                 return self._finish(
                     view,
                     handled,
-                    search_title=intent.search_title or subject_title,
-                    media_kind=intent.media_kind or subject_media_kind,
+                    search_title=subject_title,
+                    media_kind=subject_media_kind,
                     record_user=True,
                     user_text=view.text,
                 )
 
-        if parsed.kind == "ignore":
-            return InboxResult(handled=True, reply="")
+        # Instant: catalog id/URL or Title (YYYY) — no model.
+        if self._is_instant_catalog(parsed, view):
+            if not self.rate.allow():
+                return InboxResult(handled=True, reply=format_rate_limited())
+            if self.deduper.seen_title(view.chat_id, parsed.dedup_key()):
+                return InboxResult(handled=True, reply="")
+            self.pending.pop(view.chat_id, None)
+            result = await self._grab(view, parsed)
+            self.memory.set_subject(
+                view.chat_id,
+                parsed.title or result.title or "",
+                media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
+                clear_rejected=True,
+            )
+            return self._finish(
+                view,
+                result,
+                search_title=parsed.title or result.title or "",
+                media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
+                record_user=True,
+                user_text=view.text,
+            )
 
         if parsed.kind == "reject_download":
             return self._finish(
@@ -277,25 +280,105 @@ class TelegramInbox:
                 user_text=view.text,
             )
 
+        # Magnets/greetings/empty already classified — ignore without a model hop
+        # only when there is truly nothing conversational to resolve.
+        if parsed.kind == "ignore" and not history and not pending:
+            return InboxResult(handled=True, reply="")
+
+        # Everything else: AI conversation with ~8-turn memory.
+        # Non-instant reply while a 1–2 list is pending → pivot: remember those
+        # titles as rejected, clear the sticky list, call the model without
+        # forcing pick-from-candidates.
+        candidates_for_model: list[dict[str, Any]] | None = None
+        pending_query = (pending.query if pending else subject_title) or ""
+        last_bot = (
+            pending.last_bot_reply
+            if pending
+            else (history[-1]["text"] if history else "")
+        )
+        pivoted_off_list = False
+        if pending is not None:
+            rejected_now = self._titles_from_options(pending.options)
+            if pending.query:
+                rejected_now.append(pending.query)
+            self.memory.remember_rejected(
+                view.chat_id,
+                rejected_now,
+                clear_offered=True,
+                clear_subject=True,
+            )
+            rejected = list(self.memory.rejected(view.chat_id))
+            self.pending.pop(view.chat_id, None)
+            pending = None
+            pending_query = ""
+            subject_title, subject_media_kind = "", ""
+            candidates_for_model = None
+            memory_offered = []
+            pivoted_off_list = True
+        else:
+            # Last offered set is context for picks — not after a reject pivot.
+            candidates_for_model = memory_offered or None
+
+        intent = await interpret_intent(
+            view.text,
+            candidates=candidates_for_model,
+            pending_query=pending_query,
+            last_bot_reply=last_bot,
+            force=True,
+            history=history,
+            subject_title=subject_title,
+            subject_media_kind=subject_media_kind,
+            rejected_titles=rejected,
+        )
+
+        # Soft-revive offered rows only when the model explicitly picks indices
+        # and we did not just reject the on-screen list.
+        active_pending = pending
+        if (
+            not pivoted_off_list
+            and active_pending is None
+            and intent.action in {"pick", "pick_many"}
+            and intent.indices
+            and (candidates_for_model or memory_offered)
+        ):
+            rows = candidates_for_model or memory_offered
+            active_pending = PendingDisambiguation(
+                chat_id=view.chat_id,
+                options=rows[:MAX_CANDIDATES],
+                media_kind=subject_media_kind or "movie",
+                query=subject_title or "",
+                created_message_id=view.message_id,
+                last_bot_reply=last_bot,
+            )
+            self.pending[view.chat_id] = active_pending
+
+        handled = await self._apply_intent(
+            view, parsed, intent, pending=active_pending
+        )
+        if handled is not None:
+            return self._finish(
+                view,
+                handled,
+                search_title=intent.search_title or subject_title,
+                media_kind=intent.media_kind or subject_media_kind,
+                record_user=True,
+                user_text=view.text,
+            )
+
+        if parsed.kind == "ignore":
+            return InboxResult(handled=True, reply="")
+
         if parsed.kind != "request":
             return InboxResult(handled=True, reply="")
 
+        # Model said passthrough on a non-instant title — still grab, but this
+        # path is rare (AI should return search/clarify).
         if not self.rate.allow():
             return InboxResult(handled=True, reply=format_rate_limited())
-
         if self.deduper.seen_title(view.chat_id, parsed.dedup_key()):
             return InboxResult(handled=True, reply="")
-
-        # New concrete request replaces stale disambiguation context.
         self.pending.pop(view.chat_id, None)
         result = await self._grab(view, parsed)
-        if concrete:
-            # Year / catalog id — still remember the title for later follow-ups.
-            self.memory.set_subject(
-                view.chat_id,
-                parsed.title or result.title or "",
-                media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
-            )
         return self._finish(
             view,
             result,
@@ -317,8 +400,11 @@ class TelegramInbox:
             return InboxResult(handled=True, reply="")
         if intent.action == "clarify":
             question = intent.clarify_question or (
-                "Which one — reply with a number, 'all of them', or a clearer title?"
+                "Which movie or series did you mean? Send the title if you know it."
             )
+            # Never re-stick a rejected 1–2 list after a clarify pivot.
+            if pending is None:
+                self.pending.pop(view.chat_id, None)
             return InboxResult(handled=True, reply=question)
         if intent.action == "pick" and pending and intent.indices:
             return await self._handle_indices(view, pending, intent.indices[:1])
@@ -336,6 +422,7 @@ class TelegramInbox:
                 view.chat_id,
                 intent.search_title,
                 media_kind=media_kind if media_kind in {"movie", "tv"} else "",
+                clear_rejected=True,
             )
             synthetic = ParsedRequest(
                 kind="request",
@@ -348,15 +435,6 @@ class TelegramInbox:
                 view,
                 synthetic,
                 select_all=intent.select_all,
-            )
-        # passthrough: if this looked like a follow-up but intent gave up, ask.
-        if pending and looks_like_followup(view.text) and parsed.kind != "request":
-            return InboxResult(
-                handled=True,
-                reply=(
-                    f"Which one — reply 1–{min(3, len(pending.options))}, "
-                    "'all of them', or a clearer title?"
-                ),
             )
         return None
 

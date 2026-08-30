@@ -295,6 +295,15 @@ async def test_inbox_ambiguous_then_pick(inbox: TelegramInbox, monkeypatch):
         }
 
     monkeypatch.setattr("hearth.telegram.inbox.radarr.search", multi)
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Heat",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
 
     ask = await inbox.handle_message(_msg("Heat", message_id=30))
     assert ask.grabbed is False
@@ -337,7 +346,16 @@ async def test_inbox_user_allowlist(inbox: TelegramInbox, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_inbox_not_found(inbox: TelegramInbox):
+async def test_inbox_not_found(inbox: TelegramInbox, monkeypatch):
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "ZzzNotARealFilm999",
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
     result = await inbox.handle_message(_msg("ZzzNotARealFilm999", message_id=70))
     assert result.grabbed is False
     assert "Couldn't find" in result.reply
@@ -346,34 +364,67 @@ async def test_inbox_not_found(inbox: TelegramInbox):
 # --- intent / follow-ups ----------------------------------------------------
 
 
-def test_heuristic_all_of_them_and_ordinals():
-    from hearth.telegram.intent import heuristic_intent
+def test_instant_pick_all_of_them_and_de_eerste():
+    from hearth.telegram.intent import instant_pick_decision
 
     candidates = [
         {"title": "Harry Potter and the Sorcerer's Stone", "year": 2001, "tmdbId": 671},
         {"title": "Harry Potter and the Chamber of Secrets", "year": 2002, "tmdbId": 672},
         {"title": "Harry Potter and the Prisoner of Azkaban", "year": 2004, "tmdbId": 673},
     ]
-    all_of = heuristic_intent("all of them", candidates=candidates)
+    all_of = instant_pick_decision("all of them", candidates)
+    assert all_of is not None
     assert all_of.action == "pick_many"
     assert all_of.indices == [1, 2, 3]
+    assert all_of.source == "instant"
 
-    first = heuristic_intent("just the first one", candidates=candidates)
+    first = instant_pick_decision("de eerste", candidates)
+    assert first is not None
     assert first.action == "pick"
     assert first.indices == [1]
 
-    newest = heuristic_intent("the new one", candidates=candidates)
-    assert newest.action == "pick"
-    assert newest.indices == [3]
+    # Without a live list these are not instant.
+    assert instant_pick_decision("all of them", None) is None
+    assert instant_pick_decision("de eerste", []) is None
+    # "the new one" is conversational — model path, not instant.
+    assert instant_pick_decision("the new one", candidates) is None
 
-    series = heuristic_intent("the whole Harry Potter series")
-    assert series.action == "search"
-    assert "Harry Potter" in series.search_title
-    assert series.select_all is True
+
+def test_telegram_intent_model_prefers_gpt4o_over_mini(monkeypatch):
+    from hearth.config import settings as _settings
+    from hearth.telegram.intent import TELEGRAM_INTENT_MODEL, telegram_intent_model
+
+    monkeypatch.setattr(_settings, "openai_model", "gpt-4o-mini")
+    assert telegram_intent_model() == TELEGRAM_INTENT_MODEL
+    assert telegram_intent_model() == "gpt-4o"
+    monkeypatch.setattr(_settings, "openai_model", "gpt-4o")
+    assert telegram_intent_model() == "gpt-4o"
+    monkeypatch.setattr(_settings, "openai_model", "gpt-4.1")
+    assert telegram_intent_model() == "gpt-4.1"
+
+
+def test_explicit_title_year_instant_helper():
+    from hearth.telegram.intent import is_explicit_title_year
+
+    assert is_explicit_title_year("Annihilation (2018)")
+    assert is_explicit_title_year("Annihilation (2018) 1080p")
+    assert not is_explicit_title_year("Annihilation")
+    assert not is_explicit_title_year(
+        "Die film waar iemand een puzzel oplost door een spiegel"
+    )
 
 
 @pytest.mark.asyncio
-async def test_inbox_harry_potter_then_all_of_them(inbox: TelegramInbox):
+async def test_inbox_harry_potter_then_all_of_them(inbox: TelegramInbox, monkeypatch):
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Harry Potter",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
     ask = await inbox.handle_message(_msg("Harry Potter", message_id=100))
     assert ask.grabbed is False
     assert "Which one" in ask.reply
@@ -391,16 +442,35 @@ async def test_inbox_harry_potter_then_all_of_them(inbox: TelegramInbox):
 
 
 @pytest.mark.asyncio
-async def test_inbox_followup_first_one(inbox: TelegramInbox):
+async def test_inbox_followup_de_eerste_instant(inbox: TelegramInbox, monkeypatch):
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Harry Potter",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
     await inbox.handle_message(_msg("Harry Potter", message_id=110))
-    pick = await inbox.handle_message(_msg("the first one", message_id=111))
+    pick = await inbox.handle_message(_msg("de eerste", message_id=111))
     assert pick.grabbed is True
     assert "2001" in pick.reply or "Sorcerer" in pick.reply or "Harry Potter" in pick.reply
     assert len(pipeline.radarr_queue) == 1
 
 
 @pytest.mark.asyncio
-async def test_inbox_whole_series_one_shot(inbox: TelegramInbox):
+async def test_inbox_whole_series_via_model(inbox: TelegramInbox, monkeypatch):
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Harry Potter",
+            "select_all": True,
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
     result = await inbox.handle_message(
         _msg("the whole Harry Potter series", message_id=120)
     )
@@ -409,61 +479,64 @@ async def test_inbox_whole_series_one_shot(inbox: TelegramInbox):
 
 
 @pytest.mark.asyncio
-async def test_inbox_ambiguous_yes_clarifies(inbox: TelegramInbox):
+async def test_inbox_ambiguous_yes_clarifies(inbox: TelegramInbox, monkeypatch):
+    _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "search",
+                "search_title": "Harry Potter",
+                "media_kind": "movie",
+                "confidence": 0.95,
+            },
+            {
+                "action": "clarify",
+                "clarify_question": "Which Harry Potter — reply 1–3, or say all of them?",
+                "confidence": 0.7,
+            },
+        ],
+    )
     await inbox.handle_message(_msg("Harry Potter", message_id=130))
     yes = await inbox.handle_message(_msg("yes", message_id=131))
     assert yes.grabbed is False
-    assert "all of them" in yes.reply.lower() or "Which" in yes.reply
+    assert "Which" in yes.reply or "all of them" in yes.reply.lower()
 
 
 @pytest.mark.asyncio
-async def test_inbox_numeric_pick_still_works_with_franchise(inbox: TelegramInbox):
+async def test_inbox_numeric_pick_still_works_with_franchise(
+    inbox: TelegramInbox, monkeypatch
+):
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Harry Potter",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
     ask = await inbox.handle_message(_msg("Harry Potter", message_id=140))
     assert "1." in ask.reply
+    before = len(calls)
     pick = await inbox.handle_message(_msg("2", message_id=141))
     assert pick.grabbed is True
     assert "Chamber" in pick.reply or "2002" in pick.reply or "Harry Potter" in pick.reply
+    assert len(calls) == before  # bare "2" is instant — no second OpenAI hop
 
 
-# --- descriptive / plot-to-title resolution ---------------------------------
+# --- conversation / plot-to-title (always AI) ---------------------------------
 
 
-def test_looks_like_descriptive_ask_harry_potter_example():
+def test_looks_like_descriptive_ask_compat_shim():
+    """Deprecated helper may remain, but is not used as a gate."""
     from hearth.telegram.intent import looks_like_descriptive_ask
 
     assert looks_like_descriptive_ask(
         "a movie about a boy with glasses who is a wizard"
     )
     assert looks_like_descriptive_ask(
-        "tv show about a chemistry teacher who cooks meth"
+        "Die film waar iemand een puzzel oplost door een spiegel"
     )
-    # Concrete titles / links / picks skip the descriptive hop.
-    assert not looks_like_descriptive_ask("Annihilation (2018)")
-    assert not looks_like_descriptive_ask("Harry Potter")
-    assert not looks_like_descriptive_ask("2")
-    assert not looks_like_descriptive_ask("https://www.imdb.com/title/tt2798920/")
-    assert not looks_like_descriptive_ask("tt2798920")
-    assert not looks_like_descriptive_ask("all of them")
-
-
-def test_looks_like_descriptive_ask_dutch_plot_phrases():
-    """Live Waterloo Movies failures — Dutch must hit the model, not literal Radarr."""
-    from hearth.telegram.intent import looks_like_descriptive_ask
-
-    dutch_wizard = (
-        "Ben je nu wat slimmer? Ik zoek die film met die bebrilde tovenaar."
-    )
-    dutch_ring = (
-        "Ok, nog een poging. Die film met dat mannetje met harige voeten "
-        "die een ring kapot moet maken."
-    )
-    assert looks_like_descriptive_ask(dutch_wizard)
-    assert looks_like_descriptive_ask(dutch_ring)
-    assert looks_like_descriptive_ask("film met die bebrilde tovenaar")
-    assert looks_like_descriptive_ask("ik zoek die film met die bebrilde tovenaar")
-    assert looks_like_descriptive_ask("die serie over een chemieleraar")
-    # Year / short title still passthrough.
-    assert not looks_like_descriptive_ask("Annihilation (2018)")
 
 
 def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
@@ -473,6 +546,7 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
     from hearth.config import settings as _settings
 
     monkeypatch.setattr(_settings, "openai_api_key", "sk-test-not-a-real-key")
+    # House default stays mini; Telegram intent hop must still use gpt-4o.
     monkeypatch.setattr(_settings, "openai_model", "gpt-4o-mini")
 
     queue = list(payload) if isinstance(payload, list) else [payload]
@@ -506,6 +580,39 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
     return calls
 
 
+def _imitation_and_davinci_radarr(monkeypatch) -> list[str]:
+    """Radarr stub: Imitation Game 1–2 + Da Vinci Code single hit."""
+    from hearth.telegram import inbox as inbox_mod
+
+    imitation = [
+        {"title": "The Imitation Game", "year": 2014, "tmdbId": 205596},
+        {"title": "The Imitation Game", "year": 1980, "tmdbId": 999001},
+    ]
+    davinci = [{"title": "The Da Vinci Code", "year": 2006, "tmdbId": 591}]
+    queries: list[str] = []
+    original = inbox_mod.radarr.search
+
+    async def _capture(query: str, *args, **kwargs):
+        queries.append(str(query))
+        q = (query or "").lower()
+        if "imitation" in q:
+            return {"mode": "mock", "service": "radarr", "results": list(imitation)}
+        if "da vinci" in q or "davinci" in q:
+            return {"mode": "mock", "service": "radarr", "results": list(davinci)}
+        if q.startswith("tmdb:"):
+            try:
+                want = int(q.split(":", 1)[1])
+            except ValueError:
+                want = None
+            rows = [r for r in imitation + davinci if r.get("tmdbId") == want]
+            if rows:
+                return {"mode": "mock", "service": "radarr", "results": rows}
+        return await original(query, *args, **kwargs)
+
+    monkeypatch.setattr(inbox_mod.radarr, "search", _capture)
+    return queries
+
+
 @pytest.mark.asyncio
 async def test_interpret_descriptive_resolves_harry_potter(monkeypatch):
     from hearth.telegram.intent import interpret_intent
@@ -527,24 +634,31 @@ async def test_interpret_descriptive_resolves_harry_potter(monkeypatch):
     assert decision.media_kind == "movie"
     assert decision.source == "openai"
     assert calls
-    # System prompt + user JSON only — never leak the stub key into the payload.
+    assert calls[0]["model"] == "gpt-4o"
     user_content = calls[0]["messages"][1]["content"]
     assert "sk-test" not in user_content
     assert "sk-test" not in calls[0]["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
-async def test_interpret_obvious_title_skips_model(monkeypatch):
+async def test_interpret_bare_title_still_calls_model(monkeypatch):
+    """Bare title without year is conversational — always AI."""
     from hearth.telegram.intent import interpret_intent
 
     calls = _patch_openai_intent(
         monkeypatch,
-        {"action": "search", "search_title": "SHOULD_NOT_RUN", "confidence": 0.99},
+        {
+            "action": "search",
+            "search_title": "Annihilation",
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
     )
     decision = await interpret_intent("Annihilation")
-    assert decision.action == "passthrough"
-    assert decision.source == "skip"
-    assert calls == []
+    assert decision.action == "search"
+    assert decision.search_title == "Annihilation"
+    assert calls
+    assert calls[0]["model"] == "gpt-4o"
 
 
 @pytest.mark.asyncio
@@ -591,6 +705,206 @@ def _wrap_radarr_search(monkeypatch) -> list[str]:
 
 
 @pytest.mark.asyncio
+async def test_inbox_dutch_mirror_puzzle_always_calls_openai(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Always-AI: Dutch plot must hit the model even without English descriptive regex."""
+    dutch = (
+        "Die film waar iemand een puzzel oplost door een spiegel voor rare tekens "
+        "te houden en dan ineens kan lezen, super slim"
+    )
+    queries = _imitation_and_davinci_radarr(monkeypatch)
+    openai_calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Imitation Game",
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    result = await inbox.handle_message(_msg(dutch, message_id=300))
+    assert openai_calls, "Dutch plot ask must call OpenAI"
+    assert openai_calls[0]["model"] == "gpt-4o"
+    user_payload = openai_calls[0]["messages"][1]["content"]
+    assert "spiegel" in user_payload
+    assert "Which one" in result.reply
+    assert "Imitation Game" in result.reply
+    assert inbox.pending.get(-1001) is not None
+    for q in queries:
+        assert "spiegel" not in q.lower()
+        assert "puzzel" not in q.lower()
+
+
+@pytest.mark.asyncio
+async def test_inbox_reject_imitation_game_leonardo_clue_searches_davinci(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Wrong first guess must not trap the user in a 1–2 loop."""
+    import json as _json
+
+    dutch = (
+        "Die film waar iemand een puzzel oplost door een spiegel voor rare tekens "
+        "te houden en dan ineens kan lezen, super slim"
+    )
+    reject = (
+        "Nee, niet die. Ik denk dat het van die kunstenaar leonardo dicaprio was"
+    )
+    queries = _imitation_and_davinci_radarr(monkeypatch)
+    openai_calls = _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "search",
+                "search_title": "The Imitation Game",
+                "media_kind": "movie",
+                "confidence": 0.9,
+            },
+            {
+                "action": "search",
+                "search_title": "The Da Vinci Code",
+                "media_kind": "movie",
+                "confidence": 0.95,
+            },
+        ],
+    )
+    first = await inbox.handle_message(_msg(dutch, message_id=301))
+    assert "Imitation Game" in first.reply
+    assert "1–2" in first.reply or "1-2" in first.reply or "Reply 1" in first.reply
+    assert inbox.pending.get(-1001) is not None
+
+    second = await inbox.handle_message(_msg(reject, message_id=302))
+    assert len(openai_calls) >= 2
+    payload = _json.loads(openai_calls[1]["messages"][1]["content"])
+    rejected = [str(t).lower() for t in (payload.get("rejected_titles") or [])]
+    assert any("imitation" in t for t in rejected)
+    # Must not force pick-from Imitation Game candidates on the reject turn.
+    cands = payload.get("candidates") or []
+    assert not any("imitation" in str(c.get("title") or "").lower() for c in cands)
+    history = payload.get("recent_history") or []
+    assert history, "reject turn must include chat history"
+    assert "1–2" not in second.reply and "Reply 1" not in second.reply
+    assert "Imitation Game" not in second.reply or "Da Vinci" in second.reply
+    assert any("da vinci" in q.lower() for q in queries)
+    assert not any(
+        "imitation" in q.lower() for q in queries[1:]
+    ) or any("da vinci" in q.lower() for q in queries)
+    subject, _ = inbox.memory.subject(-1001)
+    assert "Da Vinci" in subject
+    assert "Imitation" not in subject
+    assert inbox.pending.get(-1001) is None or "Da Vinci" in (
+        inbox.pending[-1001].query if inbox.pending.get(-1001) else ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbox_reject_imitation_game_tim_honks_searches_davinci(
+    inbox: TelegramInbox, monkeypatch
+):
+    import json as _json
+
+    dutch = (
+        "Die film waar iemand een puzzel oplost door een spiegel voor rare tekens "
+        "te houden en dan ineens kan lezen, super slim"
+    )
+    reject = "Niet the imitation game. Degene die ik zoek was met tim honks"
+    queries = _imitation_and_davinci_radarr(monkeypatch)
+    openai_calls = _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "search",
+                "search_title": "The Imitation Game",
+                "media_kind": "movie",
+                "confidence": 0.9,
+            },
+            {
+                "action": "search",
+                "search_title": "The Da Vinci Code",
+                "media_kind": "movie",
+                "confidence": 0.95,
+            },
+        ],
+    )
+    await inbox.handle_message(_msg(dutch, message_id=310))
+    second = await inbox.handle_message(_msg(reject, message_id=311))
+    assert len(openai_calls) >= 2
+    payload = _json.loads(openai_calls[1]["messages"][1]["content"])
+    rejected = [str(t).lower() for t in (payload.get("rejected_titles") or [])]
+    assert any("imitation" in t for t in rejected)
+    assert not (payload.get("candidates") or [])
+    assert "Which one — reply 1" not in second.reply
+    assert any("da vinci" in q.lower() for q in queries)
+    subject, _ = inbox.memory.subject(-1001)
+    assert "Da Vinci" in subject
+
+
+@pytest.mark.asyncio
+async def test_inbox_bare_nee_after_disambiguation_clarifies_no_grab(
+    inbox: TelegramInbox, monkeypatch
+):
+    dutch = (
+        "Die film waar iemand een puzzel oplost door een spiegel voor rare tekens "
+        "te houden en dan ineens kan lezen, super slim"
+    )
+    _imitation_and_davinci_radarr(monkeypatch)
+    openai_calls = _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "search",
+                "search_title": "The Imitation Game",
+                "media_kind": "movie",
+                "confidence": 0.9,
+            },
+            {
+                "action": "clarify",
+                "clarify_question": "Ok — which film did you mean then?",
+                "confidence": 0.8,
+            },
+        ],
+    )
+    await inbox.handle_message(_msg(dutch, message_id=320))
+    before_queue = len(pipeline.radarr_queue)
+    nee = await inbox.handle_message(_msg("nee", message_id=321))
+    assert nee.grabbed is False
+    assert len(pipeline.radarr_queue) == before_queue
+    assert "Ok" in nee.reply or "Which" in nee.reply or "?" in nee.reply
+    # Must not stay stuck on the Imitation Game 1–2 prompt.
+    assert "Imitation Game" not in nee.reply
+    assert "1–2" not in nee.reply and "Reply 1" not in nee.reply
+    assert len(openai_calls) >= 2
+    assert inbox.pending.get(-1001) is None
+
+
+@pytest.mark.asyncio
+async def test_inbox_instant_annihilation_year_skips_openai(
+    inbox: TelegramInbox, monkeypatch
+):
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "search", "search_title": "WRONG", "confidence": 0.99},
+    )
+    result = await inbox.handle_message(_msg("Annihilation (2018)", message_id=330))
+    assert calls == []
+    assert "already" in result.reply.lower() or "Annihilation" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_instant_imdb_url_skips_openai(inbox: TelegramInbox, monkeypatch):
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "search", "search_title": "WRONG", "confidence": 0.99},
+    )
+    # Fixture knows Annihilation via tmdb; plain imdb may not-found — still no AI.
+    result = await inbox.handle_message(
+        _msg("https://www.imdb.com/title/tt2798920/", message_id=331)
+    )
+    assert calls == []
+    assert result.handled is True
+
+
+@pytest.mark.asyncio
 async def test_inbox_dutch_wizard_resolves_not_literal_title(
     inbox: TelegramInbox, monkeypatch
 ):
@@ -606,11 +920,11 @@ async def test_inbox_dutch_wizard_resolves_not_literal_title(
         },
     )
     result = await inbox.handle_message(_msg(dutch, message_id=240))
-    assert openai_calls, "Dutch plot ask must call gpt-4o-mini"
+    assert openai_calls, "Dutch plot ask must call OpenAI"
+    assert openai_calls[0]["model"] == "gpt-4o"
     user_payload = openai_calls[0]["messages"][1]["content"]
-    assert "bebrilde tovenaar" in user_payload  # full message to the model
+    assert "bebrilde tovenaar" in user_payload
     assert "Harry Potter" in result.reply or "Sorcerer" in result.reply or "Which one" in result.reply
-    # Never search Radarr with the raw Dutch sentence / plot fragment.
     for q in queries:
         assert "bebrilde" not in q.lower()
         assert "tovenaar" not in q.lower()
@@ -642,14 +956,13 @@ async def test_inbox_dutch_ring_resolves_not_entire_sentence(
     assert openai_calls
     user_payload = openai_calls[0]["messages"][1]["content"]
     assert "harige voeten" in user_payload
-    assert "Ok, nog een poging" in user_payload  # conversational filler stays for the model
+    assert "Ok, nog een poging" in user_payload
     for q in queries:
         assert "harige" not in q.lower()
         assert "mannetje" not in q.lower()
         assert "poging" not in q.lower()
         assert dutch not in q
     assert result.grabbed is False or "Lord" in result.reply or "Ring" in result.reply
-    # Fixture lookup may miss LOTR — either disambiguation, queued, or not-found on resolved title.
     assert "harige voeten" not in result.reply.lower()
     assert "nog een poging" not in result.reply.lower()
 
@@ -658,9 +971,9 @@ async def test_inbox_dutch_ring_resolves_not_entire_sentence(
 async def test_inbox_chat_memory_dutch_followup_de_eerste(
     inbox: TelegramInbox, monkeypatch
 ):
-    """After HP resolution, 'de eerste' must not Radarr-search the literal string."""
+    """After HP resolution, 'de eerste' is instant while the numbered list is showing."""
     queries = _wrap_radarr_search(monkeypatch)
-    _patch_openai_intent(
+    calls = _patch_openai_intent(
         monkeypatch,
         {
             "action": "search",
@@ -677,9 +990,11 @@ async def test_inbox_chat_memory_dutch_followup_de_eerste(
     assert inbox.memory.has_history(-1001)
 
     before = list(queries)
+    before_calls = len(calls)
     pick = await inbox.handle_message(_msg("de eerste", message_id=251))
     assert pick.grabbed is True
     assert "2001" in pick.reply or "Sorcerer" in pick.reply or "Harry Potter" in pick.reply
+    assert len(calls) == before_calls  # instant — no second model hop
     new_queries = queries[len(before) :]
     for q in new_queries:
         assert q.strip().lower() != "de eerste"
@@ -793,7 +1108,7 @@ async def test_inbox_literal_title_still_passthrough(inbox: TelegramInbox, monke
     result = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=210))
     assert result.grabbed is True
     assert "Brutalist" in result.reply
-    assert calls == []  # year + concrete title → no intent hop
+    assert calls == []  # year + concrete title → instant, no intent hop
 
 
 @pytest.mark.asyncio
@@ -854,19 +1169,17 @@ async def test_inbox_descriptive_low_confidence_search_clarifies(
 async def test_inbox_followups_still_work_with_descriptive_layer(
     inbox: TelegramInbox, monkeypatch
 ):
-    # Ensure franchise follow-ups from PR #36 are unchanged even with OpenAI stubbed.
     _patch_openai_intent(
         monkeypatch,
         {
-            "action": "pick_many",
-            "indices": [1, 2, 3],
-            "select_all": True,
-            "confidence": 0.9,
+            "action": "search",
+            "search_title": "Harry Potter",
+            "media_kind": "movie",
+            "confidence": 0.95,
         },
     )
     ask = await inbox.handle_message(_msg("Harry Potter", message_id=230))
     assert "Which one" in ask.reply
-    # High-confidence heuristic for "all of them" skips the model.
     all_of = await inbox.handle_message(_msg("all of them", message_id=231))
     assert all_of.grabbed is True
     assert len(pipeline.radarr_queue) >= 3
