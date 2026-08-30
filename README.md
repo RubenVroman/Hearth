@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Lights/AVR/TV/Apple TV via HA, Infuse play on ATV, *arr/Overseerr grab/request, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Lights/AVR/TV/Apple TV via HA, Infuse play on ATV, *arr/Overseerr grab/request, Telegram drop-group inbox, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -163,6 +163,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
+- **Telegram drop-group** → same *arr/Overseerr grab path; status posts back into the group (see below)
 - Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
 - Weather outside → `get_weather` (Open-Meteo; no API key)
 - Live web (news, current events, where-to-watch / streaming) → `web_search` (OpenAI hosted web search by default; optional Brave; DuckDuckGo HTML lite last resort). Search results only — Hearth does not fetch arbitrary pages.
@@ -374,7 +375,38 @@ Hearth will not talk webOS, Denon, or Infuse protocol itself. After HA is on:
 
 For LAN discovery (Cast, some TVs), you may want host networking on the HA service — see comments in `docker-compose.yml`. Hearth itself stays on the `hearth` bridge.
 
-Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve → the app). Do not document or use `:8443` / `:8787` in the UI.
+Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve → the app). Do not document or use `:8443` / `:8787` in the UI. Do **not** enable Tailscale Funnel. Hearth stays Tailscale-only; bind the app to LAN/Tailscale (or localhost behind Serve), never a WAN port-forward.
+
+## Telegram drop-group inbox
+
+A dedicated house Telegram group can act as a movie/series/TV **request inbox**. Anything that looks like a title or catalog link is queued through the existing Overseerr / Radarr / Sonarr tools. Status (queued, progress, done, failed) is posted back into the **same** group. There is no WhatsApp / WAHA / Baileys path — Telegram Bot API only.
+
+### Setup (Ruben)
+
+1. Talk to [@BotFather](https://t.me/BotFather): `/newbot`, copy the token.
+2. Add the bot to the house group. Prefer making it an admin (or at least able to read messages).
+3. Disable privacy mode so the bot sees all group messages: BotFather → `/setprivacy` → **Disable**.
+4. Get the group chat id (negative number for groups/supergroups). Easiest: temporarily add a “get ids” bot, or inspect `getUpdates` once after posting in the group.
+5. On VAULT, put secrets in host `.env` only (never commit):
+
+   ```bash
+   TELEGRAM_BOT_TOKEN=123456:ABC…
+   TELEGRAM_CHAT_IDS=-1001234567890
+   # optional house-member allowlist:
+   # TELEGRAM_USER_IDS=111,222
+   ```
+
+6. Recreate the hearth container. Feature stays **off** until both token and chat id are set.
+7. Long-polling (`getUpdates`) runs inside Hearth — no public webhook, no Funnel, no extra NAS docker sidecar. An optional localhost-only webhook (`TELEGRAM_WEBHOOK_LOCAL=true`, loopback clients only) exists for advanced setups; it is **not** the default.
+
+### Behavior
+
+- Only allowlisted `TELEGRAM_CHAT_IDS` are inboxes. Messages from other chats are ignored.
+- Catalog links (IMDb / TMDB / TVDB / Trakt / JustWatch), plain `tt…` / `tmdb:` / `tvdb:` ids, and titles like `Annihilation (2018)` or `Severance S02E03` are requests. The group itself is the confirmation — no extra Hearth UI confirm.
+- Magnets, `.torrent` files, and raw media attachments get a short in-group refusal (this is not a general downloader).
+- Ambiguous titles get a top-3 disambiguation; reply `1` / `2` / `3` to pick. Exact catalog ids grab immediately.
+- Dedup (message id + title/year window), per-group rate limit, max title length, bot loop-prevention, and log redaction for `TELEGRAM_BOT_TOKEN` ship by default.
+- Progress polls Radarr/Sonarr queue tools only for titles this inbox queued, and only posts meaningful steps (started, ~25/50/75, done, failed).
 
 ## What is stubbed vs live in v0.1
 
@@ -389,6 +421,7 @@ Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve →
 | `/ws/voice` text fallback | Live protocol; not the disabled beta websocket |
 | Whisper/TTS on fallback | Live when a key is set but Realtime is down |
 | HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
+| Telegram drop-group inbox | Live when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` are set; long-poll inside Hearth. Otherwise off. |
 | Thuisbezorgd / Just Eat Takeaway NL | Fixtures + confirm/dry-run always. Live paid submit needs partner `THUISBEZORGD_API_KEY` + session (no public consumer OAuth; no scrape). |
 | Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |
 | HA onboarding, TV/AVR pairing | Yours — service is included unconfigured |

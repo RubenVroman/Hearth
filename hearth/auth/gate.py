@@ -22,6 +22,10 @@ PUBLIC_EXACT = {
 }
 PUBLIC_PREFIXES = ("/static/",)
 
+# Optional Telegram localhost webhook (off by default). Path is public only so a
+# local reverse-proxy can POST; the handler still rejects non-loopback clients.
+TELEGRAM_WEBHOOK_PATH_DEFAULT = "/telegram/webhook"
+
 # Browser <img> / <link> cannot send X-Auth-Token. Same-origin GETs for these
 # paths may authenticate with the refresh cookie (same model as GET "/").
 _REFRESH_OK_GET_EXACT = frozenset({"/", "/api/media/art"})
@@ -31,7 +35,18 @@ _REFRESH_OK_GET_PREFIXES = ("/api/plex/thumb/",)
 def is_public_path(path: str) -> bool:
     if path in PUBLIC_EXACT:
         return True
-    return any(path.startswith(prefix) for prefix in PUBLIC_PREFIXES)
+    if any(path.startswith(prefix) for prefix in PUBLIC_PREFIXES):
+        return True
+    # Localhost-only Telegram webhook (feature-flagged in the handler).
+    from hearth.config import settings
+
+    if settings.telegram_webhook_local:
+        expected = (settings.telegram_webhook_path or TELEGRAM_WEBHOOK_PATH_DEFAULT).rstrip("/") or (
+            TELEGRAM_WEBHOOK_PATH_DEFAULT
+        )
+        if path.rstrip("/") == expected.rstrip("/"):
+            return True
+    return False
 
 
 def refresh_cookie_ok_for_request(method: str, path: str) -> bool:

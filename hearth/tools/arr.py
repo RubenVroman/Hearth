@@ -48,26 +48,81 @@ def _poster_path(item: dict[str, Any]) -> str | None:
     return enriched.get("posterPath")
 
 
+def _library_id(item: dict[str, Any]) -> int | None:
+    """Radarr/Sonarr assign a numeric id only after the title is in the library."""
+    raw = item.get("id")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    # Lookup payloads sometimes echo tmdb/tvdb into id; real library ids are present
+    # alongside tmdbId/tvdbId as a separate field. Prefer explicit hasFile / path.
+    if item.get("hasFile") or item.get("path") or item.get("movieFile") or item.get("statistics"):
+        return value
+    if item.get("tmdbId") is not None and value == item.get("tmdbId"):
+        return None
+    if item.get("tvdbId") is not None and value == item.get("tvdbId"):
+        return None
+    # If both catalog id and a distinct library id exist, keep the library id.
+    if item.get("tmdbId") is not None or item.get("tvdbId") is not None:
+        return value
+    return None
+
+
+def _in_library(item: dict[str, Any]) -> bool:
+    if item.get("hasFile") is True:
+        return True
+    if item.get("path") and _library_id(item) is not None:
+        return True
+    if item.get("queued") is True or item.get("requested") is True:
+        return True
+    media = item.get("media") if isinstance(item.get("media"), dict) else {}
+    # Overseerr mediaInfo status: 3=available, 4=partial, 5=processing, …
+    status = media.get("status")
+    try:
+        if status is not None and int(status) >= 3:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
-    return {
+    tmdb = item.get("tmdbId")
+    if tmdb is None and item.get("id") is not None and not _library_id(item):
+        tmdb = item.get("id")
+    out = {
         "title": item.get("title"),
         "year": item.get("year"),
-        "tmdbId": item.get("tmdbId") or item.get("id"),
+        "tmdbId": tmdb,
+        "libraryId": _library_id(item),
+        "inLibrary": _in_library(item) or _library_id(item) is not None,
+        "hasFile": bool(item.get("hasFile")),
         "status": item.get("status"),
         "overview": (item.get("overview") or "")[:180],
         "posterPath": _poster_path(item),
     }
+    if item.get("matched"):
+        out["matched"] = item.get("matched")
+    return out
 
 
 def _summarize_series(item: dict[str, Any]) -> dict[str, Any]:
-    return {
+    out = {
         "title": item.get("title"),
         "year": item.get("year"),
         "tvdbId": item.get("tvdbId"),
+        "libraryId": _library_id(item),
+        "inLibrary": _in_library(item) or _library_id(item) is not None,
         "status": item.get("status"),
         "overview": (item.get("overview") or "")[:180],
         "posterPath": _poster_path(item),
     }
+    if item.get("matched"):
+        out["matched"] = item.get("matched")
+    return out
 
 
 def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
@@ -76,14 +131,19 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
         date = item.get("releaseDate") or item.get("firstAirDate") or ""
         year = str(date)[:4] or None
     media_id = item.get("id") or item.get("mediaId")
-    return {
+    out = {
         "title": item.get("title") or item.get("name"),
         "year": year,
         "mediaType": item.get("mediaType"),
         "mediaId": media_id,
         "tmdbId": media_id,
+        "inLibrary": _in_library(item),
         "posterPath": _poster_path(item),
     }
+    if item.get("matched"):
+        out["matched"] = item.get("matched")
+    return out
+
 
 
 def queue_percent(size: Any, sizeleft: Any) -> float | None:
