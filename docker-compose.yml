@@ -1,0 +1,101 @@
+# Hearth on VAULT (Synology DS1817+, DSM 7.3, x86_64)
+#
+# Binds to LAN / Tailscale. Do not port-forward 8787 or 8123 on the router.
+# Existing media stack (Plex, Sonarr, Radarr, Prowlarr, Overseerr, Gluetun)
+# stays in its own compose file; point PLEX_URL at the host.
+
+services:
+  hearth:
+    build: .
+    image: hearth:local
+    container_name: hearth
+    restart: unless-stopped
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_REALTIME_MODEL: ${OPENAI_REALTIME_MODEL:-gpt-realtime-2.1}
+      HA_URL: ${HA_URL:-http://homeassistant:8123}
+      HA_TOKEN: ${HA_TOKEN:-}
+      HA_TV_ENTITY: ${HA_TV_ENTITY:-media_player.lg_webos_tv}
+      HA_AVR_ENTITY: ${HA_AVR_ENTITY:-media_player.denon_avr_x3700h}
+      PLEX_URL: ${PLEX_URL:-http://host.docker.internal:32400}
+      PLEX_TOKEN: ${PLEX_TOKEN:-}
+      PLEX_DEFAULT_PLAYER: ${PLEX_DEFAULT_PLAYER:-}
+      RADARR_URL: ${RADARR_URL:-http://host.docker.internal:7878}
+      RADARR_API_KEY: ${RADARR_API_KEY:-}
+      SONARR_URL: ${SONARR_URL:-http://host.docker.internal:8989}
+      SONARR_API_KEY: ${SONARR_API_KEY:-}
+      OVERSEERR_URL: ${OVERSEERR_URL:-http://host.docker.internal:5055}
+      OVERSEERR_API_KEY: ${OVERSEERR_API_KEY:-}
+      HEARTH_COS_WEBHOOK: ${HEARTH_COS_WEBHOOK:-}
+      HEARTH_COS_WEBHOOK_KEY: ${HEARTH_COS_WEBHOOK_KEY:-}
+      HEARTH_COS_REPO: ${HEARTH_COS_REPO:-RubenVroman/Hearth}
+      HEARTH_HOUSE_NAME: ${HEARTH_HOUSE_NAME:-VAULT}
+      HEARTH_OWNER: ${HEARTH_OWNER:-Ruben}
+      HEARTH_TOKEN: ${HEARTH_TOKEN:-}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-}
+      ALGORITHM: ${ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-14}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
+      HEARTH_ADMIN_EMAIL: ${HEARTH_ADMIN_EMAIL:-}
+      HEARTH_ADMIN_PASSWORD: ${HEARTH_ADMIN_PASSWORD:-}
+      HEARTH_AUTH_DB: /app/data/hearth-auth.db
+      HEARTH_MEMORY_DB: /app/data/hearth-memory.db
+      HEARTH_MEMORY_ENABLED: ${HEARTH_MEMORY_ENABLED:-true}
+      HEARTH_MEMORY_STORE_CONVERSATIONS: ${HEARTH_MEMORY_STORE_CONVERSATIONS:-true}
+      HEARTH_MEMORY_STORE_HOUSE_EVENTS: ${HEARTH_MEMORY_STORE_HOUSE_EVENTS:-false}
+      HEARTH_MEMORY_HOUSE_EVENT_SAMPLE: ${HEARTH_MEMORY_HOUSE_EVENT_SAMPLE:-1}
+      HEARTH_MEMORY_EMBEDDINGS: ${HEARTH_MEMORY_EMBEDDINGS:-true}
+      HEARTH_MEMORY_EMBEDDING_MODEL: ${HEARTH_MEMORY_EMBEDDING_MODEL:-text-embedding-3-small}
+      HEARTH_MEMORY_INJECT: ${HEARTH_MEMORY_INJECT:-true}
+      HEARTH_MEMORY_RETENTION_DAYS: ${HEARTH_MEMORY_RETENTION_DAYS:-90}
+      HEARTH_MEMORY_HOUSE_EVENT_RETENTION_DAYS: ${HEARTH_MEMORY_HOUSE_EVENT_RETENTION_DAYS:-30}
+      HEARTH_MEMORY_SUMMARIZE_AFTER: ${HEARTH_MEMORY_SUMMARIZE_AFTER:-16}
+      HEARTH_MEMORY_PRUNE_INTERVAL_MINUTES: ${HEARTH_MEMORY_PRUNE_INTERVAL_MINUTES:-60}
+      HEARTH_MOCK_IF_UNCONFIGURED: ${HEARTH_MOCK_IF_UNCONFIGURED:-true}
+      WORKSPACE_PATH: /app/workspace
+      DOCKER_SOCKET: /var/run/docker.sock
+    ports:
+      # Default publishes on all host interfaces. Prefer HEARTH_BIND=100.x.y.z
+      # (Tailscale) or a LAN IP. Never forward this on the WAN router.
+      - "${HEARTH_BIND:-0.0.0.0}:${HEARTH_PORT:-8787}:8787"
+    volumes:
+      - ./workspace:/app/workspace
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - homeassistant
+    networks:
+      - hearth
+    mem_limit: 512m
+
+  homeassistant:
+    image: homeassistant/home-assistant:stable
+    container_name: hearth-ha
+    restart: unless-stopped
+    # HA is the device layer (lights, Denon AVR-X3700H, LG webOS). This service
+    # is included unconfigured — complete onboarding on :8123 from LAN/Tailscale.
+    ports:
+      - "${HA_BIND:-0.0.0.0}:8123:8123"
+    volumes:
+      - ./ha:/config
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      TZ: ${TZ:-Europe/Brussels}
+    # For mDNS / Cast / HDMI-CEC discovery on the LAN, DSM Container Manager
+    # can use host networking. If you switch this on, comment out `ports:`
+    # and `networks:` for this service and set HA_URL=http://127.0.0.1:8123
+    # from hearth via host.docker.internal:8123 instead.
+    # network_mode: host
+    networks:
+      - hearth
+    mem_limit: 1g
+
+networks:
+  hearth:
+    name: hearth
+    driver: bridge
