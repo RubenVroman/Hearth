@@ -1372,3 +1372,183 @@ async def test_manual_status_path_still_reports_current_progress(client):
     assert body["tools"][0]["name"] == "radarr_queue"
     assert "Annihilation" in body["reply"]
     assert "75" in body["reply"] or "%" in body["reply"]
+
+
+# --- catalog resolve / years / chatter / dedup (Cape Fear + Sloss) ------------
+
+
+def test_search_query_never_returns_raw_imdb_id():
+    parsed = parse_message_text("https://www.imdb.com/title/tt34675596/")
+    assert parsed.imdb_id == "tt34675596"
+    assert parsed.search_query() == ""
+    assert "tt34675596" not in parsed.display_label()
+
+
+@pytest.mark.asyncio
+async def test_inbox_imdb_cape_fear_resolves_tv_not_tt_string(
+    inbox: TelegramInbox, monkeypatch
+):
+    """IMDb URL must TMDB-resolve to Cape Fear TV 2026 — never Radarr search tt…."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    async def _fake_find(external_id: str, *, external_source: str = "imdb_id"):
+        assert "tt34675596" in external_id.lower()
+        assert external_source == "imdb_id"
+        return {
+            "movie_results": [],
+            "tv_results": [
+                {
+                    "id": 241001,
+                    "name": "Cape Fear",
+                    "first_air_date": "2026-01-01",
+                    "mediaType": "tv",
+                }
+            ],
+            "source": "mock_tmdb",
+        }
+
+    monkeypatch.setattr(catalog_mod, "tmdb_find", _fake_find)
+    monkeypatch.setattr(settings, "telegram_prefer_overseerr", True)
+    monkeypatch.setattr(settings, "overseerr_api_key", "ov-test")
+
+    radarr_queries: list[str] = []
+    original_radarr = inbox_mod.radarr.search
+
+    async def _radarr_capture(query: str, *args, **kwargs):
+        radarr_queries.append(str(query))
+        return await original_radarr(query, *args, **kwargs)
+
+    monkeypatch.setattr(inbox_mod.radarr, "search", _radarr_capture)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    result = await inbox.handle_message(
+        _msg("https://www.imdb.com/title/tt34675596/", message_id=400)
+    )
+    assert result.grabbed is True
+    assert "Cape Fear" in result.reply
+    assert "2026" in result.reply
+    assert "tt34675596" not in result.reply
+    assert not any("tt34675596" == q.strip().lower() for q in radarr_queries)
+    assert not any(q.strip().lower() == "tt34675596" for q in radarr_queries)
+    assert overseerr_requests
+    assert overseerr_requests[0]["media_type"] == "tv"
+    assert overseerr_requests[0]["media_id"] == 241001
+    assert pipeline.overseerr_queue or result.service == "sonarr"
+
+
+@pytest.mark.asyncio
+async def test_inbox_chatter_ignored_empty_reply(inbox: TelegramInbox, monkeypatch):
+    """Meta talk / emoji must not ask which movie — empty reply (ignore)."""
+    # Seed history so the old force=True path would have fired.
+    inbox.memory.record_user(-1001, "https://www.imdb.com/title/tt34675596/")
+    inbox.memory.record_bot(-1001, "Couldn't find a match for 'tt34675596'.")
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "clarify", "clarify_question": "Which movie or series did you mean?"},
+    )
+    for mid, text in (
+        (401, "🙈"),
+        (402, "Jaartallen kloppen niet altijd volgens mij..."),
+        (403, "Ga ik fixen 😄"),
+    ):
+        result = await inbox.handle_message(_msg(text, message_id=mid))
+        assert result.handled is True
+        assert result.reply == "", f"expected ignore for {text!r}, got {result.reply!r}"
+        assert result.grabbed is False
+    # Chatter short-circuits before the model.
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_inbox_annihilation_year_goes_through_tmdb_resolve(
+    inbox: TelegramInbox, monkeypatch
+):
+    from hearth.telegram import catalog as catalog_mod
+
+    resolve_calls: list[dict] = []
+    original = catalog_mod.resolve_title
+
+    async def _wrap(title: str, *, year=None, media_kind: str = ""):
+        resolve_calls.append({"title": title, "year": year, "media_kind": media_kind})
+        return await original(title, year=year, media_kind=media_kind)
+
+    monkeypatch.setattr(catalog_mod, "resolve_title", _wrap)
+    result = await inbox.handle_message(_msg("Annihilation (2018)", message_id=410))
+    assert resolve_calls, "Title (YYYY) must TMDB/catalog-resolve the year"
+    assert resolve_calls[0]["title"] == "Annihilation"
+    assert resolve_calls[0]["year"] == 2018
+    assert "Annihilation" in result.reply
+    assert "2018" in result.reply or "already" in result.reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_inbox_daniel_sloss_near_exact_queues_without_dup_12(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Near-exact special title → one grab; never a fake 1–2 of identical 2025 rows."""
+    monkeypatch.setattr(settings, "telegram_prefer_overseerr", True)
+    monkeypatch.setattr(settings, "overseerr_api_key", "ov-test")
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "clarify", "clarify_question": "Which movie or series did you mean?"},
+    )
+    result = await inbox.handle_message(_msg("Daniel sloss can't", message_id=420))
+    assert result.grabbed is True
+    assert "Daniel Sloss" in result.reply
+    assert "2025" in result.reply
+    assert "Which one" not in result.reply
+    assert "1." not in result.reply
+    assert "2." not in result.reply
+    assert calls == []  # catalog resolve — no model / no fake clarify
+
+    # Colon form with Overseerr duplicate rows must also collapse + grab.
+    inbox.deduper.reset()
+    pipeline.overseerr_queue.clear()
+    again = await inbox.handle_message(_msg("Daniel sloss: Can't", message_id=421))
+    assert again.grabbed is True or "already" in again.reply.lower()
+    assert "1. Daniel Sloss: Can't (2025)" not in again.reply
+    assert again.reply.count("2025") <= 2  # queued line only, not a 1–2 list
+
+
+@pytest.mark.asyncio
+async def test_dedupe_choices_collapses_identical_title_year():
+    box = TelegramInbox()
+    rows = [
+        {"title": "Daniel Sloss: Can't", "year": 2025, "tmdbId": 1520001, "mediaType": "movie"},
+        {"title": "Daniel Sloss: Can't", "year": 2025, "tmdbId": 1520002, "mediaType": "movie"},
+    ]
+    deduped = box._dedupe_choices(rows)
+    assert len(deduped) == 1
+    assert deduped[0]["year"] == 2025
+
+
+@pytest.mark.asyncio
+async def test_disambiguation_options_include_years(inbox: TelegramInbox, monkeypatch):
+    _imitation_and_davinci_radarr(monkeypatch)
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Imitation Game",
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    dutch = (
+        "Die film waar iemand een puzzel oplost door een spiegel voor rare tekens "
+        "te houden en dan ineens kan lezen, super slim"
+    )
+    result = await inbox.handle_message(_msg(dutch, message_id=430))
+    assert "2014" in result.reply
+    assert "1980" in result.reply or "Which one" in result.reply

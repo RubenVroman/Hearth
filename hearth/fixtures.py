@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -391,6 +392,14 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "overview": "The Triwizard Tournament.",
         "status": "released",
     },
+    {
+        "title": "Daniel Sloss: Can't",
+        "year": 2025,
+        "tmdbId": 1520001,
+        "imdbId": "tt35000001",
+        "overview": "Stand-up special by Daniel Sloss.",
+        "status": "released",
+    },
 ]
 
 MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
@@ -408,6 +417,16 @@ MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
         "tvdbId": 397382,
         "overview": "Misfit spies at MI5's Slough House.",
         "status": "continuing",
+    },
+    {
+        "title": "Cape Fear",
+        "year": 2026,
+        "tvdbId": 449001,
+        "tmdbId": 241001,
+        "imdbId": "tt34675596",
+        "overview": "Amy Adams and Javier Bardem in a Cape Fear series.",
+        "status": "continuing",
+        "mediaType": "tv",
     },
 ]
 
@@ -475,6 +494,29 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
         "year": 2022,
         "posterPath": "/pPHpeI2X1qEd1CS1SeyrdhZ4qnT.jpg",
     },
+    {
+        "id": 241001,
+        "mediaType": "tv",
+        "title": "Cape Fear",
+        "year": 2026,
+        "imdbId": "tt34675596",
+        "posterPath": "/cape-fear-2026.jpg",
+    },
+    {
+        "id": 1520001,
+        "mediaType": "movie",
+        "title": "Daniel Sloss: Can't",
+        "year": 2025,
+        "imdbId": "tt35000001",
+    },
+    # Duplicate row (same title+year, different internal id) — must collapse in UI.
+    {
+        "id": 1520002,
+        "mediaType": "movie",
+        "title": "Daniel Sloss: Can't",
+        "year": 2025,
+        "imdbId": "tt35000001",
+    },
 ]
 
 
@@ -525,7 +567,64 @@ def _filter_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any
     needle = (query or "").strip().lower()
     if not needle:
         return deepcopy(items)
-    hits = [deepcopy(item) for item in items if needle in str(item.get("title", "")).lower()]
+
+    def _loose(value: str) -> str:
+        return re.sub(r"[^a-z0-9à-ÿ]+", " ", (value or "").lower()).strip()
+
+    # Catalog id lookups — never fuzzy-fallback a raw tt/tmdb/tvdb miss.
+    if needle.startswith("imdb:"):
+        imdb = needle.split(":", 1)[1].strip()
+        hits = [
+            deepcopy(item)
+            for item in items
+            if str(item.get("imdbId") or "").lower() == imdb
+        ]
+        return hits
+    if needle.startswith("tt") and needle[2:].isdigit():
+        hits = [
+            deepcopy(item)
+            for item in items
+            if str(item.get("imdbId") or "").lower() == needle
+        ]
+        return hits
+    if needle.startswith("tmdb:"):
+        try:
+            want = int(needle.split(":", 1)[1])
+        except ValueError:
+            return []
+        hits = [
+            deepcopy(item)
+            for item in items
+            if item.get("tmdbId") == want or item.get("id") == want
+        ]
+        return hits
+    if needle.startswith("tvdb:"):
+        try:
+            want = int(needle.split(":", 1)[1])
+        except ValueError:
+            return []
+        hits = [deepcopy(item) for item in items if item.get("tvdbId") == want]
+        return hits
+    if needle.isdigit():
+        want = int(needle)
+        hits = [
+            deepcopy(item)
+            for item in items
+            if item.get("tmdbId") == want
+            or item.get("tvdbId") == want
+            or item.get("id") == want
+        ]
+        if hits:
+            return hits
+
+    loose_needle = _loose(needle)
+    hits = [
+        deepcopy(item)
+        for item in items
+        if needle in str(item.get("title", "")).lower()
+        or (loose_needle and loose_needle in _loose(str(item.get("title", ""))))
+        or (loose_needle and _loose(str(item.get("title", ""))) == loose_needle)
+    ]
     return hits or [deepcopy(items[0]) | {"title": items[0]["title"], "matched": "fallback"}]
 
 

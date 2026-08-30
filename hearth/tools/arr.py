@@ -89,6 +89,25 @@ def _in_library(item: dict[str, Any]) -> bool:
     return False
 
 
+def _summarize_series(item: dict[str, Any]) -> dict[str, Any]:
+    out = {
+        "title": item.get("title"),
+        "year": item.get("year"),
+        "tvdbId": item.get("tvdbId"),
+        "tmdbId": item.get("tmdbId"),
+        "imdbId": item.get("imdbId"),
+        "libraryId": _library_id(item),
+        "inLibrary": _in_library(item) or _library_id(item) is not None,
+        "status": item.get("status"),
+        "overview": (item.get("overview") or "")[:180],
+        "posterPath": _poster_path(item),
+        "mediaType": "tv",
+    }
+    if item.get("matched"):
+        out["matched"] = item.get("matched")
+    return out
+
+
 def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
     tmdb = item.get("tmdbId")
     if tmdb is None and item.get("id") is not None and not _library_id(item):
@@ -97,28 +116,14 @@ def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
         "title": item.get("title"),
         "year": item.get("year"),
         "tmdbId": tmdb,
+        "imdbId": item.get("imdbId"),
         "libraryId": _library_id(item),
         "inLibrary": _in_library(item) or _library_id(item) is not None,
         "hasFile": bool(item.get("hasFile")),
         "status": item.get("status"),
         "overview": (item.get("overview") or "")[:180],
         "posterPath": _poster_path(item),
-    }
-    if item.get("matched"):
-        out["matched"] = item.get("matched")
-    return out
-
-
-def _summarize_series(item: dict[str, Any]) -> dict[str, Any]:
-    out = {
-        "title": item.get("title"),
-        "year": item.get("year"),
-        "tvdbId": item.get("tvdbId"),
-        "libraryId": _library_id(item),
-        "inLibrary": _in_library(item) or _library_id(item) is not None,
-        "status": item.get("status"),
-        "overview": (item.get("overview") or "")[:180],
-        "posterPath": _poster_path(item),
+        "mediaType": "movie",
     }
     if item.get("matched"):
         out["matched"] = item.get("matched")
@@ -137,8 +142,10 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
         "mediaType": item.get("mediaType"),
         "mediaId": media_id,
         "tmdbId": media_id,
+        "imdbId": item.get("imdbId"),
         "inLibrary": _in_library(item),
         "posterPath": _poster_path(item),
+        "popularity": item.get("popularity"),
     }
     if item.get("matched"):
         out["matched"] = item.get("matched")

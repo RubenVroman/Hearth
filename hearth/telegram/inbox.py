@@ -16,6 +16,8 @@ from hearth.telegram.intent import (
     instant_pick_decision,
     interpret_intent,
     is_explicit_title_year,
+    looks_like_chatter,
+    looks_like_concrete_title,
 )
 from hearth.telegram.memory import ChatMemory
 from hearth.telegram.parse import (
@@ -23,6 +25,12 @@ from hearth.telegram.parse import (
     ParsedRequest,
     normalize_title,
     parse_message,
+)
+from hearth.telegram.catalog import (
+    CatalogHit,
+    hit_to_parsed,
+    resolve_parsed,
+    resolve_title,
 )
 from hearth.telegram.progress import (
     ProgressTracker,
@@ -181,6 +189,142 @@ class TelegramInbox:
             return True
         return False
 
+    def _dedupe_choices(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Collapse indistinguishable options (same title+year+kind+id).
+
+        Never offer two identical ``Title (2025)`` rows. Prefer a row with a
+        TMDB/TVDB id when collapsing duplicates.
+        """
+        best: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        order: list[tuple[str, str, str, str]] = []
+        for row in rows:
+            title = normalize_title(str(row.get("title") or ""))
+            year = str(row.get("year") or "")
+            kind = str(
+                row.get("mediaType")
+                or row.get("media_kind")
+                or ("tv" if row.get("tvdbId") else "movie")
+            )
+            tmdb = row.get("tmdbId") or row.get("mediaId")
+            tvdb = row.get("tvdbId")
+            imdb = str(row.get("imdbId") or "").lower()
+            # Identity key: prefer catalog id when present, else title+year+kind.
+            if tmdb not in (None, ""):
+                id_key = f"tmdb:{tmdb}"
+            elif tvdb not in (None, ""):
+                id_key = f"tvdb:{tvdb}"
+            elif imdb:
+                id_key = f"imdb:{imdb}"
+            else:
+                id_key = ""
+            # Indistinguishable to the user: same title + year + kind.
+            display_key = (title, year, kind, "")
+            id_full = (title, year, kind, id_key)
+            # Collapse by display first — two rows that look identical merge.
+            key = display_key if display_key[0] else id_full
+            if key not in best:
+                best[key] = row
+                order.append(key)
+                continue
+            prev = best[key]
+            prev_id = prev.get("tmdbId") or prev.get("mediaId") or prev.get("tvdbId")
+            new_id = tmdb or tvdb
+            # Prefer the row that carries a catalog id / higher popularity.
+            prev_pop = prev.get("popularity") or prev.get("voteCount") or 0
+            new_pop = row.get("popularity") or row.get("voteCount") or 0
+            if (not prev_id and new_id) or (new_pop and new_pop > (prev_pop or 0)):
+                best[key] = row
+        return [best[k] for k in order]
+
+    def _choices_are_indistinguishable(self, choices: list[dict[str, Any]]) -> bool:
+        if len(choices) <= 1:
+            return True
+        labels = {
+            (
+                normalize_title(str(c.get("title") or "")),
+                str(c.get("year") or ""),
+                str(c.get("mediaType") or ""),
+            )
+            for c in choices
+        }
+        return len(labels) == 1
+
+    async def _resolve_and_grab(
+        self,
+        view: MessageView,
+        parsed: ParsedRequest,
+        *,
+        select_all: bool = False,
+        exact: bool = False,
+    ) -> InboxResult:
+        """TMDB/catalog resolve then queue by id — never search raw ``tt…``."""
+        needs_resolve = parsed.needs_catalog_resolve()
+        if not needs_resolve:
+            return await self._grab(
+                view, parsed, exact=exact, select_all=select_all
+            )
+
+        hits, err_label = await resolve_parsed(parsed)
+        if not hits:
+            return InboxResult(
+                handled=True,
+                reply=format_not_found(err_label or parsed.display_label()),
+            )
+
+        # Multiple hits: only disambiguate when title/year/type actually differ.
+        if len(hits) > 1 and not select_all:
+            rows = self._dedupe_choices([h.as_dict() for h in hits])
+            if len(rows) == 1 or self._choices_are_indistinguishable(rows):
+                hits = [
+                    CatalogHit(
+                        title=str(rows[0].get("title") or hits[0].title),
+                        year=int(rows[0]["year"])
+                        if rows[0].get("year") not in (None, "")
+                        else hits[0].year,
+                        media_kind=(
+                            "tv"
+                            if str(rows[0].get("mediaType") or "") == "tv"
+                            else "movie"
+                        ),
+                        tmdb_id=int(rows[0]["tmdbId"])
+                        if rows[0].get("tmdbId") not in (None, "")
+                        else hits[0].tmdb_id,
+                        tvdb_id=int(rows[0]["tvdbId"])
+                        if rows[0].get("tvdbId") not in (None, "")
+                        else hits[0].tvdb_id,
+                        imdb_id=hits[0].imdb_id,
+                        source="deduped",
+                    )
+                ]
+            else:
+                reply = format_ambiguous(
+                    parsed.title or err_label or "that",
+                    rows,
+                )
+                kind = rows[0].get("mediaType") or parsed.media_kind or "movie"
+                self._remember_pending(
+                    view,
+                    options=rows,
+                    media_kind=str(kind) if str(kind) in {"movie", "tv"} else "movie",
+                    query=parsed.title or err_label,
+                    reply=reply,
+                )
+                return InboxResult(handled=True, reply=reply)
+
+        if select_all and len(hits) > 1:
+            rows = self._dedupe_choices([h.as_dict() for h in hits])
+            return await self._queue_many(
+                view,
+                parsed.title or err_label,
+                str(rows[0].get("mediaType") or "movie"),
+                rows,
+            )
+
+        resolved = hit_to_parsed(hits[0], base=parsed, reason="catalog_resolve")
+        return await self._grab(
+            view, resolved, exact=True, select_all=False
+        )
+
     async def handle_message(self, message: dict[str, Any]) -> InboxResult:
         view, parsed = parse_message(
             message,
@@ -249,24 +393,30 @@ class TelegramInbox:
                     user_text=view.text,
                 )
 
-        # Instant: catalog id/URL or Title (YYYY) — no model.
+        # Instant: catalog id/URL or Title (YYYY) — resolve via TMDB, no model.
         if self._is_instant_catalog(parsed, view):
             if not self.rate.allow():
                 return InboxResult(handled=True, reply=format_rate_limited())
             if self.deduper.seen_title(view.chat_id, parsed.dedup_key()):
                 return InboxResult(handled=True, reply="")
             self.pending.pop(view.chat_id, None)
-            result = await self._grab(view, parsed)
+            result = await self._resolve_and_grab(view, parsed)
             self.memory.set_subject(
                 view.chat_id,
-                parsed.title or result.title or "",
-                media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
+                result.title or parsed.title or "",
+                media_kind=(
+                    parsed.media_kind
+                    if parsed.media_kind in {"movie", "tv"}
+                    else ("tv" if result.service == "sonarr" else "movie")
+                    if result.grabbed
+                    else ""
+                ),
                 clear_rejected=True,
             )
             return self._finish(
                 view,
                 result,
-                search_title=parsed.title or result.title or "",
+                search_title=result.title or parsed.title or "",
                 media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
                 record_user=True,
                 user_text=view.text,
@@ -279,6 +429,89 @@ class TelegramInbox:
                 record_user=True,
                 user_text=view.text,
             )
+
+        # Chatter / emoji / meta — never ask "which movie".
+        if looks_like_chatter(view.text) and not pending:
+            return self._finish(
+                view,
+                InboxResult(handled=True, reply=""),
+                record_user=True,
+                user_text=view.text,
+            )
+
+        # Near-exact plain title: try TMDB first. Single unique hit → grab;
+        # distinct years/types → real disambiguation; miss → conversation hop.
+        # Skip plot sentences — those always go through the model.
+        if (
+            parsed.kind == "request"
+            and parsed.title
+            and not pending
+            and parsed.reason in {"plain_title", "trakt_movie_url", "trakt_show_url", "justwatch_url"}
+            and looks_like_concrete_title(view.text)
+        ):
+            title_hits = await resolve_title(
+                parsed.title,
+                year=parsed.year,
+                media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
+            )
+            rows = self._dedupe_choices([h.as_dict() for h in title_hits])
+            if len(rows) == 1 or (rows and self._choices_are_indistinguishable(rows)):
+                if not self.rate.allow():
+                    return InboxResult(handled=True, reply=format_rate_limited())
+                if self.deduper.seen_title(view.chat_id, parsed.dedup_key()):
+                    return InboxResult(handled=True, reply="")
+                self.pending.pop(view.chat_id, None)
+                pick = rows[0]
+                resolved = ParsedRequest(
+                    kind="request",
+                    media_kind=(
+                        "tv"
+                        if str(pick.get("mediaType") or "") == "tv"
+                        else "movie"
+                    ),
+                    title=str(pick.get("title") or parsed.title),
+                    year=int(pick["year"]) if pick.get("year") not in (None, "") else None,
+                    tmdb_id=int(pick["tmdbId"]) if pick.get("tmdbId") not in (None, "") else None,
+                    tvdb_id=int(pick["tvdbId"]) if pick.get("tvdbId") not in (None, "") else None,
+                    reason="title_catalog_resolve",
+                    raw_text=parsed.raw_text,
+                )
+                result = await self._grab(view, resolved, exact=True)
+                self.memory.set_subject(
+                    view.chat_id,
+                    result.title or resolved.title,
+                    media_kind=resolved.media_kind,
+                    clear_rejected=True,
+                )
+                return self._finish(
+                    view,
+                    result,
+                    search_title=result.title or resolved.title,
+                    media_kind=resolved.media_kind,
+                    record_user=True,
+                    user_text=view.text,
+                )
+            if len(rows) > 1:
+                if not self.rate.allow():
+                    return InboxResult(handled=True, reply=format_rate_limited())
+                reply = format_ambiguous(parsed.title, rows)
+                kind = rows[0].get("mediaType") or "movie"
+                self._remember_pending(
+                    view,
+                    options=rows,
+                    media_kind=str(kind) if str(kind) in {"movie", "tv"} else "movie",
+                    query=parsed.title,
+                    reply=reply,
+                )
+                return self._finish(
+                    view,
+                    InboxResult(handled=True, reply=reply),
+                    search_title=parsed.title,
+                    media_kind=str(kind) if str(kind) in {"movie", "tv"} else "",
+                    offered=rows,
+                    record_user=True,
+                    user_text=view.text,
+                )
 
         # Magnets/greetings/empty already classified — ignore without a model hop
         # only when there is truly nothing conversational to resolve.
@@ -378,7 +611,7 @@ class TelegramInbox:
         if self.deduper.seen_title(view.chat_id, parsed.dedup_key()):
             return InboxResult(handled=True, reply="")
         self.pending.pop(view.chat_id, None)
-        result = await self._grab(view, parsed)
+        result = await self._resolve_and_grab(view, parsed)
         return self._finish(
             view,
             result,
@@ -428,10 +661,11 @@ class TelegramInbox:
                 kind="request",
                 media_kind=media_kind,  # type: ignore[arg-type]
                 title=intent.search_title,
+                year=intent.year,
                 reason="intent_search",
             )
             self.pending.pop(view.chat_id, None)
-            return await self._grab(
+            return await self._resolve_and_grab(
                 view,
                 synthetic,
                 select_all=intent.select_all,
@@ -553,7 +787,7 @@ class TelegramInbox:
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("telegram grab failed: %s", redact(str(exc)))
-            query = parsed.search_query() or parsed.title or "that"
+            query = parsed.display_label() or parsed.title or "that"
             return InboxResult(
                 handled=True,
                 reply=f"Couldn't queue '{query}' — *arr look-up failed.",
@@ -591,8 +825,13 @@ class TelegramInbox:
             return "radarr", rows
 
         query = parsed.title or parsed.search_query()
-        if parsed.imdb_id and not parsed.title:
-            query = parsed.imdb_id
+        if parsed.year and parsed.title:
+            # Keep year out of the *arr term — filter by year after lookup.
+            query = parsed.title
+        if not query and parsed.tmdb_id:
+            query = f"tmdb:{parsed.tmdb_id}"
+        if not query:
+            return "radarr", []
         found = await radarr.search(query)
         return "radarr", list(found.get("results") or [])
 
@@ -664,7 +903,7 @@ class TelegramInbox:
         # Single hit is fine; multiple fuzzy hits need disambiguation.
         if len(hits) == 1:
             return hits
-        return hits[:MAX_CANDIDATES]
+        return self._dedupe_choices(hits[:MAX_CANDIDATES])
 
     async def _already_queued(self, title: str, service: str) -> bool:
         client = radarr if service == "radarr" else sonarr
@@ -703,11 +942,11 @@ class TelegramInbox:
         select_all: bool = False,
     ) -> InboxResult:
         _service, hits = await self._search_hits(parsed, "movie")
-        choices = self._filter_hits(hits, parsed, exact_id=exact_id)
+        choices = self._dedupe_choices(self._filter_hits(hits, parsed, exact_id=exact_id))
         if not choices:
             return InboxResult(
                 handled=True,
-                reply=format_not_found(parsed.search_query() or parsed.title or "that"),
+                reply=format_not_found(parsed.display_label()),
             )
         if select_all and len(choices) > 1 and not exact_id:
             return await self._queue_many(
@@ -716,13 +955,13 @@ class TelegramInbox:
                 "movie",
                 choices,
             )
-        if len(choices) > 1 and not exact_id:
-            reply = format_ambiguous(parsed.title or parsed.search_query(), choices)
+        if len(choices) > 1 and not exact_id and not self._choices_are_indistinguishable(choices):
+            reply = format_ambiguous(parsed.title or parsed.search_query() or parsed.display_label(), choices)
             self._remember_pending(
                 view,
                 options=choices,
                 media_kind="movie",
-                query=parsed.title or parsed.search_query(),
+                query=parsed.title or parsed.search_query() or parsed.display_label(),
                 reply=reply,
             )
             return InboxResult(handled=True, reply=reply)
@@ -748,7 +987,7 @@ class TelegramInbox:
         if result.get("ok") is False:
             return InboxResult(
                 handled=True,
-                reply=format_not_found(parsed.search_query() or title),
+                reply=format_not_found(parsed.display_label() or title),
             )
         self.progress.track(view.chat_id, title, "radarr", year_i)
         return InboxResult(
@@ -769,11 +1008,11 @@ class TelegramInbox:
         select_all: bool = False,
     ) -> InboxResult:
         _service, hits = await self._search_hits(parsed, "tv")
-        choices = self._filter_hits(hits, parsed, exact_id=exact_id)
+        choices = self._dedupe_choices(self._filter_hits(hits, parsed, exact_id=exact_id))
         if not choices:
             return InboxResult(
                 handled=True,
-                reply=format_not_found(parsed.search_query() or parsed.title or "that"),
+                reply=format_not_found(parsed.display_label()),
             )
         if select_all and len(choices) > 1 and not exact_id:
             return await self._queue_many(
@@ -782,13 +1021,13 @@ class TelegramInbox:
                 "tv",
                 choices,
             )
-        if len(choices) > 1 and not exact_id:
-            reply = format_ambiguous(parsed.title or parsed.search_query(), choices)
+        if len(choices) > 1 and not exact_id and not self._choices_are_indistinguishable(choices):
+            reply = format_ambiguous(parsed.title or parsed.search_query() or parsed.display_label(), choices)
             self._remember_pending(
                 view,
                 options=choices,
                 media_kind="tv",
-                query=parsed.title or parsed.search_query(),
+                query=parsed.title or parsed.search_query() or parsed.display_label(),
                 reply=reply,
             )
             return InboxResult(handled=True, reply=reply)
@@ -813,7 +1052,7 @@ class TelegramInbox:
         if result.get("ok") is False:
             return InboxResult(
                 handled=True,
-                reply=format_not_found(parsed.search_query() or title),
+                reply=format_not_found(parsed.display_label() or title),
             )
         self.progress.track(view.chat_id, title, "sonarr", year_i)
         return InboxResult(
@@ -834,17 +1073,18 @@ class TelegramInbox:
         exact_id: bool,
         select_all: bool = False,
     ) -> InboxResult:
-        query = parsed.search_query() or parsed.title
-        if parsed.tmdb_id and not query:
-            query = str(parsed.tmdb_id)
-        found = await overseerr.search(query)
+        query = parsed.title or parsed.search_query()
+        if parsed.tmdb_id and media_kind in {"movie", "tv"}:
+            # Prefer id-based Overseerr request after catalog resolve.
+            query = query or str(parsed.tmdb_id)
+        found = await overseerr.search(query) if query else {"results": []}
         hits = list(found.get("results") or [])
         if media_kind in {"movie", "tv"}:
             want = "movie" if media_kind == "movie" else "tv"
             typed = [row for row in hits if (row.get("mediaType") or "") == want]
             if typed:
                 hits = typed
-        choices = self._filter_hits(hits, parsed, exact_id=exact_id)
+        choices = self._dedupe_choices(self._filter_hits(hits, parsed, exact_id=exact_id))
         if parsed.tmdb_id:
             id_hits = [
                 row
@@ -852,7 +1092,18 @@ class TelegramInbox:
                 if row.get("tmdbId") == parsed.tmdb_id or row.get("mediaId") == parsed.tmdb_id
             ]
             if id_hits:
-                choices = id_hits[:1]
+                choices = self._dedupe_choices(id_hits)[:1]
+            elif exact_id:
+                # Direct request by resolved TMDB id — skip fuzzy search miss.
+                choices = [
+                    {
+                        "title": parsed.title or f"TMDB {parsed.tmdb_id}",
+                        "year": parsed.year,
+                        "mediaType": media_kind if media_kind in {"movie", "tv"} else "movie",
+                        "mediaId": parsed.tmdb_id,
+                        "tmdbId": parsed.tmdb_id,
+                    }
+                ]
         if not choices:
             # Fall back to direct *arr if Overseerr has nothing.
             if media_kind == "tv":
@@ -865,17 +1116,21 @@ class TelegramInbox:
         if select_all and len(choices) > 1 and not exact_id:
             return await self._queue_many(
                 view,
-                parsed.title or query,
+                parsed.title or query or parsed.display_label(),
                 media_kind if media_kind in {"movie", "tv"} else "movie",
                 choices,
             )
-        if len(choices) > 1 and not exact_id:
-            reply = format_ambiguous(parsed.title or query, choices)
+        if (
+            len(choices) > 1
+            and not exact_id
+            and not self._choices_are_indistinguishable(choices)
+        ):
+            reply = format_ambiguous(parsed.title or query or parsed.display_label(), choices)
             self._remember_pending(
                 view,
                 options=choices,
                 media_kind=media_kind,
-                query=parsed.title or query,
+                query=parsed.title or query or parsed.display_label(),
                 reply=reply,
             )
             return InboxResult(handled=True, reply=reply)
@@ -895,7 +1150,10 @@ class TelegramInbox:
             media_type=media_type,
         )
         if result.get("ok") is False:
-            return InboxResult(handled=True, reply=format_not_found(query or title))
+            return InboxResult(
+                handled=True,
+                reply=format_not_found(parsed.display_label() or title),
+            )
         service = "radarr" if media_type == "movie" else "sonarr"
         self.progress.track(view.chat_id, title, service, year_i)
         return InboxResult(

@@ -145,16 +145,26 @@ class ParsedRequest:
     raw_text: str = ""
 
     def search_query(self) -> str:
-        if self.imdb_id:
-            return self.imdb_id
+        """Human/search term for *arr — never a raw ``tt…`` id string."""
+        if self.title:
+            bits = [self.title.strip()]
+            if self.year:
+                bits.append(f"({self.year})")
+            return " ".join(bit for bit in bits if bit).strip()
         if self.tmdb_id and self.media_kind != "tv":
             return f"tmdb:{self.tmdb_id}"
         if self.tvdb_id:
             return f"tvdb:{self.tvdb_id}"
-        bits = [self.title.strip()]
-        if self.year:
-            bits.append(f"({self.year})")
-        return " ".join(bit for bit in bits if bit).strip()
+        # Unresolved IMDb id: empty — callers must resolve via catalog first.
+        return ""
+
+    def display_label(self) -> str:
+        """Label for user-facing not-found / status — never a raw ``tt…`` id."""
+        if self.title and self.year:
+            return f"{self.title} ({self.year})"
+        if self.title:
+            return self.title
+        return "that title"
 
     def dedup_key(self) -> str:
         if self.imdb_id:
@@ -166,6 +176,14 @@ class ParsedRequest:
         title = normalize_title(self.title)
         year = self.year or ""
         return f"title:{title}:{year}:{self.media_kind}"
+
+    def needs_catalog_resolve(self) -> bool:
+        """True when an external id or title/year must be verified on TMDB."""
+        if self.kind != "request":
+            return False
+        if self.imdb_id or self.tmdb_id or self.tvdb_id:
+            return True
+        return bool(self.title)
 
 
 @dataclass
