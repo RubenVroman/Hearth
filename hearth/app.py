@@ -131,6 +131,8 @@ async def status() -> dict[str, Any]:
             **ha_ping,
             "tv_entity": settings.ha_tv_entity,
             "avr_entity": settings.ha_avr_entity,
+            "apple_tv_entity": settings.ha_apple_tv_entity,
+            "apple_tv_player": settings.apple_tv_player,
         },
         "plex": {"configured": settings.plex_configured},
         "radarr": {"configured": settings.radarr_configured},
@@ -155,7 +157,7 @@ async def now_playing() -> dict[str, Any]:
 
 @app.get("/api/media")
 async def media_inventory() -> dict[str, Any]:
-    """TV + AVR (HA) + Plex — speakable house media snapshot for the agent/UI."""
+    """TV + AVR + Apple TV (HA) + Plex — speakable house media snapshot."""
     return await house_media_inventory()
 
 
@@ -169,7 +171,11 @@ async def rooms() -> dict[str, Any]:
         "scenes": scenes.get("states") or [],
         "media": media.get("states") or [],
         "mode": lights.get("mode"),
-        "entities": {"tv": settings.ha_tv_entity, "avr": settings.ha_avr_entity},
+        "entities": {
+            "tv": settings.ha_tv_entity,
+            "avr": settings.ha_avr_entity,
+            "apple_tv": settings.ha_apple_tv_entity,
+        },
     }
 
 

@@ -46,12 +46,16 @@ def test_media_inventory_endpoint(client):
     assert body["ok"] is True
     assert body["tv"]["entity_id"] == "media_player.lg_webos_tv"
     assert body["avr"]["ok"] is True
+    assert body["apple_tv"]["entity_id"] == "media_player.apple_tv"
+    assert body["apple_tv"]["ok"] is True
     assert body["plex"]["sessions"]
     assert "speak" in body
     status = client.get("/api/status")
     assert status.status_code == 200
     assert "radarr" in status.json()
     assert status.json()["ha"]["tv_entity"] == "media_player.lg_webos_tv"
+    assert status.json()["ha"]["apple_tv_entity"] == "media_player.apple_tv"
+    assert status.json()["ha"]["apple_tv_player"] == "infuse"
 
 
 def test_chat_turn_on_tv_uses_media_control(client):

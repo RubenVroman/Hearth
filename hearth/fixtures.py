@@ -55,6 +55,16 @@ MOCK_HA_STATES: list[dict[str, Any]] = [
             "volume_level": 0.0,
         },
     },
+    {
+        "entity_id": "media_player.apple_tv",
+        "state": "idle",
+        "attributes": {
+            "friendly_name": "Living Room Apple TV",
+            "app_name": None,
+            "source_list": ["Infuse", "Plex", "TV"],
+            "volume_level": 0.4,
+        },
+    },
 ]
 
 MOCK_PLEX_SESSIONS: dict[str, Any] = {
@@ -95,6 +105,8 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "summary": "Paul Atreides unites with Chani and the Fremen while seeking revenge against the conspirators who destroyed his family.",
         "contentRating": "PG-13",
         "audienceRating": 8.8,
+        "Guid": [{"id": "tmdb://693134"}, {"id": "imdb://tt15239678"}],
+        "tmdbId": 693134,
     },
     {
         "title": "The Endless",
@@ -106,6 +118,8 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "summary": "Two brothers return to the UFO death cult they fled from years earlier to discover the group’s secret.",
         "contentRating": "NR",
         "audienceRating": 6.5,
+        "Guid": [{"id": "tmdb://430231"}, {"id": "imdb://tt3986820"}],
+        "tmdbId": 430231,
     },
     {
         "title": "The Brutalist",
@@ -117,6 +131,8 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "summary": "A Hungarian-born Jewish architect starts over in America.",
         "contentRating": "R",
         "audienceRating": 7.9,
+        "Guid": [{"id": "tmdb://974950"}],
+        "tmdbId": 974950,
     },
     # Two exact-title editions so ambiguous library matches can be tested.
     {
@@ -129,6 +145,8 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "summary": "A group of professional bank robbers start to feel the heat from police when they unknowingly leave a clue at their latest heist.",
         "contentRating": "R",
         "audienceRating": 8.3,
+        "Guid": [{"id": "tmdb://949"}],
+        "tmdbId": 949,
     },
     {
         "title": "Heat",
@@ -140,6 +158,26 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "summary": "An ex-mercenary living in Las Vegas is hired to protect an old friend.",
         "contentRating": "R",
         "audienceRating": 5.7,
+        "Guid": [{"id": "tmdb://10784"}],
+        "tmdbId": 10784,
+    },
+    {
+        "title": "Hide and Seek",
+        "type": "episode",
+        "year": 2022,
+        "ratingKey": "4001",
+        "key": "/library/metadata/4001",
+        "guid": "plex://episode/severance-s1e1",
+        "grandparentTitle": "Severance",
+        "parentIndex": 1,
+        "index": 1,
+        "summary": "Mark discovers a mysterious self-help book that leads him to Lumon Industries.",
+        "contentRating": "TV-MA",
+        "audienceRating": 8.7,
+        "Guid": [{"id": "tmdb://95396"}],
+        "tmdbId": 95396,
+        "season": 1,
+        "episode": 1,
     },
 ]
 
@@ -207,6 +245,13 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "year": 2024,
         "tmdbId": 974950,
         "overview": "A Hungarian-born Jewish architect starts over in America.",
+        "status": "released",
+    },
+    {
+        "title": "The Endless",
+        "year": 2017,
+        "tmdbId": 430231,
+        "overview": "Two brothers return to a UFO death cult.",
         "status": "released",
     },
 ]
@@ -623,6 +668,8 @@ class MockHouse:
                 state["state"] = "off" if service == "turn_off" else "idle"
             elif service == "media_pause":
                 state["state"] = "paused"
+            elif service in {"media_next_track", "media_previous_track"}:
+                state["state"] = "playing"
             elif service == "select_source" and "source" in data:
                 state["attributes"]["source"] = data["source"]
             elif service == "play_media":
@@ -631,6 +678,11 @@ class MockHouse:
                     state["attributes"]["media_content_id"] = data["media_content_id"]
                 if "media_content_type" in data:
                     state["attributes"]["media_content_type"] = data["media_content_type"]
+                # Infuse / app deep links often surface as app_name on Apple TV.
+                content = str(data.get("media_content_id") or "")
+                if content.startswith("infuse://"):
+                    state["attributes"]["app_name"] = "Infuse"
+                    state["attributes"]["media_title"] = content.split("?")[0]
         return {"ok": True, "entity": deepcopy(state)}
 
     def _set_light(self, entity_id: str, on_off: str, brightness: int) -> None:

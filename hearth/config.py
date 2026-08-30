@@ -71,6 +71,16 @@ class Settings(BaseSettings):
     # Optional overrides after HA pairing (entity_ids differ per install).
     ha_tv_entity: str = Field(default="media_player.lg_webos_tv", alias="HA_TV_ENTITY")
     ha_avr_entity: str = Field(default="media_player.denon_avr_x3700h", alias="HA_AVR_ENTITY")
+    # Apple TV via HA apple_tv / pyatv — used to launch Infuse deep links + transport.
+    ha_apple_tv_entity: str = Field(
+        default="media_player.apple_tv",
+        alias="HA_APPLE_TV_ENTITY",
+    )
+    # Prefer Infuse (Firecore) over the Plex tvOS app when playing on Apple TV.
+    # Set to "plex" to keep the Plex-client playMedia path as the default.
+    apple_tv_player: str = Field(default="infuse", alias="HEARTH_APPLE_TV_PLAYER")
+    # Bundle id / app id for launch_app fallback (HA media_content_type=app).
+    infuse_app_id: str = Field(default="com.firecore.infuse", alias="INFUSE_APP_ID")
 
     plex_url: str = Field(default="http://host.docker.internal:32400", alias="PLEX_URL")
     plex_token: str = Field(default="", alias="PLEX_TOKEN")

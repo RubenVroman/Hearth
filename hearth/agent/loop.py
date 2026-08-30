@@ -160,10 +160,11 @@ class AgentLoop:
         used: list[dict[str, Any]] = []
         if plan is None:
             reply = (
-                "I can drive the house — lights, Denon, LG TV, play a Plex title on the TV, "
-                "grab movies in Radarr or shows in Sonarr, request via Overseerr, order food on "
-                "Thuisbezorgd, Plex now-playing, workspace, docker inspect. Repo, Gridways, "
-                "Discord, calendar, and anything I can't do yet go to Chief of Staff."
+                "I can drive the house — lights, Denon, LG TV, play titles in Infuse on the "
+                "Apple TV (or Plex on LG), grab movies in Radarr or shows in Sonarr, request "
+                "via Overseerr, order food on Thuisbezorgd, Plex now-playing, workspace, docker "
+                "inspect. Repo, Gridways, Discord, calendar, and anything I can't do yet go to "
+                "Chief of Staff."
             )
             runtime.note("assistant", reply)
             return {"reply": reply, "mode": "local", "tools": used}
@@ -278,6 +279,19 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
             f"Playing {item.get('title') or 'that'} on "
             f"{client.get('name') or 'the TV'}{mock}."
         )
+    if name == "infuse_play":
+        spoken = data.get("speak")
+        if spoken:
+            return spoken if mock == "" else f"{spoken.rstrip('.')}" + mock + "."
+        if data.get("needs_setup"):
+            return str(data.get("speak") or data.get("error") or "Apple TV / Infuse needs setup.")
+        item = data.get("item") or {}
+        return f"Opening {item.get('title') or 'that'} in Infuse on the Apple TV{mock}."
+    if name == "infuse_transport":
+        spoken = data.get("speak")
+        if spoken:
+            return spoken if mock == "" else f"{spoken.rstrip('.')}" + mock + "."
+        return f"Apple TV transport{mock}: {data.get('action') or 'done'}."
     if name == "ha_list_entities":
         states = data.get("states") or []
         if not states:
@@ -415,12 +429,27 @@ def _confirm_line(
     if name == "docker_stop":
         container = preview.get("container") or "that container"
         return f"I'll stop Docker container {container}. Confirm to stop it."
+    if name == "plex_play":
+        if plan and plan.get("speak"):
+            return str(plan["speak"])
+        query = preview.get("query") or "that"
+        player = preview.get("player") or "the TV"
+        return f"I'll play {query} on {player}. Confirm to start."
+    if name == "infuse_play":
+        if plan and plan.get("speak"):
+            return str(plan["speak"])
+        query = preview.get("query") or "that"
+        return f"I'll open {query} in Infuse on the Apple TV. Confirm to launch."
+    if name == "infuse_transport":
+        action = preview.get("action") or "control"
+        return f"I'll {action} on the Apple TV. Confirm to run."
     return f"{name} is waiting for confirm. Preview: {preview}"
 
 
 _PLAYING = re.compile(r"\b(now playing|what'?s (on|playing)|what is playing|now-playing)\b", re.I)
 _PLAY_ON_TV = re.compile(
     r"\bplay\s+(.+?)\s+on\s+(?:the\s+)?("
+    r"infuse|firecore|"
     r"apple\s*tv|lg(?:\s*webos)?(?:\s*tv)?|webos|"
     r"living\s*room(?:\s*tv)?|shield|plex|"
     r"tv|television"
@@ -431,9 +460,21 @@ _PLAY_TITLE = re.compile(
     r"\b(?:play|put on)\s+(.+?)(?:\s+please)?$",
     re.I,
 )
+_PUT_ON_INFUSE = re.compile(
+    r"\b(?:put|play)\s+(.+?)\s+(?:on|in)\s+(?:the\s+)?infuse\b",
+    re.I,
+)
+_INFUSE_TRANSPORT = re.compile(
+    r"\b(pause|stop|skip(?:\s+(?:ahead|forward))?|next(?:\s+track)?|"
+    r"resume|unpause|play|go\s+back|previous(?:\s+track)?)\b"
+    r".*\b(?:apple\s*tv|infuse|atv)\b"
+    r"|\b(?:apple\s*tv|infuse|atv)\b.*"
+    r"\b(pause|stop|skip|next|resume|unpause|go\s+back|previous)\b",
+    re.I,
+)
 _MEDIA_STATUS = re.compile(
-    r"\b(house media|media status|media inventory|what'?s on the (tv|avr|denon)|"
-    r"is the (tv|avr|denon) on|avr status|tv status)\b",
+    r"\b(house media|media status|media inventory|what'?s on the (tv|avr|denon|apple\s*tv)|"
+    r"is the (tv|avr|denon|apple\s*tv) on|avr status|tv status)\b",
     re.I,
 )
 _PLEX_CLIENTS = re.compile(
@@ -566,16 +607,31 @@ def route_intent(text: str) -> dict[str, Any] | None:
         if _MOVIE.search(raw):
             return {"tool": "radarr_add", "args": {"query": query or raw}}
         return {"tool": "overseerr_request", "args": {"query": query or raw}}
+    transport = _infuse_transport_plan(raw)
+    if transport:
+        return transport
+    put_infuse = _PUT_ON_INFUSE.search(raw)
+    if put_infuse:
+        title = _play_title_clean(put_infuse.group(1))
+        return {"tool": "infuse_play", "args": {"query": title}}
     play_on = _PLAY_ON_TV.search(raw)
     if play_on:
         title = _play_title_clean(play_on.group(1))
         player = _plex_player_hint(play_on.group(2))
+        from hearth.tools.infuse import prefer_infuse_for_apple_tv
+
+        if prefer_infuse_for_apple_tv(player) or "infuse" in player.lower() or "firecore" in player.lower():
+            return {"tool": "infuse_play", "args": {"query": title}}
         return {"tool": "plex_play", "args": {"query": title, "player": player}}
     play_title = _PLAY_TITLE.search(raw)
     if play_title and not _PLAYING.search(raw):
         title = _play_title_clean(play_title.group(1))
         # Avoid treating "play" as resume on HA media_player without a title.
         if title and title.lower() not in {"it", "that", "this", "something"}:
+            from hearth.tools.infuse import prefer_infuse_for_apple_tv
+
+            if prefer_infuse_for_apple_tv(None):
+                return {"tool": "infuse_play", "args": {"query": title}}
             return {"tool": "plex_play", "args": {"query": title}}
     if _PLEX_CLIENTS.search(raw):
         return {"tool": "plex_clients", "args": {}}
@@ -690,6 +746,8 @@ def _plex_player_hint(phrase: str | None) -> str:
     name = re.sub(r"\s+", " ", (phrase or "").strip().lower())
     if name in {"tv", "television", "plex"}:
         return "tv"
+    if "infuse" in name or "firecore" in name:
+        return "Infuse"
     if "apple" in name:
         return "Apple TV"
     if "lg" in name or "webos" in name:
@@ -699,6 +757,39 @@ def _plex_player_hint(phrase: str | None) -> str:
     if "shield" in name:
         return "Shield"
     return phrase.strip() if phrase else "tv"
+
+
+def _infuse_transport_plan(raw: str) -> dict[str, Any] | None:
+    match = _INFUSE_TRANSPORT.search(raw)
+    if not match:
+        return None
+    # Action may be in group 1 or 2 depending on word order.
+    action_raw = (match.group(1) or match.group(2) or "").strip().lower()
+    action_raw = re.sub(r"\s+", " ", action_raw)
+    mapping = {
+        "pause": "pause",
+        "stop": "stop",
+        "skip": "skip",
+        "skip ahead": "skip",
+        "skip forward": "skip",
+        "next": "skip",
+        "next track": "skip",
+        "resume": "play",
+        "unpause": "play",
+        "play": "play",
+        "go back": "previous",
+        "previous": "previous",
+        "previous track": "previous",
+    }
+    action = mapping.get(action_raw)
+    if not action:
+        return None
+    # Bare "play …" with a title is handled elsewhere; only transport when ATV/Infuse is named.
+    if action == "play" and _PLAY_ON_TV.search(raw):
+        return None
+    if action == "play" and _PLAY_TITLE.search(raw) and "apple" not in raw.lower() and "infuse" not in raw.lower():
+        return None
+    return {"tool": "infuse_transport", "args": {"action": action}}
 
 
 _PLAY_NOISE = re.compile(

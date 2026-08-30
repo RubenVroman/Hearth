@@ -8,6 +8,7 @@ from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.cos import cos_configured, escalate, not_configured_message
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.infuse import infuse
 from hearth.tools.media import house_media_inventory, media_control
 from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
@@ -119,6 +120,44 @@ async def _plex_play_preview(args: dict[str, Any]) -> dict[str, Any]:
         offset_ms=offset_ms,
         wait_for_client=False,
     )
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _infuse_play(args: dict[str, Any]) -> dict[str, Any]:
+    return await infuse.play(
+        str(args.get("query") or ""),
+        tmdb_id=_optional_int(args.get("tmdbId") or args.get("tmdb_id")),
+        rating_key=args.get("ratingKey") or args.get("rating_key"),
+        season=_optional_int(args.get("season")),
+        episode=_optional_int(args.get("episode")),
+        play=bool(args.get("play", True)),
+    )
+
+
+async def _infuse_play_preview(args: dict[str, Any]) -> dict[str, Any]:
+    return await infuse.resolve_play(
+        str(args.get("query") or ""),
+        tmdb_id=_optional_int(args.get("tmdbId") or args.get("tmdb_id")),
+        rating_key=args.get("ratingKey") or args.get("rating_key"),
+        season=_optional_int(args.get("season")),
+        episode=_optional_int(args.get("episode")),
+        play=bool(args.get("play", True)),
+    )
+
+
+async def _infuse_transport(args: dict[str, Any]) -> dict[str, Any]:
+    action = str(args.get("action") or "")
+    if not action:
+        return {"ok": False, "error": "action required (pause, play, stop, skip, previous)"}
+    return await infuse.transport(action)
 
 
 async def _docker_ps(_args: dict[str, Any]) -> dict[str, Any]:
@@ -372,17 +411,22 @@ def register_builtin_tools() -> None:
         ToolSpec(
             name="ha_media_control",
             description=(
-                "Control the LG webOS TV or Denon AVR via Home Assistant media_player services. "
-                "Prefer this over raw ha_call_service for TV/AVR. Runs immediately — no confirm step. "
-                "device=tv|avr; action=turn_on|turn_off|volume_set|volume_mute|unmute|volume_up|"
-                "volume_down|select_source|play_media|media_play|media_pause|media_stop."
+                "Control the LG webOS TV, Denon AVR, or Apple TV via Home Assistant "
+                "media_player services. Prefer this over raw ha_call_service for TV/AVR/ATV. "
+                "Runs immediately — no confirm step. "
+                "device=tv|avr|apple_tv; action=turn_on|turn_off|volume_set|volume_mute|unmute|"
+                "volume_up|volume_down|select_source|play_media|media_play|media_pause|"
+                "media_stop|media_next_track|media_previous_track."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "device": {
                         "type": "string",
-                        "description": "tv (LG webOS) or avr (Denon). Aliases: lg, denon, receiver.",
+                        "description": (
+                            "tv (LG webOS), avr (Denon), or apple_tv (HA Apple TV / Infuse transport). "
+                            "Aliases: lg, denon, receiver, atv, infuse."
+                        ),
                     },
                     "action": {"type": "string"},
                     "volume_level": {
@@ -445,7 +489,8 @@ def register_builtin_tools() -> None:
             name="plex_play",
             description=(
                 "Start playback of a specific Plex library title on a Plex client "
-                "(Apple TV / LG TV / living-room player) without tapping Play on the client. "
+                "(LG TV / Shield / living-room / explicit Plex player). Prefer infuse_play for "
+                "Apple TV unless HEARTH_APPLE_TV_PLAYER=plex or the user asks for Plex. "
                 "Searches the library (asks when multiple titles match), resolves the player "
                 "(named hint, else active/recent session, else PLEX_DEFAULT_PLAYER, else "
                 "Apple TV/LG/living room, else the only client), then playMedia via the PMS. "
@@ -487,6 +532,73 @@ def register_builtin_tools() -> None:
             },
             handler=_plex_play,
             preview_handler=_plex_play_preview,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="infuse_play",
+            description=(
+                "Play a library title in Infuse (Firecore) on the Apple TV. Prefer this over "
+                "plex_play when the target is Apple TV / Infuse — Ruben uses Infuse, not the "
+                "Plex tvOS app. Resolves title → TMDB id (Plex Guids, else Radarr/Overseerr), "
+                "builds infuse://movie/{tmdb}?play (or series/season/episode), and launches it "
+                "via Home Assistant's Apple TV media_player.play_media (type=url). "
+                "Requires HA Apple TV paired (HA_APPLE_TV_ENTITY). Infuse has no now-playing API. "
+                "Runs immediately — no confirm step. If HA Apple TV is missing, returns "
+                "clear setup steps — do not silently no-op or fall back to opening Plex."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Title to play, e.g. The Endless",
+                    },
+                    "tmdbId": {
+                        "type": "integer",
+                        "description": "Optional TMDB id when already known",
+                    },
+                    "ratingKey": {
+                        "type": "string",
+                        "description": "Optional Plex ratingKey from plex_search",
+                    },
+                    "season": {"type": "integer"},
+                    "episode": {"type": "integer"},
+                    "play": {
+                        "type": "boolean",
+                        "description": "Append ?play to the Infuse deep link (default true)",
+                    },
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["query"],
+            },
+            handler=_infuse_play,
+            preview_handler=_infuse_play_preview,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="infuse_transport",
+            description=(
+                "Pause / play / stop / skip on the Apple TV while Infuse (or another app) is "
+                "active. Uses Home Assistant Apple TV media_player remote commands — Infuse has "
+                "no playback-state or transport API. Runs immediately — no confirm step. "
+                "action=pause|play|stop|skip|previous."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "pause, play, stop, skip (next), or previous",
+                    },
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["action"],
+            },
+            handler=_infuse_transport,
         )
     )
     registry.register(

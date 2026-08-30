@@ -175,6 +175,41 @@ class Plex:
                 return info
             raise
 
+    async def metadata(self, rating_key: str | int) -> dict[str, Any]:
+        """Fetch one library item (includes Guid[] with tmdb:// when PMS has it)."""
+        rk = str(rating_key or "").strip()
+        if not rk:
+            return {"ok": False, "error": "ratingKey required"}
+        if not self.live:
+            for row in MOCK_PLEX_LIBRARY:
+                if str(row.get("ratingKey")) == rk:
+                    return {"ok": True, "mode": "mock", "item": _item_summary(row)}
+            return {"ok": False, "mode": "mock", "error": f"ratingKey {rk} not in fixtures"}
+        client = await self._http()
+        try:
+            response = await client.get(
+                f"/library/metadata/{rk}",
+                params={"includeGuids": 1},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            metadata = (payload.get("MediaContainer") or {}).get("Metadata") or []
+            if not metadata:
+                return {"ok": False, "mode": "live", "error": f"ratingKey {rk} not found"}
+            return {"ok": True, "mode": "live", "item": _item_summary(metadata[0])}
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                for row in MOCK_PLEX_LIBRARY:
+                    if str(row.get("ratingKey")) == rk:
+                        return {
+                            "ok": True,
+                            "mode": "mock",
+                            "error": str(exc),
+                            "item": _item_summary(row),
+                        }
+                return {"ok": False, "mode": "mock", "error": str(exc)}
+            raise
+
     async def resolve_play(
         self,
         query: str,
@@ -592,6 +627,15 @@ def _item_summary(m: dict[str, Any]) -> dict[str, Any]:
     key = m.get("key") or (f"/library/metadata/{rating_key}" if rating_key is not None else None)
     summary = (m.get("summary") or m.get("tagline") or "").strip()
     rating = m.get("audienceRating") or m.get("rating")
+    tmdb = m.get("tmdbId")
+    if tmdb is None:
+        tmdb = _tmdb_from_guids(m.get("Guid") or m.get("guid"))
+    season = m.get("season")
+    if season is None and m.get("parentIndex") is not None:
+        season = m.get("parentIndex")
+    episode = m.get("episode")
+    if episode is None and m.get("index") is not None and m.get("type") == "episode":
+        episode = m.get("index")
     return {
         "title": m.get("title"),
         "type": m.get("type"),
@@ -604,7 +648,33 @@ def _item_summary(m: dict[str, Any]) -> dict[str, Any]:
         "contentRating": m.get("contentRating"),
         "rating": rating,
         "thumb": bool(rating_key),
+        "Guid": m.get("Guid"),
+        "tmdbId": int(tmdb) if tmdb is not None else None,
+        "season": int(season) if season is not None else None,
+        "episode": int(episode) if episode is not None else None,
     }
+
+
+def _tmdb_from_guids(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        for entry in raw:
+            found = _tmdb_from_guids(entry)
+            if found is not None:
+                return found
+        return None
+    if isinstance(raw, dict):
+        return _tmdb_from_guids(raw.get("id") or raw.get("guid"))
+    text = str(raw)
+    for prefix in ("tmdb://", "themoviedb://", "com.plexapp.agents.themoviedb://"):
+        if prefix in text.lower() or text.lower().startswith(prefix):
+            # Handle both "tmdb://123" and agent style "…://123?lang=en"
+            tail = text.split("://", 1)[-1]
+            digits = "".join(ch for ch in tail.split("?")[0].split("/")[0] if ch.isdigit())
+            if digits:
+                return int(digits)
+    return None
 
 
 def _sessions(payload: dict[str, Any]) -> list[dict[str, Any]]:
