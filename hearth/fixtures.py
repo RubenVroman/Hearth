@@ -81,6 +81,8 @@ MOCK_PLEX_SESSIONS: dict[str, Any] = {
                 "summary": "Paul Atreides unites with Chani and the Fremen while seeking revenge against the conspirators who destroyed his family.",
                 "duration": 16600000,
                 "viewOffset": 4920000,
+                "tmdbId": 693134,
+                "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
                 "Player": {
                     "title": "Apple TV",
                     "state": "playing",
@@ -107,6 +109,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 8.8,
         "Guid": [{"id": "tmdb://693134"}, {"id": "imdb://tt15239678"}],
         "tmdbId": 693134,
+        "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
     },
     {
         "title": "The Endless",
@@ -120,6 +123,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 6.5,
         "Guid": [{"id": "tmdb://430231"}, {"id": "imdb://tt3986820"}],
         "tmdbId": 430231,
+        "posterPath": "/uVHPBTLb6Sj1Eso9HzyBAOMRheM.jpg",
     },
     {
         "title": "The Brutalist",
@@ -133,6 +137,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 7.9,
         "Guid": [{"id": "tmdb://974950"}],
         "tmdbId": 974950,
+        "posterPath": "/7seqaCaaXDNUHOx4DqwpoOH8pPa.jpg",
     },
     # Two exact-title editions so ambiguous library matches can be tested.
     {
@@ -147,6 +152,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 8.3,
         "Guid": [{"id": "tmdb://949"}],
         "tmdbId": 949,
+        "posterPath": "/gKaePbkEkaqvMtw74EyhhkfCKKh.jpg",
     },
     {
         "title": "Heat",
@@ -160,6 +166,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "audienceRating": 5.7,
         "Guid": [{"id": "tmdb://10784"}],
         "tmdbId": 10784,
+        "posterPath": "/fMhOeJ2TvuY46iYGmsowhgRXfnr.jpg",
     },
     {
         "title": "Hide and Seek",
@@ -178,6 +185,7 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "tmdbId": 95396,
         "season": 1,
         "episode": 1,
+        "posterPath": "/pPHpeI2X1qEd1CS1SeyrdhZ4qnT.jpg",
     },
 ]
 
@@ -261,6 +269,7 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "tmdbId": 693134,
         "overview": "Paul Atreides unites with Chani and the Fremen.",
         "status": "released",
+        "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
     },
     {
         "title": "The Brutalist",
@@ -268,12 +277,21 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "tmdbId": 974950,
         "overview": "A Hungarian-born Jewish architect starts over in America.",
         "status": "released",
+        "posterPath": "/7seqaCaaXDNUHOx4DqwpoOH8pPa.jpg",
     },
     {
         "title": "The Endless",
         "year": 2017,
         "tmdbId": 430231,
         "overview": "Two brothers return to a UFO death cult.",
+        "status": "released",
+        "posterPath": "/uVHPBTLb6Sj1Eso9HzyBAOMRheM.jpg",
+    },
+    {
+        "title": "Annihilation",
+        "year": 2018,
+        "tmdbId": 300668,
+        "overview": "A biologist enters the Shimmer after her husband's return.",
         "status": "released",
     },
 ]
@@ -285,6 +303,7 @@ MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
         "tvdbId": 371980,
         "overview": "Mark Scout leads a team whose memories are split.",
         "status": "continuing",
+        "posterPath": "/pPHpeI2X1qEd1CS1SeyrdhZ4qnT.jpg",
     },
     {
         "title": "Slow Horses",
@@ -295,9 +314,70 @@ MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
     },
 ]
 
+# Active download-client queue fixtures (Radarr/Sonarr /api/v3/queue shape).
+MOCK_RADARR_DOWNLOADS: list[dict[str, Any]] = [
+    {
+        "id": 1,
+        "title": "Annihilation",
+        "status": "downloading",
+        "trackedDownloadState": "downloading",
+        "trackedDownloadStatus": "ok",
+        "size": 8_000_000_000,
+        "sizeleft": 2_000_000_000,
+        "timeleft": "00:25:00",
+        "indexer": "MockIndexer",
+        "quality": {"quality": {"name": "Bluray-1080p"}},
+        "downloadClient": "qBittorrent",
+        "movie": {"title": "Annihilation", "year": 2018, "tmdbId": 300668},
+    },
+    {
+        "id": 2,
+        "title": "Dune: Part Two",
+        "status": "queued",
+        "trackedDownloadState": "downloading",
+        "trackedDownloadStatus": "ok",
+        "size": 12_000_000_000,
+        "sizeleft": 12_000_000_000,
+        "timeleft": "00:00:00",
+        "indexer": "MockIndexer",
+        "quality": {"quality": {"name": "Bluray-2160p"}},
+        "downloadClient": "qBittorrent",
+        "movie": {"title": "Dune: Part Two", "year": 2024, "tmdbId": 693134},
+    },
+]
+
+MOCK_SONARR_DOWNLOADS: list[dict[str, Any]] = [
+    {
+        "id": 11,
+        "title": "Severance - S02E03",
+        "status": "downloading",
+        "trackedDownloadState": "downloading",
+        "trackedDownloadStatus": "ok",
+        "size": 2_500_000_000,
+        "sizeleft": 1_000_000_000,
+        "timeleft": "00:12:00",
+        "indexer": "MockIndexer",
+        "quality": {"quality": {"name": "WEBDL-1080p"}},
+        "downloadClient": "qBittorrent",
+        "series": {"title": "Severance", "year": 2022, "tvdbId": 371980},
+    },
+]
+
 MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
-    {"id": 693134, "mediaType": "movie", "title": "Dune: Part Two", "year": 2024},
-    {"id": 95396, "mediaType": "tv", "title": "Severance", "year": 2022},
+    {
+        "id": 693134,
+        "mediaType": "movie",
+        "title": "Dune: Part Two",
+        "year": 2024,
+        "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
+    },
+    {
+        "id": 95396,
+        "mediaType": "tv",
+        "title": "Severance",
+        "year": 2022,
+        "posterPath": "/pPHpeI2X1qEd1CS1SeyrdhZ4qnT.jpg",
+    },
 ]
 
 
@@ -308,6 +388,8 @@ class MockPipeline:
         self.radarr_queue: list[dict[str, Any]] = []
         self.sonarr_queue: list[dict[str, Any]] = []
         self.overseerr_queue: list[dict[str, Any]] = []
+        self.radarr_downloads: list[dict[str, Any]] | None = None
+        self.sonarr_downloads: list[dict[str, Any]] | None = None
 
     def search_radarr(self, query: str) -> list[dict[str, Any]]:
         return _filter_title(MOCK_RADARR_LOOKUP, query)
@@ -333,6 +415,14 @@ class MockPipeline:
         self.overseerr_queue.append(queued)
         return queued
 
+    def list_radarr_downloads(self, title: str = "") -> list[dict[str, Any]]:
+        source = self.radarr_downloads if self.radarr_downloads is not None else MOCK_RADARR_DOWNLOADS
+        return _filter_download_title(source, title)
+
+    def list_sonarr_downloads(self, title: str = "") -> list[dict[str, Any]]:
+        source = self.sonarr_downloads if self.sonarr_downloads is not None else MOCK_SONARR_DOWNLOADS
+        return _filter_download_title(source, title)
+
 
 def _filter_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
     needle = (query or "").strip().lower()
@@ -340,6 +430,27 @@ def _filter_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any
         return deepcopy(items[:5])
     hits = [deepcopy(item) for item in items if needle in str(item.get("title", "")).lower()]
     return hits or [deepcopy(items[0]) | {"title": items[0]["title"], "matched": "fallback"}]
+
+
+def _download_title_for_filter(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or "")
+    movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+    series = item.get("series") if isinstance(item.get("series"), dict) else {}
+    return " ".join(
+        bit for bit in (title, str(movie.get("title") or ""), str(series.get("title") or "")) if bit
+    )
+
+
+def _filter_download_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Filter active downloads by title. No fallback — missing title means not downloading."""
+    needle = (query or "").strip().lower()
+    if not needle:
+        return deepcopy(items)
+    return [
+        deepcopy(item)
+        for item in items
+        if needle in _download_title_for_filter(item).lower()
+    ]
 
 
 pipeline = MockPipeline()

@@ -1,8 +1,12 @@
-"""Glass info overlays — weather / media only (no flickering update guards)."""
+"""Glass info overlays — weather / media / downloads (no flickering update guards)."""
+
+from datetime import datetime, timedelta, timezone
 
 from hearth.agent.loop import route_intent
 from hearth.agent.registry import registry
-from hearth.runtime import runtime
+from hearth.fixtures import pipeline
+from hearth.overlay_context import evaluate_widget, text_matches_topics, topics_for_widget
+from hearth.runtime import Widget, runtime
 
 
 def test_command_center_includes_info_overlay(client):
@@ -12,13 +16,23 @@ def test_command_center_includes_info_overlay(client):
     assert 'id="widget-stack"' not in page.text
     js = client.get("/static/app.js")
     assert "openInfoOverlay" in js.text
+    assert "softHideInfoOverlay" in js.text
+    assert "noteOverlayConversation" in js.text
+    assert "is-soft-hidden" in js.text
     assert "renderWidgets" in js.text
+    assert "/api/media/art" in js.text
+    assert "downloadsMarkup" in js.text
+    assert "info-download-bar" in js.text
+    assert "fadeMediaOverlayOnProgress" not in js.text
+
     assert "/api/widgets/" in js.text
     assert "upsertLocalWidget" not in js.text
     assert 'kind: "action"' not in js.text
     css = client.get("/static/styles.css")
     assert ".info-overlay" in css.text
     assert ".info-glass" in css.text
+    assert ".info-overlay.is-soft-hidden" in css.text
+    assert ".info-download-list" in css.text
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
@@ -40,6 +54,9 @@ def test_weather_ask_surfaces_weather_overlay(client):
     assert "14" in weather["body"]
     assert "Partly cloudy" in weather["body"]
     assert weather["data"]["temperature"] == 14
+    assert weather["context"]["relevant"] is True
+    assert weather["context"]["reason"] in {"fresh", "tool_match", "topic_match", "active"}
+    assert "weather" in weather["context"]["topics"]
 
     status = client.get("/api/status")
     assert status.status_code == 200
@@ -67,10 +84,46 @@ def test_movie_ask_surfaces_media_overlay(client):
     item = media["data"]["item"]
     assert item.get("summary")
     assert item.get("ratingKey") == "1001"
+    assert media["context"]["relevant"] is True
+    assert item.get("tmdbId") == 693134
+    assert item.get("posterPath")
+    assert media.get("sticky") is False
 
     thumb = client.get("/api/plex/thumb/1001")
     assert thumb.status_code == 200
     assert "image/" in thumb.headers.get("content-type", "")
+
+    art = client.get("/api/media/art", params={"ratingKey": "1001", "tmdbId": 693134})
+    assert art.status_code == 200
+    assert "image/" in art.headers.get("content-type", "")
+
+
+def test_media_overlay_soft_hides_on_next_turn(client):
+    """#27 policy: unrelated/ack turns keep media for reappear; do not hard-delete."""
+    first = client.post("/api/chat", json={"message": "tell me about the movie Dune"})
+    assert first.status_code == 200
+    assert any(w["kind"] == "media" for w in first.json()["widgets"])
+
+    second = client.post("/api/chat", json={"message": "thanks"})
+    assert second.status_code == 200
+    # Soft-hide memory: widget remains; relevance may stay active for a brief ack.
+    assert runtime.get_widget("media") is not None
+    kinds = {w["kind"] for w in second.json()["widgets"]}
+    assert "media" in kinds
+
+
+def test_media_art_endpoint_accepts_tmdb_and_falls_back(client):
+    ok = client.get(
+        "/api/media/art",
+        params={"tmdbId": 693134, "mediaType": "movie", "title": "Dune: Part Two"},
+    )
+    assert ok.status_code == 200
+    ctype = ok.headers.get("content-type", "")
+    assert ctype.startswith("image/")
+    # Real TMDB JPEG when CDN reachable; SVG placeholder otherwise.
+    assert ctype in {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/svg+xml"} or ctype.startswith(
+        "image/"
+    )
 
 
 def test_now_playing_surfaces_media_overlay(client):
@@ -79,6 +132,45 @@ def test_now_playing_surfaces_media_overlay(client):
     body = chat.json()
     media = next(w for w in body["widgets"] if w["kind"] == "media")
     assert "Dune" in media["title"]
+
+
+def test_download_progress_surfaces_downloads_overlay(client):
+    chat = client.post("/api/chat", json={"message": "How far along is Annihilation?"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "radarr_queue"
+    downloads = next(w for w in body["widgets"] if w["kind"] == "downloads")
+    assert downloads["status"] == "done"
+    assert "Annihilation" in downloads["title"]
+    rows = downloads["data"]["downloads"]
+    assert len(rows) == 1
+    assert rows[0]["percent"] == 75.0
+    assert rows[0]["status"] == "downloading"
+    assert rows[0].get("sizeleft_label")
+    assert downloads["data"].get("empty") is None
+
+    listed = client.post("/api/chat", json={"message": "What's downloading right now?"})
+    assert listed.status_code == 200
+    panel = next(w for w in listed.json()["widgets"] if w["kind"] == "downloads")
+    assert len(panel["data"]["downloads"]) >= 1
+    assert panel["data"]["service"] == "radarr"
+
+
+def test_download_progress_empty_and_missing_are_calm(client, monkeypatch):
+    miss = client.post("/api/chat", json={"message": "Download progress for NotARealMovieXYZ"})
+    assert miss.status_code == 200
+    missing = next(w for w in miss.json()["widgets"] if w["kind"] == "downloads")
+    assert missing["data"]["empty"] == "missing"
+    assert missing["data"]["downloads"] == []
+    assert "not" in missing["body"].lower() or "not" in missing["detail"].lower()
+
+    monkeypatch.setattr(pipeline, "radarr_downloads", [])
+    idle = client.post("/api/chat", json={"message": "What's downloading right now?"})
+    assert idle.status_code == 200
+    quiet = next(w for w in idle.json()["widgets"] if w["kind"] == "downloads")
+    assert quiet["data"]["empty"] == "idle"
+    assert quiet["data"]["downloads"] == []
+    assert "nothing" in quiet["body"].lower()
 
 
 def test_dismiss_overlay(client):
@@ -114,6 +206,77 @@ def test_overlay_updated_at_stable_across_identical_upserts(client):
     second = runtime.get_widget("weather")
     assert second is not None
     assert second.updated_at == stamp
+
+
+def test_overlay_stays_through_unrelated_turn_but_marks_irrelevant(client):
+    """Smart hide keeps the widget for reappear; context.relevant flips off."""
+    client.post("/api/chat", json={"message": "what's the weather"})
+    assert runtime.get_widget("weather") is not None
+    follow = client.post("/api/chat", json={"message": "turn on the living room lights"})
+    assert follow.status_code == 200
+    weather = runtime.get_widget("weather")
+    assert weather is not None  # soft-hide, not hard delete
+    listed = {w["id"]: w for w in follow.json()["widgets"]}
+    assert "weather" in listed
+    assert listed["weather"]["context"]["relevant"] is False
+    assert listed["weather"]["context"]["reason"].startswith("unrelated:")
+
+
+def test_overlay_reappears_relevant_when_talk_returns(client):
+    client.post("/api/chat", json={"message": "tell me about the movie Dune"})
+    client.post("/api/chat", json={"message": "turn on the kitchen lights"})
+    media = runtime.get_widget("media")
+    assert media is not None
+    # Age the update so we're past the fresh window; topic match should still win.
+    past = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    media.updated_at = past
+    media.ts = past
+    runtime.note("user", "what was that Dune movie about again?")
+    rel = evaluate_widget(media)
+    assert rel.relevant is True
+    assert rel.reason == "topic_match"
+
+
+def test_overlay_idle_marks_irrelevant(monkeypatch):
+    monkeypatch.setattr(
+        "hearth.overlay_context.settings.overlay_fresh_seconds",
+        5,
+    )
+    monkeypatch.setattr(
+        "hearth.overlay_context.settings.overlay_idle_seconds",
+        20,
+    )
+    widget = Widget(
+        id="weather",
+        kind="weather",
+        title="Home",
+        status="done",
+        body="14°C · Partly cloudy",
+        data={"place": "Home", "condition": "Partly cloudy", "temperature": 14},
+        sticky=True,
+    )
+    past = (datetime.now(timezone.utc) - timedelta(seconds=45)).isoformat()
+    widget.updated_at = past
+    widget.ts = past
+    runtime.widgets["weather"] = widget
+    rel = evaluate_widget(widget, transcript=[], last_tools=[])
+    assert rel.relevant is False
+    assert rel.reason == "idle"
+
+
+def test_topics_include_media_title():
+    widget = Widget(
+        id="media",
+        kind="media",
+        title="Dune: Part Two",
+        status="done",
+        body="movie · 2024",
+        data={"item": {"title": "Dune: Part Two", "type": "movie", "year": 2024}},
+    )
+    topics = topics_for_widget(widget)
+    assert "media" in topics
+    assert "dune" in topics
+    assert text_matches_topics("tell me more about dune", topics)
 
 
 async def test_get_weather_tool_mocked():

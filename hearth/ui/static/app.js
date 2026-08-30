@@ -30,7 +30,18 @@ const state = {
   widgets: [],
   infoSignature: "",
   infoCloseTimer: null,
+  /** Soft-hidden by context/idle — widget stays; can reappear without refetch. */
+  infoSoftHidden: false,
+  /** User focused the glass — keep visible until idle or hard dismiss. */
+  infoPinned: false,
+  infoHideTimer: null,
+  infoIdleTimer: null,
 };
+
+/** Client grace before fading when talk is clearly unrelated (ms). */
+const OVERLAY_IRRELEVANT_GRACE_MS = 900;
+/** Client idle soft-hide while still "relevant" but conversation is quiet (ms). */
+const OVERLAY_IDLE_HIDE_MS = 55000;
 
 function micStorageGet(key) {
   try {
@@ -293,7 +304,7 @@ function escapeHtml(value) {
 
 function isVisualOverlay(widget) {
   const kind = widget && widget.kind;
-  return kind === "weather" || kind === "media";
+  return kind === "weather" || kind === "media" || kind === "downloads";
 }
 
 function pickVisualOverlay(widgets) {
@@ -305,6 +316,10 @@ function pickVisualOverlay(widgets) {
 
 function overlaySignature(widget) {
   if (!widget) return "";
+  const downloads = widget.data && Array.isArray(widget.data.downloads) ? widget.data.downloads : [];
+  const progressKey = downloads
+    .map((row) => `${row.title || ""}:${row.status || ""}:${row.percent ?? ""}`)
+    .join(",");
   return [
     widget.id,
     widget.kind,
@@ -313,6 +328,7 @@ function overlaySignature(widget) {
     widget.title || "",
     widget.body || "",
     widget.detail || "",
+    progressKey,
   ].join("|");
 }
 
@@ -321,6 +337,158 @@ function clearInfoCloseTimer() {
     clearTimeout(state.infoCloseTimer);
     state.infoCloseTimer = null;
   }
+}
+
+function clearOverlayPolicyTimers() {
+  if (state.infoHideTimer) {
+    clearTimeout(state.infoHideTimer);
+    state.infoHideTimer = null;
+  }
+  if (state.infoIdleTimer) {
+    clearTimeout(state.infoIdleTimer);
+    state.infoIdleTimer = null;
+  }
+}
+
+function overlayTopics(widget) {
+  const ctx = widget && widget.context;
+  if (ctx && Array.isArray(ctx.topics) && ctx.topics.length) {
+    return ctx.topics.map((t) => String(t).toLowerCase());
+  }
+  const topics = new Set([String(widget.kind || "").toLowerCase()]);
+  for (const chunk of [widget.title, widget.body, widget.detail]) {
+    String(chunk || "")
+      .toLowerCase()
+      .match(/[a-z0-9']{3,}/g)
+      ?.forEach((t) => topics.add(t));
+  }
+  return [...topics];
+}
+
+function textTouchesOverlay(text, widget) {
+  if (!text || !widget) return false;
+  const topics = new Set(overlayTopics(widget));
+  const tokens = String(text)
+    .toLowerCase()
+    .match(/[a-z0-9']{3,}/g);
+  if (!tokens) return false;
+  return tokens.some((t) => topics.has(t));
+}
+
+function overlayIsRelevant(widget) {
+  if (!widget) return false;
+  if (state.infoPinned) return true;
+  const ctx = widget.context;
+  if (ctx && typeof ctx.relevant === "boolean") return ctx.relevant;
+  return true;
+}
+
+function scheduleOverlayIdleHide() {
+  if (state.infoIdleTimer) {
+    clearTimeout(state.infoIdleTimer);
+    state.infoIdleTimer = null;
+  }
+  if (state.infoSoftHidden || state.infoPinned) return;
+  const visual = pickVisualOverlay(state.widgets);
+  if (!visual) return;
+  state.infoIdleTimer = setTimeout(() => {
+    state.infoIdleTimer = null;
+    if (state.infoPinned) return;
+    softHideInfoOverlay();
+  }, OVERLAY_IDLE_HIDE_MS);
+}
+
+function softHideInfoOverlay() {
+  const root = $("info-overlay");
+  if (!root || root.hidden) return;
+  if (state.infoSoftHidden) return;
+  clearOverlayPolicyTimers();
+  clearInfoCloseTimer();
+  state.infoSoftHidden = true;
+  state.infoPinned = false;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    root.classList.remove("is-open", "is-closing");
+    root.classList.add("is-soft-hidden");
+    root.setAttribute("aria-hidden", "true");
+    return;
+  }
+  root.classList.add("is-closing");
+  root.classList.remove("is-open");
+  state.infoCloseTimer = setTimeout(() => {
+    root.classList.remove("is-closing");
+    root.classList.add("is-soft-hidden");
+    root.setAttribute("aria-hidden", "true");
+    state.infoCloseTimer = null;
+  }, 300);
+}
+
+function revealInfoOverlay() {
+  const root = $("info-overlay");
+  if (!root) return;
+  clearInfoCloseTimer();
+  state.infoSoftHidden = false;
+  root.hidden = false;
+  root.classList.remove("is-soft-hidden", "is-closing");
+  root.setAttribute("aria-hidden", "false");
+  void root.offsetWidth;
+  root.classList.add("is-open");
+  scheduleOverlayIdleHide();
+}
+
+function looksUnrelatedToOverlay(text, widget) {
+  if (!text || !widget) return false;
+  if (textTouchesOverlay(text, widget)) return false;
+  const kind = String(widget.kind || "");
+  if (/\b(lights?|scenes?|turn (on|off)|dim |brightness|home assistant)\b/i.test(text)) return true;
+  if (/\b(thuisbezorgd|just\s*eat|takeaway|hungry|restaurants?|pizza|burger|sushi|food cart)\b/i.test(text)) {
+    return true;
+  }
+  if (/\b(docker|containers?)\b/i.test(text)) return true;
+  if (kind === "weather" && /\b(movie|film|plex|playing|watch|radarr|sonarr|overseerr|infuse)\b/i.test(text)) {
+    return true;
+  }
+  if (kind === "media" && /\b(weather|forecast|temperature|raining|humidity)\b/i.test(text)) {
+    return true;
+  }
+  if (kind === "downloads" && /\b(weather|forecast|temperature|raining|humidity|lights?|scenes?)\b/i.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * New user utterance — hide quickly when talk leaves the panel; keep/reveal when
+ * it still touches on-screen topics. Server context on the next payload confirms.
+ */
+function noteOverlayConversation(text) {
+  const visual = pickVisualOverlay(state.widgets);
+  if (!visual) return;
+  const related = textTouchesOverlay(text, visual);
+  if (related) {
+    if (state.infoHideTimer) {
+      clearTimeout(state.infoHideTimer);
+      state.infoHideTimer = null;
+    }
+    state.infoPinned = false;
+    if (state.infoSoftHidden || !$("info-overlay")?.classList.contains("is-open")) {
+      openInfoOverlay(visual);
+    } else {
+      scheduleOverlayIdleHide();
+    }
+    return;
+  }
+  if (!looksUnrelatedToOverlay(text, visual)) {
+    // Acknowledgments / side chat — leave visible until idle or server says otherwise.
+    scheduleOverlayIdleHide();
+    return;
+  }
+  if (state.infoPinned) return;
+  if (state.infoHideTimer) clearTimeout(state.infoHideTimer);
+  state.infoHideTimer = setTimeout(() => {
+    state.infoHideTimer = null;
+    if (state.infoPinned) return;
+    softHideInfoOverlay();
+  }, OVERLAY_IRRELEVANT_GRACE_MS);
 }
 
 function weatherMarkup(widget) {
@@ -355,30 +523,47 @@ function weatherMarkup(widget) {
   `;
 }
 
+function mediaArtUrl(item) {
+  const params = new URLSearchParams();
+  if (item.ratingKey) params.set("ratingKey", String(item.ratingKey));
+  if (item.tmdbId != null && item.tmdbId !== "") params.set("tmdbId", String(item.tmdbId));
+  if (item.posterPath) params.set("posterPath", String(item.posterPath));
+  const type = item.type || "movie";
+  if (type) params.set("mediaType", String(type));
+  if (item.title) params.set("title", String(item.title));
+  if (![...params.keys()].some((k) => k === "ratingKey" || k === "tmdbId" || k === "posterPath")) {
+    return "";
+  }
+  return `/api/media/art?${params.toString()}`;
+}
+
+function mediaPosterFallback(title) {
+  const initials = String(title || "")
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((p) => p[0] || "")
+    .join("")
+    .toUpperCase();
+  return `<div class="info-poster info-poster-fallback" aria-hidden="true">${escapeHtml(
+    initials || "·"
+  )}</div>`;
+}
+
 function mediaMarkup(widget) {
   const item = (widget.data && widget.data.item) || {};
   const title = widget.title || item.title || "Untitled";
   const year = item.year;
   const type = item.type || "movie";
   const summary = item.summary || "";
-  const ratingKey = item.ratingKey;
-  const initials = String(title)
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((p) => p[0] || "")
-    .join("")
-    .toUpperCase();
   const meta = [type, year, item.show, item.contentRating]
     .filter(Boolean)
     .map((v) => escapeHtml(v))
     .join(" · ");
-  const poster = ratingKey
-    ? `<img class="info-poster" src="/api/plex/thumb/${encodeURIComponent(
-        ratingKey
-      )}" alt="" width="108" height="162" loading="lazy" />`
-    : `<div class="info-poster info-poster-fallback" aria-hidden="true">${escapeHtml(
-        initials || "·"
-      )}</div>`;
+  const art = mediaArtUrl({ ...item, title });
+  // /api/media/art always returns bytes (real JPEG or SVG fallback); onerror is a last resort.
+  const poster = art
+    ? `<img class="info-poster" src="${escapeHtml(art)}" alt="" width="108" height="162" loading="lazy" />`
+    : mediaPosterFallback(title);
   const bits = [];
   if (summary) bits.push(`<p class="info-detail">${escapeHtml(summary)}</p>`);
   if (item.player) {
@@ -404,9 +589,100 @@ function mediaMarkup(widget) {
   `;
 }
 
+function downloadStatusClass(status) {
+  const key = String(status || "unknown").toLowerCase();
+  if (
+    key === "queued" ||
+    key === "downloading" ||
+    key === "paused" ||
+    key === "importing" ||
+    key === "stalled" ||
+    key === "completed" ||
+    key === "failed" ||
+    key === "unknown"
+  ) {
+    return key;
+  }
+  return "unknown";
+}
+
+function downloadsMarkup(widget) {
+  const data = widget.data || {};
+  const downloads = Array.isArray(data.downloads) ? data.downloads : [];
+  const service = data.service === "sonarr" ? "Sonarr" : "Radarr";
+  const empty = data.empty;
+  const kicker = empty === "idle" || empty === "missing" ? "Downloads" : `${service} queue`;
+
+  if (!downloads.length) {
+    const calmTitle =
+      empty === "missing"
+        ? widget.title || data.query || "Not downloading"
+        : widget.title || service;
+    const calmBody =
+      empty === "missing"
+        ? widget.detail || `Not in the ${service} queue right now.`
+        : widget.body || "Nothing downloading";
+    const calmHint =
+      empty === "idle" ? widget.detail || "Queue is quiet." : empty === "missing" ? "" : widget.detail || "";
+    return `
+      <div class="info-downloads is-empty">
+        <p class="info-kicker">${escapeHtml(kicker)}</p>
+        <h2 class="info-title" id="info-title">${escapeHtml(calmTitle)}</h2>
+        <p class="info-downloads-empty">${escapeHtml(calmBody)}</p>
+        ${calmHint ? `<p class="info-detail">${escapeHtml(calmHint)}</p>` : ""}
+      </div>
+    `;
+  }
+
+  const rows = downloads
+    .map((row) => {
+      const status = row.status || "unknown";
+      const pct = row.percent != null && !Number.isNaN(Number(row.percent)) ? Number(row.percent) : null;
+      const pctLabel = pct != null ? `${pct}%` : "—";
+      const width = pct != null ? Math.max(0, Math.min(100, pct)) : 0;
+      const meta = [row.timeleft ? `${row.timeleft} left` : "", row.sizeleft_label ? `${row.sizeleft_label} left` : "", row.quality]
+        .filter(Boolean)
+        .map((v) => escapeHtml(v))
+        .join(" · ");
+      return `
+        <li class="info-download-row status-${escapeHtml(downloadStatusClass(status))}">
+          <div class="info-download-head">
+            <p class="info-download-title">${escapeHtml(row.title || "Untitled")}</p>
+            <p class="info-download-pct">${escapeHtml(String(pctLabel))}</p>
+          </div>
+          <div class="info-download-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+            ${pct != null ? `aria-valuenow="${escapeHtml(String(width))}"` : 'aria-valuetext="unknown"'}
+            aria-label="${escapeHtml(row.title || "Download")} progress">
+            <span style="width:${width}%"></span>
+          </div>
+          <p class="info-download-meta">
+            <span class="info-download-status">${escapeHtml(status)}</span>
+            ${meta ? `<span class="info-download-extra">${meta}</span>` : ""}
+          </p>
+        </li>
+      `;
+    })
+    .join("");
+
+  const heading =
+    downloads.length === 1 ? downloads[0].title || widget.title || service : widget.title || service;
+  const sub = downloads.length === 1 ? widget.body || "" : widget.body || `${downloads.length} active`;
+
+  return `
+    <div class="info-downloads">
+      <p class="info-kicker">${escapeHtml(kicker)}</p>
+      <h2 class="info-title" id="info-title">${escapeHtml(heading)}</h2>
+      ${sub ? `<p class="info-meta">${escapeHtml(sub)}</p>` : ""}
+      <ul class="info-download-list">${rows}</ul>
+      ${data.mode === "mock" ? `<p class="info-detail">mock</p>` : ""}
+    </div>
+  `;
+}
+
 function overlayInnerHtml(widget) {
   if (widget.kind === "weather") return weatherMarkup(widget);
   if (widget.kind === "media") return mediaMarkup(widget);
+  if (widget.kind === "downloads") return downloadsMarkup(widget);
   return `
     <p class="info-kicker">Info</p>
     <h2 class="info-title" id="info-title">${escapeHtml(widget.title || "")}</h2>
@@ -421,30 +697,41 @@ function openInfoOverlay(widget) {
   if (!root || !content || !widget) return;
   clearInfoCloseTimer();
   const signature = overlaySignature(widget);
-  const alreadyOpen = root.classList.contains("is-open") && !root.classList.contains("is-closing");
+  const alreadyOpen =
+    root.classList.contains("is-open") &&
+    !root.classList.contains("is-closing") &&
+    !root.classList.contains("is-soft-hidden") &&
+    !state.infoSoftHidden;
   if (alreadyOpen && state.infoSignature === signature) {
+    scheduleOverlayIdleHide();
     return;
   }
   content.innerHTML = overlayInnerHtml(widget);
   state.infoSignature = signature;
+  state.infoSoftHidden = false;
   root.hidden = false;
   root.setAttribute("aria-hidden", "false");
-  root.classList.remove("is-closing");
-  // Force style flush so enter transition runs when opening from hidden.
+  root.classList.remove("is-closing", "is-soft-hidden");
+  // Force style flush so enter transition runs when opening from hidden / soft-hidden.
   if (!alreadyOpen) {
     void root.offsetWidth;
   }
   root.classList.add("is-open");
+  scheduleOverlayIdleHide();
 }
 
 function closeInfoOverlay({ animate = true } = {}) {
   const root = $("info-overlay");
+  clearOverlayPolicyTimers();
+  state.infoSoftHidden = false;
+  state.infoPinned = false;
   if (!root || root.hidden) {
     state.infoSignature = "";
     return;
   }
   clearInfoCloseTimer();
   state.infoSignature = "";
+  root.classList.remove("is-soft-hidden");
   if (!animate || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
     root.classList.remove("is-open", "is-closing");
     root.hidden = true;
@@ -473,7 +760,23 @@ function renderWidgets(widgets) {
     closeInfoOverlay({ animate: true });
     return;
   }
-  openInfoOverlay(visual);
+  if (overlayIsRelevant(visual)) {
+    if (state.infoHideTimer) {
+      clearTimeout(state.infoHideTimer);
+      state.infoHideTimer = null;
+    }
+    openInfoOverlay(visual);
+    return;
+  }
+  // Keep content for reappear; fade out if currently visible.
+  if (!state.infoSoftHidden) {
+    if (state.infoSignature !== overlaySignature(visual)) {
+      const content = $("info-content");
+      if (content) content.innerHTML = overlayInnerHtml(visual);
+      state.infoSignature = overlaySignature(visual);
+    }
+    softHideInfoOverlay();
+  }
 }
 
 async function dismissWidget(id, { silent = false } = {}) {
@@ -498,6 +801,17 @@ function bindInfoOverlay() {
     if (visual) dismissWidget(visual.id);
     else closeInfoOverlay({ animate: true });
   };
+  const pinFromUser = () => {
+    const visual = pickVisualOverlay(state.widgets);
+    if (!visual) return;
+    state.infoPinned = true;
+    if (state.infoHideTimer) {
+      clearTimeout(state.infoHideTimer);
+      state.infoHideTimer = null;
+    }
+    if (state.infoSoftHidden) openInfoOverlay(visual);
+    else scheduleOverlayIdleHide();
+  };
   $("info-dismiss")?.addEventListener("click", (ev) => {
     ev.preventDefault();
     dismiss();
@@ -506,10 +820,14 @@ function bindInfoOverlay() {
     ev.preventDefault();
     dismiss();
   });
+  $("info-glass")?.addEventListener("pointerdown", () => {
+    pinFromUser();
+  });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     const root = $("info-overlay");
-    if (!root || root.hidden || !root.classList.contains("is-open")) return;
+    if (!root || root.hidden) return;
+    if (!root.classList.contains("is-open") && !root.classList.contains("is-soft-hidden")) return;
     dismiss();
   });
 }
@@ -752,6 +1070,7 @@ $("composer").addEventListener("submit", async (ev) => {
   if (!text) return;
   input.value = "";
   appendLog("you", text);
+  noteOverlayConversation(text);
   if (
     sendRealtime({
       type: "conversation.item.create",
@@ -788,6 +1107,7 @@ function onRealtimeEvent(event) {
     type === "conversation.item.audio_transcription.completed"
   ) {
     appendLog("you", event.transcript);
+    noteOverlayConversation(event.transcript || "");
   }
   if (type === "error") {
     const message = event.error?.message || event.message || "realtime error";

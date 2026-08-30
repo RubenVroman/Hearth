@@ -1,4 +1,4 @@
-"""Map rich tool results into visual info overlays (weather, movie/TV).
+"""Map rich tool results into visual info overlays (weather, movie/TV, downloads).
 
 Action / “update guard” panels were removed — they flickered on status polls
 and were not useful. Only content that benefits from visualization is published.
@@ -20,7 +20,12 @@ _MEDIA_TOOLS = {
     "overseerr_search",
 }
 
-_VISUAL_KINDS = frozenset({"weather", "media"})
+_DOWNLOAD_TOOLS = {
+    "radarr_queue",
+    "sonarr_queue",
+}
+
+_VISUAL_KINDS = frozenset({"weather", "media", "downloads"})
 
 
 def new_id(prefix: str = "w") -> str:
@@ -30,7 +35,11 @@ def new_id(prefix: str = "w") -> str:
 
 
 def start_turn(message: str) -> Widget | None:
-    """No-op: thinking / update guards are gone."""
+    """New user turn — keep overlays in memory; relevance soft-hides in the UI.
+
+    Hard-deleting here would prevent reappear when talk returns to on-screen
+    content. Context is re-evaluated on the next widgets/status payload.
+    """
     _ = message
     return None
 
@@ -48,6 +57,8 @@ def publish_tool(result: dict[str, Any]) -> Widget | None:
         return None
     if name == "get_weather":
         return _weather_widget(result)
+    if name in _DOWNLOAD_TOOLS:
+        return _downloads_widget(result)
     if name in _MEDIA_TOOLS:
         return _media_widget(result)
     return None
@@ -101,12 +112,172 @@ def _weather_widget(result: dict[str, Any]) -> Widget:
     )
 
 
+def _art_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Poster identifiers safe to send to the browser (no API keys / tokens)."""
+    from hearth.tools.media_art import enrich_media_hit, poster_path_for_tmdb, sanitize_poster_path
+
+    tmdb = row.get("tmdbId") or row.get("mediaId")
+    try:
+        tmdb_id = int(tmdb) if tmdb is not None else None
+    except (TypeError, ValueError):
+        tmdb_id = None
+    path = sanitize_poster_path(row.get("posterPath") or row.get("poster_path"))
+    if path is None and tmdb_id is not None:
+        path = poster_path_for_tmdb(tmdb_id)
+    rating_key = row.get("ratingKey")
+    enriched = enrich_media_hit(
+        {
+            "ratingKey": str(rating_key) if rating_key is not None else None,
+            "tmdbId": tmdb_id,
+            "posterPath": path,
+        }
+    )
+    return {
+        "ratingKey": enriched.get("ratingKey"),
+        "tmdbId": enriched.get("tmdbId"),
+        "posterPath": enriched.get("posterPath"),
+        "thumb": bool(enriched.get("thumb")),
+    }
+
+
+def _format_bytes(value: Any) -> str | None:
+    try:
+        if value is None:
+            return None
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = n
+    unit = units[0]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            break
+        size /= 1024
+    if unit == "B":
+        return f"{int(size)} {unit}"
+    return f"{size:.1f} {unit}"
+
+
+def _downloads_rows(downloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in downloads[:8]:
+        if not isinstance(item, dict):
+            continue
+        percent = item.get("percent")
+        try:
+            percent_n = float(percent) if percent is not None else None
+        except (TypeError, ValueError):
+            percent_n = None
+        rows.append(
+            {
+                "title": item.get("title") or "Untitled",
+                "status": item.get("status") or "unknown",
+                "percent": percent_n,
+                "timeleft": item.get("timeleft"),
+                "sizeleft": item.get("sizeleft"),
+                "sizeleft_label": _format_bytes(item.get("sizeleft")),
+                "size_label": _format_bytes(item.get("size")),
+                "quality": item.get("quality"),
+                "indexer": item.get("indexer"),
+                "service": item.get("service"),
+            }
+        )
+    return rows
+
+
+def _downloads_widget(result: dict[str, Any]) -> Widget:
+    """Glass panel for Radarr/Sonarr queue progress — including calm empty states."""
+    name = str(result.get("name") or "radarr_queue")
+    data = result.get("data") or {}
+    ok = bool(result.get("ok")) and data.get("ok") is not False
+    service = str(data.get("service") or ("sonarr" if "sonarr" in name else "radarr"))
+    label = "Sonarr" if service == "sonarr" else "Radarr"
+    query = str(data.get("query") or "").strip()
+    downloads = _downloads_rows(list(data.get("downloads") or []))
+    found = data.get("found")
+
+    if not ok:
+        return runtime.upsert_widget(
+            Widget(
+                id="downloads",
+                kind="downloads",
+                title=label,
+                status="error",
+                body=str(data.get("error") or "Could not read the download queue."),
+                detail="",
+                data={
+                    "tool": name,
+                    "service": service,
+                    "query": query or None,
+                    "downloads": [],
+                    "empty": True,
+                    "mode": data.get("mode"),
+                },
+            )
+        )
+
+    if query and not downloads:
+        title = query
+        body = "Not downloading"
+        detail = f"Not in the {label} queue right now."
+        empty_kind = "missing"
+    elif not downloads:
+        title = label
+        body = "Nothing downloading"
+        detail = "Queue is quiet."
+        empty_kind = "idle"
+    else:
+        title = query or label
+        if len(downloads) == 1:
+            row = downloads[0]
+            pct = row.get("percent")
+            pct_bit = f"{pct:g}%" if isinstance(pct, (int, float)) else ""
+            body = " · ".join(
+                bit for bit in (str(row.get("status") or "unknown"), pct_bit) if bit
+            )
+            title = str(row.get("title") or title)
+        else:
+            body = f"{len(downloads)} active"
+        detail_parts = [label]
+        if data.get("mode") == "mock":
+            detail_parts.append("mock")
+        detail = " · ".join(detail_parts)
+        empty_kind = None
+
+    return runtime.upsert_widget(
+        Widget(
+            id="downloads",
+            kind="downloads",
+            title=title,
+            status="done",
+            body=body,
+            detail=detail,
+            data={
+                "tool": name,
+                "service": service,
+                "query": query or None,
+                "downloads": downloads,
+                "found": found,
+                "empty": empty_kind,
+                "mode": data.get("mode"),
+                "speak": data.get("speak"),
+            },
+            sticky=True,
+        )
+    )
+
+
+
 def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
     if name == "plex_now_playing":
         sessions = data.get("sessions") or []
         if not sessions:
             return None
         row = sessions[0]
+        art = _art_fields(row)
         return {
             "title": row.get("title"),
             "type": row.get("type") or "movie",
@@ -115,8 +286,7 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
             "summary": row.get("summary") or "",
             "player": row.get("player"),
             "state": row.get("state"),
-            "ratingKey": row.get("ratingKey"),
-            "thumb": bool(row.get("ratingKey")),
+            **art,
             "source": "plex",
         }
     if name == "plex_play":
@@ -124,6 +294,7 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
         if not item.get("title"):
             return None
         client = data.get("client") or {}
+        art = _art_fields(item)
         return {
             "title": item.get("title"),
             "type": item.get("type") or "movie",
@@ -132,8 +303,7 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
             "summary": item.get("summary") or "",
             "contentRating": item.get("contentRating"),
             "rating": item.get("rating") or item.get("audienceRating"),
-            "ratingKey": item.get("ratingKey"),
-            "thumb": bool(item.get("ratingKey")),
+            **art,
             "player": client.get("name"),
             "source": "plex",
             "pending": bool(data.get("needs_confirm") or data.get("would_call_with")),
@@ -149,6 +319,10 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
             "sonarr_search": "sonarr",
             "overseerr_search": "overseerr",
         }.get(name, "media")
+        # Overseerr uses mediaId as the TMDB id.
+        if hit.get("tmdbId") is None and hit.get("mediaId") is not None:
+            hit = {**hit, "tmdbId": hit.get("mediaId")}
+        art = _art_fields(hit)
         return {
             "title": hit.get("title") or hit.get("name"),
             "type": hit.get("type") or hit.get("mediaType") or ("movie" if "radarr" in name else "show"),
@@ -157,9 +331,7 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
             "summary": hit.get("summary") or hit.get("overview") or "",
             "contentRating": hit.get("contentRating"),
             "rating": hit.get("rating") or hit.get("audienceRating"),
-            "ratingKey": hit.get("ratingKey"),
-            "tmdbId": hit.get("tmdbId"),
-            "thumb": bool(hit.get("ratingKey")),
+            **art,
             "source": source,
             "result_count": len(results),
         }
@@ -219,6 +391,7 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
             body=body,
             detail=" · ".join(detail_parts),
             data={"tool": name, "item": item},
-            sticky=True,
+            # Soft-hide keeps this in memory for reappear; hard X still deletes.
+            sticky=False,
         )
     )

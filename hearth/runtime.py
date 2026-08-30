@@ -9,7 +9,7 @@ from hearth.config import settings
 
 AgentStatus = Literal["idle", "listening", "thinking", "speaking", "tool"]
 VoiceMode = Literal["disconnected", "fallback", "live"]
-WidgetKind = Literal["weather", "media"]
+WidgetKind = Literal["weather", "media", "downloads"]
 WidgetStatus = Literal["pending", "running", "done", "error", "info"]
 
 
@@ -37,7 +37,7 @@ class PendingConfirm:
 
 @dataclass
 class Widget:
-    """Centered glass-panel overlay for rich visual content (weather, movie/TV)."""
+    """Centered glass-panel overlay for rich visual content (weather, media, downloads)."""
 
     id: str
     kind: WidgetKind | str
@@ -132,7 +132,9 @@ class Runtime:
         return len(remove)
 
     def list_widgets(self) -> list[dict[str, Any]]:
-        return [w.as_dict() for w in self.widgets.values()]
+        from hearth.overlay_context import enrich_widget_dict
+
+        return [enrich_widget_dict(w) for w in self.widgets.values()]
 
     def snapshot(self) -> dict[str, Any]:
         return {
