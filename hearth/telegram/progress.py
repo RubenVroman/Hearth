@@ -69,7 +69,17 @@ def format_ambiguous(query: str, options: list[dict[str, Any]]) -> str:
     for idx, row in enumerate(options[:show], start=1):
         title = row.get("title") or "Untitled"
         year = row.get("year")
+        kind = str(row.get("mediaType") or "").strip().lower()
         label = f"{title} ({year})" if year else str(title)
+        if kind in {"movie", "tv"}:
+            type_bit = "TV" if kind == "tv" else "movie"
+            # Only annotate type when it helps tell options apart.
+            kinds = {
+                str(o.get("mediaType") or "").strip().lower()
+                for o in options[:show]
+            }
+            if len(kinds) > 1:
+                label = f"{label} [{type_bit}]"
         lines.append(f"{idx}. {label}")
     if len(options) > 1:
         extra = f" ({len(options)} matches)" if len(options) > show else ""
