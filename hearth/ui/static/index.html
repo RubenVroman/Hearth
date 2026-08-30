@@ -21,7 +21,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Outfit:wght@300;400;500&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Outfit:wght@300;400;500&family=Orbitron:wght@400;600&family=Rajdhani:wght@400;500;600&family=Syne:wght@500;600&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/static/styles.css" />
@@ -29,6 +29,15 @@
   <body class="app">
     <div class="grain" aria-hidden="true"></div>
     <div class="ember" aria-hidden="true"></div>
+    <div class="look-chrome" aria-hidden="true">
+      <span class="hud-corner hud-tl"></span>
+      <span class="hud-corner hud-tr"></span>
+      <span class="hud-corner hud-bl"></span>
+      <span class="hud-corner hud-br"></span>
+      <span class="hud-scan"></span>
+      <span class="hud-rail hud-rail-l"></span>
+      <span class="hud-rail hud-rail-r"></span>
+    </div>
 
     <header class="top">
       <div class="brand">
@@ -39,7 +48,12 @@
         <span class="pill" id="agent-pill">idle</span>
         <span class="pill" id="voice-pill">voice off</span>
         <span class="pill dim" id="mode-pill">fallback</span>
-        <button type="button" id="logout-btn" class="pill-btn">Log out</button>
+        <div class="pill-actions">
+          <button type="button" id="settings-btn" class="pill-btn" aria-haspopup="dialog" aria-controls="settings-sheet">
+            Look
+          </button>
+          <button type="button" id="logout-btn" class="pill-btn">Log out</button>
+        </div>
       </div>
     </header>
 
@@ -58,13 +72,36 @@
       </aside>
 
       <section class="hearth">
-        <audio id="remote-audio" autoplay playsinline></audio>
-        <button type="button" id="orb" class="orb" aria-label="Tap to talk">
-          <span class="orb-ring"></span>
-          <span class="orb-core"></span>
-          <span class="orb-label" id="orb-label">Tap to talk</span>
-        </button>
+        <div class="hearth-hero">
+          <audio id="remote-audio" autoplay playsinline></audio>
+          <button type="button" id="orb" class="orb" aria-label="Tap to talk">
+            <span class="orb-ring"></span>
+            <span class="orb-core"></span>
+            <span class="orb-label" id="orb-label">Tap to talk</span>
+          </button>
+        </div>
+        <div class="phone-rest-anchor" aria-hidden="true"></div>
         <p class="hint" id="hint">Tap to talk.</p>
+        <div id="mic-gate" class="mic-panel hidden" role="dialog" aria-labelledby="mic-gate-title">
+          <p class="mic-panel-title" id="mic-gate-title">Microphone for live voice</p>
+          <p class="mic-panel-copy" id="mic-gate-detail">
+            Hearth only opens the mic when you tap to talk — never in the background.
+          </p>
+          <div class="mic-panel-actions">
+            <button type="button" id="mic-gate-continue" class="mic-panel-primary">Continue</button>
+            <button type="button" id="mic-gate-not-now" class="mic-panel-secondary">Not now</button>
+          </div>
+        </div>
+        <div id="mic-denied" class="mic-panel hidden" role="status" aria-live="polite">
+          <p class="mic-panel-title">Microphone blocked</p>
+          <p class="mic-panel-copy" id="mic-denied-detail">
+            Enable the microphone in Settings, then tap the hearth again.
+          </p>
+          <div class="mic-panel-actions">
+            <button type="button" id="mic-denied-retry" class="mic-panel-primary">Try again</button>
+            <button type="button" id="mic-denied-dismiss" class="mic-panel-secondary">Dismiss</button>
+          </div>
+        </div>
         <div class="composer-dock">
           <form id="composer" class="composer" autocomplete="off">
             <input
@@ -92,15 +129,67 @@
           <p class="kicker rest">Scenes</p>
           <div id="scenes" class="stack"></div>
         </div>
+        <div class="rail-block is-empty" id="memory-block">
+          <p class="kicker rest">Remembered</p>
+          <ul id="memory-list" class="memory-list"></ul>
+        </div>
       </aside>
 
-      <section class="transcript is-empty" id="transcript" aria-live="polite">
-        <p class="kicker">Conversation</p>
-        <ol id="log"></ol>
+      <section class="transcript is-empty" id="transcript">
+        <details class="transcript-details" id="transcript-details">
+          <summary class="transcript-toggle">Conversation</summary>
+          <ol id="log" aria-live="polite"></ol>
+        </details>
       </section>
     </main>
 
+    <div
+      id="info-overlay"
+      class="info-overlay"
+      hidden
+      aria-hidden="true"
+    >
+      <button type="button" class="info-overlay-backdrop" id="info-backdrop" aria-label="Dismiss"></button>
+      <div
+        class="info-glass"
+        id="info-glass"
+        role="dialog"
+        aria-modal="false"
+        aria-live="polite"
+        aria-labelledby="info-title"
+      >
+        <button type="button" class="info-dismiss" id="info-dismiss" aria-label="Dismiss">×</button>
+        <div class="info-glass-inner" id="info-content"></div>
+      </div>
+    </div>
+
+    <div
+      id="settings-sheet"
+      class="settings-sheet hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      aria-hidden="true"
+    >
+      <button type="button" id="settings-backdrop" class="settings-backdrop" aria-label="Close settings"></button>
+      <div class="settings-panel" id="settings-panel">
+        <header class="settings-head">
+          <div>
+            <p class="kicker">Hearth</p>
+            <h2 id="settings-title">Look &amp; feel</h2>
+          </div>
+          <button type="button" id="settings-close" class="pill-btn settings-close">Done</button>
+        </header>
+        <div id="settings-body" class="settings-body"></div>
+        <footer class="settings-foot">
+          <button type="button" id="settings-reset" class="settings-reset">Reset to Hearth defaults</button>
+        </footer>
+      </div>
+    </div>
+
     <script src="/static/pwa.js"></script>
+    <script src="/static/vad.js"></script>
+    <script src="/static/settings.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

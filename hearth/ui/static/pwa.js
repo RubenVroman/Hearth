@@ -15,7 +15,20 @@
     return Math.max(0, window.innerHeight - (viewport.height + viewport.offsetTop));
   }
 
+  /*
+   * iOS Safari / Home Screen PWAs often keep 100svh/100dvh (and sometimes
+   * innerHeight) stale across orientationchange until a later resize. The
+   * orb-first fold and absolute header are keyed off --phone-fold so Ask the
+   * House stays in the right place as soon as the layout viewport updates.
+   */
+  function syncPhoneFold() {
+    if (isTyping()) return;
+    const height = Math.round(window.innerHeight);
+    if (height > 0) root.style.setProperty("--phone-fold", `${height}px`);
+  }
+
   function applyPhoneInsets() {
+    syncPhoneFold();
     const keyboard = keyboardInset();
     root.style.setProperty("--keyboard-inset", `${keyboard}px`);
     root.style.setProperty(
@@ -28,14 +41,26 @@
     if (height > 0) root.style.setProperty("--dock-space", `${height}px`);
   }
 
+  /* orientationchange fires before iOS swaps the layout viewport — paint twice. */
+  function afterOrientation() {
+    requestAnimationFrame(() => {
+      applyPhoneInsets();
+      requestAnimationFrame(applyPhoneInsets);
+    });
+  }
+
   if (window.visualViewport) {
     window.visualViewport.addEventListener("resize", applyPhoneInsets);
     window.visualViewport.addEventListener("scroll", applyPhoneInsets);
   }
-  window.addEventListener("orientationchange", applyPhoneInsets);
+  window.addEventListener("orientationchange", afterOrientation);
+  if (window.screen && screen.orientation && typeof screen.orientation.addEventListener === "function") {
+    screen.orientation.addEventListener("change", afterOrientation);
+  }
   window.addEventListener("focusin", applyPhoneInsets);
   window.addEventListener("focusout", applyPhoneInsets);
   window.addEventListener("resize", applyPhoneInsets);
+  window.addEventListener("pageshow", applyPhoneInsets);
 
   const dock = document.querySelector(".composer-dock");
   if (dock && typeof ResizeObserver === "function") {

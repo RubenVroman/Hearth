@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -18,12 +18,19 @@ from hearth.auth.db import init_db
 from hearth.auth.gate import http_authorized, is_public_path, ws_authorized
 from hearth.auth.routers import auth_router
 from hearth.config import settings
+from hearth.fixtures import MOCK_PLEX_LIBRARY
+from hearth.memory.prune import prune_loop
+from hearth.memory.retrieve import search as memory_search, status_snapshot as memory_status_snapshot
+from hearth.memory.store import export_snapshot, forget as memory_forget_row, init_memory_db, remember_preference
+from hearth.memory.tools import register_memory_tools
 from hearth.runtime import runtime
 from hearth.tools.builtin import register_builtin_tools
 from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
+from hearth.tools.thuisbezorgd import thuisbezorgd
 from hearth.voice.gateway import voice_socket
 from hearth.voice import webrtc as realtime_rtc
 
@@ -33,17 +40,30 @@ _agent = AgentLoop()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    import asyncio
+
     settings.workspace_path.mkdir(parents=True, exist_ok=True)
     init_db()
     bootstrap_admin()
+    init_memory_db()
     register_builtin_tools()
+    register_memory_tools()
+    stop_prune = asyncio.Event()
+    prune_task = asyncio.create_task(prune_loop(stop_prune))
     yield
+    stop_prune.set()
+    prune_task.cancel()
+    try:
+        await prune_task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
     await ha.aclose()
     await plex.aclose()
     await docker.aclose()
     await radarr.aclose()
     await sonarr.aclose()
     await overseerr.aclose()
+    await thuisbezorgd.aclose()
 
 
 app = FastAPI(
@@ -107,17 +127,38 @@ async def status() -> dict[str, Any]:
             "calls": "/api/realtime/calls",
             "client_secrets": "/api/realtime/client_secrets",
         },
-        "ha": ha_ping,
+        "ha": {
+            **ha_ping,
+            "tv_entity": settings.ha_tv_entity,
+            "avr_entity": settings.ha_avr_entity,
+            "apple_tv_entity": settings.ha_apple_tv_entity,
+            "apple_tv_player": settings.apple_tv_player,
+        },
         "plex": {"configured": settings.plex_configured},
+        "radarr": {"configured": settings.radarr_configured},
+        "sonarr": {"configured": settings.sonarr_configured},
+        "overseerr": {"configured": settings.overseerr_configured},
+        "thuisbezorgd": {
+            "configured": settings.thuisbezorgd_configured,
+            "live_submit_ready": thuisbezorgd.live_submit_ready,
+            "delivery_address": settings.delivery_address_configured,
+        },
         "docker": {"socket": docker.live},
         "tools": registry.names(),
         "workspace": str(settings.workspace_path.resolve()),
+        "memory": memory_status_snapshot(),
     }
 
 
 @app.get("/api/now-playing")
 async def now_playing() -> dict[str, Any]:
     return await plex.now_playing()
+
+
+@app.get("/api/media")
+async def media_inventory() -> dict[str, Any]:
+    """TV + AVR + Apple TV (HA) + Plex — speakable house media snapshot."""
+    return await house_media_inventory()
 
 
 @app.get("/api/rooms")
@@ -130,6 +171,11 @@ async def rooms() -> dict[str, Any]:
         "scenes": scenes.get("states") or [],
         "media": media.get("states") or [],
         "mode": lights.get("mode"),
+        "entities": {
+            "tv": settings.ha_tv_entity,
+            "avr": settings.ha_avr_entity,
+            "apple_tv": settings.ha_apple_tv_entity,
+        },
     }
 
 
@@ -143,6 +189,71 @@ async def transcript() -> dict[str, Any]:
     }
 
 
+@app.get("/api/widgets")
+async def widgets() -> dict[str, Any]:
+    return {"widgets": runtime.list_widgets()}
+
+
+@app.get("/api/plex/thumb/{rating_key}")
+async def plex_thumb(rating_key: str) -> Response:
+    """Poster proxy — Plex token never leaves the server."""
+    key = str(rating_key or "").strip()
+    if not key or not key.isdigit():
+        raise HTTPException(status_code=400, detail="invalid ratingKey")
+    fetched = await plex.thumb_bytes(key)
+    if fetched is not None:
+        body, content_type = fetched
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+    # Fixture / offline placeholder — no secrets, still looks like a poster tile.
+    title = next(
+        (
+            str(row.get("title") or "")
+            for row in MOCK_PLEX_LIBRARY
+            if str(row.get("ratingKey")) == key
+        ),
+        "Hearth",
+    )
+    initials = "".join(part[0] for part in title.split()[:2] if part).upper() or "H"
+    safe_title = (
+        title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="400" height="600" viewBox="0 0 400 600">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3a1608"/>
+      <stop offset="55%" stop-color="#c45a12"/>
+      <stop offset="100%" stop-color="#ffd7a1"/>
+    </linearGradient>
+  </defs>
+  <rect width="400" height="600" fill="url(#g)"/>
+  <text x="200" y="280" text-anchor="middle" font-family="Georgia, serif" font-size="72" fill="#f4ead8" opacity="0.92">{initials}</text>
+  <text x="200" y="520" text-anchor="middle" font-family="Georgia, serif" font-size="22" fill="#f4ead8" opacity="0.75">{safe_title[:28]}</text>
+</svg>"""
+    return Response(
+        content=svg.encode("utf-8"),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
+@app.delete("/api/widgets/{widget_id}")
+async def dismiss_widget(widget_id: str) -> dict[str, Any]:
+    ok = runtime.dismiss_widget(widget_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="unknown widget")
+    return {"ok": True, "id": widget_id, "widgets": runtime.list_widgets()}
+
+
+@app.delete("/api/widgets")
+async def clear_widgets() -> dict[str, Any]:
+    removed = runtime.clear_widgets(dismissible_only=True)
+    return {"ok": True, "removed": removed, "widgets": runtime.list_widgets()}
+
+
 @app.get("/api/tools")
 async def tools() -> dict[str, Any]:
     return {"tools": registry.list_public()}
@@ -152,7 +263,9 @@ async def tools() -> dict[str, Any]:
 async def chat(body: ChatBody) -> dict[str, Any]:
     runtime.agent_status = "thinking"
     try:
-        return await _agent.run(body.message, confirm=body.confirm)
+        out = await _agent.run(body.message, confirm=body.confirm)
+        out.setdefault("widgets", runtime.list_widgets())
+        return out
     finally:
         runtime.agent_status = "idle"
 
@@ -162,7 +275,93 @@ async def invoke(body: InvokeBody) -> dict[str, Any]:
     if registry.get(body.tool) is None:
         raise HTTPException(status_code=404, detail="unknown tool")
     result = await registry.call(body.tool, body.args)
-    return result.as_dict()
+    return {**result.as_dict(), "widgets": runtime.list_widgets()}
+
+
+class MemoryRememberBody(BaseModel):
+    key: str = ""
+    value: str = ""
+    text: str = ""
+    category: str = "general"
+
+
+class MemoryForgetBody(BaseModel):
+    key: str = ""
+    id: str = ""
+    confirm: bool = False
+
+
+class MemoryPurgeBody(BaseModel):
+    kind: str = "all"
+    confirm: bool = False
+
+
+@app.get("/api/memory")
+async def memory_get() -> dict[str, Any]:
+    snap = memory_status_snapshot()
+    from hearth.memory.store import list_preferences, recent_house_events
+
+    snap["preferences"] = list_preferences(limit=40)
+    snap["house_events"] = recent_house_events(limit=12)
+    return snap
+
+
+@app.get("/api/memory/search")
+async def memory_search_api(q: str = Query(default="", min_length=0)) -> dict[str, Any]:
+    hits = await memory_search(q) if q.strip() else []
+    return {"query": q, "hits": hits}
+
+
+@app.post("/api/memory/remember")
+async def memory_remember_api(body: MemoryRememberBody) -> dict[str, Any]:
+    value = (body.value or body.text).strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="value required")
+    row = remember_preference(body.key or value, value, category=body.category or "general")
+    return row
+
+
+@app.post("/api/memory/forget")
+async def memory_forget_api(body: MemoryForgetBody) -> dict[str, Any]:
+    if not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm=true required to forget. Memory deletes default to dry-run.",
+        )
+    result = memory_forget_row(pref_id=body.id, key=body.key)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error") or "not found")
+    return result
+
+
+@app.post("/api/memory/export")
+async def memory_export_api(confirm: bool = False) -> dict[str, Any]:
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm=true required to export. Memory export is gated like other high-risk tools.",
+        )
+    return export_snapshot()
+
+
+@app.post("/api/memory/purge")
+async def memory_purge_api(body: MemoryPurgeBody) -> dict[str, Any]:
+    if not body.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm=true required to purge.",
+        )
+    from hearth.memory.store import purge
+
+    kind = (body.kind or "all").lower()
+    return purge(
+        conversations=kind in {"all", "conversations", "session", "sessions"},
+        house_events=kind in {"all", "events", "house", "house_events"},
+        preferences=kind in {"all", "preferences", "prefs"},
+    )
+
+
+@app.post("/api/realtime/client_secrets")
 
 
 @app.post("/api/realtime/client_secrets")
@@ -219,6 +418,7 @@ async def realtime_tools(body: RealtimeToolBody) -> dict[str, Any]:
         "path": "webrtc-ga",
         "call_id": body.call_id,
         "output": result,
+        "widgets": runtime.list_widgets(),
     }
 
 

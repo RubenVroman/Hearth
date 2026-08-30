@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from hearth.app import app
 from hearth.auth.db import reset_engine
 from hearth.config import settings
+from hearth.runtime import runtime
 from hearth.tools.builtin import register_builtin_tools
 
 TEST_ADMIN_EMAIL = "admin@hearth.test"
@@ -28,7 +29,22 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "radarr_api_key", "")
     monkeypatch.setattr(settings, "sonarr_api_key", "")
     monkeypatch.setattr(settings, "overseerr_api_key", "")
+    monkeypatch.setattr(settings, "thuisbezorgd_api_key", "")
+    monkeypatch.setattr(settings, "thuisbezorgd_email", "")
+    monkeypatch.setattr(settings, "thuisbezorgd_password", "")
+    monkeypatch.setattr(settings, "thuisbezorgd_session_token", "")
+    monkeypatch.setattr(settings, "hearth_delivery_street", "")
+    monkeypatch.setattr(settings, "hearth_delivery_postcode", "")
+    monkeypatch.setattr(settings, "hearth_delivery_city", "")
+    monkeypatch.setattr(settings, "weather_force_mock", True)
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
+    monkeypatch.setattr(settings, "memory_db_path", tmp_path / "hearth-memory.db")
+    monkeypatch.setattr(settings, "memory_enabled", True)
+    monkeypatch.setattr(settings, "memory_store_conversations", True)
+    monkeypatch.setattr(settings, "memory_store_house_events", False)
+    monkeypatch.setattr(settings, "memory_embeddings", False)
+    monkeypatch.setattr(settings, "memory_inject", True)
+    monkeypatch.setattr(settings, "memory_prune_interval_minutes", 0)
     monkeypatch.setattr(settings, "app_secret_key", TEST_APP_SECRET)
     monkeypatch.setattr(settings, "algorithm", "HS256")
     monkeypatch.setattr(settings, "access_token_expire_minutes", 30)
@@ -37,12 +53,28 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "cookie_samesite", "lax")
     monkeypatch.setattr(settings, "admin_email", TEST_ADMIN_EMAIL)
     monkeypatch.setattr(settings, "admin_password", TEST_ADMIN_PASSWORD)
+    from hearth.fixtures import mock_thuisbezorgd
+    from hearth.tools.thuisbezorgd import thuisbezorgd
+
+    mock_thuisbezorgd.clear_cart()
+    mock_thuisbezorgd.orders.clear()
+    mock_thuisbezorgd._order_seq = 0
+    thuisbezorgd._session_token = ""
     (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
     (tmp_path / "skills" / "vault_echo.py").write_text(
         Path(__file__).resolve().parents[1].joinpath("workspace/skills/vault_echo.py").read_text(),
         encoding="utf-8",
     )
     reset_engine()
+    runtime.widgets.clear()
+    runtime.pending = None
+    runtime.last_tools.clear()
+    runtime.transcript.clear()
+    runtime.agent_status = "idle"
+    from hearth.memory.store import init_memory_db, reset_memory
+
+    reset_memory()
+    init_memory_db()
     register_builtin_tools()
     return tmp_path
 

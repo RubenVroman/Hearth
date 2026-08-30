@@ -1,5 +1,8 @@
 from unittest.mock import patch
 
+import json
+import pytest
+
 from hearth.config import settings
 from hearth.voice import webrtc as realtime_rtc
 
@@ -77,7 +80,10 @@ def test_client_secrets_mints_ephemeral_ek_token(client, monkeypatch):
     assert "OpenAI-Beta" not in captured["headers"]
     assert captured["json"]["session"]["type"] == "realtime"
     assert captured["json"]["session"]["model"] == "gpt-realtime-2.1"
-
+    audio_in = captured["json"]["session"]["audio"]["input"]
+    assert audio_in["transcription"]["model"] == "gpt-4o-mini-transcribe"
+    assert audio_in["turn_detection"]["type"] == "semantic_vad"
+    assert "memory_remember" in captured["json"]["session"]["instructions"]
 
 def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "sk-test-hearth")
@@ -152,6 +158,8 @@ def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
     session = captured["files"]["session"][1]
     assert '"type": "realtime"' in session or '"type":"realtime"' in session
     assert "gpt-realtime-2.1" in session
+    assert "gpt-4o-mini-transcribe" in session
+    assert "transcription" in session
     assert captured["ws_url"] == f"{realtime_rtc.SIDEBAND_URL}?call_id=rtc_test_call"
     assert "OpenAI-Beta" not in captured["ws_headers"]
     assert hangup.status_code == 200
@@ -191,7 +199,96 @@ def test_realtime_tools_run_on_hearth(client):
     assert "Dune" in str(body["output"])
 
 
+def test_session_config_includes_memory_slice(monkeypatch):
+    from hearth.memory.store import remember_preference
+    from hearth.voice import webrtc as realtime_rtc
+
+    remember_preference("coffee", "Pour-over in the morning")
+    cfg = realtime_rtc.session_config(query="coffee")
+    assert cfg["type"] == "realtime"
+    assert "Pour-over in the morning" in cfg["instructions"]
+    assert "Retrieved house memory" in cfg["instructions"]
+    names = {tool["name"] for tool in cfg["tools"]}
+    assert "memory_search" in names
+    assert "memory_forget" in names
+
+
 def test_secret_value_reads_ga_and_nested_shapes():
     assert realtime_rtc.secret_value({"value": "ek_abc"}) == "ek_abc"
     assert realtime_rtc.secret_value({"client_secret": {"value": "ek_nested"}}) == "ek_nested"
     assert realtime_rtc.secret_value({}) is None
+
+
+@pytest.mark.asyncio
+async def test_end_call_tool_marks_close_of_call():
+    from hearth.agent.registry import registry
+
+    result = await registry.call("end_call", {"reason": "goodbye"})
+    assert result.ok
+    assert result.data["ended"] is True
+    assert result.data["reason"] == "goodbye"
+    tools = {t["name"] for t in registry.openai_realtime_tools()}
+    assert "end_call" in tools
+
+
+@pytest.mark.asyncio
+async def test_sideband_end_call_closes_after_response_done(monkeypatch):
+    """Close-of-call: end_call tool → response.done → sideband hangup (no extra response.create)."""
+    sent: list[dict] = []
+    closed = {"n": 0}
+
+    class DummyWS:
+        async def send(self, msg):
+            sent.append(json.loads(msg) if isinstance(msg, str) else msg)
+
+        async def close(self):
+            closed["n"] += 1
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    band = realtime_rtc.Sideband("rtc_close_test")
+    band._ws = DummyWS()
+    realtime_rtc._sidebands["rtc_close_test"] = band
+
+    await band._on_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "end_call",
+            "arguments": '{"reason":"goodbye"}',
+            "call_id": "call_end_1",
+        }
+    )
+    assert band._pending_hangup is True
+    assert any(m.get("type") == "conversation.item.create" for m in sent)
+    assert not any(m.get("type") == "response.create" for m in sent)
+
+    await band._on_event({"type": "response.done", "response": {"output": []}})
+    # Hangup is scheduled as a task; let it run.
+    if band._hangup_task is not None:
+        await band._hangup_task
+
+    assert "rtc_close_test" not in realtime_rtc._sidebands
+    assert closed["n"] >= 1
+    assert band._ws is None
+
+
+@pytest.mark.asyncio
+async def test_sideband_house_tool_still_requests_follow_up_response():
+    sent: list[dict] = []
+
+    class DummyWS:
+        async def send(self, msg):
+            sent.append(json.loads(msg) if isinstance(msg, str) else msg)
+
+        async def close(self):
+            return None
+
+    band = realtime_rtc.Sideband("rtc_tool_test")
+    band._ws = DummyWS()
+    await band._run_function_call("plex_now_playing", "{}", "call_plex_1")
+    assert any(m.get("type") == "response.create" for m in sent)
+    assert band._pending_hangup is False

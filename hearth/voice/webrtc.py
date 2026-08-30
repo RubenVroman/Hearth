@@ -21,11 +21,13 @@ from typing import Any
 import httpx
 from websockets.asyncio.client import connect as ws_connect
 
-from hearth.agent.prompts import SYSTEM_PROMPT
+from hearth.agent.prompts import compose_system_prompt, compose_system_prompt_async
 from hearth.agent.registry import registry
 from hearth.config import settings
+from hearth.memory import store as memory_store
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
+from hearth.voice.vad import audio_input_config
 
 CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
@@ -49,18 +51,29 @@ def openai_auth_headers(*, json_body: bool = False) -> dict[str, str]:
     return headers
 
 
-def session_config() -> dict[str, Any]:
-    """GA session shape. ChatGPT-app voice: gpt-realtime-2.1 + semantic VAD."""
+def session_config(*, query: str | None = None, instructions: str | None = None) -> dict[str, Any]:
+    """GA session shape. ChatGPT-app voice: gpt-realtime-2.1 + speech-aware VAD.
+
+    ``noise_reduction`` runs before server VAD so TV/HVAC energy is less likely
+    to fire ``speech_started``. Client barge-in gate (``/static/vad.js``) adds a
+    second speech-band check while the assistant is talking.
+
+    Input ``transcription`` is required for
+    ``conversation.item.input_audio_transcription.completed`` so the phone UI
+    can show what the user said when Conversation is expanded. Spoken turns also
+    refresh the memory slice injected into Realtime ``instructions``.
+    """
+    text = instructions or compose_system_prompt(
+        query if query is not None else runtime.latest_user(),
+        include_recent_turns=True,
+    )
     return {
         "type": "realtime",
         "model": settings.openai_realtime_model,
-        "instructions": SYSTEM_PROMPT,
+        "instructions": text,
         "output_modalities": ["audio"],
         "audio": {
-            "input": {
-                "turn_detection": {"type": "semantic_vad"},
-            },
-            "output": {
+            "input": audio_input_config(),            "output": {
                 "voice": settings.openai_tts_voice,
             },
         },
@@ -93,6 +106,13 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
     return result.as_dict()
 
 
+def _persist_voice_turn(role: str, text: str) -> None:
+    try:
+        memory_store.persist_turn(role, text, channel="voice")
+    except Exception:  # noqa: BLE001
+        return
+
+
 def client_secret_body() -> dict[str, Any]:
     return {"session": session_config()}
 
@@ -103,6 +123,8 @@ class Sideband:
         self._ws = None
         self._pump: asyncio.Task[None] | None = None
         self._done_calls: set[str] = set()
+        self._pending_hangup = False
+        self._hangup_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         url = f"{SIDEBAND_URL}?call_id={self.call_id}"
@@ -116,6 +138,15 @@ class Sideband:
         runtime.agent_status = "listening"
 
     async def close(self) -> None:
+        self._pending_hangup = False
+        current = asyncio.current_task()
+        if (
+            self._hangup_task is not None
+            and not self._hangup_task.done()
+            and self._hangup_task is not current
+        ):
+            self._hangup_task.cancel()
+            self._hangup_task = None
         if self._pump is not None:
             self._pump.cancel()
             self._pump = None
@@ -129,6 +160,20 @@ class Sideband:
             runtime.voice_mode = "disconnected"
             runtime.openai_live = False
             runtime.agent_status = "idle"
+
+    def _schedule_hangup(self) -> None:
+        """Close this call once the current Realtime response has finished."""
+        if self._hangup_task is not None and not self._hangup_task.done():
+            return
+        self._hangup_task = asyncio.create_task(self._hangup_self())
+
+    async def _hangup_self(self) -> None:
+        band = _sidebands.pop(self.call_id, None)
+        self._hangup_task = None
+        if band is self or band is None:
+            await self.close()
+        elif band is not None:
+            await band.close()
 
     async def _listen(self) -> None:
         assert self._ws is not None
@@ -161,10 +206,16 @@ class Sideband:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("assistant", text)
-        elif etype == "conversation.item.input_audio_transcription.completed":
+                _persist_voice_turn("assistant", text)
+        elif etype in {
+            "conversation.item.input_audio_transcription.completed",
+            "conversation.item.audio_transcription.completed",
+        }:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("user", text)
+                _persist_voice_turn("user", text)
+                await self._refresh_memory(text)
         elif etype == "response.function_call_arguments.done":
             await self._run_function_call(
                 event.get("name") or "",
@@ -174,6 +225,8 @@ class Sideband:
         elif etype == "response.done":
             await self._handle_function_calls(event)
             runtime.agent_status = "listening"
+            if self._pending_hangup:
+                self._schedule_hangup()
         elif etype == "error":
             err = event.get("error") or event
             runtime.voice_reason = str(err)[:300]
@@ -222,7 +275,24 @@ class Sideband:
                 }
             )
         )
+        if name == "end_call":
+            # Close after this response finishes so farewell audio can play.
+            self._pending_hangup = True
+            runtime.voice_reason = f"close_of_call:{result.get('reason', 'close_of_call')}"
+            return
         await self._ws.send(dumps({"type": "response.create"}))
+
+    async def _refresh_memory(self, query: str) -> None:
+        """Re-inject a retrieved memory slice after each spoken turn (Realtime hook)."""
+        if self._ws is None:
+            return
+        try:
+            instructions = await compose_system_prompt_async(query, include_recent_turns=True)
+            await self._ws.send(
+                dumps({"type": "session.update", "session": session_config(instructions=instructions)})
+            )
+        except Exception:  # noqa: BLE001
+            return
 
 
 _sidebands: dict[str, Sideband] = {}
