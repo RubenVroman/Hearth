@@ -1,7 +1,7 @@
 """Progress status posts for titles queued by the Telegram inbox.
 
 Quiet policy: one early "started and healthy" ping once a download reaches
-~START_THRESHOLD percent, then silence until done / failed (or a manual
+a trustworthy mid-start percent, then silence until done / failed (or a manual
 status ask via radarr_queue / sonarr_queue elsewhere).
 """
 
@@ -17,8 +17,10 @@ from hearth.tools.arr import radarr, sonarr
 log = logging.getLogger("hearth.telegram")
 
 # Early healthy-start signal. Small threshold so we know the grab is moving
-# without spamming later percent ticks (10%, 25%, …).
+# without spamming later percent ticks (10%, 25%, …). Skip near-complete
+# first sightings so we never announce "downloading, ~100%".
 START_THRESHOLD = 5.0
+START_PERCENT_MAX = 95.0
 
 
 @dataclass
@@ -39,7 +41,11 @@ def format_queued(title: str, year: int | None, via: str) -> str:
 
 
 def format_downloading(title: str, percent: float | None) -> str:
-    if percent is None:
+    """Announce an in-flight grab. Never formats a fake near-100% figure."""
+    if percent is None or percent < 0:
+        return f"{title} is downloading."
+    # Guard: never say "~100%" (or ~95%+) while still "downloading".
+    if percent >= START_PERCENT_MAX:
         return f"{title} is downloading."
     return f"{title} is downloading, ~{percent:g}%."
 
@@ -113,9 +119,21 @@ def format_rate_limited() -> str:
 
 
 def _as_percent(value: Any) -> float | None:
+    """Coerce a queue percent already on 0–100 (from summarize_queue_item)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    n = float(value)
+    if n < 0:
+        return None
+    # summarize_queue_item already scales 0–1 API fractions; do not ×100 again.
+    return n
+
+
+def _trustworthy_start_percent(percent: float | None, *, threshold: float) -> bool:
+    """True when percent is a real early-progress signal (not missing / not ~done)."""
+    if percent is None:
+        return False
+    return threshold <= percent < START_PERCENT_MAX
 
 
 class ProgressTracker:
@@ -166,7 +184,7 @@ class ProgressTracker:
                     item.done = True
                 continue
             row = downloads[0]
-            status = str(row.get("status") or "unknown")
+            status = str(row.get("status") or "unknown").strip().lower()
             percent = _as_percent(row.get("percent"))
             item.last_status = status
             if status == "failed":
@@ -174,11 +192,18 @@ class ProgressTracker:
                 item.done = True
                 continue
             if status == "completed":
+                # Imported (or *arr says completed) — announce done, never
+                # "downloading ~100%" even on first sighting.
                 await send(item.chat_id, format_done(item.title))
                 item.done = True
                 continue
-            # One early healthy-start ping at ~threshold; no later percent spam.
-            if not item.announce_started:
-                if percent is not None and percent >= start_threshold:
-                    await send(item.chat_id, format_downloading(item.title, percent))
-                    item.announce_started = True
+            if status == "importing":
+                # Still processing — stay quiet; do not claim Plex or ~100%.
+                continue
+            # One early healthy-start ping at a trustworthy mid-start percent;
+            # no later percent spam. Skip bogus near-100 / missing-byte first polls.
+            if not item.announce_started and _trustworthy_start_percent(
+                percent, threshold=start_threshold
+            ):
+                await send(item.chat_id, format_downloading(item.title, percent))
+                item.announce_started = True

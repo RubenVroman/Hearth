@@ -153,8 +153,19 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
 
 
 
+# Statuses where a grab is still in flight — never report 100% yet.
+_IN_FLIGHT_STATUSES = frozenset(
+    {"queued", "downloading", "paused", "warning", "stalled", "importing", "unknown"}
+)
+
+
 def queue_percent(size: Any, sizeleft: Any) -> float | None:
-    """Percent complete from Radarr/Sonarr size + sizeleft (0–100, one decimal)."""
+    """Percent complete from real *arr bytes only (0–100, one decimal).
+
+    Uses ``(size - sizeleft) / size * 100`` when ``size > 0`` and ``sizeleft``
+    is numeric. Missing/invalid size or sizeleft → ``None`` (never invent 100
+    from size=0 / sizeleft=0).
+    """
     try:
         if size is None or sizeleft is None:
             return None
@@ -163,9 +174,57 @@ def queue_percent(size: Any, sizeleft: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     if total <= 0:
-        return 100.0 if left <= 0 else None
+        return None
     done = ((total - left) / total) * 100.0
     return round(max(0.0, min(100.0, done)), 1)
+
+
+def coerce_api_percent(value: Any) -> float | None:
+    """Normalize a raw API percent-like value to 0–100.
+
+    Values in ``[0, 1]`` are treated as fractions and scaled ×100. Values
+    above 1 are treated as already on a 0–100 scale.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    n = float(value)
+    if n < 0:
+        return None
+    if n <= 1.0:
+        n *= 100.0
+    return round(min(100.0, n), 1)
+
+
+def clamp_download_percent(percent: float | None, status: str | None) -> float | None:
+    """Clamp in-flight downloads to 0–99; allow 100 only when completed."""
+    if percent is None:
+        return None
+    try:
+        n = float(percent)
+    except (TypeError, ValueError):
+        return None
+    n = max(0.0, min(100.0, n))
+    state = (status or "").strip().lower()
+    if state in _IN_FLIGHT_STATUSES:
+        return round(min(99.0, n), 1)
+    return round(n, 1)
+
+
+def resolve_queue_percent(
+    item: dict[str, Any],
+    *,
+    status: str | None = None,
+) -> float | None:
+    """Best-effort queue percent: bytes first, then scaled API field, then clamp."""
+    size = item.get("size")
+    sizeleft = item.get("sizeleft") if "sizeleft" in item else item.get("sizeLeft")
+    percent = queue_percent(size, sizeleft)
+    if percent is None:
+        raw = item.get("percent")
+        if raw is None:
+            raw = item.get("progress")
+        percent = coerce_api_percent(raw)
+    return clamp_download_percent(percent, status)
 
 
 def _status_messages_text(item: dict[str, Any]) -> str:
@@ -242,17 +301,17 @@ def _quality_name(item: dict[str, Any]) -> str | None:
 
 def summarize_queue_item(item: dict[str, Any], *, service: str) -> dict[str, Any]:
     size = item.get("size")
-    sizeleft = item.get("sizeleft")
-    percent = queue_percent(size, sizeleft)
+    sizeleft = item.get("sizeleft") if "sizeleft" in item else item.get("sizeLeft")
     title = _download_title(item)
     status = normalize_download_status(item)
+    percent = resolve_queue_percent(item, status=status)
     return {
         "title": title or None,
         "status": status,
         "percent": percent,
         "size": size,
         "sizeleft": sizeleft,
-        "timeleft": item.get("timeleft"),
+        "timeleft": item.get("timeleft") or item.get("timeLeft"),
         "indexer": item.get("indexer"),
         "quality": _quality_name(item),
         "downloadClient": item.get("downloadClient"),

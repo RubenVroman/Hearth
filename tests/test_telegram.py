@@ -1415,6 +1415,110 @@ async def test_progress_failure_before_start_threshold_still_notifies(monkeypatc
     assert tracker.active == []
 
 
+def test_format_downloading_never_says_near_100():
+    from hearth.telegram.progress import format_done, format_downloading
+
+    assert format_downloading("Annihilation", None) == "Annihilation is downloading."
+    assert format_downloading("Annihilation", 12.0) == "Annihilation is downloading, ~12%."
+    assert "~100%" not in format_downloading("Annihilation", 100.0)
+    assert "~99%" not in format_downloading("Annihilation", 99.0)
+    assert format_downloading("Annihilation", 100.0) == "Annihilation is downloading."
+    assert format_downloading("Annihilation", 95.0) == "Annihilation is downloading."
+    assert format_done("Annihilation") == "Annihilation is done — in Plex."
+
+
+@pytest.mark.asyncio
+async def test_progress_bogus_100_does_not_start_ping(monkeypatch):
+    """First poll at ~100% while still downloading must not announce downloading ~100%."""
+    from hearth.telegram.progress import ProgressTracker
+
+    tracker = ProgressTracker()
+    tracker.track(-1001, "Annihilation", "radarr", 2018)
+    sent: list[str] = []
+
+    async def capture(_chat_id: int, text: str) -> None:
+        sent.append(text)
+
+    state = {"percent": 100.0, "status": "downloading"}
+
+    async def fake_queue(_title: str):
+        return _queue_payload(
+            "Annihilation", percent=state["percent"], status=state["status"]
+        )
+
+    monkeypatch.setattr("hearth.telegram.progress.radarr.queue", fake_queue)
+
+    await tracker.poll_once(capture)
+    assert sent == []
+    assert tracker.active[0].announce_started is False
+
+    # Missing percent — also no invented start ping.
+    state["percent"] = None
+    await tracker.poll_once(capture)
+    assert sent == []
+
+    # Real mid-start percent — one quiet start ping.
+    state["percent"] = 8.0
+    await tracker.poll_once(capture)
+    assert len(sent) == 1
+    assert "Annihilation is downloading, ~8%" in sent[0]
+    assert "~100%" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_progress_first_sighting_completed_says_done_not_downloading(
+    monkeypatch,
+):
+    from hearth.telegram.progress import ProgressTracker
+
+    tracker = ProgressTracker()
+    tracker.track(-1001, "Annihilation", "radarr", 2018)
+    sent: list[str] = []
+
+    async def capture(_chat_id: int, text: str) -> None:
+        sent.append(text)
+
+    async def fake_queue(_title: str):
+        return _queue_payload("Annihilation", percent=100.0, status="completed")
+
+    monkeypatch.setattr("hearth.telegram.progress.radarr.queue", fake_queue)
+
+    await tracker.poll_once(capture)
+    assert len(sent) == 1
+    assert "done" in sent[0].lower()
+    assert "downloading" not in sent[0].lower()
+    assert tracker.active == []
+
+
+@pytest.mark.asyncio
+async def test_progress_importing_stays_quiet_until_completed(monkeypatch):
+    from hearth.telegram.progress import ProgressTracker
+
+    tracker = ProgressTracker()
+    tracker.track(-1001, "Annihilation", "radarr", 2018)
+    sent: list[str] = []
+
+    async def capture(_chat_id: int, text: str) -> None:
+        sent.append(text)
+
+    state = {"percent": 99.0, "status": "importing"}
+
+    async def fake_queue(_title: str):
+        return _queue_payload(
+            "Annihilation", percent=state["percent"], status=state["status"]
+        )
+
+    monkeypatch.setattr("hearth.telegram.progress.radarr.queue", fake_queue)
+
+    await tracker.poll_once(capture)
+    assert sent == []
+
+    state["status"] = "completed"
+    await tracker.poll_once(capture)
+    assert len(sent) == 1
+    assert "done" in sent[0].lower()
+
+
 @pytest.mark.asyncio
 async def test_manual_status_path_still_reports_current_progress(client):
     """Voice/chat status asks use radarr_queue — unchanged by quiet Telegram pings."""
