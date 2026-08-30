@@ -1,12 +1,19 @@
-"""Glass info overlays — weather / media / downloads (no flickering update guards)."""
+"""Glass info overlays — weather / media stack / downloads (no flickering update guards)."""
 
 from datetime import datetime, timedelta, timezone
 
 from hearth.agent.loop import route_intent
 from hearth.agent.registry import registry
 from hearth.fixtures import pipeline
-from hearth.overlay_context import evaluate_widget, text_matches_topics, topics_for_widget
+from hearth.overlay_context import (
+    apply_media_focus,
+    evaluate_widget,
+    focus_media_from_text,
+    text_matches_topics,
+    topics_for_widget,
+)
 from hearth.runtime import Widget, runtime
+from hearth.widgets import publish_tool
 
 
 def test_command_center_includes_info_overlay(client):
@@ -18,12 +25,15 @@ def test_command_center_includes_info_overlay(client):
     assert "openInfoOverlay" in js.text
     assert "softHideInfoOverlay" in js.text
     assert "noteOverlayConversation" in js.text
+    assert "focusMediaFromText" in js.text
+    assert "info-media-stack" in js.text
     assert "is-soft-hidden" in js.text
     assert "renderWidgets" in js.text
     assert "/api/media/art" in js.text
     assert "downloadsMarkup" in js.text
     assert "info-download-bar" in js.text
     assert "fadeMediaOverlayOnProgress" not in js.text
+    assert "response.output_audio_transcript.delta" in js.text
 
     assert "/api/widgets/" in js.text
     assert "upsertLocalWidget" not in js.text
@@ -32,11 +42,13 @@ def test_command_center_includes_info_overlay(client):
     assert ".info-overlay" in css.text
     assert ".info-glass" in css.text
     assert ".info-overlay.is-soft-hidden" in css.text
+    assert ".info-media-stack" in css.text
+    assert ".info-media-card" in css.text
     assert ".info-download-list" in css.text
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v12" in sw.text
+    assert "hearth-shell-v13" in sw.text
 
 
 def test_weather_ask_surfaces_weather_overlay(client):
@@ -88,6 +100,10 @@ def test_movie_ask_surfaces_media_overlay(client):
     assert item.get("tmdbId") == 693134
     assert item.get("posterPath")
     assert media.get("sticky") is False
+    items = media["data"]["items"]
+    assert isinstance(items, list) and items
+    assert media["data"]["active_id"] == items[0]["id"]
+    assert items[0]["title"] == item["title"]
 
     thumb = client.get("/api/plex/thumb/1001")
     assert thumb.status_code == 200
@@ -96,6 +112,52 @@ def test_movie_ask_surfaces_media_overlay(client):
     art = client.get("/api/media/art", params={"ratingKey": "1001", "tmdbId": 693134})
     assert art.status_code == 200
     assert "image/" in art.headers.get("content-type", "")
+
+
+def test_media_search_stacks_multiple_hits(client):
+    chat = client.post("/api/chat", json={"message": "tell me about the movie Heat"})
+    assert chat.status_code == 200
+    media = next(w for w in chat.json()["widgets"] if w["kind"] == "media")
+    items = media["data"]["items"]
+    assert len(items) >= 2
+    titles = {str(row.get("title") or "") for row in items}
+    assert "Heat" in titles
+    assert media["data"]["active_id"]
+    assert media["data"]["item"]["id"] == media["data"]["active_id"]
+
+
+def test_media_stack_accumulates_across_searches(client):
+    first = client.post("/api/chat", json={"message": "tell me about the movie Dune"})
+    assert first.status_code == 200
+    second = client.post("/api/chat", json={"message": "tell me about the movie The Endless"})
+    assert second.status_code == 200
+    media = next(w for w in second.json()["widgets"] if w["kind"] == "media")
+    items = media["data"]["items"]
+    titles = [str(row.get("title") or "") for row in items]
+    assert any("Endless" in t for t in titles)
+    assert any("Dune" in t for t in titles)
+    assert "Endless" in media["title"]
+    # Active card is the latest spoken title.
+    assert "Endless" in str(media["data"]["item"].get("title") or "")
+
+
+def test_media_active_card_follows_transcript(client):
+    client.post("/api/chat", json={"message": "tell me about the movie Dune"})
+    client.post("/api/chat", json={"message": "tell me about the movie The Endless"})
+    media = runtime.get_widget("media")
+    assert media is not None
+    past = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    media.updated_at = past
+    media.ts = past
+    runtime.note("assistant", "Dune: Part Two is the one with the Fremen sandwalk.")
+    rel = evaluate_widget(media)
+    assert rel.relevant is True
+    assert rel.reason == "topic_match"
+    assert "Dune" in media.title
+    hit = focus_media_from_text(media, "what about The Endless again")
+    assert hit
+    apply_media_focus(media, hit)
+    assert "Endless" in media.title
 
 
 def test_media_overlay_soft_hides_on_next_turn(client):
@@ -222,6 +284,20 @@ def test_overlay_stays_through_unrelated_turn_but_marks_irrelevant(client):
     assert listed["weather"]["context"]["reason"].startswith("unrelated:")
 
 
+def test_overlay_hides_when_talk_leaves_without_domain_keyword(client):
+    """Past the fresh window, generic chat must not keep a title panel stuck."""
+    client.post("/api/chat", json={"message": "tell me about the movie Dune"})
+    media = runtime.get_widget("media")
+    assert media is not None
+    past = (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()
+    media.updated_at = past
+    media.ts = past
+    runtime.note("user", "tell me a joke about chickens")
+    rel = evaluate_widget(media)
+    assert rel.relevant is False
+    assert rel.reason in {"stale", "idle"}
+
+
 def test_overlay_reappears_relevant_when_talk_returns(client):
     client.post("/api/chat", json={"message": "tell me about the movie Dune"})
     client.post("/api/chat", json={"message": "turn on the kitchen lights"})
@@ -271,12 +347,68 @@ def test_topics_include_media_title():
         title="Dune: Part Two",
         status="done",
         body="movie · 2024",
-        data={"item": {"title": "Dune: Part Two", "type": "movie", "year": 2024}},
+        data={
+            "item": {
+                "id": "plex:1001",
+                "title": "Dune: Part Two",
+                "type": "movie",
+                "year": 2024,
+            },
+            "items": [
+                {
+                    "id": "plex:1001",
+                    "title": "Dune: Part Two",
+                    "type": "movie",
+                    "year": 2024,
+                }
+            ],
+            "active_id": "plex:1001",
+        },
     )
     topics = topics_for_widget(widget)
     assert "media" in topics
     assert "dune" in topics
     assert text_matches_topics("tell me more about dune", topics)
+
+
+def test_publish_tool_builds_media_stack_from_results():
+    runtime.widgets.clear()
+    publish_tool(
+        {
+            "name": "plex_search",
+            "ok": True,
+            "data": {
+                "ok": True,
+                "mode": "mock",
+                "results": [
+                    {
+                        "title": "Dune: Part Two",
+                        "type": "movie",
+                        "year": 2024,
+                        "ratingKey": "1001",
+                        "summary": "Fremen.",
+                        "tmdbId": 693134,
+                        "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
+                    },
+                    {
+                        "title": "The Endless",
+                        "type": "movie",
+                        "year": 2017,
+                        "ratingKey": "2042",
+                        "summary": "Cult.",
+                        "tmdbId": 430231,
+                        "posterPath": "/uVHPBTLb6Sj1Eso9HzyBAOMRheM.jpg",
+                    },
+                ],
+            },
+        }
+    )
+    media = runtime.get_widget("media")
+    assert media is not None
+    items = media.data["items"]
+    assert len(items) == 2
+    assert media.data["active_id"] == items[0]["id"]
+    assert items[0]["title"] == "Dune: Part Two"
 
 
 async def test_get_weather_tool_mocked():

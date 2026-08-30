@@ -40,12 +40,15 @@ class ToolResult:
     dry_run: bool = False
 
     def as_dict(self) -> dict[str, Any]:
+        from hearth.runtime import _now
+
         return {
             "name": self.name,
             "ok": self.ok,
             "needs_confirm": self.needs_confirm,
             "dry_run": self.dry_run,
             "data": self.data,
+            "ts": _now(),
         }
 
 

@@ -194,20 +194,27 @@ says it is not configured.
 
 The old “update guard” widget stack (Thinking / Action / Update cards beside the orb) is gone — it remounted on every status poll and flickered.
 
-In its place, a single **centered glass panel** opens only when there is rich visual content:
+In its place, a **centered glass panel** opens when there is rich visual content. Media titles stack as cards when several come up in conversation.
 
 | Kind | Source tools | Shows |
 | --- | --- | --- |
-| `weather` | `get_weather` | Place, temperature, condition, humidity / wind |
-| `media` | `plex_search`, `plex_now_playing`, `plex_play`, `radarr_search`, `sonarr_search`, `overseerr_search` | Title, type/year, summary, optional poster |
+| `weather` | `get_weather` | Place, temperature, condition, humidity / wind (single panel) |
+| `media` | `plex_search`, `plex_now_playing`, `plex_play`, `radarr_search`, `sonarr_search`, `overseerr_search` | Stacked title cards (poster, year, summary); front card = what is being talked about now |
+| `downloads` | `radarr_queue`, `sonarr_queue` | Queue progress list |
 
-Payload path (unchanged transport, narrower kinds):
+### Behavior
 
-1. Tool runs on the server → `hearth/widgets.publish_tool` upserts a `Widget` on `runtime` (`kind` = `weather` \| `media` only).
-2. Chat / invoke / realtime / `GET /api/status` return `widgets: [...]`.
-3. The UI (`#info-overlay`) picks the latest visual widget, renders frosted glass markup, and **skips DOM work when `id` + `updated_at` are unchanged** so 8s status polls do not flicker.
+- **Hide when talk leaves.** Soft-hide (fade) when the conversation is no longer about the on-screen weather/title. Acknowledgments (“ok”, “thanks”) do not force-hide. Clear topic switches (lights, food, docker, weather↔media) hide promptly. The widget stays in runtime memory so the same topic can reappear without a new tool fetch. Hard dismiss (× / backdrop / Esc) still deletes.
+- **Stacked media cards.** Search hits and successive title lookups accumulate into one `media` widget (`data.items` + `data.active_id`, with `data.item` = the active card). Naming a stacked title (chat or live Realtime transcript, including assistant audio deltas) brings that card forward. Single title → one card (not an empty stack).
+- **Relevance** is evaluated against the *active* card’s entity tokens (title/place), not generic words like “movie”. Past the fresh window with no entity evidence → `context.relevant: false` (`stale` / `idle` / `unrelated:*`).
+
+Payload path:
+
+1. Tool runs on the server → `hearth/widgets.publish_tool` upserts a `Widget` on `runtime` (`kind` = `weather` \| `media` \| `downloads`).
+2. Chat / invoke / realtime / `GET /api/status` return `widgets: [...]` with `context: { relevant, reason, topics, active_id? }` from `hearth/overlay_context.py`.
+3. The UI (`#info-overlay`) renders the glass panel / card stack, reacts to live transcripts (not only the 8s status poll), and **skips DOM work when the overlay signature is unchanged** so polls do not flicker.
 4. Dismiss: ×, backdrop, or Esc → `DELETE /api/widgets/{id}`.
-5. Poster art: `GET /api/plex/thumb/{ratingKey}` proxies Plex thumbnails (token stays on the NAS). Fixture mode returns an SVG placeholder.
+5. Poster art: `GET /api/media/art` (and `/api/plex/thumb/{ratingKey}`) proxy art; API keys stay on the server. Missing art → initials fallback, never a broken image.
 
 Ordinary confirms still use the bottom **Confirm** button — not the glass panel.
 
