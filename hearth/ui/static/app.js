@@ -42,6 +42,11 @@ const state = {
   refreshTimer: null,
   /** Client-only provisional media cards (title skeletons) pending tool fill-in. */
   localMediaExtras: [],
+  /** Last activity payload from /api/status. */
+  serverActivity: { phase: "idle", label: "", tool: "" },
+  /** Optimistic / client-flash activity (chat submit, fetch errors). */
+  localActivity: null,
+  localActivityTimer: null,
 };
 
 /** Client grace before fading when talk is clearly unrelated (ms). */
@@ -1339,9 +1344,71 @@ function idleHint() {
   return `Tap the hearth for a live conversation (${rt.model || "gpt-realtime-2.1"} · ${rt.path || "webrtc-ga"}). Real speech interrupts; noise should not.`;
 }
 
+const ACTIVITY_IDLE_PHASES = new Set(["idle", "listening", "speaking"]);
+
+function renderActivity(activity) {
+  const el = $("activity");
+  const labelEl = $("activity-label");
+  if (!el || !labelEl) return;
+  const src = state.localActivity || activity || state.serverActivity || {};
+  const phase = String(src.phase || "idle");
+  const label = String(src.label || "").trim();
+  const show = Boolean(label) && !ACTIVITY_IDLE_PHASES.has(phase);
+  const classes = ["activity", `is-${phase || "idle"}`];
+  if (!show) classes.push("is-idle");
+  el.className = classes.join(" ");
+  labelEl.textContent = show ? label : "";
+  el.hidden = !show;
+  el.setAttribute("aria-hidden", show ? "false" : "true");
+}
+
+function flashLocalActivity(phase, label, holdMs = 4000) {
+  state.localActivity = { phase, label, tool: "" };
+  renderActivity(state.serverActivity);
+  if (state.localActivityTimer) {
+    clearTimeout(state.localActivityTimer);
+    state.localActivityTimer = null;
+  }
+  state.localActivityTimer = setTimeout(() => {
+    state.localActivity = null;
+    state.localActivityTimer = null;
+    renderActivity(state.serverActivity);
+  }, holdMs);
+}
+
+function clearLocalActivity() {
+  if (state.localActivityTimer) {
+    clearTimeout(state.localActivityTimer);
+    state.localActivityTimer = null;
+  }
+  state.localActivity = null;
+}
+
 function renderStatus(status) {
   $("house").textContent = status.house || "VAULT";
-  $("agent-pill").textContent = status.agent || "idle";
+  const activity = status.activity || {};
+  state.serverActivity = {
+    phase: activity.phase || status.agent || "idle",
+    label: activity.label || "",
+    tool: activity.tool || "",
+  };
+  // Server activity wins over optimistic "Working…" once the house is actually busy,
+  // and always wins for error flashes.
+  if (
+    state.localActivity &&
+    (state.serverActivity.phase === "error" ||
+      (state.localActivity.phase !== "error" &&
+        state.serverActivity.phase !== "idle" &&
+        state.serverActivity.phase !== "listening"))
+  ) {
+    clearLocalActivity();
+  }
+  const pillLabel = state.serverActivity.label || status.agent || "idle";
+  $("agent-pill").textContent =
+    state.serverActivity.phase === "idle" || state.serverActivity.phase === "listening"
+      ? status.agent || "idle"
+      : pillLabel.replace(/…$/, "");
+  renderActivity(state.serverActivity);
   const voice = status.voice || {};
   const rt = status.realtime || {};
   state.openai = Boolean(status.openai);
@@ -1401,14 +1468,26 @@ async function invoke(tool, args) {
 }
 
 async function talk(message, confirm = false) {
-  const out = await api("/api/chat", {
-    method: "POST",
-    body: JSON.stringify({ message, confirm }),
-  });
-  appendLog("hearth", out.reply);
-  applyWidgetPayload(out);
-  if (out.reply) noteOverlayConversation(out.reply);
-  return out;
+  flashLocalActivity("thinking", "Working…", 60000);
+  const wasLive = Boolean(state.call);
+  if (!wasLive) setRefreshInterval(900);
+  try {
+    const out = await api("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ message, confirm }),
+    });
+    appendLog("hearth", out.reply);
+    applyWidgetPayload(out);
+    if (out.reply) noteOverlayConversation(out.reply);
+    clearLocalActivity();
+    renderActivity(state.serverActivity);
+    return out;
+  } catch (err) {
+    flashLocalActivity("error", "Request failed", 4000);
+    throw err;
+  } finally {
+    if (!state.call) setRefreshInterval(8000);
+  }
 }
 
 async function refresh() {
@@ -1459,15 +1538,24 @@ $("composer").addEventListener("submit", async (ev) => {
       },
     })
   ) {
+    flashLocalActivity("thinking", "Working…", 12000);
     sendRealtime({ type: "response.create" });
     return;
   }
-  await talk(text);
+  try {
+    await talk(text);
+  } catch (err) {
+    appendLog("system", err.message || "Request failed");
+  }
   refresh();
 });
 
 $("confirm-btn").addEventListener("click", async () => {
-  await talk("confirm", true);
+  try {
+    await talk("confirm", true);
+  } catch (err) {
+    appendLog("system", err.message || "Request failed");
+  }
   refresh();
 });
 
@@ -1506,6 +1594,7 @@ function onRealtimeEvent(event) {
   if (type === "error") {
     const message = event.error?.message || event.message || "realtime error";
     appendLog("system", message);
+    flashLocalActivity("error", "Voice error", 4000);
   }
   if (type === "response.function_call_arguments.done" && event.name === "end_call") {
     if (state.call) state.call.pendingHangup = true;
@@ -1566,6 +1655,7 @@ async function relayTool(event) {
     refresh();
   } catch (err) {
     appendLog("system", `Tool failed: ${err.message}`);
+    flashLocalActivity("error", "Tool failed", 4000);
   }
 }
 

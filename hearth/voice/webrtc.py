@@ -135,7 +135,7 @@ class Sideband:
         runtime.voice_path = PATH_ID
         runtime.voice_reason = f"GA WebRTC + sideband {self.call_id[:12]}"
         runtime.openai_live = True
-        runtime.agent_status = "listening"
+        runtime.set_status("listening")
 
     async def close(self) -> None:
         self._pending_hangup = False
@@ -159,7 +159,7 @@ class Sideband:
         if runtime.voice_path == PATH_ID:
             runtime.voice_mode = "disconnected"
             runtime.openai_live = False
-            runtime.agent_status = "idle"
+            runtime.set_status("idle")
 
     def _schedule_hangup(self) -> None:
         """Close this call once the current Realtime response has finished."""
@@ -193,16 +193,16 @@ class Sideband:
     async def _on_event(self, event: dict[str, Any]) -> None:
         etype = event.get("type")
         if etype == "input_audio_buffer.speech_started":
-            runtime.agent_status = "listening"
+            runtime.set_status("listening")
         elif etype == "response.created":
-            runtime.agent_status = "thinking"
+            runtime.set_status("thinking")
         elif etype in {"response.output_audio.delta", "response.audio.delta"}:
-            runtime.agent_status = "speaking"
+            runtime.set_status("speaking")
         elif etype in {
             "response.output_audio_transcript.done",
             "response.audio_transcript.done",
         }:
-            runtime.agent_status = "speaking"
+            runtime.set_status("speaking")
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("assistant", text)
@@ -224,7 +224,7 @@ class Sideband:
             )
         elif etype == "response.done":
             await self._handle_function_calls(event)
-            runtime.agent_status = "listening"
+            runtime.set_status("listening")
             if self._pending_hangup:
                 self._schedule_hangup()
         elif etype == "error":
@@ -257,7 +257,7 @@ class Sideband:
             return
         if call_id:
             self._done_calls.add(call_id)
-        runtime.agent_status = "tool"
+        runtime.begin_tool(name)
         try:
             args = json.loads(arguments or "{}")
         except json.JSONDecodeError:
@@ -403,7 +403,7 @@ async def create_call(sdp: str) -> dict[str, Any]:
         runtime.voice_mode = "live"
         runtime.voice_path = PATH_ID
         runtime.openai_live = True
-        runtime.agent_status = "listening"
+        runtime.set_status("listening")
 
     return {
         "ok": True,

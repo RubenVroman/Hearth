@@ -107,8 +107,10 @@ class ToolRegistry:
     async def call(self, name: str, args: dict[str, Any] | None = None) -> ToolResult:
         args = dict(args or {})
         spec = self._tools.get(name)
+        runtime.begin_tool(name)
         if spec is None:
-            return ToolResult(name=name, ok=False, data={"error": f"unknown tool {name}"})
+            result = ToolResult(name=name, ok=False, data={"error": f"unknown tool {name}"})
+            return _finish_tool(result)
 
         if spec.configured is not None and not spec.configured():
             message = spec.not_configured or f"{name} is not configured"
@@ -117,10 +119,7 @@ class ToolRegistry:
                 ok=False,
                 data={"ok": False, "configured": False, "error": message},
             )
-            payload = result.as_dict()
-            runtime.last_tools.append(payload)
-            widget_bus.publish_tool(payload)
-            return result
+            return _finish_tool(result)
 
         if spec.destructive:
             confirm = bool(args.get("confirm"))
@@ -135,10 +134,7 @@ class ToolRegistry:
                         planned = await spec.preview_handler(preview_args)
                     except Exception as exc:  # noqa: BLE001
                         result = ToolResult(name=name, ok=False, data={"error": str(exc)})
-                        payload = result.as_dict()
-                        runtime.last_tools.append(payload)
-                        widget_bus.publish_tool(payload)
-                        return result
+                        return _finish_tool(result)
                     plan = planned if isinstance(planned, dict) else {"result": planned}
                     if plan.get("ok") is False:
                         if plan.get("needs_client") and plan.get("retryable"):
@@ -164,17 +160,13 @@ class ToolRegistry:
                                     ),
                                 },
                             )
-                            payload = result.as_dict()
-                            runtime.last_tools.append(payload)
-                            widget_bus.publish_tool(payload)
-                            return result
+                            # Waiting on the user — not a hard backend failure.
+                            return _finish_tool(result, flash_error=False)
                         runtime.pending = None
                         result = ToolResult(name=name, ok=False, data=plan)
-                        payload = result.as_dict()
-                        runtime.last_tools.append(payload)
-                        widget_bus.publish_tool(payload)
-                        _offer_memory(spec, result)
-                        return result
+                        finished = _finish_tool(result)
+                        _offer_memory(spec, finished)
+                        return finished
                 preview: dict[str, Any] = {
                     "tool": name,
                     "would_call_with": preview_args,
@@ -204,11 +196,9 @@ class ToolRegistry:
                     dry_run=True,
                     data=preview,
                 )
-                payload = result.as_dict()
-                runtime.last_tools.append(payload)
-                widget_bus.publish_tool(payload)
-                _offer_memory(spec, result)
-                return result
+                finished = _finish_tool(result, flash_error=False)
+                _offer_memory(spec, finished)
+                return finished
             args["confirm"] = True
             args["dry_run"] = False
 
@@ -216,10 +206,7 @@ class ToolRegistry:
             data = await spec.handler(args)
         except Exception as exc:  # noqa: BLE001 — surface tool errors to the agent
             result = ToolResult(name=name, ok=False, data={"error": str(exc)})
-            payload = result.as_dict()
-            runtime.last_tools.append(payload)
-            widget_bus.publish_tool(payload)
-            return result
+            return _finish_tool(result)
 
         payload_data = data if isinstance(data, dict) else {"result": data}
         ok = not (isinstance(payload_data, dict) and payload_data.get("ok") is False)
@@ -244,20 +231,30 @@ class ToolRegistry:
                 dry_run=not bool(args.get("confirm")),
                 data=payload_data,
             )
-            payload = result.as_dict()
-            runtime.last_tools.append(payload)
-            widget_bus.publish_tool(payload)
-            _offer_memory(spec, result)
-            return result
+            finished = _finish_tool(result, flash_error=False)
+            _offer_memory(spec, finished)
+            return finished
 
         if spec.destructive or (runtime.pending is not None and runtime.pending.tool == name):
             runtime.pending = None
         result = ToolResult(name=name, ok=ok, data=payload_data)
-        payload = result.as_dict()
-        runtime.last_tools.append(payload)
-        widget_bus.publish_tool(payload)
-        _offer_memory(spec, result)
-        return result
+        finished = _finish_tool(result)
+        _offer_memory(spec, finished)
+        return finished
+
+
+def _finish_tool(result: ToolResult, *, flash_error: bool = True) -> ToolResult:
+    """Record the tool result, publish widgets, and update the UI activity."""
+    payload = result.as_dict()
+    runtime.last_tools.append(payload)
+    widget_bus.publish_tool(payload)
+    if not result.ok and flash_error:
+        data = result.data if isinstance(result.data, dict) else {}
+        # Unconfigured integrations are soft misses, not scary UI errors.
+        if data.get("configured") is not False:
+            err = str(data.get("error") or data.get("message") or "")
+            runtime.end_tool(ok=False, error=err, tool=result.name)
+    return result
 
 
 def _offer_memory(spec: ToolSpec, result: ToolResult) -> None:

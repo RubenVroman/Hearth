@@ -37,7 +37,7 @@ class VoiceSession:
             "not the disabled beta websocket."
         )
         runtime.openai_live = False
-        runtime.agent_status = "idle"
+        runtime.set_status("idle")
         await self.send(
             {
                 "type": "session.ready",
@@ -66,7 +66,7 @@ class VoiceSession:
         finally:
             if runtime.voice_path == "text-fallback":
                 runtime.voice_mode = "disconnected"
-                runtime.agent_status = "idle"
+                runtime.set_status("idle")
 
     async def _on_client(self, event: dict[str, Any]) -> None:
         etype = event.get("type")
@@ -101,7 +101,7 @@ class VoiceSession:
             await self._fallback_turn(text)
 
     async def _fallback_turn(self, text: str, *, confirm: bool = False) -> None:
-        runtime.agent_status = "thinking"
+        runtime.set_status("thinking")
         await self.send({"type": "status", "agent": "thinking"})
         if text:
             await self.send({"type": "transcript.user", "text": text})
@@ -110,7 +110,7 @@ class VoiceSession:
             await self.send({"type": "tool.result", "name": tool.get("name"), "result": tool})
         reply = result.get("reply") or ""
         await self.send({"type": "transcript.assistant", "text": reply, "final": True})
-        runtime.agent_status = "idle"
+        runtime.set_status("idle")
         await self.send({"type": "status", "agent": "idle"})
 
     async def _transcribe(self, pcm: bytes) -> str:
