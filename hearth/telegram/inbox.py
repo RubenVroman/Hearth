@@ -15,6 +15,7 @@ from hearth.telegram.intent import (
     IntentDecision,
     interpret_intent,
     looks_like_collection_request,
+    looks_like_descriptive_ask,
     looks_like_followup,
 )
 from hearth.telegram.parse import (
@@ -157,6 +158,13 @@ class TelegramInbox:
         )
         if not needs_intent and looks_like_collection_request(view.text):
             needs_intent = True
+        if (
+            not needs_intent
+            and parsed.kind == "request"
+            and not (parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id or parsed.year)
+            and looks_like_descriptive_ask(view.text)
+        ):
+            needs_intent = True
 
         if needs_intent:
             intent = await interpret_intent(
@@ -211,9 +219,14 @@ class TelegramInbox:
         if intent.action == "search" and intent.search_title:
             if not self.rate.allow():
                 return InboxResult(handled=True, reply=format_rate_limited())
+            media_kind = (
+                intent.media_kind
+                if intent.media_kind in {"movie", "tv"}
+                else (parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "unknown")
+            )
             synthetic = ParsedRequest(
                 kind="request",
-                media_kind="movie",
+                media_kind=media_kind,  # type: ignore[arg-type]
                 title=intent.search_title,
                 reason="intent_search",
             )
