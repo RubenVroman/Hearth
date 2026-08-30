@@ -206,7 +206,8 @@ class Sideband:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("assistant", text)
-                _persist_voice_turn("assistant", text)        elif etype in {
+                _persist_voice_turn("assistant", text)
+        elif etype in {
             "conversation.item.input_audio_transcription.completed",
             "conversation.item.audio_transcription.completed",
         }:

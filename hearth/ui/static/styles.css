@@ -1146,20 +1146,6 @@ input,
     padding: 10px 16px;
   }
 
-  .widget-stack {
-    position: relative;
-    left: auto;
-    right: auto;
-    bottom: auto;
-    width: 100%;
-    max-width: min(360px, 100%);
-    margin: 0;
-    z-index: 4;
-    max-height: none;
-    overflow: visible;
-    pointer-events: auto;
-  }
-
   .info-overlay {
     padding-bottom: calc(var(--dock-space) + 16px + var(--keyboard-inset));
   }
