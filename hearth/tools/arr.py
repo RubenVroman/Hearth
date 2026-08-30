@@ -20,6 +20,125 @@ def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bytes_label(value: Any) -> str | None:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(n)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return None
+
+
+def _queue_percent(size: Any, sizeleft: Any) -> float | None:
+    try:
+        total = float(size)
+        left = float(sizeleft)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    done = max(0.0, min(100.0, ((total - left) / total) * 100.0))
+    return round(done, 1)
+
+
+def _queue_title(item: dict[str, Any]) -> str:
+    movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+    return str(
+        movie.get("title")
+        or item.get("title")
+        or item.get("sourceTitle")
+        or "Unknown"
+    )
+
+
+def _summarize_queue_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a Radarr /api/v3/queue record for voice/status replies."""
+    movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+    size = item.get("size")
+    sizeleft = item.get("sizeleft") if "sizeleft" in item else item.get("sizeLeft")
+    percent = _queue_percent(size, sizeleft)
+    title = _queue_title(item)
+    year = movie.get("year") or item.get("year")
+    status = item.get("status") or item.get("trackedDownloadState") or "unknown"
+    timeleft = item.get("timeleft") or item.get("timeLeft")
+    return {
+        "id": item.get("id"),
+        "title": title,
+        "year": year,
+        "release": item.get("title"),
+        "percent": percent,
+        "size": _bytes_label(size),
+        "size_bytes": size,
+        "sizeleft": _bytes_label(sizeleft),
+        "sizeleft_bytes": sizeleft,
+        "status": status,
+        "trackedDownloadStatus": item.get("trackedDownloadStatus"),
+        "trackedDownloadState": item.get("trackedDownloadState"),
+        "timeleft": timeleft,
+        "downloadClient": item.get("downloadClient") or item.get("downloadClientName"),
+        "indexer": item.get("indexer"),
+        "protocol": item.get("protocol"),
+        "tmdbId": movie.get("tmdbId"),
+    }
+
+
+def _fuzzy_queue_match(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    needle = (query or "").strip().lower()
+    if not needle:
+        return list(items)
+    exact: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
+    for row in items:
+        title = str(row.get("title") or "").lower()
+        release = str(row.get("release") or "").lower()
+        hay = f"{title} {release}"
+        if needle == title:
+            exact.append(row)
+        elif needle in hay or any(tok and tok in hay for tok in needle.split()):
+            partial.append(row)
+    return exact or partial
+
+
+def _speak_queue(items: list[dict[str, Any]], *, query: str = "", empty_reason: str = "") -> str:
+    if not items:
+        if query:
+            return (
+                empty_reason
+                or f"{query} is not in the Radarr download queue right now."
+            )
+        return empty_reason or "The Radarr download queue is empty."
+    bits: list[str] = []
+    for row in items[:5]:
+        title = row.get("title") or "a title"
+        year = row.get("year")
+        label = f"{title} ({year})" if year else str(title)
+        percent = row.get("percent")
+        status = row.get("status") or "downloading"
+        timeleft = row.get("timeleft")
+        if percent is not None:
+            piece = f"{label} is {percent}% complete ({status})"
+        else:
+            piece = f"{label} is {status}"
+        if timeleft:
+            piece += f", about {timeleft} left"
+        client = row.get("downloadClient")
+        if client:
+            piece += f" via {client}"
+        bits.append(piece)
+    if len(items) == 1:
+        return bits[0] + "."
+    return "Radarr queue: " + "; ".join(bits) + "."
+
+
 def _summarize_series(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "title": item.get("title"),
@@ -194,6 +313,85 @@ class StarrClient:
                     "added": _summarize_series(item),
                 }
             raise
+
+    async def queue(self, query: str = "") -> dict[str, Any]:
+        """List active download-queue items; optional fuzzy title filter (movies).
+
+        Response shape (tool `radarr_queue`):
+          mode, service, query, count, items[{title,year,percent,size,sizeleft,
+          status,timeleft,downloadClient,indexer,…}], matched, empty, speak
+        Empty queue / no title match returns empty=True and a clear speak line
+        so Hearth can say that cleanly without escalating.
+        """
+        query = (query or "").strip()
+        if self.kind != "radarr":
+            return {
+                "ok": False,
+                "service": self.kind,
+                "error": "download queue progress is only wired for Radarr right now",
+            }
+
+        if not self.live:
+            return self._queue_payload(
+                pipeline.list_radarr_downloads(),
+                query=query,
+                mode="mock",
+            )
+
+        client = await self._http()
+        try:
+            response = await client.get(
+                "/api/v3/queue",
+                params={"page": 1, "pageSize": 50, "includeMovie": "true"},
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+            if isinstance(payload, list):
+                rows = payload
+            else:
+                rows = payload.get("records") or payload.get("Records") or []
+            return self._queue_payload(rows, query=query, mode="live")
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                return self._queue_payload(
+                    pipeline.list_radarr_downloads(),
+                    query=query,
+                    mode="mock",
+                    error=str(exc),
+                )
+            raise
+
+    def _queue_payload(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        query: str = "",
+        mode: str,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        summarized = [_summarize_queue_item(row) for row in rows if isinstance(row, dict)]
+        matched = _fuzzy_queue_match(summarized, query) if query else list(summarized)
+        empty = len(matched) == 0
+        if empty and query and summarized:
+            empty_reason = f"{query} is not in the Radarr download queue right now."
+        elif empty:
+            empty_reason = "The Radarr download queue is empty."
+        else:
+            empty_reason = ""
+        out: dict[str, Any] = {
+            "ok": True,
+            "mode": mode,
+            "service": "radarr",
+            "query": query or None,
+            "count": len(matched),
+            "items": matched,
+            "matched": bool(query) and not empty,
+            "empty": empty,
+            "speak": _speak_queue(matched, query=query, empty_reason=empty_reason),
+        }
+        if error:
+            out["error"] = error
+        return out
 
     async def _root_folder(self, client: httpx.AsyncClient) -> str:
         response = await client.get("/api/v3/rootFolder")

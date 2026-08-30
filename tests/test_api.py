@@ -39,6 +39,22 @@ def test_chat_download_movie_uses_radarr(client):
     assert "Radarr" in body["reply"]
 
 
+def test_chat_download_progress_uses_radarr_queue(client):
+    chat = client.post(
+        "/api/chat",
+        json={"message": "Hey, can you check the progress of Annihilation—the download progress?"},
+    )
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "radarr_queue"
+    assert body["tools"][0]["needs_confirm"] is False
+    data = body["tools"][0]["data"]
+    assert data["matched"] is True
+    assert data["items"][0]["title"] == "Annihilation"
+    assert "Annihilation" in body["reply"]
+    assert "75" in body["reply"]
+
+
 def test_media_inventory_endpoint(client):
     response = client.get("/api/media")
     assert response.status_code == 200

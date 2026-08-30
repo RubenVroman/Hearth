@@ -221,6 +221,12 @@ async def _radarr_add(args: dict[str, Any]) -> dict[str, Any]:
     return await radarr.add(str(args.get("query") or ""), tmdb_id=int(tmdb) if tmdb else None)
 
 
+async def _radarr_queue(args: dict[str, Any]) -> dict[str, Any]:
+    """Active Radarr download queue / per-movie progress (spoken status)."""
+    query = args.get("query") or args.get("title") or ""
+    return await radarr.queue(str(query or ""))
+
+
 async def _sonarr_search(args: dict[str, Any]) -> dict[str, Any]:
     return await sonarr.search(str(args.get("query") or ""))
 
@@ -768,6 +774,33 @@ def register_builtin_tools() -> None:
                 "required": ["query"],
             },
             handler=_radarr_add,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="radarr_queue",
+            description=(
+                "Check Radarr's active download queue and per-movie progress (percent, size left, "
+                "time left, status, download client). Use for “download progress for X”, "
+                "“how's Annihilation downloading”, or “what's in the Radarr queue”. "
+                "Optional query fuzzy-matches a title; omit query to list the whole queue. "
+                "If the queue is empty or the title is not downloading, the tool returns empty=true "
+                "and a clear speak line — say that; do not escalate to Chief of Staff."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional movie title to look up (fuzzy match OK).",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Alias for query.",
+                    },
+                },
+            },
+            handler=_radarr_queue,
         )
     )
     registry.register(

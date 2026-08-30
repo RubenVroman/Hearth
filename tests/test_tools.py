@@ -184,6 +184,69 @@ async def test_radarr_add_still_accepts_confirm_flag():
     assert result.data["added"]["title"]
 
 
+async def test_radarr_queue_lists_active_downloads():
+    result = await registry.call("radarr_queue", {})
+    assert result.ok
+    assert result.data["mode"] == "mock"
+    assert result.data["count"] >= 1
+    assert not result.data["empty"]
+    titles = {row["title"] for row in result.data["items"]}
+    assert "Annihilation" in titles
+    anni = next(row for row in result.data["items"] if row["title"] == "Annihilation")
+    assert anni["percent"] == 75.0
+    assert anni["timeleft"]
+    assert anni["downloadClient"]
+    assert "annihilation" in result.data["speak"].lower()
+
+
+async def test_radarr_queue_fuzzy_title_match():
+    result = await registry.call("radarr_queue", {"query": "Annihilation"})
+    assert result.ok
+    assert result.data["matched"] is True
+    assert result.data["count"] == 1
+    assert result.data["items"][0]["title"] == "Annihilation"
+    assert result.data["items"][0]["percent"] == 75.0
+    speak = result.data["speak"].lower()
+    assert "annihilation" in speak
+    assert "75" in speak
+
+
+async def test_radarr_queue_missing_title_clear_fallback():
+    result = await registry.call("radarr_queue", {"query": "Totally Missing Film"})
+    assert result.ok
+    assert result.data["empty"] is True
+    assert result.data["count"] == 0
+    assert "not in the radarr download queue" in result.data["speak"].lower()
+
+
+async def test_radarr_queue_empty_queue_clear_fallback():
+    from hearth.fixtures import pipeline
+
+    pipeline.clear_radarr_downloads()
+    result = await registry.call("radarr_queue", {})
+    assert result.ok
+    assert result.data["empty"] is True
+    assert "empty" in result.data["speak"].lower()
+
+
+async def test_intent_download_progress_uses_radarr_queue():
+    plan = route_intent("Hey, can you check the progress of Annihilation—the download progress?")
+    assert plan is not None
+    assert plan["tool"] == "radarr_queue"
+    assert "Annihilation" in plan["args"]["query"]
+
+
+async def test_intent_whats_downloading_lists_queue():
+    plan = route_intent("what's downloading")
+    assert plan["tool"] == "radarr_queue"
+    assert not plan["args"].get("query")
+
+
+async def test_intent_grab_movie_still_uses_radarr_add():
+    plan = route_intent("download the movie Dune")
+    assert plan["tool"] == "radarr_add"
+
+
 async def test_house_media_inventory_speaks_tv_avr_plex():
     result = await registry.call("house_media", {})
     assert result.ok
