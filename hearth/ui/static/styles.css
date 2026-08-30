@@ -688,12 +688,64 @@ input,
 
 .info-media {
   display: grid;
-  grid-template-columns: 108px 1fr;
+  grid-template-columns: 120px 1fr;
   gap: 18px;
   align-items: start;
 }
 
 .info-media-stack {
+  position: relative;
+  isolation: isolate;
+  min-height: 0;
+  touch-action: pan-y;
+}
+
+.info-media-stack.is-stacked {
+  touch-action: pan-y pinch-zoom;
+}
+
+.info-media-rail {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 14px;
+  min-width: 0;
+}
+
+.info-media-count {
+  margin: 0;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.info-media-dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.info-media-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(244, 234, 216, 0.22);
+}
+
+.info-media-dot.is-on {
+  width: 18px;
+  background: var(--ember-2, #e08a3a);
+}
+
+.info-media-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  opacity: 0.85;
+}
+
+.info-media-deck {
   position: relative;
   isolation: isolate;
   min-height: 0;
@@ -706,10 +758,10 @@ input,
   pointer-events: auto;
 }
 
-.info-media-stack.is-stacked {
+.info-media-stack.is-stacked .info-media-deck {
   /* Room for recessed cards peeking behind the front title card. */
-  min-height: min(52vh, 420px);
-  padding-bottom: 28px;
+  min-height: min(48vh, 400px);
+  padding-bottom: 32px;
 }
 
 .info-media-stack.is-stacked .info-media-card {
@@ -738,10 +790,10 @@ input,
 .info-media-stack.is-stacked .info-media-card.is-recessed {
   z-index: calc(4 - var(--stack-i, 1));
   transform:
-    translateY(calc(var(--stack-i, 1) * -14px))
-    scale(calc(1 - var(--stack-i, 1) * 0.045));
-  opacity: calc(1 - var(--stack-i, 1) * 0.28);
-  filter: brightness(0.72);
+    translateY(calc(var(--stack-i, 1) * -16px))
+    scale(calc(1 - var(--stack-i, 1) * 0.04));
+  opacity: calc(1 - min(var(--stack-i, 1), 5) * 0.16);
+  filter: brightness(0.78);
   /* Clickable so users can bring a recessed recommendation forward. */
   pointer-events: auto;
   cursor: pointer;
@@ -840,12 +892,12 @@ input,
 }
 
 .info-poster {
-  width: 108px;
+  width: 120px;
   aspect-ratio: 2 / 3;
-  border-radius: 12px;
+  border-radius: 14px;
   object-fit: cover;
   background: linear-gradient(160deg, #3a1608, #c45a12 60%, #ffd7a1);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.38);
 }
 
 .info-poster-fallback {
@@ -862,7 +914,25 @@ input,
 }
 
 .info-media .info-title {
-  font-size: clamp(22px, 3.6vw, 28px);
+  font-size: clamp(24px, 4vw, 30px);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+}
+
+.info-media .info-meta {
+  margin: 4px 0 0;
+  font-size: clamp(15px, 3.2vw, 17px);
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.info-media-card.is-recessed .info-media-copy .info-detail,
+.info-media-card.is-recessed .info-media-actions {
+  display: none;
+}
+
+.info-media-card.is-recessed .info-title {
+  font-size: clamp(18px, 3.2vw, 22px);
 }
 
 /* Download queue progress — phone-first glass list. */
@@ -1587,23 +1657,27 @@ input,
   }
 
   .info-media {
-    grid-template-columns: 88px 1fr;
+    grid-template-columns: 96px 1fr;
     gap: 14px;
   }
 
-  .info-media-stack.is-stacked {
-    min-height: min(46vh, 360px);
-    padding-bottom: 22px;
+  .info-media-stack.is-stacked .info-media-deck {
+    min-height: min(44vh, 340px);
+    padding-bottom: 26px;
   }
 
   .info-media-stack.is-stacked .info-media-card.is-recessed {
     transform:
-      translateY(calc(var(--stack-i, 1) * -10px))
-      scale(calc(1 - var(--stack-i, 1) * 0.04));
+      translateY(calc(var(--stack-i, 1) * -12px))
+      scale(calc(1 - var(--stack-i, 1) * 0.035));
   }
 
   .info-poster {
-    width: 88px;
+    width: 96px;
+  }
+
+  .info-media-hint {
+    font-size: 11px;
   }
 
   .info-download-pct {

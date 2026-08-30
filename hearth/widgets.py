@@ -273,8 +273,11 @@ def _downloads_widget(result: dict[str, Any]) -> Widget:
 
 
 
-_MEDIA_STACK_CAP = 5
+_MEDIA_STACK_CAP = 12
 _SEARCH_HIT_CAP = 4
+# Genre browse is meant to be flicked through on the glass stack — more than a
+# search disambiguation set, but still capped like speakable browse results.
+_BROWSE_HIT_CAP = 12
 
 
 def _media_item_id(row: dict[str, Any]) -> str:
@@ -390,8 +393,9 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
         default_type = "movie" if "radarr" in name or name == "plex_browse_genre" else "show"
         if name == "plex_browse_genre" and str(data.get("media_type") or "").lower() == "show":
             default_type = "show"
+        cap = _BROWSE_HIT_CAP if name == "plex_browse_genre" else _SEARCH_HIT_CAP
         out = []
-        for hit in results[:_SEARCH_HIT_CAP]:
+        for hit in results[:cap]:
             if not isinstance(hit, dict):
                 continue
             row = {
@@ -400,6 +404,11 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
             }
             item = _normalize_media_item(row, source=source)
             if item:
+                # Browse stack: keep copy tight so title + year stay readable.
+                if name == "plex_browse_genre" and item.get("summary"):
+                    summary = str(item["summary"]).strip()
+                    if len(summary) > 140:
+                        item["summary"] = summary[:137].rstrip() + "…"
                 out.append(item)
         return out
     return []
@@ -470,7 +479,14 @@ def _merge_media_stack(
     return [by_id[item_id] for item_id in ordered_ids], chosen
 
 
-def _media_panel_copy(active: dict[str, Any], items: list[dict[str, Any]], *, mode: Any = None) -> tuple[str, str, str]:
+def _media_panel_copy(
+    active: dict[str, Any],
+    items: list[dict[str, Any]],
+    *,
+    mode: Any = None,
+    genre: str | None = None,
+    total: int | None = None,
+) -> tuple[str, str, str]:
     title = str(active.get("title") or "Untitled")
     year = active.get("year")
     media_type = str(active.get("type") or "movie")
@@ -481,9 +497,22 @@ def _media_panel_copy(active: dict[str, Any], items: list[dict[str, Any]], *, mo
         bits.append(str(active["show"]))
     body = " · ".join(bits)
     detail_parts: list[str] = []
+    if genre:
+        shown = len(items)
+        try:
+            total_n = int(total) if total is not None else shown
+        except (TypeError, ValueError):
+            total_n = shown
+        if total_n > shown:
+            detail_parts.append(f"{genre} · {shown} of {total_n}")
+        elif shown > 1:
+            detail_parts.append(f"{genre} · {shown} titles")
+        else:
+            detail_parts.append(str(genre))
     summary = (active.get("summary") or "").strip()
     if summary:
-        detail_parts.append(summary[:220] + ("…" if len(summary) > 220 else ""))
+        limit = 140 if genre else 220
+        detail_parts.append(summary[:limit] + ("…" if len(summary) > limit else ""))
     if active.get("player") and active.get("state"):
         detail_parts.append(f"{active['player']} · {active['state']}")
     elif active.get("player"):
@@ -492,7 +521,7 @@ def _media_panel_copy(active: dict[str, Any], items: list[dict[str, Any]], *, mo
         detail_parts.append("looking up")
     if mode == "mock":
         detail_parts.append("mock")
-    if len(items) > 1:
+    if not genre and len(items) > 1:
         detail_parts.append(f"{len(items)} on screen")
     return title, body, " · ".join(detail_parts)
 
@@ -508,22 +537,47 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
     if result.get("needs_confirm"):
         incoming[0]["pending"] = True
 
-    existing_widget = runtime.get_widget("media")
+    # Genre browse replaces the prior stack so ask-once shows only that genre.
     existing_items: list[dict[str, Any]] = []
-    if existing_widget is not None and existing_widget.kind == "media":
-        raw_items = (existing_widget.data or {}).get("items")
-        if isinstance(raw_items, list) and raw_items:
-            existing_items = [row for row in raw_items if isinstance(row, dict)]
-        else:
-            prev = (existing_widget.data or {}).get("item")
-            if isinstance(prev, dict):
-                existing_items = [prev]
+    if name != "plex_browse_genre":
+        existing_widget = runtime.get_widget("media")
+        if existing_widget is not None and existing_widget.kind == "media":
+            raw_items = (existing_widget.data or {}).get("items")
+            if isinstance(raw_items, list) and raw_items:
+                existing_items = [row for row in raw_items if isinstance(row, dict)]
+            else:
+                prev = (existing_widget.data or {}).get("item")
+                if isinstance(prev, dict):
+                    existing_items = [prev]
 
     # Query / first hit becomes the spoken focus for this tool round-trip.
     preferred = str(incoming[0].get("id") or "")
     items, active_id = _merge_media_stack(existing_items, incoming, active_id=preferred)
     active = next((row for row in items if str(row.get("id") or "") == active_id), items[0])
-    title, body, detail = _media_panel_copy(active, items, mode=data.get("mode"))
+    genre = str(data.get("genre") or "").strip() or None if name == "plex_browse_genre" else None
+    title, body, detail = _media_panel_copy(
+        active,
+        items,
+        mode=data.get("mode"),
+        genre=genre,
+        total=data.get("total"),
+    )
+
+    payload = {
+        "tool": name,
+        "item": active,
+        "items": items,
+        "active_id": active_id,
+        "presentation": "stack",
+    }
+    if genre:
+        payload["genre"] = genre
+    if data.get("media_type"):
+        payload["media_type"] = data.get("media_type")
+    if data.get("total") is not None:
+        payload["total"] = data.get("total")
+    if data.get("count") is not None:
+        payload["count"] = data.get("count")
 
     if not ok:
         return runtime.upsert_widget(
@@ -534,12 +588,7 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
                 status="error",
                 body=str(data.get("error") or "Could not load media."),
                 detail="",
-                data={
-                    "tool": name,
-                    "item": active,
-                    "items": items,
-                    "active_id": active_id,
-                },
+                data=payload,
             )
         )
     return runtime.upsert_widget(
@@ -550,12 +599,7 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
             status="done",
             body=body,
             detail=detail,
-            data={
-                "tool": name,
-                "item": active,
-                "items": items,
-                "active_id": active_id,
-            },
+            data=payload,
             # Soft-hide keeps this in memory for reappear; hard X still deletes.
             sticky=False,
         )
