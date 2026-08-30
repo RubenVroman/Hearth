@@ -375,14 +375,54 @@ async def test_radarr_add_still_accepts_confirm_flag():
 
 
 def test_queue_percent_mapping():
-    from hearth.tools.arr import normalize_download_status, queue_percent, summarize_queue_item
+    from hearth.tools.arr import (
+        clamp_download_percent,
+        coerce_api_percent,
+        normalize_download_status,
+        queue_percent,
+        resolve_queue_percent,
+        summarize_queue_item,
+    )
 
+    # Real bytes only — never invent 100 from empty size.
     assert queue_percent(8_000_000_000, 2_000_000_000) == 75.0
     assert queue_percent(10_000_000_000, 10_000_000_000) == 0.0
+    assert queue_percent(100, 50) == 50.0
     assert queue_percent(100, 0) == 100.0
-    assert queue_percent(0, 0) == 100.0
+    assert queue_percent(0, 0) is None
+    assert queue_percent(0, 1) is None
     assert queue_percent(None, 1) is None
+    assert queue_percent(100, None) is None
     assert queue_percent("bad", 1) is None
+
+    # API fractions 0–1 → 0–100; already-scaled values left alone.
+    assert coerce_api_percent(0.5) == 50.0
+    assert coerce_api_percent(1) == 100.0
+    assert coerce_api_percent(0) == 0.0
+    assert coerce_api_percent(75) == 75.0
+    assert coerce_api_percent(None) is None
+
+    # In-flight statuses never surface 100%.
+    assert clamp_download_percent(100.0, "downloading") == 99.0
+    assert clamp_download_percent(100.0, "queued") == 99.0
+    assert clamp_download_percent(100.0, "paused") == 99.0
+    assert clamp_download_percent(100.0, "warning") == 99.0
+    assert clamp_download_percent(100.0, "importing") == 99.0
+    assert clamp_download_percent(100.0, "completed") == 100.0
+    assert clamp_download_percent(None, "downloading") is None
+
+    # sizeleft missing → None; bogus zero-size → None (not 100).
+    assert resolve_queue_percent({"size": 100}, status="downloading") is None
+    assert resolve_queue_percent({"size": 0, "sizeleft": 0}, status="downloading") is None
+    assert (
+        resolve_queue_percent(
+            {"size": 100, "sizeleft": 0}, status="downloading"
+        )
+        == 99.0
+    )
+    assert (
+        resolve_queue_percent({"percent": 0.12}, status="downloading") == 12.0
+    )
 
     downloading = summarize_queue_item(
         {
@@ -400,6 +440,31 @@ def test_queue_percent_mapping():
     assert downloading["status"] == "downloading"
     assert downloading["percent"] == 75.0
     assert downloading["quality"] == "Bluray-1080p"
+
+    # Downloading with sizeleft=0 must not report 100% on the shared helper/UI path.
+    bogus_done = summarize_queue_item(
+        {
+            "title": "Almost",
+            "status": "downloading",
+            "trackedDownloadState": "downloading",
+            "size": 1_000,
+            "sizeleft": 0,
+        },
+        service="radarr",
+    )
+    assert bogus_done["status"] == "downloading"
+    assert bogus_done["percent"] == 99.0
+
+    missing_left = summarize_queue_item(
+        {
+            "title": "Unknown size left",
+            "status": "downloading",
+            "trackedDownloadState": "downloading",
+            "size": 1_000,
+        },
+        service="radarr",
+    )
+    assert missing_left["percent"] is None
 
     assert (
         normalize_download_status(
