@@ -91,12 +91,6 @@
             <button type="button" id="mic-denied-dismiss" class="mic-panel-secondary">Dismiss</button>
           </div>
         </div>
-        <div
-          id="widget-stack"
-          class="widget-stack is-empty"
-          aria-live="polite"
-          aria-relevant="additions text"
-        ></div>
         <div class="composer-dock">
           <form id="composer" class="composer" autocomplete="off">
             <input
@@ -135,6 +129,26 @@
         <ol id="log"></ol>
       </section>
     </main>
+
+    <div
+      id="info-overlay"
+      class="info-overlay"
+      hidden
+      aria-hidden="true"
+    >
+      <button type="button" class="info-overlay-backdrop" id="info-backdrop" aria-label="Dismiss"></button>
+      <div
+        class="info-glass"
+        id="info-glass"
+        role="dialog"
+        aria-modal="false"
+        aria-live="polite"
+        aria-labelledby="info-title"
+      >
+        <button type="button" class="info-dismiss" id="info-dismiss" aria-label="Dismiss">×</button>
+        <div class="info-glass-inner" id="info-content"></div>
+      </div>
+    </div>
 
     <div
       id="settings-sheet"

@@ -50,6 +50,28 @@ class Plex:
             self._client = None
         self._identity_cache = None
 
+    async def thumb_bytes(self, rating_key: str) -> tuple[bytes, str] | None:
+        """Fetch poster art for a library item. Token stays server-side."""
+        key = str(rating_key or "").strip()
+        if not key or not key.isdigit():
+            return None
+        # Mock / offline: no remote art — caller may synthesize a placeholder.
+        if not self.live:
+            return None
+        client = await self._http()
+        try:
+            response = await client.get(
+                f"/library/metadata/{key}/thumb",
+                params={"width": 400, "height": 600, "minSize": 1},
+            )
+            if response.status_code >= 400:
+                response = await client.get(f"/library/metadata/{key}/thumb")
+            response.raise_for_status()
+            content_type = response.headers.get("content-type") or "image/jpeg"
+            return response.content, content_type.split(";")[0].strip()
+        except Exception:  # noqa: BLE001
+            return None
+
     async def now_playing(self) -> dict[str, Any]:
         if not self.live:
             return {"mode": "mock", "sessions": _sessions(MOCK_PLEX_SESSIONS)}
@@ -459,6 +481,8 @@ def _mock_search(query: str, limit: int) -> list[dict[str, Any]]:
 def _item_summary(m: dict[str, Any]) -> dict[str, Any]:
     rating_key = m.get("ratingKey")
     key = m.get("key") or (f"/library/metadata/{rating_key}" if rating_key is not None else None)
+    summary = (m.get("summary") or m.get("tagline") or "").strip()
+    rating = m.get("audienceRating") or m.get("rating")
     return {
         "title": m.get("title"),
         "type": m.get("type"),
@@ -467,6 +491,10 @@ def _item_summary(m: dict[str, Any]) -> dict[str, Any]:
         "ratingKey": str(rating_key) if rating_key is not None else None,
         "key": key,
         "guid": m.get("guid"),
+        "summary": summary[:400] if summary else "",
+        "contentRating": m.get("contentRating"),
+        "rating": rating,
+        "thumb": bool(rating_key),
     }
 
 
@@ -479,6 +507,8 @@ def _sessions(payload: dict[str, Any]) -> list[dict[str, Any]]:
         remaining_ms = max(duration - offset, 0)
         player = item.get("Player") or {}
         user = item.get("User") or {}
+        rating_key = item.get("ratingKey")
+        summary = (item.get("summary") or item.get("tagline") or "").strip()
         out.append(
             {
                 "title": item.get("title"),
@@ -491,6 +521,9 @@ def _sessions(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "progress_ms": offset,
                 "duration_ms": duration,
                 "remaining_ms": remaining_ms,
+                "ratingKey": str(rating_key) if rating_key is not None else None,
+                "summary": summary[:400] if summary else "",
+                "thumb": bool(rating_key),
             }
         )
     return out

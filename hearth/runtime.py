@@ -9,7 +9,7 @@ from hearth.config import settings
 
 AgentStatus = Literal["idle", "listening", "thinking", "speaking", "tool"]
 VoiceMode = Literal["disconnected", "fallback", "live"]
-WidgetKind = Literal["weather", "action", "generic"]
+WidgetKind = Literal["weather", "media"]
 WidgetStatus = Literal["pending", "running", "done", "error", "info"]
 
 
@@ -35,7 +35,7 @@ class PendingConfirm:
 
 @dataclass
 class Widget:
-    """Contextual panel shown beside the orb while asking / acting."""
+    """Centered glass-panel overlay for rich visual content (weather, movie/TV)."""
 
     id: str
     kind: WidgetKind | str
@@ -90,12 +90,25 @@ class Runtime:
         existing = self.widgets.get(widget.id)
         if existing is not None:
             widget.ts = existing.ts
+            # Keep updated_at stable when payload is unchanged so the UI does not
+            # re-render / flicker on status polls.
+            if (
+                existing.kind == widget.kind
+                and existing.title == widget.title
+                and existing.status == widget.status
+                and existing.body == widget.body
+                and existing.detail == widget.detail
+                and existing.data == widget.data
+            ):
+                widget.updated_at = existing.updated_at
+                self.widgets[widget.id] = widget
+                return widget
         widget.updated_at = _now()
-        # Re-insert so updated widgets float to the end (most recent).
+        # Re-insert so the latest visual floats to the end.
         self.widgets.pop(widget.id, None)
         self.widgets[widget.id] = widget
-        # Cap stack so the orb stays readable.
-        while len(self.widgets) > 6:
+        # Cap overlays (weather + media + a little headroom).
+        while len(self.widgets) > 4:
             oldest = next(iter(self.widgets))
             del self.widgets[oldest]
         return widget
