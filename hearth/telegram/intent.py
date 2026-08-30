@@ -2,14 +2,15 @@
 
 Instant path (no model) only when there is no reasonable doubt:
 catalog id/URL, explicit ``Title (YYYY)``, or a live numbered pick
-(``1``/``2``/``3``, ``all of them``, ``de eerste``, or ``yes`` while a
-list/guess is on screen).
+(``1``/``2``/``3``, ``all of them``, ``de eerste``, or short exact ``yes``
+while a 1-item guess is on screen).
 
-Everything else always calls gpt-4o with Overseerr catalog hits for this turn
-as ``candidates``, plus the last ~8 turns of this chat. No keyword gates, no
-franchise/actor maps. Plot/vibe asks → one best ``search_title`` guess; the
-inbox asks the user to confirm before queueing. Unsure with 2+ hits → clarify
-with a real 1–N list; never invent a grab or a list-less ``reply 1–1``.
+Everything else always calls gpt-4o with live pending options and/or Overseerr
+catalog hits for this turn as ``candidates``, plus the last ~8 turns of this
+chat. No keyword gates, no franchise/actor maps, no expanding confirm-phrase
+lists. Plot/vibe asks → one best ``search_title`` guess; the inbox asks the
+user to confirm before queueing. Unsure with 2+ hits → clarify with a real
+1–N list; never invent a grab or a list-less ``reply 1–1``.
 """
 
 from __future__ import annotations
@@ -153,11 +154,20 @@ _SYSTEM = (
     "NEW title ask that does not match it, or when they reject it. "
     "rejected_titles must NEVER be re-offered as search_title or implied picks. "
     "When the user rejects the current/last suggestion (nee/niet die/not that/"
-    "no not X) and adds new clues, return action=search with a NEW search_title "
-    "from the original plot + new clues; do not ask them to pick 1–2 for a "
-    "rejected film. Bare nee/no with no new info → action=clarify with a short "
-    "useful question (not a 1–2 list). "
-    "candidates are real Overseerr/TMDB hits for THIS user message (same turn). "
+    "no not X / we already have that) and adds new clues or asks for another, "
+    "return action=search with a NEW search_title from the original plot + new "
+    "clues; do not ask them to pick 1–2 for a rejected film. Bare nee/no with "
+    "no new info → action=clarify with a short useful question (not a 1–2 list). "
+    "candidates are the live on-screen offer and/or Overseerr/TMDB hits for THIS "
+    "turn. When candidates_are_live_pending is true, those rows are the sticky "
+    "Did-you-mean / 1–N list still on screen — confirm → action=pick; reject "
+    "with new clues → action=search a NEW title not in those candidates; bare "
+    "nee/no → action=clarify (short question, not a 1–N re-list). "
+    "last_bot_reply may be 'Did you mean Title (year)?' — that row is "
+    "still pending. Confirmations that accept the on-screen offer (yes, or any "
+    "short accept/bring/get/download/queue of 'it'/'that'/the offered title) → "
+    "action=pick with indices=[1] (or the matching candidate). Do NOT ask which "
+    "movie when a single candidate is already on screen. "
     "When candidates are listed: pick/pick_many with 1-based indices, OR "
     "action=search with search_title that MATCHES a candidate title (or the "
     "user's own words). NEVER invent a title that is not a candidate and not "
@@ -173,18 +183,27 @@ _SYSTEM = (
     "named or described a different title. "
     "Follow-ups that ask YOU to pick/find another title in the recent vibe "
     "('another one', 'do you know another', 'another horror in space', "
-    "'I don't know, find one', 'surprise me', 'more like that') are media asks: "
+    "'I don't know, find one', 'surprise me', 'more like that', "
+    "'we already have that, find another') are media asks: "
     "always action=search with a NEW catalog title that is NOT in "
-    "rejected_titles and not the last queued/subject title. Never answer with "
-    "'send the title if you know it' — the user is asking you to guess. "
+    "rejected_titles and not the last queued/subject/candidate title. Never "
+    "answer with 'send the title if you know it' — the user is asking you to "
+    "guess. "
+    "When the user names a title (even prefixed with download/queue/get/bring/"
+    "add), action=search that catalog title, or pick if it matches a candidate. "
+    "Never clarify with 'send the title if you know it' when candidates, "
+    "last_bot_reply, subject_title, pending_query, or recent_history already "
+    "name a guessed/queued title, or when the user asked you to find/confirm/"
+    "download something. "
     "Actor/artist names and misspellings are clues for you — never refuse because "
     "of spelling. If unsure which title and you have no good guess, action=clarify "
     "once with a useful question (never 'reply 1–1' / list-less 1–N). "
     "NEVER action=ignore for plot/vibe/description asks, recommend/find-one "
-    "follow-ups, or title typos "
+    "follow-ups, confirmations of an on-screen guess, titled download asks, or "
+    "title typos "
     "(e.g. 'coolest sci-fi you can fins', 'old horror movie on a spaceship') — "
-    "always action=search with your best catalog guess so the bot can ask "
-    "yes/no. Ignore is only for pure chatter/emoji/meta with no media ask. "
+    "always action=search or pick so the bot can queue or ask yes/no. Ignore is "
+    "only for pure chatter/emoji/meta with no media ask. "
     "Actions: passthrough, ignore, clarify, pick, pick_many, search. "
     "search sets search_title (and year when known; select_all=true for whole "
     "series/trilogy). Catalog year wins later — still include your best year. "
@@ -194,6 +213,13 @@ _SYSTEM = (
     "when unsure (Overseerr returns both). "
     "If the user clearly names a concrete catalog title with no ambiguity, "
     "action=search with that title (or pick the matching candidate)."
+)
+
+SOFT_CONTEXT_CLARIFY = (
+    "Want another in that vibe? Any year, actor, or other clue?"
+)
+EMPTY_TITLE_CLARIFY = (
+    "Which movie or series did you mean? Send the title if you know it."
 )
 
 
@@ -400,14 +426,79 @@ def looks_like_media_ask(text: str) -> bool:
     return False
 
 
-def _default_clarify_question(candidate_count: int) -> str:
-    """Never emit list-less 1–N wording when fewer than 2 candidates exist."""
+def history_has_named_title(history: list[dict[str, Any]] | None) -> bool:
+    """True when recent turns already named or offered a title."""
+    for turn in history or []:
+        if str(turn.get("search_title") or "").strip():
+            return True
+        if turn.get("offered"):
+            return True
+        text = str(turn.get("text") or "")
+        if re.search(r"did you mean\b", text, re.I):
+            return True
+        if re.search(r"queued\b", text, re.I):
+            return True
+    return False
+
+
+def has_guess_context(
+    *,
+    candidate_count: int = 0,
+    pending_query: str = "",
+    last_bot_reply: str = "",
+    subject_title: str = "",
+    history: list[dict[str, Any]] | None = None,
+    rejected_titles: list[str] | None = None,
+) -> bool:
+    """True when a guessed/named title is already in play — never demand one."""
+    if candidate_count > 0:
+        return True
+    if (pending_query or "").strip() or (subject_title or "").strip():
+        return True
+    if (last_bot_reply or "").strip():
+        return True
+    if rejected_titles:
+        return True
+    return history_has_named_title(history)
+
+
+def _default_clarify_question(
+    candidate_count: int,
+    *,
+    has_context: bool = False,
+    recommend: bool = False,
+) -> str:
+    """Never emit list-less 1–N wording when fewer than 2 candidates exist.
+
+    Never ask "send the title if you know it" when history/pending already
+    has a guessed title, or the user asked the bot to find one.
+    """
     if candidate_count >= 2:
         return (
             f"Which one — reply 1–{min(3, candidate_count)}, "
             "'all of them', or a clearer title?"
         )
-    return "Which movie or series did you mean? Send the title if you know it."
+    if recommend or has_context:
+        return SOFT_CONTEXT_CLARIFY
+    return EMPTY_TITLE_CLARIFY
+
+
+def _sanitize_clarify_question(
+    question: str,
+    *,
+    candidate_count: int,
+    has_context: bool,
+    recommend: bool,
+) -> str:
+    """Replace the empty-title template when context already names a title."""
+    raw = (question or "").strip()
+    if "send the title if you know it" in raw.lower() and (
+        recommend or has_context or candidate_count > 0
+    ):
+        return _default_clarify_question(
+            candidate_count, has_context=True, recommend=recommend
+        )
+    return raw
 
 
 def _year_from_candidate(row: dict[str, Any]) -> int | None:
@@ -551,6 +642,10 @@ def search_title_grounded(
     Plot asks with empty candidates may invent a catalog title. Concrete title
     asks must still share tokens with the user message (Da Vinci must not
     survive a Christophers ask).
+
+    Recommend / find-another asks may invent a NEW catalog title that
+    intentionally avoids the on-screen candidates (those are the offer being
+    rejected) — still grounded for the inbox guess-and-ask path.
     """
     title = (search_title or "").strip()
     if not title:
@@ -567,6 +662,9 @@ def search_title_grounded(
         # Plot / character resolve may invent when the user did not name a title.
         if looks_like_concrete_title(user_message):
             return False
+        return True
+    # Live pending options are often the rejected offer on a find-another turn.
+    if looks_like_recommend_ask(user_message):
         return True
     return False
 
@@ -642,6 +740,7 @@ async def interpret_intent(
     subject_title: str = "",
     subject_media_kind: str = "",
     rejected_titles: list[str] | None = None,
+    candidates_are_pending: bool = False,
 ) -> IntentDecision:
     """Interpret a user message. Always uses the model when configured.
 
@@ -684,6 +783,7 @@ async def interpret_intent(
             "pending_query": redact(pending_query)[:120] if pending_query else "",
             "last_bot_reply": redact(last_bot_reply)[:400] if last_bot_reply else "",
             "candidates": _candidate_blob(candidates or []),
+            "candidates_are_live_pending": bool(candidates_are_pending),
             "rejected_titles": rejected,
             "recent_history": history or [],
             "subject_title": redact(subject_title)[:120] if subject_title else "",
@@ -707,18 +807,30 @@ async def interpret_intent(
             temperature=0,
         )
         drafted = (response.choices[0].message.content or "").strip()
+        ctx = has_guess_context(
+            candidate_count=len(candidates or []),
+            pending_query=pending_query,
+            last_bot_reply=last_bot_reply,
+            subject_title=subject_title,
+            history=history,
+            rejected_titles=rejected_titles,
+        )
         parsed = _parse_model_json(
             drafted,
             candidate_count=len(candidates or []),
             rejected_titles=rejected,
             user_message=raw,
             candidates=candidates,
+            has_context=ctx,
+            candidates_are_pending=candidates_are_pending,
         )
         if parsed is None:
             return IntentDecision(
                 action="clarify",
-                clarify_question=(
-                    "Which movie or series did you mean? Send the title if you know it."
+                clarify_question=_default_clarify_question(
+                    len(candidates or []),
+                    has_context=ctx,
+                    recommend=looks_like_recommend_ask(raw),
                 ),
                 confidence=0.4,
                 source="openai_fallback",
@@ -739,6 +851,8 @@ def _parse_model_json(
     rejected_titles: list[str] | None = None,
     user_message: str = "",
     candidates: list[dict[str, Any]] | None = None,
+    has_context: bool = False,
+    candidates_are_pending: bool = False,
 ) -> IntentDecision | None:
     try:
         data = json.loads(raw)
@@ -810,7 +924,12 @@ def _parse_model_json(
         else:
             return IntentDecision(
                 action="clarify",
-                clarify_question=clarify or _default_clarify_question(candidate_count),
+                clarify_question=clarify
+                or _default_clarify_question(
+                    candidate_count,
+                    has_context=has_context,
+                    recommend=looks_like_recommend_ask(user_message),
+                ),
                 confidence=confidence,
             )
     if action == "pick_many" and not indices:
@@ -820,16 +939,20 @@ def _parse_model_json(
             confidence=confidence,
         )
     recommend = looks_like_recommend_ask(user_message)
-    soft_recommend_clarify = (
-        "Want another in that vibe? Any year, actor, or other clue?"
-    )
+    # Pending/history already named a title → never demand one from the user.
+    ctx = bool(has_context or candidate_count > 0 or recommend)
+    soft_recommend_clarify = SOFT_CONTEXT_CLARIFY
 
     if action == "search":
         if not search_title:
             return IntentDecision(
                 action="clarify",
                 clarify_question=clarify
-                or (soft_recommend_clarify if recommend else "Which series or title should I search for?"),
+                or (
+                    soft_recommend_clarify
+                    if ctx
+                    else "Which series or title should I search for?"
+                ),
                 confidence=confidence,
                 media_kind=media_kind,
             )
@@ -839,7 +962,7 @@ def _parse_model_json(
                 clarify_question=clarify
                 or (
                     soft_recommend_clarify
-                    if recommend
+                    if ctx
                     else "Which movie did you mean instead? Send another title or clue."
                 ),
                 confidence=confidence,
@@ -850,24 +973,41 @@ def _parse_model_json(
             user_message=user_message,
             candidates=candidates,
         ):
-            # Invented title while real hits exist — force clarify (inbox lists them).
-            return IntentDecision(
-                action="clarify",
-                clarify_question=clarify or _default_clarify_question(candidate_count),
-                confidence=confidence,
-                media_kind=media_kind,
+            # Invented title while real THIS-TURN catalog hits exist → clarify.
+            # Live pending options are the on-screen offer: a different
+            # search_title is a reject/new-ask pivot (recommend or clue update).
+            allow_pending_pivot = (
+                candidates_are_pending
+                and search_title.strip().lower() not in rejected_norm
+                and not any(
+                    titles_match(search_title, str(row.get("title") or ""))
+                    for row in (candidates or [])
+                )
             )
+            if not (
+                allow_pending_pivot
+                or (
+                    recommend
+                    and search_title.strip().lower() not in rejected_norm
+                )
+            ):
+                return IntentDecision(
+                    action="clarify",
+                    clarify_question=clarify
+                    or _default_clarify_question(
+                        candidate_count, has_context=ctx, recommend=recommend
+                    ),
+                    confidence=confidence,
+                    media_kind=media_kind,
+                )
         if confidence < MIN_RESOLVE_CONFIDENCE:
             # Recommend/find-one: keep the guess so inbox can ask "Did you mean …?".
             if not (recommend and search_title):
                 return IntentDecision(
                     action="clarify",
                     clarify_question=clarify
-                    or (
-                        soft_recommend_clarify
-                        if recommend
-                        else "Which movie or series did you mean? "
-                        "Send the title if you know it."
+                    or _default_clarify_question(
+                        candidate_count, has_context=ctx, recommend=recommend
                     ),
                     confidence=confidence,
                     media_kind=media_kind,
@@ -880,10 +1020,8 @@ def _parse_model_json(
             action = "search"
         else:
             action = "clarify"
-            clarify = clarify or (
-                soft_recommend_clarify
-                if recommend
-                else "Which movie or series did you mean? Send the title if you know it."
+            clarify = clarify or _default_clarify_question(
+                candidate_count, has_context=ctx, recommend=recommend
             )
 
     # Ban list-less "reply 1–N" / "1–1" forever when fewer than 2 real candidates.
@@ -918,28 +1056,22 @@ def _parse_model_json(
                     action = "search"
                     clarify = ""
                 else:
-                    clarify = (
-                        soft_recommend_clarify
-                        if recommend
-                        else _default_clarify_question(0)
+                    clarify = _default_clarify_question(
+                        0, has_context=ctx, recommend=recommend
                     )
             else:
-                # Recommend/find-one must never demand the user already knows the
-                # title (live: "Do you know another one?" → empty-title fallback).
-                clarify = (
-                    soft_recommend_clarify
-                    if recommend
-                    else _default_clarify_question(0)
+                # Recommend/find-one / in-context must never demand the user
+                # already knows the title (live empty-title fallback).
+                clarify = _default_clarify_question(
+                    0, has_context=ctx, recommend=recommend
                 )
         elif not clarify:
-            clarify = (
-                soft_recommend_clarify
-                if recommend
-                else _default_clarify_question(candidate_count)
+            clarify = _default_clarify_question(
+                candidate_count, has_context=ctx, recommend=recommend
             )
         elif clarify_wants_numbered_list(clarify) and candidate_count < 2:
-            clarify = (
-                soft_recommend_clarify if recommend else _default_clarify_question(0)
+            clarify = _default_clarify_question(
+                0, has_context=ctx, recommend=recommend
             )
 
     # Absolute last line of defense: never return list-less 1–N wording.
@@ -948,21 +1080,25 @@ def _parse_model_json(
             action = "search"
             clarify = ""
         else:
-            clarify = (
-                soft_recommend_clarify if recommend else _default_clarify_question(0)
+            clarify = _default_clarify_question(
+                0, has_context=ctx, recommend=recommend
             )
 
-    # Recommend/find-one: never leave the empty-title "if you know it" template.
-    if (
-        recommend
-        and action == "clarify"
-        and "send the title if you know it" in (clarify or "").lower()
-    ):
-        if search_title and search_title.strip().lower() not in rejected_norm:
+    # Never leave the empty-title "if you know it" template when context exists.
+    if action == "clarify":
+        clarify = _sanitize_clarify_question(
+            clarify,
+            candidate_count=candidate_count,
+            has_context=ctx,
+            recommend=recommend,
+        )
+        if (
+            "send the title if you know it" in (clarify or "").lower()
+            and search_title
+            and search_title.strip().lower() not in rejected_norm
+        ):
             action = "search"
             clarify = ""
-        else:
-            clarify = soft_recommend_clarify
 
     return IntentDecision(
         action=action,  # type: ignore[arg-type]
@@ -1040,8 +1176,11 @@ __all__ = [
     "MAX_BATCH",
     "MAX_CANDIDATES",
     "MIN_RESOLVE_CONFIDENCE",
+    "SOFT_CONTEXT_CLARIFY",
+    "EMPTY_TITLE_CLARIFY",
     "TELEGRAM_INTENT_MODEL",
     "clarify_wants_numbered_list",
+    "has_guess_context",
     "heuristic_intent",
     "instant_pick_decision",
     "interpret_intent",

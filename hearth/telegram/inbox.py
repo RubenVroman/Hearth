@@ -12,6 +12,7 @@ from hearth.memory.redact import redact
 from hearth.telegram.intent import (
     MAX_BATCH,
     MAX_CANDIDATES,
+    SOFT_CONTEXT_CLARIFY,
     IntentDecision,
     clarify_wants_numbered_list,
     instant_pick_decision,
@@ -201,6 +202,80 @@ class TelegramInbox:
             seen.add(key)
             titles.append(title)
         return titles
+
+    def _index_in_pending(
+        self, pending: PendingDisambiguation, search_title: str
+    ) -> int | None:
+        """1-based index of a pending option matching ``search_title``, if any."""
+        needle = (search_title or "").strip()
+        if not needle:
+            return None
+        for idx, row in enumerate(pending.options, start=1):
+            if titles_match(str(row.get("title") or ""), needle):
+                return idx
+        return None
+
+    def _reconcile_pending_after_intent(
+        self,
+        chat_id: int,
+        pending: PendingDisambiguation,
+        intent: IntentDecision,
+    ) -> tuple[IntentDecision, PendingDisambiguation | None]:
+        """Keep live pending until the model picks, matches, or starts a new ask.
+
+        Confirm / download of the on-screen title → pick that row's tmdbId.
+        New search_title that does not match pending → reject + clear, then
+        let the search path run. Clarify that re-lists the pending options
+        keeps them; bare reject clarify (nee/no) drops them.
+        """
+        if intent.action in {"pick", "pick_many"} and intent.indices:
+            return intent, pending
+
+        if intent.action == "search" and intent.search_title.strip():
+            match_idx = self._index_in_pending(pending, intent.search_title)
+            if match_idx is not None:
+                return (
+                    IntentDecision(
+                        action="pick",
+                        indices=[match_idx],
+                        confidence=intent.confidence,
+                        source=intent.source,
+                        media_kind=intent.media_kind,
+                    ),
+                    pending,
+                )
+            # New ask / reject of the on-screen offer — drop sticky list now.
+            rejected_now = self._titles_from_options(pending.options)
+            if pending.query:
+                rejected_now.append(pending.query)
+            self.memory.remember_rejected(
+                chat_id,
+                rejected_now,
+                clear_offered=True,
+                clear_subject=True,
+            )
+            self.pending.pop(chat_id, None)
+            return intent, None
+
+        if intent.action == "clarify":
+            # Bare nee/no / soft reject without naming a replacement → drop list.
+            # Numbered-list clarify about the same options → keep pending.
+            if not clarify_wants_numbered_list(intent.clarify_question or ""):
+                rejected_now = self._titles_from_options(pending.options)
+                if pending.query:
+                    rejected_now.append(pending.query)
+                self.memory.remember_rejected(
+                    chat_id,
+                    rejected_now,
+                    clear_offered=True,
+                    clear_subject=False,
+                )
+                self.pending.pop(chat_id, None)
+                return intent, None
+            return intent, pending
+
+        # ignore / passthrough — keep the on-screen guess alive.
+        return intent, pending
 
     def _is_instant_catalog(self, parsed: ParsedRequest, view: MessageView) -> bool:
         """No-doubt grabs: catalog id/URL or explicit ``Title (YYYY)`` only.
@@ -524,10 +599,11 @@ class TelegramInbox:
         if parsed.kind == "ignore" and not history and not pending:
             return InboxResult(handled=True, reply="")
 
-        # Everything else: gpt-4o with Overseerr candidates on the SAME turn.
-        # Non-instant reply while a 1–N list is pending → pivot: remember those
-        # titles as rejected, clear the sticky list, then refill candidates from
-        # a fresh catalog search for the new user text.
+        # Everything else: gpt-4o with live pending options and/or Overseerr
+        # candidates on the SAME turn. Do NOT pivot-clear a live 1-item guess
+        # before the model hop — the model must see that offer (e.g. a multi-word
+        # confirm of "Did you mean Title (year)?"). Only drop pending after the
+        # model decides pick / new search / reject.
         catalog_hits: list[dict[str, Any]] = []
         pending_query = (pending.query if pending else subject_title) or ""
         last_bot = (
@@ -535,29 +611,14 @@ class TelegramInbox:
             if pending
             else (history[-1]["text"] if history else "")
         )
-        pivoted_off_list = False
-        if pending is not None:
-            rejected_now = self._titles_from_options(pending.options)
-            if pending.query:
-                rejected_now.append(pending.query)
-            self.memory.remember_rejected(
-                view.chat_id,
-                rejected_now,
-                clear_offered=True,
-                clear_subject=True,
-            )
-            rejected = list(self.memory.rejected(view.chat_id))
-            self.pending.pop(view.chat_id, None)
-            pending = None
-            pending_query = ""
-            subject_title, subject_media_kind = "", ""
-            memory_offered = []
-            pivoted_off_list = True
 
         # New plot/title ask that does not match sticky subject → clear leftover
         # subject + offered so Harry Potter never leaks into a spaceship-horror turn.
+        # Skip this wipe while a live PendingDisambiguation is on screen — the
+        # model needs that offer + subject to interpret confirms/rejects.
         if (
-            subject_title
+            pending is None
+            and subject_title
             and not subject_matches_user_title(subject_title, view.text)
             and not looks_like_confirm_yes(view.text)
         ):
@@ -570,7 +631,7 @@ class TelegramInbox:
             subject_title, subject_media_kind = "", ""
             pending_query = ""
             memory_offered = []
-        elif memory_offered and not pivoted_off_list:
+        elif memory_offered and pending is None:
             # Leftover offered rows from a prior grab are not candidates unless
             # a live PendingDisambiguation is on screen (handled above).
             self.memory.clear_offered(view.chat_id)
@@ -583,10 +644,13 @@ class TelegramInbox:
                 view, parsed, rejected_titles=rejected
             )
 
-        # Fresh catalog hits only — never feed leftover memory_offered.
-        candidates_for_model: list[dict[str, Any]] | None = (
-            catalog_hits if catalog_hits else None
-        )
+        # Live pending options are the pick targets. Prefer them over a fresh
+        # catalog search so confirm/reject of the on-screen guess stays grounded.
+        candidates_are_pending = bool(pending is not None and pending.options)
+        if candidates_are_pending:
+            candidates_for_model: list[dict[str, Any]] | None = list(pending.options)
+        else:
+            candidates_for_model = catalog_hits if catalog_hits else None
 
         intent = await interpret_intent(
             view.text,
@@ -598,7 +662,19 @@ class TelegramInbox:
             subject_title=subject_title,
             subject_media_kind=subject_media_kind,
             rejected_titles=rejected,
+            candidates_are_pending=candidates_are_pending,
         )
+
+        # Reconcile live pending with the model decision — only then clear.
+        if pending is not None:
+            intent, pending = self._reconcile_pending_after_intent(
+                view.chat_id, pending, intent
+            )
+            if pending is None:
+                rejected = list(self.memory.rejected(view.chat_id))
+                subject_title, subject_media_kind = self.memory.subject(view.chat_id)
+                pending_query = subject_title or ""
+                memory_offered = []
 
         # Soft-revive this turn's catalog hits only when the model picks indices.
         active_pending = pending
@@ -696,12 +772,21 @@ class TelegramInbox:
                     confidence=intent.confidence,
                     source=intent.source,
                 )
+            elif pending is not None and len(pending.options) == 1:
+                # On-screen guess still live — re-ask, never empty-title fallback.
+                return self._ask_guess_confirm(
+                    view, pending.options[0], query=pending.query
+                )
             else:
                 return InboxResult(
                     handled=True,
                     reply=(
-                        "Want another in that vibe? Any year, actor, or other clue?"
-                        if looks_like_recommend_ask(view.text)
+                        SOFT_CONTEXT_CLARIFY
+                        if (
+                            looks_like_recommend_ask(view.text)
+                            or pending is not None
+                            or self.memory.has_history(view.chat_id)
+                        )
                         else (
                             "Which movie or series did you mean? "
                             "Send the title if you know it."
@@ -749,24 +834,46 @@ class TelegramInbox:
                     "mediaType": intent.media_kind or "movie",
                 }
                 return self._ask_guess_confirm(view, row, query=intent.search_title)
+            # Live pending 1-item guess → re-ask that row, never empty-title.
+            if pending is not None and len(pending.options) == 1:
+                return self._ask_guess_confirm(
+                    view, pending.options[0], query=pending.query
+                )
+            # Live 1–N list + numbered clarify → re-show those rows.
+            if pending is not None and len(pending.options) >= 2:
+                reply = format_ambiguous(pending.query or "that", pending.options)
+                self._remember_pending(
+                    view,
+                    options=pending.options,
+                    media_kind=pending.media_kind,
+                    query=pending.query,
+                    reply=reply,
+                )
+                return InboxResult(handled=True, reply=reply)
             question = intent.clarify_question or (
-                "Want another in that vibe? Any year, actor, or other clue?"
-                if looks_like_recommend_ask(view.text)
+                SOFT_CONTEXT_CLARIFY
+                if (
+                    looks_like_recommend_ask(view.text)
+                    or self.memory.has_history(view.chat_id)
+                )
                 else "Which movie or series did you mean? Send the title if you know it."
             )
             # Never emit list-less "reply 1–N" / "1–1".
             if clarify_wants_numbered_list(question):
                 question = (
-                    "Want another in that vibe? Any year, actor, or other clue?"
-                    if looks_like_recommend_ask(view.text)
+                    SOFT_CONTEXT_CLARIFY
+                    if (
+                        looks_like_recommend_ask(view.text)
+                        or self.memory.has_history(view.chat_id)
+                    )
                     else "Which movie or series did you mean? Send the title if you know it."
                 )
-            # Recommend/find-one must never demand the user already knows the title.
-            if (
+            # Never demand a title when history already has one.
+            if "send the title if you know it" in question.lower() and (
                 looks_like_recommend_ask(view.text)
-                and "send the title if you know it" in question.lower()
+                or self.memory.has_history(view.chat_id)
             ):
-                question = "Want another in that vibe? Any year, actor, or other clue?"
+                question = SOFT_CONTEXT_CLARIFY
             # Never re-stick a rejected 1–N list after a clarify pivot.
             if pending is None:
                 self.pending.pop(view.chat_id, None)
