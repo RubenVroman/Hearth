@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -43,6 +44,7 @@ class ChatThread:
     subject_title: str = ""
     subject_media_kind: str = ""
     offered: list[dict[str, Any]] = field(default_factory=list)
+    rejected_titles: list[str] = field(default_factory=list)
     updated_at: float = field(default_factory=time.time)
 
     def alive(self, *, now: float | None = None, ttl_s: float = IDLE_TTL_S) -> bool:
@@ -121,6 +123,59 @@ class ChatMemory:
             return []
         return list(thread.offered)
 
+    def rejected(self, chat_id: int) -> list[str]:
+        thread = self.get(chat_id)
+        if thread is None:
+            return []
+        return list(thread.rejected_titles)
+
+    def remember_rejected(
+        self,
+        chat_id: int,
+        titles: list[str] | None,
+        *,
+        clear_offered: bool = False,
+        clear_subject: bool = False,
+    ) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for title in titles or []:
+            text = re.sub(r"\s+", " ", str(title or "")).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text[:200])
+        if not cleaned and not clear_offered and not clear_subject:
+            return
+        with self._lock:
+            thread = self._ensure_unlocked(int(chat_id))
+            existing = {
+                re.sub(r"\s+", " ", t).strip().lower(): t
+                for t in thread.rejected_titles
+            }
+            for title in cleaned:
+                existing[title.lower()] = title
+            thread.rejected_titles = list(existing.values())[-12:]
+            if clear_offered:
+                thread.offered = []
+            if clear_subject:
+                thread.subject_title = ""
+                thread.subject_media_kind = ""
+            thread.updated_at = time.time()
+            self._persist_unlocked()
+
+    def clear_rejected(self, chat_id: int) -> None:
+        with self._lock:
+            thread = self._threads.get(int(chat_id))
+            if thread is None:
+                return
+            thread.rejected_titles = []
+            thread.updated_at = time.time()
+            self._persist_unlocked()
+
     def record_user(self, chat_id: int, text: str) -> None:
         raw = (text or "").strip()
         if not raw:
@@ -160,6 +215,12 @@ class ChatMemory:
                 thread.subject_title = search_title[:200]
                 if media_kind in {"movie", "tv"}:
                     thread.subject_media_kind = media_kind
+                # Successful new subject replaces prior rejects for that title.
+                thread.rejected_titles = [
+                    t
+                    for t in thread.rejected_titles
+                    if t.strip().lower() != search_title.strip().lower()
+                ]
             if compact:
                 thread.offered = compact
             self._trim_unlocked(thread)
@@ -173,6 +234,7 @@ class ChatMemory:
         *,
         media_kind: str = "",
         offered: list[dict[str, Any]] | None = None,
+        clear_rejected: bool = False,
     ) -> None:
         title = (title or "").strip()
         if not title:
@@ -185,6 +247,12 @@ class ChatMemory:
                 thread.subject_media_kind = media_kind
             if compact:
                 thread.offered = compact
+            if clear_rejected:
+                thread.rejected_titles = [
+                    t
+                    for t in thread.rejected_titles
+                    if t.strip().lower() != title.lower()
+                ]
             thread.updated_at = time.time()
             self._persist_unlocked()
 
@@ -249,6 +317,11 @@ class ChatMemory:
                 subject_title=str(blob.get("subject_title") or "")[:200],
                 subject_media_kind=str(blob.get("subject_media_kind") or ""),
                 offered=_compact_offered(blob.get("offered") or []),
+                rejected_titles=[
+                    str(t)[:200]
+                    for t in (blob.get("rejected_titles") or [])
+                    if str(t).strip()
+                ][:12],
                 updated_at=float(blob.get("updated_at") or now),
             )
             if thread.alive(now=now):
@@ -264,6 +337,7 @@ class ChatMemory:
                     "subject_title": th.subject_title,
                     "subject_media_kind": th.subject_media_kind,
                     "offered": th.offered,
+                    "rejected_titles": th.rejected_titles,
                     "updated_at": th.updated_at,
                     "turns": [asdict(t) for t in th.turns[-MAX_TURNS:]],
                 }
