@@ -15,9 +15,11 @@ from hearth.telegram.intent import (
     IntentDecision,
     interpret_intent,
     looks_like_collection_request,
+    looks_like_contextual_followup,
     looks_like_descriptive_ask,
     looks_like_followup,
 )
+from hearth.telegram.memory import ChatMemory
 from hearth.telegram.parse import (
     MessageView,
     ParsedRequest,
@@ -73,6 +75,7 @@ class TelegramInbox:
     pending: dict[int, PendingDisambiguation] = field(default_factory=dict)
     outbound_message_ids: set[tuple[int, int]] = field(default_factory=set)
     bot_user_id: int | None = None
+    memory: ChatMemory = field(default_factory=ChatMemory)
 
     def reset(self) -> None:
         self.deduper.reset()
@@ -80,6 +83,7 @@ class TelegramInbox:
         self.progress.reset()
         self.pending.clear()
         self.outbound_message_ids.clear()
+        self.memory.reset()
 
     def remember_outbound(self, chat_id: int, message_id: int) -> None:
         self.outbound_message_ids.add((int(chat_id), int(message_id)))
@@ -117,6 +121,40 @@ class TelegramInbox:
             created_message_id=view.message_id,
             last_bot_reply=reply[:400],
         )
+        self.memory.set_subject(
+            view.chat_id,
+            query,
+            media_kind=media_kind if media_kind in {"movie", "tv"} else "",
+            offered=options,
+        )
+
+    def _finish(
+        self,
+        view: MessageView,
+        result: InboxResult,
+        *,
+        search_title: str = "",
+        media_kind: str = "",
+        offered: list[dict[str, Any]] | None = None,
+        record_user: bool = False,
+        user_text: str = "",
+    ) -> InboxResult:
+        if record_user and user_text:
+            self.memory.record_user(view.chat_id, user_text)
+        if result.reply:
+            pending = self.pending.get(view.chat_id)
+            self.memory.record_bot(
+                view.chat_id,
+                result.reply,
+                search_title=search_title
+                or (pending.query if pending else "")
+                or result.title
+                or "",
+                media_kind=media_kind
+                or (pending.media_kind if pending and pending.media_kind in {"movie", "tv"} else ""),
+                offered=offered if offered is not None else (pending.options if pending else None),
+            )
+        return result
 
     async def handle_message(self, message: dict[str, Any]) -> InboxResult:
         view, parsed = parse_message(
@@ -145,44 +183,99 @@ class TelegramInbox:
 
         # Disambiguation pick (1/2/3) for a pending prompt in this chat.
         if parsed.kind == "disambiguation_pick":
-            return await self._handle_pick(view, parsed)
+            result = await self._handle_pick(view, parsed)
+            return self._finish(view, result, record_user=True, user_text=view.text)
 
         pending = self._pending_for(view.chat_id)
+        history = self.memory.history_blob(view.chat_id)
+        subject_title, subject_media_kind = self.memory.subject(view.chat_id)
+        memory_offered = self.memory.offered(view.chat_id)
+        has_ids_or_year = bool(
+            parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id or parsed.year
+        )
+        concrete = parsed.kind == "request" and has_ids_or_year
+
         needs_intent = bool(pending) and (
             looks_like_followup(view.text)
             or parsed.kind == "ignore"
-            or (
-                parsed.kind == "request"
-                and not (parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id or parsed.year)
-            )
+            or (parsed.kind == "request" and not has_ids_or_year)
         )
         if not needs_intent and looks_like_collection_request(view.text):
             needs_intent = True
         if (
             not needs_intent
             and parsed.kind == "request"
-            and not (parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id or parsed.year)
+            and not has_ids_or_year
             and looks_like_descriptive_ask(view.text)
+        ):
+            needs_intent = True
+        # Recent chat context: short NL/EN follow-ups must hit the model even
+        # when they are not English franchise phrases and pending expired.
+        if (
+            not needs_intent
+            and not concrete
+            and history
+            and looks_like_contextual_followup(view.text)
+            and parsed.kind in {"request", "ignore"}
         ):
             needs_intent = True
 
         if needs_intent:
+            candidates = pending.options if pending else (memory_offered or None)
             intent = await interpret_intent(
                 view.text,
-                candidates=pending.options if pending else None,
-                pending_query=pending.query if pending else "",
-                last_bot_reply=pending.last_bot_reply if pending else "",
-                force=bool(pending),
+                candidates=candidates,
+                pending_query=(pending.query if pending else subject_title) or "",
+                last_bot_reply=(
+                    pending.last_bot_reply
+                    if pending
+                    else (history[-1]["text"] if history else "")
+                ),
+                force=bool(pending) or bool(history and looks_like_contextual_followup(view.text)),
+                history=history,
+                subject_title=subject_title,
+                subject_media_kind=subject_media_kind,
             )
-            handled = await self._apply_intent(view, parsed, intent, pending=pending)
+            # Soft-revive pending from memory so pick/pick_many still work.
+            active_pending = pending
+            if (
+                active_pending is None
+                and intent.action in {"pick", "pick_many"}
+                and intent.indices
+                and memory_offered
+            ):
+                active_pending = PendingDisambiguation(
+                    chat_id=view.chat_id,
+                    options=memory_offered[:MAX_CANDIDATES],
+                    media_kind=subject_media_kind or "movie",
+                    query=subject_title or "",
+                    created_message_id=view.message_id,
+                    last_bot_reply=history[-1]["text"] if history else "",
+                )
+                self.pending[view.chat_id] = active_pending
+            handled = await self._apply_intent(
+                view, parsed, intent, pending=active_pending
+            )
             if handled is not None:
-                return handled
+                return self._finish(
+                    view,
+                    handled,
+                    search_title=intent.search_title or subject_title,
+                    media_kind=intent.media_kind or subject_media_kind,
+                    record_user=True,
+                    user_text=view.text,
+                )
 
         if parsed.kind == "ignore":
             return InboxResult(handled=True, reply="")
 
         if parsed.kind == "reject_download":
-            return InboxResult(handled=True, reply=format_reject_download())
+            return self._finish(
+                view,
+                InboxResult(handled=True, reply=format_reject_download()),
+                record_user=True,
+                user_text=view.text,
+            )
 
         if parsed.kind != "request":
             return InboxResult(handled=True, reply="")
@@ -195,7 +288,22 @@ class TelegramInbox:
 
         # New concrete request replaces stale disambiguation context.
         self.pending.pop(view.chat_id, None)
-        return await self._grab(view, parsed)
+        result = await self._grab(view, parsed)
+        if concrete:
+            # Year / catalog id — still remember the title for later follow-ups.
+            self.memory.set_subject(
+                view.chat_id,
+                parsed.title or result.title or "",
+                media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
+            )
+        return self._finish(
+            view,
+            result,
+            search_title=parsed.title or result.title or "",
+            media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
+            record_user=True,
+            user_text=view.text,
+        )
 
     async def _apply_intent(
         self,
@@ -223,6 +331,11 @@ class TelegramInbox:
                 intent.media_kind
                 if intent.media_kind in {"movie", "tv"}
                 else (parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "unknown")
+            )
+            self.memory.set_subject(
+                view.chat_id,
+                intent.search_title,
+                media_kind=media_kind if media_kind in {"movie", "tv"} else "",
             )
             synthetic = ParsedRequest(
                 kind="request",

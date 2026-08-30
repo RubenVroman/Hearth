@@ -44,25 +44,49 @@ _FOLLOWUP_ALL = re.compile(
     r"|entire\s+series"
     r"|the\s+trilogy"
     r"|full\s+series"
+    # Dutch house language
+    r"|allemaal|alles"
+    r"|de\s+hele(?:\s+\w+){0,4}"
+    r"|de\s+trilogie|hele\s+trilogie|de\s+reeks"
     r")\b",
     re.I,
 )
 _FOLLOWUP_FIRST = re.compile(
-    r"\b((?:just\s+)?(?:the\s+)?first(?:\s+one)?|oldest|(?:the\s+)?1st(?:\s+one)?)\b",
+    r"\b("
+    r"(?:just\s+)?(?:the\s+)?first(?:\s+one)?|oldest|(?:the\s+)?1st(?:\s+one)?"
+    r"|(?:de\s+|het\s+)?eerste(?:\s+(?:een|één|one|film|movie))?"
+    r")\b",
     re.I,
 )
 _FOLLOWUP_NEW = re.compile(
-    r"\b((?:the\s+)?(?:new|newest|latest|most\s+recent)(?:\s+one)?)\b",
+    r"\b("
+    r"(?:the\s+)?(?:new|newest|latest|most\s+recent)(?:\s+one)?"
+    r"|(?:de\s+|het\s+)?(?:nieuwste|recente)(?:\s+(?:een|één|one|film|movie))?"
+    r")\b",
     re.I,
 )
 _FOLLOWUP_LAST = re.compile(
-    r"\b((?:the\s+)?last(?:\s+one)?|(?:the\s+)?final(?:\s+one)?)\b",
+    r"\b("
+    r"(?:the\s+)?last(?:\s+one)?|(?:the\s+)?final(?:\s+one)?"
+    r"|(?:de\s+|het\s+)?laatste(?:\s+(?:een|één|one|film|movie))?"
+    r")\b",
     re.I,
 )
 _ORDINAL = re.compile(
-    r"^\s*(?:(?:just|only)\s+)?(?:the\s+)?"
-    r"(?P<ord>first|second|third|1st|2nd|3rd|#?\s*[1-9]|one|two|three)"
-    r"(?:\s+one)?\s*$",
+    r"^\s*(?:(?:just|only)\s+)?(?:(?:the|de|het)\s+)?"
+    r"(?P<ord>first|second|third|1st|2nd|3rd|#?\s*[1-9]|one|two|three|"
+    r"eerste|tweede|derde)"
+    r"(?:\s+(?:one|een|één))?\s*$",
+    re.I,
+)
+# Short NL/EN replies that only make sense with recent chat context.
+_CONTEXTUAL_SHORT = re.compile(
+    r"^\s*("
+    r"ja|jawel|nee|yes|yep|yeah|sure|no|nope|"
+    r"die|dat|deze|dit|that|this|those|these|them|"
+    r"(?:nee\s+)?(?:de|het)\s+andere|"
+    r"the\s+other(?:\s+one)?"
+    r")\s*[.!?]*\s*$",
     re.I,
 )
 _COLLECTION_SEARCH = re.compile(
@@ -80,10 +104,11 @@ _COLLECTION_SEARCH = re.compile(
 )
 _COLLECTION_HINT = re.compile(
     r"\b("
-    r"trilogy|franchise|saga|collection|"
+    r"trilogy|franchise|saga|collection|trilogie|reeks|"
     r"whole\s+(?:\w+\s+){0,6}(?:series|franchise|saga|collection)|"
     r"entire\s+(?:\w+\s+){0,6}(?:series|franchise|saga|collection)|"
-    r"all\s+(?:the\s+)?(?:movies?|films?|ones?)"
+    r"all\s+(?:the\s+)?(?:movies?|films?|ones?)|"
+    r"allemaal|de\s+hele|de\s+trilogie"
     r")\b",
     re.I,
 )
@@ -92,14 +117,17 @@ _ORDINAL_MAP = {
     "1st": 1,
     "one": 1,
     "1": 1,
+    "eerste": 1,
     "second": 2,
     "2nd": 2,
     "two": 2,
     "2": 2,
+    "tweede": 2,
     "third": 3,
     "3rd": 3,
     "three": 3,
     "3": 3,
+    "derde": 3,
 }
 
 # Media nouns shared across house languages (EN + NL; "serie" is Dutch singular).
@@ -229,6 +257,10 @@ _FUNCTION_WORDS = frozenset(
 _SYSTEM = (
     "You interpret short Telegram messages for a house movie/TV download bot. "
     "Return JSON only. Prefer clarify over wrong downloads. "
+    "When recent_history is present, use it to resolve pronouns and follow-ups "
+    "(NL+EN: de eerste, die, ja, nee de andere, de trilogie, the first one, all of them). "
+    "subject_title is the last resolved franchise/title — keep using it until the user "
+    "clearly switches topic. "
     "When candidates are listed: pick/pick_many with 1-based indices only — "
     "never invent titles or ids not listed in candidates. "
     "When candidates are empty and the message describes a plot, character, or "
@@ -264,8 +296,39 @@ def looks_like_followup(text: str) -> bool:
         return True
     if _ORDINAL.match(raw):
         return True
+    if _CONTEXTUAL_SHORT.match(raw):
+        return True
     lowered = raw.lower()
-    return lowered in {"all", "both", "those", "these", "them", "yes", "yep", "yeah", "sure"}
+    return lowered in {
+        "all",
+        "both",
+        "those",
+        "these",
+        "them",
+        "yes",
+        "yep",
+        "yeah",
+        "sure",
+        "ja",
+        "jawel",
+        "nee",
+        "allemaal",
+        "alles",
+    }
+
+
+def looks_like_contextual_followup(text: str) -> bool:
+    """Short / ambiguous replies that need recent chat history (NL+EN)."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 80:
+        return False
+    if _YEAR_PAREN.search(raw) or _CATALOG_ID.search(raw) or _URLISH.search(raw):
+        return False
+    if looks_like_followup(raw) or looks_like_collection_request(raw):
+        return True
+    words = re.findall(r"[A-Za-zÀ-ÿ']+", raw)
+    # Very short utterances with history are almost never brand-new catalog titles.
+    return 1 <= len(words) <= 5
 
 
 def looks_like_collection_request(text: str) -> bool:
@@ -396,13 +459,14 @@ def _heuristic_collection_search(text: str) -> IntentDecision | None:
         return None
     title = (match.group("title") or "").strip(" \"'`-–—")
     title = re.sub(
-        r"\b(movies?|films?|trilogy|series|franchise|saga|collection)\b",
+        r"\b(movies?|films?|trilogy|trilogie|series|serie|franchise|saga|collection|reeks)\b",
         "",
         title,
         flags=re.I,
     )
     title = re.sub(r"\s+", " ", title).strip(" \"'`")
-    if len(title) < 2:
+    # Bare "de trilogie" / "all of them" with no franchise name — need chat subject.
+    if len(title) < 2 or title.lower() in {"de", "het", "the", "a", "an", "een"}:
         return None
     want_all = bool(match.group("all")) or bool(_FOLLOWUP_ALL.search(raw)) or bool(
         _COLLECTION_HINT.search(raw)
@@ -462,6 +526,9 @@ async def interpret_intent(
     pending_query: str = "",
     last_bot_reply: str = "",
     force: bool = False,
+    history: list[dict[str, Any]] | None = None,
+    subject_title: str = "",
+    subject_media_kind: str = "",
 ) -> IntentDecision:
     """Interpret a short user message. Cheap model; fail open to heuristic/clarify."""
     raw = (text or "").strip()
@@ -469,27 +536,65 @@ async def interpret_intent(
         return IntentDecision(action="ignore", confidence=1.0)
 
     descriptive = looks_like_descriptive_ask(raw)
+    has_history = bool(history)
+    contextual = has_history and looks_like_contextual_followup(raw)
     should_run = (
         force
         or bool(candidates)
         or looks_like_followup(raw)
         or looks_like_collection_request(raw)
         or descriptive
+        or contextual
     )
     if not should_run:
         return IntentDecision(action="passthrough", confidence=1.0, source="skip")
 
     heuristic = heuristic_intent(text, candidates=candidates, pending_query=pending_query)
 
+    # With chat history but no live candidates, a collection/follow-up like
+    # "de trilogie" / "all of them" should re-search the last subject.
+    if (
+        heuristic.action == "passthrough"
+        and has_history
+        and subject_title
+        and not candidates
+        and (
+            looks_like_collection_request(raw)
+            or bool(_FOLLOWUP_ALL.search(raw))
+            or bool(_FOLLOWUP_FIRST.search(raw))
+            or bool(_FOLLOWUP_NEW.search(raw))
+            or bool(_FOLLOWUP_LAST.search(raw))
+            or bool(_ORDINAL.match(raw))
+        )
+    ):
+        select_all = bool(_FOLLOWUP_ALL.search(raw) or looks_like_collection_request(raw))
+        if select_all:
+            heuristic = IntentDecision(
+                action="search",
+                search_title=subject_title[:200],
+                select_all=True,
+                media_kind=subject_media_kind if subject_media_kind in {"movie", "tv"} else "",
+                confidence=0.88,
+                source="heuristic",
+            )
+        else:
+            heuristic = IntentDecision(
+                action="clarify",
+                clarify_question=(
+                    "Which one — reply with a number, 'all of them', or a clearer title?"
+                ),
+                confidence=0.7,
+                source="heuristic",
+            )
+
     if not settings.openai_configured:
         return heuristic
 
     # High-confidence local follow-ups skip the model hop (cost/latency).
-    if heuristic.source == "heuristic" and heuristic.confidence >= 0.85 and heuristic.action in {
-        "pick",
-        "pick_many",
-        "ignore",
-    }:
+    if heuristic.source == "heuristic" and heuristic.confidence >= 0.85 and (
+        heuristic.action in {"pick", "pick_many", "ignore"}
+        or (heuristic.action == "search" and heuristic.select_all and heuristic.search_title)
+    ):
         return heuristic
 
     try:
@@ -502,6 +607,9 @@ async def interpret_intent(
             "last_bot_reply": redact(last_bot_reply)[:400] if last_bot_reply else "",
             "candidates": _candidate_blob(candidates or []),
             "descriptive_ask": descriptive and not candidates,
+            "recent_history": history or [],
+            "subject_title": redact(subject_title)[:120] if subject_title else "",
+            "subject_media_kind": subject_media_kind if subject_media_kind in {"movie", "tv"} else "",
         }
         response = await client.chat.completions.create(
             model=settings.openai_model,
@@ -524,14 +632,14 @@ async def interpret_intent(
         )
         if parsed is None:
             return heuristic if heuristic.action != "passthrough" else IntentDecision(
-                action="clarify" if candidates or descriptive else "passthrough",
+                action="clarify" if candidates or descriptive or contextual else "passthrough",
                 clarify_question=(
                     f"Which one — reply 1–{min(3, len(candidates or []))}, "
                     "'all of them', or a clearer title?"
                     if candidates
                     else (
                         "Which movie or series did you mean? Send the title if you know it."
-                        if descriptive
+                        if descriptive or contextual
                         else ""
                     )
                 ),
@@ -661,6 +769,7 @@ __all__ = [
     "heuristic_intent",
     "interpret_intent",
     "looks_like_collection_request",
+    "looks_like_contextual_followup",
     "looks_like_descriptive_ask",
     "looks_like_followup",
 ]

@@ -199,7 +199,7 @@ async def test_poll_start_noop_when_unconfigured(monkeypatch):
 
 
 @pytest.fixture
-def inbox(monkeypatch) -> TelegramInbox:
+def inbox(monkeypatch, tmp_path) -> TelegramInbox:
     monkeypatch.setattr(settings, "telegram_bot_token", "1:test-token")
     monkeypatch.setattr(settings, "telegram_chat_ids", "-1001")
     monkeypatch.setattr(settings, "telegram_user_ids", "")
@@ -209,7 +209,9 @@ def inbox(monkeypatch) -> TelegramInbox:
     pipeline.radarr_queue.clear()
     pipeline.sonarr_queue.clear()
     pipeline.overseerr_queue.clear()
-    box = TelegramInbox()
+    from hearth.telegram.memory import ChatMemory
+
+    box = TelegramInbox(memory=ChatMemory(tmp_path / "telegram-chat-memory.json"))
     box.bot_user_id = 7
     box.rate.max_calls = 20
     return box
@@ -464,8 +466,8 @@ def test_looks_like_descriptive_ask_dutch_plot_phrases():
     assert not looks_like_descriptive_ask("Annihilation (2018)")
 
 
-def _patch_openai_intent(monkeypatch, payload: dict):
-    """Stub AsyncOpenAI chat.completions.create with a fixed JSON payload."""
+def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
+    """Stub AsyncOpenAI chat.completions.create with a fixed JSON payload (or queue)."""
     import json as _json
 
     from hearth.config import settings as _settings
@@ -473,21 +475,24 @@ def _patch_openai_intent(monkeypatch, payload: dict):
     monkeypatch.setattr(_settings, "openai_api_key", "sk-test-not-a-real-key")
     monkeypatch.setattr(_settings, "openai_model", "gpt-4o-mini")
 
-    class _Msg:
-        content = _json.dumps(payload)
-
-    class _Choice:
-        message = _Msg()
-
-    class _Resp:
-        choices = [_Choice()]
-
+    queue = list(payload) if isinstance(payload, list) else [payload]
     calls: list[dict] = []
 
     class _Completions:
         @staticmethod
         async def create(**kwargs):
             calls.append(kwargs)
+            body = queue.pop(0) if queue else {"action": "clarify", "clarify_question": "Which one?"}
+
+            class _Msg:
+                content = _json.dumps(body)
+
+            class _Choice:
+                message = _Msg()
+
+            class _Resp:
+                choices = [_Choice()]
+
             return _Resp()
 
     class _Chat:
@@ -647,6 +652,136 @@ async def test_inbox_dutch_ring_resolves_not_entire_sentence(
     # Fixture lookup may miss LOTR — either disambiguation, queued, or not-found on resolved title.
     assert "harige voeten" not in result.reply.lower()
     assert "nog een poging" not in result.reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_inbox_chat_memory_dutch_followup_de_eerste(
+    inbox: TelegramInbox, monkeypatch
+):
+    """After HP resolution, 'de eerste' must not Radarr-search the literal string."""
+    queries = _wrap_radarr_search(monkeypatch)
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Harry Potter",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    ask = await inbox.handle_message(
+        _msg("Ik zoek die film met die bebrilde tovenaar.", message_id=250)
+    )
+    assert "Which one" in ask.reply or "Harry Potter" in ask.reply
+    assert inbox.pending.get(-1001) is not None
+    assert inbox.memory.has_history(-1001)
+
+    before = list(queries)
+    pick = await inbox.handle_message(_msg("de eerste", message_id=251))
+    assert pick.grabbed is True
+    assert "2001" in pick.reply or "Sorcerer" in pick.reply or "Harry Potter" in pick.reply
+    new_queries = queries[len(before) :]
+    for q in new_queries:
+        assert q.strip().lower() != "de eerste"
+        assert "de eerste" not in q.lower()
+
+
+@pytest.mark.asyncio
+async def test_inbox_chat_memory_lotr_all_of_them_not_potter(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Later LOTR subject wins — 'all of them' must target LOTR, not leftover Potter."""
+    lotr_rows = [
+        {"title": "The Lord of the Rings: The Fellowship of the Ring", "year": 2001, "tmdbId": 120},
+        {"title": "The Lord of the Rings: The Two Towers", "year": 2002, "tmdbId": 121},
+        {"title": "The Lord of the Rings: The Return of the King", "year": 2003, "tmdbId": 122},
+    ]
+
+    from hearth.telegram import inbox as inbox_mod
+
+    queries: list[str] = []
+    original = inbox_mod.radarr.search
+
+    async def _capture(query: str, *args, **kwargs):
+        queries.append(str(query))
+        q = (query or "").lower()
+        if "lord" in q or ("ring" in q and "harry" not in q):
+            return {"mode": "mock", "service": "radarr", "results": list(lotr_rows)}
+        if q.startswith("tmdb:"):
+            try:
+                want = int(q.split(":", 1)[1])
+            except ValueError:
+                want = None
+            if want is not None:
+                hit = [row for row in lotr_rows if row.get("tmdbId") == want]
+                if hit:
+                    return {"mode": "mock", "service": "radarr", "results": hit}
+        return await original(query, *args, **kwargs)
+
+    monkeypatch.setattr(inbox_mod.radarr, "search", _capture)
+
+    _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "search",
+                "search_title": "Harry Potter",
+                "media_kind": "movie",
+                "confidence": 0.95,
+            },
+            {
+                "action": "search",
+                "search_title": "Lord of the Rings",
+                "media_kind": "movie",
+                "confidence": 0.95,
+            },
+        ],
+    )
+
+    await inbox.handle_message(
+        _msg("Ik zoek die film met die bebrilde tovenaar.", message_id=260)
+    )
+    assert inbox.memory.subject(-1001)[0]
+    assert "Harry" in inbox.memory.subject(-1001)[0]
+
+    lotr_ask = await inbox.handle_message(
+        _msg(
+            "Ok, nog een poging. Die film met dat mannetje met harige voeten "
+            "die een ring kapot moet maken.",
+            message_id=261,
+        )
+    )
+    assert "Which one" in lotr_ask.reply or "Lord" in lotr_ask.reply or "Ring" in lotr_ask.reply
+    subject, _ = inbox.memory.subject(-1001)
+    assert "Lord" in subject or "Ring" in subject
+    assert "Harry" not in subject
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert all("Lord" in str(row.get("title") or "") for row in pending.options[:3])
+
+    all_of = await inbox.handle_message(_msg("all of them", message_id=262))
+    assert all_of.grabbed is True
+    assert "Lord of the Rings" in all_of.reply
+    assert "Harry Potter" not in all_of.reply
+    joined = " ".join(all_of.titles) if all_of.titles else all_of.reply
+    assert "Lord of the Rings" in joined
+    assert "Harry Potter" not in joined
+    for q in queries:
+        assert q.strip().lower() != "all of them"
+
+
+@pytest.mark.asyncio
+async def test_inbox_annihilation_passthrough_with_empty_history(
+    inbox: TelegramInbox, monkeypatch
+):
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "search", "search_title": "WRONG", "confidence": 0.99},
+    )
+    assert not inbox.memory.has_history(-1001)
+    result = await inbox.handle_message(_msg("Annihilation (2018)", message_id=270))
+    assert calls == []
+    assert "already" in result.reply.lower() or "Annihilation" in result.reply
 
 
 @pytest.mark.asyncio
