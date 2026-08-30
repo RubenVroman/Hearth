@@ -50,7 +50,13 @@ def openai_auth_headers(*, json_body: bool = False) -> dict[str, str]:
 
 
 def session_config() -> dict[str, Any]:
-    """GA session shape. ChatGPT-app voice: gpt-realtime-2.1 + semantic VAD."""
+    """GA session shape. ChatGPT-app voice: gpt-realtime-2.1 + semantic VAD.
+
+    Input ``transcription`` is required for
+    ``conversation.item.input_audio_transcription.completed`` so the phone UI
+    can show what the user said when Conversation is expanded. Live-session
+    display only — does not change house memory pipelines.
+    """
     return {
         "type": "realtime",
         "model": settings.openai_realtime_model,
@@ -58,6 +64,8 @@ def session_config() -> dict[str, Any]:
         "output_modalities": ["audio"],
         "audio": {
             "input": {
+                # GA nested shape (not beta input_audio_transcription).
+                "transcription": {"model": "gpt-4o-mini-transcribe"},
                 "turn_detection": {"type": "semantic_vad"},
             },
             "output": {
@@ -161,7 +169,10 @@ class Sideband:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("assistant", text)
-        elif etype == "conversation.item.input_audio_transcription.completed":
+        elif etype in {
+            "conversation.item.input_audio_transcription.completed",
+            "conversation.item.audio_transcription.completed",
+        }:
             text = (event.get("transcript") or "").strip()
             if text:
                 runtime.note("user", text)

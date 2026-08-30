@@ -77,6 +77,9 @@ def test_client_secrets_mints_ephemeral_ek_token(client, monkeypatch):
     assert "OpenAI-Beta" not in captured["headers"]
     assert captured["json"]["session"]["type"] == "realtime"
     assert captured["json"]["session"]["model"] == "gpt-realtime-2.1"
+    audio_in = captured["json"]["session"]["audio"]["input"]
+    assert audio_in["transcription"]["model"] == "gpt-4o-mini-transcribe"
+    assert audio_in["turn_detection"]["type"] == "semantic_vad"
 
 
 def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
@@ -152,6 +155,8 @@ def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
     session = captured["files"]["session"][1]
     assert '"type": "realtime"' in session or '"type":"realtime"' in session
     assert "gpt-realtime-2.1" in session
+    assert "gpt-4o-mini-transcribe" in session
+    assert "transcription" in session
     assert captured["ws_url"] == f"{realtime_rtc.SIDEBAND_URL}?call_id=rtc_test_call"
     assert "OpenAI-Beta" not in captured["ws_headers"]
     assert hangup.status_code == 200

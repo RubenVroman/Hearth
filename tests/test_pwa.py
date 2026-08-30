@@ -82,3 +82,32 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200
+
+
+def test_conversation_is_collapsed_until_opened():
+    """Transcript stays out of the way; expand only via the Conversation control."""
+    index_html = (UI / "index.html").read_text(encoding="utf-8")
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+    app_js = (UI / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="transcript-details"' in index_html
+    assert 'class="transcript-toggle"' in index_html
+    assert "<details" in index_html
+    assert 'id="log"' in index_html
+    # Must start collapsed (no open attribute on details).
+    assert "transcript-details" in index_html
+    assert 'open="' not in index_html.split('id="transcript-details"')[1].split(">")[0]
+    assert ".transcript.is-empty" in css
+    assert ".transcript-details[open]" in css
+    assert "displayRole" in app_js
+    assert "input_audio_transcription.completed" in app_js
+    assert 'appendLog("you"' in app_js
+    assert 'appendLog("hearth"' in app_js
+
+
+def test_realtime_session_enables_user_input_transcription():
+    from hearth.voice.webrtc import session_config
+
+    cfg = session_config()
+    assert cfg["audio"]["input"]["transcription"]["model"] == "gpt-4o-mini-transcribe"
+    assert cfg["audio"]["input"]["turn_detection"]["type"] == "semantic_vad"

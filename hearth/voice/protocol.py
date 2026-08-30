@@ -30,6 +30,8 @@ def session_update_payload(tools: list[dict[str, Any]]) -> dict[str, Any]:
             "output_modalities": ["audio"],
             "audio": {
                 "input": {
+                    # Enable user-speech transcripts for the live conversation UI.
+                    "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {"type": "semantic_vad"},
                 },
                 "output": {
