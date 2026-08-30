@@ -12,6 +12,18 @@
   /** @type {Knob[]} */
   const KNOBS = [
     {
+      id: "look",
+      label: "Style",
+      group: "Look",
+      type: "choice",
+      default: "hearth",
+      options: [
+        { value: "hearth", label: "Hearth" },
+        { value: "jarvis", label: "Jarvis" },
+        { value: "forge", label: "Forge" },
+      ],
+    },
+    {
       id: "theme",
       label: "Palette",
       group: "Look",
@@ -80,6 +92,12 @@
     ink: "#05060a",
   };
 
+  const LOOK_COLORS = {
+    hearth: null,
+    jarvis: "#03080f",
+    forge: "#0b0908",
+  };
+
   function defaults() {
     const out = {};
     for (const knob of KNOBS) out[knob.id] = knob.default;
@@ -124,9 +142,13 @@
       const value = values[knob.id] ?? knob.default;
       root.dataset[knob.id] = value;
     }
+    const look = values.look || "hearth";
     const theme = values.theme || "ember";
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute("content", THEME_COLORS[theme] || THEME_COLORS.ember);
+    if (meta) {
+      const fromLook = LOOK_COLORS[look];
+      meta.setAttribute("content", fromLook || THEME_COLORS[theme] || THEME_COLORS.ember);
+    }
   }
 
   let current = sanitize({ ...defaults(), ...readStore() });
