@@ -132,7 +132,9 @@ class Runtime:
         return len(remove)
 
     def list_widgets(self) -> list[dict[str, Any]]:
-        return [w.as_dict() for w in self.widgets.values()]
+        from hearth.overlay_context import enrich_widget_dict
+
+        return [enrich_widget_dict(w) for w in self.widgets.values()]
 
     def snapshot(self) -> dict[str, Any]:
         return {

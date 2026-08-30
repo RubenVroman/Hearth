@@ -30,7 +30,11 @@ def new_id(prefix: str = "w") -> str:
 
 
 def start_turn(message: str) -> Widget | None:
-    """No-op: thinking / update guards are gone."""
+    """New user turn — keep overlays in memory; relevance soft-hides in the UI.
+
+    Hard-deleting here would prevent reappear when talk returns to on-screen
+    content. Context is re-evaluated on the next widgets/status payload.
+    """
     _ = message
     return None
 
