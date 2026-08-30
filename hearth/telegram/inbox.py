@@ -19,6 +19,7 @@ from hearth.telegram.intent import (
     is_explicit_title_year,
     looks_like_chatter,
     looks_like_concrete_title,
+    looks_like_confirm_yes,
     search_title_grounded,
     subject_matches_user_title,
     titles_match,
@@ -41,6 +42,7 @@ from hearth.telegram.progress import (
     ProgressTracker,
     format_already,
     format_ambiguous,
+    format_guess_confirm,
     format_not_found,
     format_queued,
     format_queued_many,
@@ -152,6 +154,11 @@ class TelegramInbox:
     ) -> InboxResult:
         if record_user and user_text:
             self.memory.record_user(view.chat_id, user_text)
+        # Unique grab must not leave a 1-item offered menu for the next ask.
+        if result.grabbed:
+            self.pending.pop(view.chat_id, None)
+            self.memory.clear_offered(view.chat_id)
+            offered = []
         if result.reply:
             pending = self.pending.get(view.chat_id)
             self.memory.record_bot(
@@ -429,27 +436,14 @@ class TelegramInbox:
         memory_offered = self.memory.offered(view.chat_id)
         rejected = list(self.memory.rejected(view.chat_id))
 
-        # Instant: all of them / de eerste only while a numbered list is on screen.
-        live_options = pending.options if pending else (memory_offered or None)
+        # Instant: 1/2/3, all of them, de eerste, or yes/that's it — only while a
+        # live PendingDisambiguation is on screen. Never soft-revive leftover
+        # memory_offered from a prior grab as a fake menu.
+        live_options = pending.options if pending else None
         instant = instant_pick_decision(view.text, live_options)
         if instant is not None and instant.action in {"pick", "pick_many"}:
-            active_pending = pending
-            if (
-                active_pending is None
-                and instant.indices
-                and memory_offered
-            ):
-                active_pending = PendingDisambiguation(
-                    chat_id=view.chat_id,
-                    options=memory_offered[:MAX_CANDIDATES],
-                    media_kind=subject_media_kind or "movie",
-                    query=subject_title or "",
-                    created_message_id=view.message_id,
-                    last_bot_reply=history[-1]["text"] if history else "",
-                )
-                self.pending[view.chat_id] = active_pending
             handled = await self._apply_intent(
-                view, parsed, instant, pending=active_pending
+                view, parsed, instant, pending=pending
             )
             if handled is not None:
                 return self._finish(
@@ -542,21 +536,27 @@ class TelegramInbox:
             memory_offered = []
             pivoted_off_list = True
 
-        # New/repeated title ask that does not match sticky subject → clear it
-        # so Da Vinci never leaks into a Christophers turn.
+        # New plot/title ask that does not match sticky subject → clear leftover
+        # subject + offered so Harry Potter never leaks into a spaceship-horror turn.
         if (
             subject_title
-            and looks_like_concrete_title(view.text)
             and not subject_matches_user_title(subject_title, view.text)
+            and not looks_like_confirm_yes(view.text)
         ):
             self.memory.remember_rejected(
                 view.chat_id,
                 [],
-                clear_offered=False,
+                clear_offered=True,
                 clear_subject=True,
             )
             subject_title, subject_media_kind = "", ""
             pending_query = ""
+            memory_offered = []
+        elif memory_offered and not pivoted_off_list:
+            # Leftover offered rows from a prior grab are not candidates unless
+            # a live PendingDisambiguation is on screen (handled above).
+            self.memory.clear_offered(view.chat_id)
+            memory_offered = []
 
         # Catalog-in-the-loop: search Overseerr (actor clause stripped) and pass
         # real hits to the model as candidates this turn.
@@ -565,14 +565,10 @@ class TelegramInbox:
                 view, parsed, rejected_titles=rejected
             )
 
-        # Prefer fresh catalog hits; fall back to last offered list only when
-        # we did not just reject/pivot and catalog returned nothing.
-        if catalog_hits:
-            candidates_for_model: list[dict[str, Any]] | None = catalog_hits
-        elif not pivoted_off_list and memory_offered:
-            candidates_for_model = memory_offered
-        else:
-            candidates_for_model = None
+        # Fresh catalog hits only — never feed leftover memory_offered.
+        candidates_for_model: list[dict[str, Any]] | None = (
+            catalog_hits if catalog_hits else None
+        )
 
         intent = await interpret_intent(
             view.text,
@@ -586,11 +582,9 @@ class TelegramInbox:
             rejected_titles=rejected,
         )
 
-        # Soft-revive offered rows only when the model explicitly picks indices
-        # and we did not just reject the on-screen list — prefer this turn's
-        # catalog hits so picks map to real Overseerr rows.
+        # Soft-revive this turn's catalog hits only when the model picks indices.
         active_pending = pending
-        pick_rows = candidates_for_model or memory_offered
+        pick_rows = candidates_for_model
         if (
             active_pending is None
             and intent.action in {"pick", "pick_many"}
@@ -621,12 +615,19 @@ class TelegramInbox:
             finish_title = intent.search_title if intent.action == "search" else ""
             if intent.action in {"pick", "pick_many"} and active_pending:
                 finish_title = active_pending.query or subject_title
+            finish_offered: list[dict[str, Any]] | None
+            if handled.grabbed:
+                finish_offered = []
+            elif self.pending.get(view.chat_id):
+                finish_offered = self.pending[view.chat_id].options
+            else:
+                finish_offered = []
             return self._finish(
                 view,
                 handled,
                 search_title=finish_title,
                 media_kind=intent.media_kind or subject_media_kind,
-                offered=catalog_hits or None,
+                offered=finish_offered,
                 record_user=True,
                 user_text=view.text,
             )
@@ -676,6 +677,8 @@ class TelegramInbox:
                     or looks_like_concrete_title(view.text)
                 ):
                     return await self._grab_catalog_row(view, hits[0], query=view.text)
+                # Plot-ish clarify with one grounded hit → name it and ask.
+                return self._ask_guess_confirm(view, hits[0], query=view.text)
             # Multiple hits (or list-wording clarify with hits) → always name them.
             if hits and (
                 len(hits) > 1
@@ -697,9 +700,22 @@ class TelegramInbox:
                     reply=reply,
                 )
                 return InboxResult(handled=True, reply=reply)
+            # Model named a guess in search_title alongside clarify → ask about it.
+            if intent.search_title.strip():
+                row = {
+                    "title": intent.search_title.strip(),
+                    "year": intent.year,
+                    "mediaType": intent.media_kind or "movie",
+                }
+                return self._ask_guess_confirm(view, row, query=intent.search_title)
             question = intent.clarify_question or (
                 "Which movie or series did you mean? Send the title if you know it."
             )
+            # Never emit list-less "reply 1–N" / "1–1".
+            if clarify_wants_numbered_list(question):
+                question = (
+                    "Which movie or series did you mean? Send the title if you know it."
+                )
             # Never re-stick a rejected 1–N list after a clarify pivot.
             if pending is None:
                 self.pending.pop(view.chat_id, None)
@@ -716,9 +732,11 @@ class TelegramInbox:
                 candidates=hits,
             ):
                 if len(hits) == 1 or self._choices_are_indistinguishable(hits):
-                    return await self._grab_catalog_row(
-                        view, hits[0], query=view.text
-                    )
+                    if looks_like_concrete_title(view.text):
+                        return await self._grab_catalog_row(
+                            view, hits[0], query=view.text
+                        )
+                    return self._ask_guess_confirm(view, hits[0], query=view.text)
                 query = catalog_search_title(view.text) or view.text
                 reply = format_ambiguous(query, hits)
                 kind = str(hits[0].get("mediaType") or "movie")
@@ -730,6 +748,11 @@ class TelegramInbox:
                     reply=reply,
                 )
                 return InboxResult(handled=True, reply=reply)
+            # Plot/vibe/description: one best guess → ASK, do not queue yet.
+            if not looks_like_concrete_title(view.text):
+                return await self._confirm_plot_guess(
+                    view, parsed, intent, catalog_hits=hits
+                )
             if not self.rate.allow():
                 return InboxResult(handled=True, reply=format_rate_limited())
             media_kind = (
@@ -765,6 +788,7 @@ class TelegramInbox:
                 search_title,
                 media_kind=media_kind if media_kind in {"movie", "tv"} else "",
                 clear_rejected=True,
+                clear_offered=True,
             )
             synthetic = ParsedRequest(
                 kind="request",
@@ -780,6 +804,113 @@ class TelegramInbox:
                 select_all=intent.select_all,
             )
         return None
+
+    def _ask_guess_confirm(
+        self,
+        view: MessageView,
+        row: dict[str, Any],
+        *,
+        query: str = "",
+    ) -> InboxResult:
+        """Ask about one guessed title — never queue, never list-less 1–N."""
+        title = str(row.get("title") or query or "Untitled")
+        year = row.get("year")
+        try:
+            year_i = int(year) if year not in (None, "") else None
+        except (TypeError, ValueError):
+            year_i = None
+        kind = str(row.get("mediaType") or row.get("media_kind") or "movie")
+        if kind not in {"movie", "tv"}:
+            kind = "movie"
+        reply = format_guess_confirm(title, year_i)
+        option = {
+            "title": title,
+            "year": year_i,
+            "mediaType": kind,
+            "tmdbId": row.get("tmdbId") or row.get("mediaId"),
+            "tvdbId": row.get("tvdbId"),
+            "mediaId": row.get("mediaId") or row.get("tmdbId"),
+        }
+        self._remember_pending(
+            view,
+            options=[option],
+            media_kind=kind,
+            query=title,
+            reply=reply,
+        )
+        self.memory.set_subject(
+            view.chat_id,
+            title,
+            media_kind=kind,
+            offered=[option],
+            clear_rejected=False,
+        )
+        return InboxResult(handled=True, reply=reply)
+
+    async def _confirm_plot_guess(
+        self,
+        view: MessageView,
+        parsed: ParsedRequest,
+        intent: IntentDecision,
+        *,
+        catalog_hits: list[dict[str, Any]],
+    ) -> InboxResult:
+        """Resolve a plot/vibe guess to catalog rows, then ask (never auto-queue)."""
+        search_title = catalog_search_title(intent.search_title) or intent.search_title
+        media_kind = (
+            intent.media_kind
+            if intent.media_kind in {"movie", "tv"}
+            else (parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "")
+        )
+        rows = list(catalog_hits)
+        if not rows:
+            try:
+                hits = await resolve_title(
+                    search_title,
+                    year=intent.year,
+                    media_kind=media_kind,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.info("plot-guess catalog resolve failed: %s", redact(str(exc)))
+                hits = []
+            rows = self._dedupe_choices([h.as_dict() for h in hits])
+            # Prefer title matches for the guessed name.
+            grounded = [
+                row
+                for row in rows
+                if titles_match(str(row.get("title") or ""), search_title)
+            ]
+            rows = grounded or rows
+
+        if len(rows) > 1 and not self._choices_are_indistinguishable(rows):
+            reply = format_ambiguous(search_title, rows)
+            kind = str(rows[0].get("mediaType") or media_kind or "movie")
+            self._remember_pending(
+                view,
+                options=rows,
+                media_kind=kind if kind in {"movie", "tv"} else "movie",
+                query=search_title,
+                reply=reply,
+            )
+            return InboxResult(handled=True, reply=reply)
+
+        if rows:
+            pick = rows[0]
+            # Prefer model year when catalog row has none.
+            if pick.get("year") in (None, "") and intent.year:
+                pick = {**pick, "year": intent.year}
+            return self._ask_guess_confirm(view, pick, query=search_title)
+
+        # No catalog hit — still ask about the model's best guess.
+        return self._ask_guess_confirm(
+            view,
+            {
+                "title": search_title,
+                "year": intent.year,
+                "mediaType": media_kind or "movie",
+            },
+            query=search_title,
+        )
 
     async def _grab_catalog_row(
         self,
@@ -818,6 +949,7 @@ class TelegramInbox:
             title,
             media_kind=kind,
             clear_rejected=True,
+            clear_offered=True,
         )
         return await self._grab(view, resolved, exact=True)
     async def _handle_pick(self, view: MessageView, parsed: ParsedRequest) -> InboxResult:

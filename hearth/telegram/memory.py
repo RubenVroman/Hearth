@@ -176,6 +176,16 @@ class ChatMemory:
             thread.updated_at = time.time()
             self._persist_unlocked()
 
+    def clear_offered(self, chat_id: int) -> None:
+        """Drop leftover disambiguation rows (e.g. after a unique grab)."""
+        with self._lock:
+            thread = self._threads.get(int(chat_id))
+            if thread is None:
+                return
+            thread.offered = []
+            thread.updated_at = time.time()
+            self._persist_unlocked()
+
     def record_user(self, chat_id: int, text: str) -> None:
         raw = (text or "").strip()
         if not raw:
@@ -197,9 +207,10 @@ class ChatMemory:
         offered: list[dict[str, Any]] | None = None,
     ) -> None:
         raw = (reply or "").strip()
-        if not raw and not search_title and not offered:
+        if not raw and not search_title and offered is None:
             return
-        compact = _compact_offered(offered)
+        # offered=None → leave sticky list alone; offered=[] clears it.
+        compact = _compact_offered(offered) if offered is not None else None
         with self._lock:
             thread = self._ensure_unlocked(int(chat_id))
             thread.turns.append(
@@ -208,7 +219,7 @@ class ChatMemory:
                     text=(raw or search_title)[:400],
                     search_title=(search_title or "")[:200],
                     media_kind=media_kind if media_kind in {"movie", "tv"} else "",
-                    offered=compact,
+                    offered=compact or [],
                 )
             )
             if search_title:
@@ -221,8 +232,8 @@ class ChatMemory:
                     for t in thread.rejected_titles
                     if t.strip().lower() != search_title.strip().lower()
                 ]
-            if compact:
-                thread.offered = compact
+            if offered is not None:
+                thread.offered = compact or []
             self._trim_unlocked(thread)
             thread.updated_at = time.time()
             self._persist_unlocked()
@@ -235,17 +246,20 @@ class ChatMemory:
         media_kind: str = "",
         offered: list[dict[str, Any]] | None = None,
         clear_rejected: bool = False,
+        clear_offered: bool = False,
     ) -> None:
         title = (title or "").strip()
         if not title:
             return
-        compact = _compact_offered(offered)
+        compact = _compact_offered(offered) if offered is not None else None
         with self._lock:
             thread = self._ensure_unlocked(int(chat_id))
             thread.subject_title = title[:200]
             if media_kind in {"movie", "tv"}:
                 thread.subject_media_kind = media_kind
-            if compact:
+            if clear_offered:
+                thread.offered = []
+            elif compact:
                 thread.offered = compact
             if clear_rejected:
                 thread.rejected_titles = [

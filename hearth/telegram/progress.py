@@ -63,7 +63,23 @@ def format_not_found(query: str) -> str:
     return f"Couldn't find a match for '{query}'. Send an IMDb/TMDB link?"
 
 
+def format_guess_confirm(title: str, year: int | None = None) -> str:
+    """Single best-guess confirmation — never a list-less 1–N range."""
+    label = f"{title} ({year})" if year not in (None, "") else str(title or "that")
+    return f"Did you mean {label}?"
+
+
 def format_ambiguous(query: str, options: list[dict[str, Any]]) -> str:
+    # n==1 must name/confirm the title — never "Reply 1–1" without a real menu.
+    if len(options) == 1:
+        row = options[0]
+        title = str(row.get("title") or query or "Untitled")
+        year = row.get("year")
+        try:
+            year_i = int(year) if year not in (None, "") else None
+        except (TypeError, ValueError):
+            year_i = None
+        return format_guess_confirm(title, year_i)
     show = min(3, len(options))
     lines = [f"Which one for '{query}'? Reply 1–{show}:"]
     for idx, row in enumerate(options[:show], start=1):
