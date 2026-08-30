@@ -22,6 +22,32 @@ DOWNLOAD_STATUSES = (
 )
 
 
+def _poster_path(item: dict[str, Any]) -> str | None:
+    from hearth.tools.media_art import enrich_media_hit, sanitize_poster_path
+
+    path = sanitize_poster_path(item.get("posterPath") or item.get("poster_path"))
+    if path:
+        return path
+    remote = item.get("remotePoster")
+    if isinstance(remote, str):
+        path = sanitize_poster_path(remote)
+        if path:
+            return path
+    for img in item.get("images") or []:
+        if not isinstance(img, dict):
+            continue
+        cover = str(img.get("coverType") or "").lower()
+        if cover and cover not in {"poster", "primary"}:
+            continue
+        candidate = img.get("remoteUrl") or img.get("url")
+        path = sanitize_poster_path(candidate) if candidate else None
+        if path:
+            return path
+    tmdb = item.get("tmdbId") or item.get("id")
+    enriched = enrich_media_hit({"tmdbId": tmdb, "posterPath": None})
+    return enriched.get("posterPath")
+
+
 def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "title": item.get("title"),
@@ -29,6 +55,7 @@ def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
         "tmdbId": item.get("tmdbId") or item.get("id"),
         "status": item.get("status"),
         "overview": (item.get("overview") or "")[:180],
+        "posterPath": _poster_path(item),
     }
 
 
@@ -39,6 +66,7 @@ def _summarize_series(item: dict[str, Any]) -> dict[str, Any]:
         "tvdbId": item.get("tvdbId"),
         "status": item.get("status"),
         "overview": (item.get("overview") or "")[:180],
+        "posterPath": _poster_path(item),
     }
 
 
@@ -47,11 +75,14 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
     if not year:
         date = item.get("releaseDate") or item.get("firstAirDate") or ""
         year = str(date)[:4] or None
+    media_id = item.get("id") or item.get("mediaId")
     return {
         "title": item.get("title") or item.get("name"),
         "year": year,
         "mediaType": item.get("mediaType"),
-        "mediaId": item.get("id"),
+        "mediaId": media_id,
+        "tmdbId": media_id,
+        "posterPath": _poster_path(item),
     }
 
 

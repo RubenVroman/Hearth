@@ -35,8 +35,13 @@ def new_id(prefix: str = "w") -> str:
 
 
 def start_turn(message: str) -> Widget | None:
-    """No-op: thinking / update guards are gone."""
+    """New user turn — fade movie/TV overlays so they don't linger forever.
+
+    Weather stays (sticky). If this turn's tools publish media again, the
+    overlay reappears with fresh art.
+    """
     _ = message
+    runtime.dismiss_widget("media")
     return None
 
 
@@ -106,6 +111,34 @@ def _weather_widget(result: dict[str, Any]) -> Widget:
             sticky=True,
         )
     )
+
+
+def _art_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Poster identifiers safe to send to the browser (no API keys / tokens)."""
+    from hearth.tools.media_art import enrich_media_hit, poster_path_for_tmdb, sanitize_poster_path
+
+    tmdb = row.get("tmdbId") or row.get("mediaId")
+    try:
+        tmdb_id = int(tmdb) if tmdb is not None else None
+    except (TypeError, ValueError):
+        tmdb_id = None
+    path = sanitize_poster_path(row.get("posterPath") or row.get("poster_path"))
+    if path is None and tmdb_id is not None:
+        path = poster_path_for_tmdb(tmdb_id)
+    rating_key = row.get("ratingKey")
+    enriched = enrich_media_hit(
+        {
+            "ratingKey": str(rating_key) if rating_key is not None else None,
+            "tmdbId": tmdb_id,
+            "posterPath": path,
+        }
+    )
+    return {
+        "ratingKey": enriched.get("ratingKey"),
+        "tmdbId": enriched.get("tmdbId"),
+        "posterPath": enriched.get("posterPath"),
+        "thumb": bool(enriched.get("thumb")),
+    }
 
 
 def _format_bytes(value: Any) -> str | None:
@@ -238,12 +271,14 @@ def _downloads_widget(result: dict[str, Any]) -> Widget:
     )
 
 
+
 def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
     if name == "plex_now_playing":
         sessions = data.get("sessions") or []
         if not sessions:
             return None
         row = sessions[0]
+        art = _art_fields(row)
         return {
             "title": row.get("title"),
             "type": row.get("type") or "movie",
@@ -252,8 +287,7 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
             "summary": row.get("summary") or "",
             "player": row.get("player"),
             "state": row.get("state"),
-            "ratingKey": row.get("ratingKey"),
-            "thumb": bool(row.get("ratingKey")),
+            **art,
             "source": "plex",
         }
     if name == "plex_play":
@@ -261,6 +295,7 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
         if not item.get("title"):
             return None
         client = data.get("client") or {}
+        art = _art_fields(item)
         return {
             "title": item.get("title"),
             "type": item.get("type") or "movie",
@@ -269,8 +304,7 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
             "summary": item.get("summary") or "",
             "contentRating": item.get("contentRating"),
             "rating": item.get("rating") or item.get("audienceRating"),
-            "ratingKey": item.get("ratingKey"),
-            "thumb": bool(item.get("ratingKey")),
+            **art,
             "player": client.get("name"),
             "source": "plex",
             "pending": bool(data.get("needs_confirm") or data.get("would_call_with")),
@@ -286,6 +320,10 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
             "sonarr_search": "sonarr",
             "overseerr_search": "overseerr",
         }.get(name, "media")
+        # Overseerr uses mediaId as the TMDB id.
+        if hit.get("tmdbId") is None and hit.get("mediaId") is not None:
+            hit = {**hit, "tmdbId": hit.get("mediaId")}
+        art = _art_fields(hit)
         return {
             "title": hit.get("title") or hit.get("name"),
             "type": hit.get("type") or hit.get("mediaType") or ("movie" if "radarr" in name else "show"),
@@ -294,9 +332,7 @@ def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
             "summary": hit.get("summary") or hit.get("overview") or "",
             "contentRating": hit.get("contentRating"),
             "rating": hit.get("rating") or hit.get("audienceRating"),
-            "ratingKey": hit.get("ratingKey"),
-            "tmdbId": hit.get("tmdbId"),
-            "thumb": bool(hit.get("ratingKey")),
+            **art,
             "source": source,
             "result_count": len(results),
         }
@@ -356,6 +392,7 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
             body=body,
             detail=" · ".join(detail_parts),
             data={"tool": name, "item": item},
-            sticky=True,
+            # Not sticky — start_turn dismisses so overlays fade as chat progresses.
+            sticky=False,
         )
     )

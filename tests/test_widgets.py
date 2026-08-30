@@ -14,8 +14,11 @@ def test_command_center_includes_info_overlay(client):
     js = client.get("/static/app.js")
     assert "openInfoOverlay" in js.text
     assert "renderWidgets" in js.text
+    assert "fadeMediaOverlayOnProgress" in js.text
+    assert "/api/media/art" in js.text
     assert "downloadsMarkup" in js.text
     assert "info-download-bar" in js.text
+
     assert "/api/widgets/" in js.text
     assert "upsertLocalWidget" not in js.text
     assert 'kind: "action"' not in js.text
@@ -71,10 +74,42 @@ def test_movie_ask_surfaces_media_overlay(client):
     item = media["data"]["item"]
     assert item.get("summary")
     assert item.get("ratingKey") == "1001"
+    assert item.get("tmdbId") == 693134
+    assert item.get("posterPath")
+    assert media.get("sticky") is False
 
     thumb = client.get("/api/plex/thumb/1001")
     assert thumb.status_code == 200
     assert "image/" in thumb.headers.get("content-type", "")
+
+    art = client.get("/api/media/art", params={"ratingKey": "1001", "tmdbId": 693134})
+    assert art.status_code == 200
+    assert "image/" in art.headers.get("content-type", "")
+
+
+def test_media_overlay_dismisses_on_next_turn(client):
+    first = client.post("/api/chat", json={"message": "tell me about the movie Dune"})
+    assert first.status_code == 200
+    assert any(w["kind"] == "media" for w in first.json()["widgets"])
+
+    second = client.post("/api/chat", json={"message": "thanks"})
+    assert second.status_code == 200
+    kinds = {w["kind"] for w in second.json()["widgets"]}
+    assert "media" not in kinds
+
+
+def test_media_art_endpoint_accepts_tmdb_and_falls_back(client):
+    ok = client.get(
+        "/api/media/art",
+        params={"tmdbId": 693134, "mediaType": "movie", "title": "Dune: Part Two"},
+    )
+    assert ok.status_code == 200
+    ctype = ok.headers.get("content-type", "")
+    assert ctype.startswith("image/")
+    # Real TMDB JPEG when CDN reachable; SVG placeholder otherwise.
+    assert ctype in {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/svg+xml"} or ctype.startswith(
+        "image/"
+    )
 
 
 def test_now_playing_surfaces_media_overlay(client):

@@ -360,30 +360,47 @@ function weatherMarkup(widget) {
   `;
 }
 
+function mediaArtUrl(item) {
+  const params = new URLSearchParams();
+  if (item.ratingKey) params.set("ratingKey", String(item.ratingKey));
+  if (item.tmdbId != null && item.tmdbId !== "") params.set("tmdbId", String(item.tmdbId));
+  if (item.posterPath) params.set("posterPath", String(item.posterPath));
+  const type = item.type || "movie";
+  if (type) params.set("mediaType", String(type));
+  if (item.title) params.set("title", String(item.title));
+  if (![...params.keys()].some((k) => k === "ratingKey" || k === "tmdbId" || k === "posterPath")) {
+    return "";
+  }
+  return `/api/media/art?${params.toString()}`;
+}
+
+function mediaPosterFallback(title) {
+  const initials = String(title || "")
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((p) => p[0] || "")
+    .join("")
+    .toUpperCase();
+  return `<div class="info-poster info-poster-fallback" aria-hidden="true">${escapeHtml(
+    initials || "·"
+  )}</div>`;
+}
+
 function mediaMarkup(widget) {
   const item = (widget.data && widget.data.item) || {};
   const title = widget.title || item.title || "Untitled";
   const year = item.year;
   const type = item.type || "movie";
   const summary = item.summary || "";
-  const ratingKey = item.ratingKey;
-  const initials = String(title)
-    .split(/\s+/)
-    .slice(0, 2)
-    .map((p) => p[0] || "")
-    .join("")
-    .toUpperCase();
   const meta = [type, year, item.show, item.contentRating]
     .filter(Boolean)
     .map((v) => escapeHtml(v))
     .join(" · ");
-  const poster = ratingKey
-    ? `<img class="info-poster" src="/api/plex/thumb/${encodeURIComponent(
-        ratingKey
-      )}" alt="" width="108" height="162" loading="lazy" />`
-    : `<div class="info-poster info-poster-fallback" aria-hidden="true">${escapeHtml(
-        initials || "·"
-      )}</div>`;
+  const art = mediaArtUrl({ ...item, title });
+  // /api/media/art always returns bytes (real JPEG or SVG fallback); onerror is a last resort.
+  const poster = art
+    ? `<img class="info-poster" src="${escapeHtml(art)}" alt="" width="108" height="162" loading="lazy" />`
+    : mediaPosterFallback(title);
   const bits = [];
   if (summary) bits.push(`<p class="info-detail">${escapeHtml(summary)}</p>`);
   if (item.player) {
@@ -580,6 +597,13 @@ async function dismissWidget(id, { silent = false } = {}) {
   } catch (err) {
     if (!silent) appendLog("system", `Dismiss failed: ${err.message}`);
   }
+}
+
+/** Fade movie/TV overlay when the conversation moves on (new user turn). */
+function fadeMediaOverlayOnProgress() {
+  const media = (state.widgets || []).find((w) => w && w.kind === "media");
+  if (!media) return;
+  dismissWidget(media.id, { silent: true });
 }
 
 function applyWidgetPayload(payload) {
@@ -848,6 +872,8 @@ $("composer").addEventListener("submit", async (ev) => {
   if (!text) return;
   input.value = "";
   appendLog("you", text);
+  // New user turn — movie overlay should not linger while the next reply loads.
+  fadeMediaOverlayOnProgress();
   if (
     sendRealtime({
       type: "conversation.item.create",
@@ -884,6 +910,7 @@ function onRealtimeEvent(event) {
     type === "conversation.item.audio_transcription.completed"
   ) {
     appendLog("you", event.transcript);
+    fadeMediaOverlayOnProgress();
   }
   if (type === "error") {
     const message = event.error?.message || event.message || "realtime error";
