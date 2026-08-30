@@ -48,7 +48,7 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v13" in sw.text
+    assert "hearth-shell-v14" in sw.text
 
 
 def test_weather_ask_surfaces_weather_overlay(client):

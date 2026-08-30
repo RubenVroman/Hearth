@@ -1975,6 +1975,12 @@ html[data-look="forge"] .hud-br {
   border-right-width: 2px;
 }
 
+/* Jarvis: hide bottom HUD L-brackets only; keep top corners + Forge bottoms */
+html[data-look="jarvis"] .hud-bl,
+html[data-look="jarvis"] .hud-br {
+  display: none;
+}
+
 html[data-look="jarvis"] .hud-scan {
   display: block;
   position: absolute;
