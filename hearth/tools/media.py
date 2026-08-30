@@ -10,11 +10,13 @@ from hearth.tools.plex import plex
 
 
 def _device_role(device: str) -> str:
-    key = (device or "").strip().lower()
-    if key in {"tv", "lg", "webos", "lg_tv", "lg webos tv", "television"}:
+    key = (device or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if key in {"tv", "lg", "webos", "lg_tv", "lg_webos_tv", "television"}:
         return "tv"
-    if key in {"avr", "denon", "receiver", "amp", "denon_avr", "denon avr"}:
+    if key in {"avr", "denon", "receiver", "amp", "denon_avr", "denon_avr_x3700h"}:
         return "avr"
+    if key in {"apple_tv", "appletv", "atv", "infuse"}:
+        return "apple_tv"
     return key or "unknown"
 
 
@@ -43,23 +45,26 @@ def _pipeline_status() -> dict[str, Any]:
 
 
 async def house_media_inventory() -> dict[str, Any]:
-    """Single snapshot: LG TV, Denon AVR, Plex now-playing, backend wiring."""
+    """Single snapshot: LG TV, Denon AVR, Apple TV, Plex now-playing, backend wiring."""
     tv = await ha.resolve_device_state("tv")
     avr = await ha.resolve_device_state("avr")
+    apple_tv = await ha.resolve_device_state("apple_tv")
     playing = await plex.now_playing()
     sessions = playing.get("sessions") or []
 
     tv_state = tv.get("state") if tv.get("ok") else None
     avr_state = avr.get("state") if avr.get("ok") else None
+    atv_state = apple_tv.get("state") if apple_tv.get("ok") else None
     tv_speak = speak_player(tv_state, label="LG webOS TV")
     avr_speak = speak_player(avr_state, label="Denon AVR")
+    atv_speak = speak_player(atv_state, label="Apple TV")
     plex_speak = _speak_plex(sessions)
 
-    modes = {tv.get("mode"), avr.get("mode"), playing.get("mode")}
+    modes = {tv.get("mode"), avr.get("mode"), apple_tv.get("mode"), playing.get("mode")}
     modes.discard(None)
     mode = "live" if modes == {"live"} else ("mock" if "mock" in modes else "mixed")
 
-    speak_parts = [tv_speak, avr_speak, plex_speak]
+    speak_parts = [tv_speak, avr_speak, atv_speak, plex_speak]
     pipeline = _pipeline_status()
     missing = [
         name
@@ -96,6 +101,15 @@ async def house_media_inventory() -> dict[str, Any]:
             "speak": avr_speak,
             "error": avr.get("error"),
         },
+        "apple_tv": {
+            "ok": bool(apple_tv.get("ok")),
+            "entity_id": apple_tv.get("entity_id") or settings.ha_apple_tv_entity,
+            "resolved": apple_tv.get("resolved"),
+            "state": atv_state,
+            "speak": atv_speak,
+            "error": apple_tv.get("error"),
+            "default_player": settings.apple_tv_player,
+        },
         "plex": {
             "mode": playing.get("mode"),
             "sessions": sessions,
@@ -106,6 +120,7 @@ async def house_media_inventory() -> dict[str, Any]:
         "entities": {
             "tv": settings.ha_tv_entity,
             "avr": settings.ha_avr_entity,
+            "apple_tv": settings.ha_apple_tv_entity,
         },
         "speak": " ".join(speak_parts),
     }
@@ -132,7 +147,13 @@ async def media_control(
         is_volume_muted=is_volume_muted,
     )
     state = result.get("state")
-    label = "LG webOS TV" if role == "tv" else "Denon AVR"
+    role = _device_role(device)
+    if role == "apple_tv":
+        label = "Apple TV"
+    elif role == "tv":
+        label = "LG webOS TV"
+    else:
+        label = "Denon AVR"
     result["device"] = role
     result["speak"] = speak_player(state, label=label) if state else (
         f"{label}: {action} via {result.get('entity_id')}."

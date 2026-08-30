@@ -349,16 +349,33 @@ async def test_plex_play_ambiguous_tv_without_sessions(monkeypatch):
 
 async def test_intent_play_on_apple_tv():
     plan = route_intent("play The Endless on the Apple TV")
-    assert plan["tool"] == "plex_play"
+    assert plan["tool"] == "infuse_play"
     assert plan["args"]["query"] == "The Endless"
-    assert "Apple" in plan["args"]["player"]
+
+
+async def test_intent_play_on_infuse():
+    plan = route_intent("put The Endless on Infuse")
+    assert plan["tool"] == "infuse_play"
+    assert plan["args"]["query"] == "The Endless"
 
 
 async def test_intent_play_on_the_tv():
     plan = route_intent("play The Endless on the TV")
+    assert plan["tool"] == "infuse_play"
+    assert plan["args"]["query"] == "The Endless"
+
+
+async def test_intent_play_on_lg_still_plex():
+    plan = route_intent("play The Endless on the LG")
     assert plan["tool"] == "plex_play"
     assert plan["args"]["query"] == "The Endless"
-    assert plan["args"]["player"] == "tv"
+    assert plan["args"]["player"] == "LG"
+
+
+async def test_intent_pause_apple_tv():
+    plan = route_intent("pause the Apple TV")
+    assert plan["tool"] == "infuse_transport"
+    assert plan["args"]["action"] == "pause"
 
 
 async def test_intent_plex_clients():
@@ -499,13 +516,14 @@ async def test_status_exposes_awaiting_client_reason(client, monkeypatch):
         return {"mode": "mock", "clients": []}
 
     monkeypatch.setattr(plex_client, "clients", _empty_clients)
+    # LG still uses the Plex-client path (Infuse is Apple TV default).
     chat = client.post(
         "/api/chat",
-        json={"message": "play The Endless on the Apple TV"},
+        json={"message": "play The Endless on the LG"},
     )
     assert chat.status_code == 200
     body = chat.json()
-    assert "Apple TV" in body["reply"] or "Plex" in body["reply"]
+    assert "LG" in body["reply"] or "Plex" in body["reply"]
     status = client.get("/api/status")
     assert status.status_code == 200
     pending = status.json().get("pending")
@@ -632,3 +650,115 @@ async def test_plex_play_live_proxies_play_media(monkeypatch):
     await plex_client.aclose()
     monkeypatch.setattr(settings, "plex_token", "")
     monkeypatch.setattr(settings, "mock_if_unconfigured", True)
+
+
+async def test_infuse_play_defaults_to_dry_run():
+    result = await registry.call("infuse_play", {"query": "The Endless"})
+    assert result.needs_confirm
+    assert result.dry_run
+    plan = result.data.get("plan") or {}
+    assert plan.get("ok") is True
+    assert plan.get("tmdbId") == 430231
+    assert plan.get("deep_link") == "infuse://movie/430231?play"
+    assert "Infuse" in (plan.get("speak") or result.data.get("speak") or "")
+
+
+async def test_infuse_play_launches_on_apple_tv_with_confirm():
+    from hearth.tools.ha import ha as ha_client
+
+    result = await registry.call(
+        "infuse_play",
+        {"query": "The Endless", "confirm": True},
+    )
+    assert result.ok
+    assert not result.needs_confirm
+    assert result.data.get("played") is True
+    assert result.data.get("tmdbId") == 430231
+    assert result.data.get("deep_link") == "infuse://movie/430231?play"
+    assert result.data.get("entity_id") == "media_player.apple_tv"
+    state = await ha_client.get_state("media_player.apple_tv")
+    attrs = (state.get("state") or {}).get("attributes") or {}
+    assert attrs.get("media_content_id") == "infuse://movie/430231?play"
+    assert attrs.get("app_name") == "Infuse"
+
+
+async def test_infuse_play_ambiguous_titles_ask_which():
+    result = await registry.call(
+        "infuse_play",
+        {"query": "Heat", "confirm": True},
+    )
+    assert not result.ok
+    assert result.data.get("ambiguous") or result.data.get("ambiguous_titles")
+    assert "Which title" in result.data["speak"]
+
+
+async def test_infuse_play_missing_setup_is_clear(monkeypatch):
+    from hearth.config import settings
+    from hearth.tools.ha import ha as ha_client
+
+    async def _missing(_device: str):
+        return {
+            "ok": False,
+            "mode": "mock",
+            "entity_id": "media_player.missing_apple_tv",
+            "error": "media_player.missing_apple_tv not found — set HA_APPLE_TV_ENTITY after pairing",
+        }
+
+    monkeypatch.setattr(settings, "ha_apple_tv_entity", "media_player.missing_apple_tv")
+    monkeypatch.setattr(ha_client, "resolve_device_state", _missing)
+    result = await registry.call(
+        "infuse_play",
+        {"query": "The Endless", "confirm": True},
+    )
+    assert not result.ok
+    assert result.data.get("needs_setup") is True
+    assert "Home Assistant" in result.data["speak"]
+    assert "HA_APPLE_TV_ENTITY" in result.data["speak"]
+
+
+async def test_infuse_transport_pause():
+    result = await registry.call(
+        "infuse_transport",
+        {"action": "pause", "confirm": True},
+    )
+    assert result.ok
+    assert "Paused" in result.data["speak"]
+    assert result.data.get("service") == "media_player.media_pause"
+
+
+async def test_infuse_series_deep_link():
+    from hearth.tools.infuse import build_infuse_url
+
+    assert build_infuse_url(95396, kind="series", season=1, episode=1) == (
+        "infuse://series/95396-1-1?play"
+    )
+    result = await registry.call(
+        "infuse_play",
+        {"query": "Hide and Seek", "confirm": True},
+    )
+    assert result.ok
+    assert result.data.get("deep_link") == "infuse://series/95396-1-1?play"
+
+
+async def test_chat_play_apple_tv_uses_infuse(client):
+    chat = client.post(
+        "/api/chat",
+        json={"message": "play The Endless on the Apple TV"},
+    )
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "infuse_play"
+    assert body["tools"][0]["needs_confirm"] is True
+    assert "Infuse" in body["reply"]
+
+
+async def test_prefer_infuse_toggle(monkeypatch):
+    from hearth.agent.loop import route_intent
+    from hearth.config import settings
+
+    monkeypatch.setattr(settings, "apple_tv_player", "plex")
+    plan = route_intent("play The Endless on the Apple TV")
+    assert plan["tool"] == "plex_play"
+    monkeypatch.setattr(settings, "apple_tv_player", "infuse")
+    plan = route_intent("play The Endless on the Apple TV")
+    assert plan["tool"] == "infuse_play"

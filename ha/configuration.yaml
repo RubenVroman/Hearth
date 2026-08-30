@@ -2,15 +2,21 @@
 # Complete onboarding in the UI (LAN/Tailscale :8123), then add:
 #   - LG webOS TV integration (accept PIN on the TV)
 #   - Denon AVR (HEOS / Network receivers) for AVR-X3700H
+#   - Apple TV integration (pyatv) — pair the living-room ATV for Infuse deep links
 #   - your lights (Hue, ZHA, Matter, …)
 #
 # HA is the device layer. Hearth talks to HA over the REST API; it does not
-# speak webOS or Denon protocol itself.
+# speak webOS, Denon, or Infuse protocol itself. Infuse launches as:
+#   media_player.play_media
+#     media_content_type: url
+#     media_content_id: infuse://movie/{tmdb_id}?play
 #
 # After pairing, copy the real media_player entity_ids into Hearth `.env`:
 #   HA_TV_ENTITY=media_player.<your_lg>
 #   HA_AVR_ENTITY=media_player.<your_denon>
+#   HA_APPLE_TV_ENTITY=media_player.<your_apple_tv>
 #   HA_TOKEN=<long-lived token from Profile → Security>
+#   HEARTH_APPLE_TV_PLAYER=infuse
 
 default_config:
 

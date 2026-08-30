@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Lights/AVR/TV via HA, *arr/Overseerr grab/request, Plex now-playing + play-on-client, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Lights/AVR/TV/Apple TV via HA, Infuse play on ATV, *arr/Overseerr grab/request, Plex now-playing + play-on-client, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -80,9 +80,12 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HA_TOKEN` | **Live** HA REST. Empty → mocked lights/scenes/Denon/LG. |
 | `HA_TV_ENTITY` | LG webOS `media_player` entity_id. Default `media_player.lg_webos_tv`. Set after HA pairing if different. |
 | `HA_AVR_ENTITY` | Denon AVR entity_id. Default `media_player.denon_avr_x3700h`. |
+| `HA_APPLE_TV_ENTITY` | Apple TV `media_player` (HA apple_tv / pyatv). Default `media_player.apple_tv`. Required for Infuse. |
+| `HEARTH_APPLE_TV_PLAYER` | `infuse` (default) or `plex`. Prefer Infuse over the Plex tvOS app for Apple TV. |
+| `INFUSE_APP_ID` | Optional Infuse bundle id. Default `com.firecore.infuse`. |
 | `PLEX_URL` | Existing Plex on the host. Default `http://host.docker.internal:32400`. |
 | `PLEX_TOKEN` | **Live** Plex sessions/search/clients/play. Empty → mocked now-playing + library/play fixtures. |
-| `PLEX_DEFAULT_PLAYER` | Optional default client name substring (e.g. `Apple TV`) when “the TV” is ambiguous. |
+| `PLEX_DEFAULT_PLAYER` | Optional default client name substring (e.g. `Apple TV`) when using the Plex-client path. |
 | `PLEX_CLIENT_WAIT_SECONDS` | On confirm/play with no online clients, re-poll `/clients` this long (default `12`). |
 | `PLEX_CLIENT_POLL_INTERVAL` | Seconds between client re-polls while waiting (default `1.5`). |
 | `RADARR_URL` / `RADARR_API_KEY` | **Live** movie search/add. Default URL `http://host.docker.internal:7878`. Empty key → fixtures. |
@@ -130,10 +133,12 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 **Do it yourself**
 
 - Lights, scenes → Home Assistant tools
-- LG TV / Denon AVR power, volume, source → `ha_media_control` (prefer over raw `ha_call_service`)
-- House media snapshot (TV + AVR + Plex) → `house_media` or `GET /api/media`
-- What's playing → `plex_now_playing`
-- Play a specific library title on Apple TV / LG / living-room Plex → `plex_play` (optional `plex_search` / `plex_clients`). Starts playback on the client via the Plex Media Server remote API — not HA `play_media` on the webOS entity. Prefers the active/recent Plex client when no player is named; asks when titles or clients are ambiguous; confirm covers switching away from whatever is already playing. If no clients are online, Hearth keeps the play ready, tells you to open Plex on the Apple TV / target, and **Try again** / confirm re-polls briefly until the client appears.
+- LG TV / Denon AVR / Apple TV power, volume, source, transport → `ha_media_control` (prefer over raw `ha_call_service`)
+- House media snapshot (TV + AVR + Apple TV + Plex) → `house_media` or `GET /api/media`
+- What's playing on Plex → `plex_now_playing` (Infuse has **no** now-playing API)
+- Play on **Apple TV / Infuse** → `infuse_play` (default). Title → TMDB (Plex Guids / Radarr / Overseerr) → `infuse://movie/{tmdb}?play` via HA Apple TV `play_media` type `url`. See [Infuse on Apple TV](#infuse-on-apple-tv) below.
+- Pause / stop / skip while Infuse is up → `infuse_transport` (HA Apple TV remote — not Infuse REST)
+- Play on **LG / Shield / an explicit Plex client** → `plex_play` (optional `plex_search` / `plex_clients`). PMS-proxied `playMedia`. If no clients are online, Hearth keeps the play ready and **Try again** / confirm re-polls until the client appears.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
@@ -159,13 +164,57 @@ Webhook payload:
 
 Auth: `Authorization: Bearer <HEARTH_COS_WEBHOOK_KEY>` when the key is set. Writes still default to dry-run until `confirm=true` (voice or UI confirm is enough). If `HEARTH_COS_WEBHOOK` is empty, the tool says it is not configured.
 
+## Infuse on Apple TV
+
+Ruben plays movies on the living-room **Apple TV in Infuse** (Firecore), not the Plex tvOS app. Plex `/clients` is often empty because Infuse is the player — so Hearth’s default Apple TV path is Infuse.
+
+### What must already be true
+
+1. **Infuse** installed on the Apple TV (8.4.7+ for the URL API), with your **Plex library and/or VAULT SMB shares** already connected inside Infuse.
+2. **Home Assistant Apple TV** integration paired (pyatv). Entity shows under Developer Tools → States.
+3. Hearth `.env` on VAULT:
+   - `HA_TOKEN` — long-lived HA token
+   - `HA_APPLE_TV_ENTITY=media_player.<your_apple_tv>` (default fixture id: `media_player.apple_tv`)
+   - `HEARTH_APPLE_TV_PLAYER=infuse` (default; set `plex` only if you want the old Plex-app path)
+   - `PLEX_TOKEN` (and optionally Radarr/Overseerr) so Hearth can resolve title → TMDB id
+4. Recreate/restart the `hearth` container after `.env` changes. **Do not deploy from this PR** until you choose to.
+
+### How it works
+
+1. Resolve the title in the Plex library (same search as `plex_play`).
+2. Read TMDB id from Plex `Guid` (`tmdb://…`). If missing, fall back to Radarr / Overseerr lookup.
+3. Build a Firecore deep link, e.g. `infuse://movie/430231?play` or `infuse://series/{id}-{season}-{episode}?play`.
+4. Call HA `media_player.play_media` on the Apple TV entity with `media_content_type: url` and that deep link (pyatv `apps.launch_app`).
+5. Pause / play / stop / skip use the same HA Apple TV `media_player` services. **Infuse exposes no playback-state API or webhooks** — Hearth will not invent now-playing inside Infuse.
+
+Direct `infuse://x-callback-url/play?url=…` file URLs are a documented fallback only; they do **not** sync Plex watch state.
+
+### Spoken workflow (voice / chat)
+
+| You say | Hearth does |
+| --- | --- |
+| “Play The Endless on the Apple TV” / “put it on Infuse” | Dry-run `infuse_play` → confirm → open Infuse deep link |
+| “Play Heat on Infuse” | Same; asks which edition if ambiguous |
+| “Pause the Apple TV” / “skip on Infuse” | `infuse_transport` via HA remote |
+| “Play X on the LG” | Still `plex_play` (Plex client on webOS) |
+
+If Apple TV isn’t paired in HA, Hearth fails clearly with the setup steps above — it does not silently no-op or tell you to open the Plex app.
+
+### Limits
+
+- No Infuse now-playing / progress / webhook.
+- Deep link needs a TMDB id; titles missing from Plex Guids and *arr will fail with a clear speak line.
+- tvOS may prompt once to open the Infuse URL the first time.
+
 ## Tools
 
 Destructive tools **default to dry-run** unless `confirm=true`:
 
-- `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG)
-- `ha_media_control` — LG TV / Denon AVR turn_on/off, volume, source, play_media
-- `plex_play` — start a Plex library title on a Plex client (Apple TV / LG / …)
+- `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG, Apple TV)
+- `ha_media_control` — LG TV / Denon AVR / Apple TV turn_on/off, volume, source, play_media, transport
+- `infuse_play` — open a library title in Infuse on the Apple TV (HA deep link)
+- `infuse_transport` — pause / play / stop / skip via HA Apple TV remote
+- `plex_play` — start a Plex library title on a Plex client (LG / Shield / …)
 - `radarr_add` / `sonarr_add` / `overseerr_request`
 - `workspace_write` / `workspace_delete`
 - `docker_stop`
@@ -173,7 +222,7 @@ Destructive tools **default to dry-run** unless `confirm=true`:
 
 Read-only / inspect:
 
-- `house_media` — speakable TV + AVR + Plex inventory (`GET /api/media`)
+- `house_media` — speakable TV + AVR + Apple TV + Plex inventory (`GET /api/media`)
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`, `plex_clients`
 - `radarr_search`, `sonarr_search`, `overseerr_search`
@@ -214,19 +263,20 @@ cp .env.example .env
 python -m hearth
 ```
 
-Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire. `{"message":"play The Endless on the Apple TV"}` dry-runs `plex_play` until confirm. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should dry-run `radarr_add`.
+Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire. `{"message":"play The Endless on the Apple TV"}` dry-runs `infuse_play` until confirm. `{"message":"play The Endless on the LG"}` dry-runs `plex_play`. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should dry-run `radarr_add`.
 
 ## Home Assistant devices
 
-Hearth will not talk webOS or Denon protocol itself. After HA is on:
+Hearth will not talk webOS, Denon, or Infuse protocol itself. After HA is on:
 
 1. Add **LG webOS TV** (accept the pairing PIN on the TV).
 2. Add **Denon AVR** / HEOS for the AVR-X3700H (same LAN as HA).
-3. Add lights (Hue, ZHA, Matter, …).
-4. Paste a long-lived token into `HA_TOKEN`.
-5. Check Developer Tools → States for the real `media_player.*` entity_ids. If they are not
-   `media_player.lg_webos_tv` / `media_player.denon_avr_x3700h`, set `HA_TV_ENTITY` and
-   `HA_AVR_ENTITY` in `.env` and recreate the hearth container.
+3. Add **Apple TV** (HA Apple TV integration / pyatv) — required for Infuse deep links.
+4. Add lights (Hue, ZHA, Matter, …).
+5. Paste a long-lived token into `HA_TOKEN`.
+6. Check Developer Tools → States for the real `media_player.*` entity_ids. If they differ from
+   the defaults, set `HA_TV_ENTITY`, `HA_AVR_ENTITY`, and `HA_APPLE_TV_ENTITY` in `.env` and
+   recreate the hearth container.
 
 For LAN discovery (Cast, some TVs), you may want host networking on the HA service — see comments in `docker-compose.yml`. Hearth itself stays on the `hearth` bridge.
 

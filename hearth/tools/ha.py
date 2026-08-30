@@ -145,13 +145,21 @@ class HomeAssistant:
             raise
 
     def entity_for(self, device: str) -> str:
-        """Map tv|avr (and aliases) to configured HA entity_id."""
-        key = (device or "").strip().lower()
-        if key in {"tv", "lg", "webos", "lg_tv", "lg webos tv", "television"}:
+        """Map tv|avr|apple_tv (and aliases) to configured HA entity_id."""
+        key = (device or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if key in {"tv", "lg", "webos", "lg_tv", "lg_webos_tv", "television"}:
             return settings.ha_tv_entity.strip() or "media_player.lg_webos_tv"
-        if key in {"avr", "denon", "receiver", "amp", "denon_avr", "denon avr"}:
+        if key in {"avr", "denon", "receiver", "amp", "denon_avr", "denon_avr_x3700h"}:
             return settings.ha_avr_entity.strip() or "media_player.denon_avr_x3700h"
-        raise ValueError(f"unknown media device {device!r}; use tv or avr")
+        if key in {
+            "apple_tv",
+            "appletv",
+            "atv",
+            "infuse",
+            "living_room_apple_tv",
+        }:
+            return settings.ha_apple_tv_entity.strip() or "media_player.apple_tv"
+        raise ValueError(f"unknown media device {device!r}; use tv, avr, or apple_tv")
 
     async def resolve_device_state(self, device: str) -> dict[str, Any]:
         entity_id = self.entity_for(device)
@@ -169,12 +177,17 @@ class HomeAssistant:
                     "state": fuzzy,
                     "resolved": "fuzzy",
                 }
+            hint = (
+                "set HA_APPLE_TV_ENTITY after pairing the Apple TV integration"
+                if self._device_role(device) == "apple_tv"
+                else "set HA_TV_ENTITY / HA_AVR_ENTITY after pairing"
+            )
             return {
                 "mode": result.get("mode") or "live",
                 "ok": False,
                 "device": device,
                 "entity_id": entity_id,
-                "error": result.get("error") or f"{entity_id} not found — set HA_TV_ENTITY / HA_AVR_ENTITY after pairing",
+                "error": result.get("error") or f"{entity_id} not found — {hint}",
             }
         return {
             "mode": result.get("mode"),
@@ -185,14 +198,37 @@ class HomeAssistant:
             "resolved": "config",
         }
 
+    def _device_role(self, device: str) -> str:
+        key = (device or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if key in {"tv", "lg", "webos", "lg_tv", "lg_webos_tv", "television"}:
+            return "tv"
+        if key in {"avr", "denon", "receiver", "amp", "denon_avr", "denon_avr_x3700h"}:
+            return "avr"
+        if key in {"apple_tv", "appletv", "atv", "infuse", "living_room_apple_tv"}:
+            return "apple_tv"
+        return key or "unknown"
+
     async def _find_by_hint(self, device: str) -> dict[str, Any] | None:
         media = await self.list_media_entities()
         states = media.get("states") or []
-        hints = ("lg", "webos", "tv") if device in {"tv", "lg", "webos", "television"} else ("denon", "avr", "receiver", "heos")
+        role = self._device_role(device)
+        if role == "apple_tv":
+            hints = ("apple tv", "apple_tv", "appletv", "atv")
+        elif role == "tv":
+            hints = ("lg", "webos", "tv")
+        else:
+            hints = ("denon", "avr", "receiver", "heos")
         for row in states:
             eid = str(row.get("entity_id") or "").lower()
             name = str((row.get("attributes") or {}).get("friendly_name") or "").lower()
             blob = f"{eid} {name}"
+            # Prefer Apple TV over generic "tv" substring when resolving apple_tv.
+            if role == "apple_tv":
+                if any(h in blob for h in hints):
+                    return row
+                continue
+            if role == "tv" and ("apple" in blob or "atv" in eid):
+                continue
             if any(h in blob for h in hints):
                 return row
         return None
@@ -263,24 +299,26 @@ class HomeAssistant:
             service = "media_pause"
         elif action in {"media_stop", "stop"}:
             service = "media_stop"
+        elif action in {"media_next_track", "next", "skip"}:
+            service = "media_next_track"
+        elif action in {"media_previous_track", "previous", "back"}:
+            service = "media_previous_track"
         else:
             return {
                 "ok": False,
                 "error": (
                     f"unknown action {action!r}; use turn_on, turn_off, volume_set, "
-                    "volume_mute, unmute, volume_up, volume_down, select_source, play_media"
+                    "volume_mute, unmute, volume_up, volume_down, select_source, play_media, "
+                    "media_play, media_pause, media_stop, media_next_track, media_previous_track"
                 ),
             }
 
         result = await self.call_service(domain, service, entity_id, data or None)
         # Re-read state when possible so the agent can speak the outcome.
         after = await self.get_state(entity_id)
-        role = "tv" if device.strip().lower() in {
-            "tv", "lg", "webos", "lg_tv", "lg webos tv", "television",
-        } else "avr"
         return {
             "ok": result.get("ok", True) is not False,
-            "device": role,
+            "device": self._device_role(device),
             "action": action,
             "entity_id": entity_id,
             "service": f"{domain}.{service}",
