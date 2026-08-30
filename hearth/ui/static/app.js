@@ -560,7 +560,7 @@ function mediaMarkup(widget) {
     .map((v) => escapeHtml(v))
     .join(" · ");
   const art = mediaArtUrl({ ...item, title });
-  // /api/media/art always returns bytes (real JPEG or SVG fallback); onerror is a last resort.
+  // /api/media/art returns real JPEG or SVG initials when the session cookie authorizes the GET.
   const poster = art
     ? `<img class="info-poster" src="${escapeHtml(art)}" alt="" width="108" height="162" loading="lazy" />`
     : mediaPosterFallback(title);

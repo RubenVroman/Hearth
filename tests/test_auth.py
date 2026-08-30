@@ -100,3 +100,51 @@ def test_login_page_and_static_are_public():
         assert js.status_code == 200
         health = client.get("/health")
         assert health.status_code == 200
+
+
+def test_media_art_allows_refresh_cookie_like_img_tag():
+    """Overlay posters use <img src>/api/media/art> — no X-Auth-Token header.
+
+    The refresh cookie alone must authorize those GETs, otherwise the browser
+    shows a broken-image question mark for every title.
+    """
+    with TestClient(app) as client:
+        login = client.post(
+            "/auth/token",
+            json={"email": TEST_ADMIN_EMAIL, "password": TEST_ADMIN_PASSWORD},
+        )
+        assert login.status_code == 200
+        assert client.cookies.get("refresh_token")
+
+        # Cookie session only — same as a browser <img> request.
+        art = client.get(
+            "/api/media/art",
+            params={
+                "tmdbId": 693134,
+                "posterPath": "/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
+                "title": "Dune: Part Two",
+            },
+            headers={},
+        )
+        assert art.status_code == 200
+        assert art.headers.get("content-type", "").startswith("image/")
+        # Real JPEG when CDN reachable; SVG initials placeholder otherwise.
+        assert art.content[:1] in {b"\xff", b"<"} or len(art.content) > 100
+
+        thumb = client.get("/api/plex/thumb/1001", headers={})
+        assert thumb.status_code == 200
+        assert thumb.headers.get("content-type", "").startswith("image/")
+
+        # Other API routes still require the access JWT (not refresh alone).
+        status = client.get("/api/status", headers={})
+        assert status.status_code == 401
+
+
+def test_media_art_still_401_without_any_session():
+    with TestClient(app) as client:
+        denied = client.get(
+            "/api/media/art",
+            params={"tmdbId": 693134, "title": "Dune"},
+        )
+        assert denied.status_code == 401
+        assert denied.json() == {"error": "unauthorized"}

@@ -22,11 +22,25 @@ PUBLIC_EXACT = {
 }
 PUBLIC_PREFIXES = ("/static/",)
 
+# Browser <img> / <link> cannot send X-Auth-Token. Same-origin GETs for these
+# paths may authenticate with the refresh cookie (same model as GET "/").
+_REFRESH_OK_GET_EXACT = frozenset({"/", "/api/media/art"})
+_REFRESH_OK_GET_PREFIXES = ("/api/plex/thumb/",)
+
 
 def is_public_path(path: str) -> bool:
     if path in PUBLIC_EXACT:
         return True
     return any(path.startswith(prefix) for prefix in PUBLIC_PREFIXES)
+
+
+def refresh_cookie_ok_for_request(method: str, path: str) -> bool:
+    """Whether a GET/HEAD may use the httpOnly refresh cookie alone."""
+    if method not in {"GET", "HEAD"}:
+        return False
+    if path in _REFRESH_OK_GET_EXACT:
+        return True
+    return any(path.startswith(prefix) for prefix in _REFRESH_OK_GET_PREFIXES)
 
 
 def machine_token_ok(value: str) -> bool:
@@ -65,7 +79,7 @@ def http_authorized(request: Request) -> bool:
     if machine_token_ok(request_machine_token(request)):
         return True
     refresh = request.cookies.get(REFRESH_COOKIE) or ""
-    allow_refresh = request.method == "GET" and request.url.path == "/"
+    allow_refresh = refresh_cookie_ok_for_request(request.method, request.url.path)
     return session_ok(request_access_token(request), refresh, allow_refresh=allow_refresh)
 
 
