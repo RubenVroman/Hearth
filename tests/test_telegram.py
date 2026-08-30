@@ -821,11 +821,10 @@ async def test_inbox_reject_imitation_game_leonardo_clue_searches_davinci(
     second = await inbox.handle_message(_msg(reject, message_id=302))
     assert len(openai_calls) >= 2
     payload = _json.loads(openai_calls[1]["messages"][1]["content"])
-    rejected = [str(t).lower() for t in (payload.get("rejected_titles") or [])]
-    assert any("imitation" in t for t in rejected)
-    # Must not force pick-from Imitation Game candidates on the reject turn.
+    # Live pending stays on screen for the model hop (not pivot-cleared first).
+    assert payload.get("candidates_are_live_pending") is True
     cands = payload.get("candidates") or []
-    assert not any("imitation" in str(c.get("title") or "").lower() for c in cands)
+    assert any("imitation" in str(c.get("title") or "").lower() for c in cands)
     history = payload.get("recent_history") or []
     assert history, "reject turn must include chat history"
     assert "1–2" not in second.reply and "Reply 1" not in second.reply
@@ -837,6 +836,9 @@ async def test_inbox_reject_imitation_game_leonardo_clue_searches_davinci(
     subject, _ = inbox.memory.subject(-1001)
     assert "Da Vinci" in subject
     assert "Imitation" not in subject
+    # After the model chose a new search, Imitation Game is rejected.
+    rejected_mem = [t.lower() for t in inbox.memory.rejected(-1001)]
+    assert any("imitation" in t for t in rejected_mem)
     assert inbox.pending.get(-1001) is None or "Da Vinci" in (
         inbox.pending[-1001].query if inbox.pending.get(-1001) else ""
     )
@@ -875,13 +877,17 @@ async def test_inbox_reject_imitation_game_tim_honks_searches_davinci(
     second = await inbox.handle_message(_msg(reject, message_id=311))
     assert len(openai_calls) >= 2
     payload = _json.loads(openai_calls[1]["messages"][1]["content"])
-    rejected = [str(t).lower() for t in (payload.get("rejected_titles") or [])]
-    assert any("imitation" in t for t in rejected)
-    assert not (payload.get("candidates") or [])
+    assert payload.get("candidates_are_live_pending") is True
+    assert any(
+        "imitation" in str(c.get("title") or "").lower()
+        for c in (payload.get("candidates") or [])
+    )
     assert "Which one — reply 1" not in second.reply
     assert any("da vinci" in q.lower() for q in queries)
     subject, _ = inbox.memory.subject(-1001)
     assert "Da Vinci" in subject
+    rejected_mem = [t.lower() for t in inbox.memory.rejected(-1001)]
+    assert any("imitation" in t for t in rejected_mem)
 
 
 @pytest.mark.asyncio
@@ -2941,3 +2947,305 @@ async def test_inbox_another_horror_followups_guess_not_send_title(
         # Clear pending so next follow-up is not an instant yes on Life.
         inbox.pending.pop(-1001, None)
         inbox.memory.clear_offered(-1001)
+
+
+# --- Live Telegram 2026-08-31: Sure. Bring it / Download pandorum / find another ---
+
+
+@pytest.mark.asyncio
+async def test_inbox_sure_bring_it_confirms_pending_pandorum_via_model(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: 'Sure. Bring it' missed confirm → empty-title fallback.
+
+    Instant path stays tiny (bare yes only). Model-shaped pick of the live
+    1-item pending must queue that tmdbId — never clear pending first.
+    """
+    import json as _json
+
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    pandorum = {
+        "title": "Pandorum",
+        "year": 2009,
+        "tmdbId": 19899,
+        "mediaId": 19899,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "pandorum" in q or "19899" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [pandorum]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # Model sees live pending + last_bot_reply and confirms the on-screen guess.
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "pick", "indices": [1], "confidence": 0.95},
+    )
+
+    option = dict(pandorum)
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[option],
+        media_kind="movie",
+        query="Pandorum",
+        created_message_id=900,
+        last_bot_reply="Did you mean Pandorum (2009)?",
+    )
+    inbox.memory.set_subject(
+        -1001, "Pandorum", media_kind="movie", offered=[option]
+    )
+    inbox.memory.record_user(-1001, "We already have that. Find another")
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean Pandorum (2009)?",
+        search_title="Pandorum",
+        media_kind="movie",
+        offered=[option],
+    )
+
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(_msg("Sure. Bring it", message_id=901))
+    assert result.grabbed is True, result.reply
+    assert "Pandorum" in result.reply
+    assert "2009" in result.reply
+    assert "Send the title if you know it" not in result.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 19899
+    assert calls  # went through gpt-4o (not instant bare-yes)
+    payload = _json.loads(calls[0]["messages"][1]["content"])
+    assert payload["candidates"]
+    assert "Pandorum" in str(payload["candidates"][0].get("title") or "")
+    assert "Did you mean Pandorum" in (payload.get("last_bot_reply") or "")
+    assert "Sure. Bring it" in (payload.get("user_message") or "")
+
+
+@pytest.mark.asyncio
+async def test_inbox_download_pandorum_queues_live_pending_via_model(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: 'Download pandorum' after pending wiped → empty-title fallback.
+
+    With live pending still on screen, model search/pick must queue Pandorum —
+    never the empty-title template.
+    """
+    import json as _json
+
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    pandorum = {
+        "title": "Pandorum",
+        "year": 2009,
+        "tmdbId": 19899,
+        "mediaId": 19899,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "pandorum" in q or "19899" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [pandorum]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # Model names the pending title — inbox reconciles search→pick on that row.
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Pandorum",
+            "year": 2009,
+            "media_kind": "movie",
+            "confidence": 0.92,
+        },
+    )
+
+    option = dict(pandorum)
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[option],
+        media_kind="movie",
+        query="Pandorum",
+        created_message_id=910,
+        last_bot_reply="Did you mean Pandorum (2009)?",
+    )
+    inbox.memory.set_subject(
+        -1001, "Pandorum", media_kind="movie", offered=[option]
+    )
+
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(_msg("Download pandorum", message_id=911))
+    assert result.grabbed is True, result.reply
+    assert "Pandorum" in result.reply
+    assert "Send the title if you know it" not in result.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 19899
+    assert calls
+    payload = _json.loads(calls[0]["messages"][1]["content"])
+    assert payload["candidates"]
+    assert "Pandorum" in str(payload["candidates"][0].get("title") or "")
+
+
+@pytest.mark.asyncio
+async def test_inbox_we_already_have_that_find_another_new_guess(
+    inbox: TelegramInbox, monkeypatch
+):
+    """After Alien guess, reject+find-another → new different guess-ask."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    alien = {
+        "title": "Alien",
+        "year": 1979,
+        "tmdbId": 348,
+        "mediaId": 348,
+        "mediaType": "movie",
+    }
+    pandorum = {
+        "title": "Pandorum",
+        "year": 2009,
+        "tmdbId": 19899,
+        "mediaId": 19899,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "pandorum" in q or "19899" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [pandorum]}
+        if "alien" in q or "348" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [alien]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Pandorum",
+            "year": 2009,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+
+    option = dict(alien)
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[option],
+        media_kind="movie",
+        query="Alien",
+        created_message_id=920,
+        last_bot_reply="Did you mean Alien (1979)?",
+    )
+    inbox.memory.set_subject(-1001, "Alien", media_kind="movie", offered=[option])
+    inbox.memory.record_user(-1001, "Find one")
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean Alien (1979)?",
+        search_title="Alien",
+        media_kind="movie",
+        offered=[option],
+    )
+
+    result = await inbox.handle_message(
+        _msg("We already have that. Find another", message_id=921)
+    )
+    assert result.grabbed is False, result.reply
+    assert "Did you mean" in result.reply or "?" in result.reply
+    assert "Pandorum" in result.reply
+    assert "2009" in result.reply
+    assert "Alien" not in result.reply
+    assert "Send the title if you know it" not in result.reply
+    assert calls
+    # Pending was live for the model hop (not pivot-cleared first).
+    import json as _json
+
+    payload = _json.loads(calls[0]["messages"][1]["content"])
+    assert payload["candidates"]
+    assert "Alien" in str(payload["candidates"][0].get("title") or "")
+    assert "Did you mean Alien" in (payload.get("last_bot_reply") or "")
+    # After model chose a new search, Alien is rejected and Pandorum is pending.
+    rejected = {t.lower() for t in inbox.memory.rejected(-1001)}
+    assert "alien" in rejected
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert "Pandorum" in str(pending.options[0].get("title") or "")
+
+
+def test_looks_like_confirm_yes_still_rejects_sure_bring_it():
+    """Instant yes stays tiny — 'Sure. Bring it' must go through the model."""
+    from hearth.telegram.intent import looks_like_confirm_yes, instant_pick_decision
+
+    assert looks_like_confirm_yes("sure")
+    assert looks_like_confirm_yes("Sure.")
+    assert not looks_like_confirm_yes("Sure. Bring it")
+    assert not looks_like_confirm_yes("Download pandorum")
+    # No instant pick for multi-word confirm even with pending on screen.
+    pending = [{"title": "Pandorum", "year": 2009, "tmdbId": 19899}]
+    assert instant_pick_decision("Sure. Bring it", pending) is None
+    assert instant_pick_decision("sure", pending) is not None
+    assert instant_pick_decision("sure", pending).action == "pick"
+
+
+def test_parse_model_json_never_empty_title_when_candidates_live():
+    """Clarify with candidates/context must not emit the empty-title template."""
+    from hearth.telegram.intent import _parse_model_json
+
+    candidates = [
+        {"title": "Pandorum", "year": 2009, "tmdbId": 19899, "mediaType": "movie"}
+    ]
+    parsed = _parse_model_json(
+        '{"action":"clarify","clarify_question":'
+        '"Which movie or series did you mean? Send the title if you know it.",'
+        '"confidence":0.5}',
+        candidate_count=1,
+        user_message="Sure. Bring it",
+        candidates=candidates,
+        has_context=True,
+    )
+    assert parsed is not None
+    # Single candidate + empty-title clarify → promote to search that row.
+    assert parsed.action in {"search", "clarify"}
+    if parsed.action == "clarify":
+        assert "send the title if you know it" not in (
+            parsed.clarify_question or ""
+        ).lower()
+    else:
+        assert parsed.search_title == "Pandorum"
