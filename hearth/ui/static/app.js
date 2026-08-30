@@ -36,12 +36,18 @@ const state = {
   infoPinned: false,
   infoHideTimer: null,
   infoIdleTimer: null,
+  /** Live assistant transcript buffer for mid-utterance card focus. */
+  liveAssistantTranscript: "",
+  /** Client-only provisional media cards (title skeletons) pending tool fill-in. */
+  localMediaExtras: [],
 };
 
 /** Client grace before fading when talk is clearly unrelated (ms). */
-const OVERLAY_IRRELEVANT_GRACE_MS = 900;
+const OVERLAY_IRRELEVANT_GRACE_MS = 650;
 /** Client idle soft-hide while still "relevant" but conversation is quiet (ms). */
-const OVERLAY_IDLE_HIDE_MS = 55000;
+const OVERLAY_IDLE_HIDE_MS = 28000;
+/** Max stacked media cards in the glass overlay. */
+const MEDIA_STACK_CAP = 5;
 
 function micStorageGet(key) {
   try {
@@ -310,8 +316,58 @@ function isVisualOverlay(widget) {
 function pickVisualOverlay(widgets) {
   const list = (Array.isArray(widgets) ? widgets : []).filter(isVisualOverlay);
   if (!list.length) return null;
-  // Most recently updated wins (list is insertion-ordered from the server).
+  // Prefer a still-relevant panel; otherwise the most recently updated visual.
+  const relevant = [...list].reverse().find((w) => {
+    const ctx = w && w.context;
+    return ctx && ctx.relevant === true;
+  });
+  if (relevant) return relevant;
   return list[list.length - 1];
+}
+
+function mediaItemsOf(widget) {
+  if (!widget || widget.kind !== "media") return [];
+  const data = widget.data || {};
+  const fromServer = Array.isArray(data.items) && data.items.length
+    ? data.items.filter((row) => row && typeof row === "object")
+    : data.item
+      ? [data.item]
+      : [];
+  const byId = new Map();
+  for (const row of fromServer) {
+    const id = String(row.id || mediaItemKey(row));
+    byId.set(id, { ...row, id });
+  }
+  for (const row of state.localMediaExtras || []) {
+    const id = String(row.id || mediaItemKey(row));
+    if (!byId.has(id)) byId.set(id, { ...row, id, skeleton: true });
+  }
+  const activeId = String(
+    (widget.context && widget.context.active_id) || data.active_id || ""
+  );
+  const items = [...byId.values()].slice(0, MEDIA_STACK_CAP);
+  if (activeId) {
+    items.sort((a, b) => {
+      const aActive = String(a.id) === activeId ? 0 : 1;
+      const bActive = String(b.id) === activeId ? 0 : 1;
+      return aActive - bActive;
+    });
+  }
+  return items;
+}
+
+function mediaItemKey(item) {
+  if (!item) return "title:untitled";
+  if (item.id) return String(item.id);
+  if (item.ratingKey) return `plex:${item.ratingKey}`;
+  if (item.tmdbId != null && item.tmdbId !== "") {
+    return `tmdb:${item.type || "movie"}:${item.tmdbId}`;
+  }
+  const slug = String(item.title || "untitled")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  return item.year != null ? `title:${slug}:${item.year}` : `title:${slug}`;
 }
 
 function overlaySignature(widget) {
@@ -320,6 +376,15 @@ function overlaySignature(widget) {
   const progressKey = downloads
     .map((row) => `${row.title || ""}:${row.status || ""}:${row.percent ?? ""}`)
     .join(",");
+  const media = mediaItemsOf(widget);
+  const mediaKey = media
+    .map((row) => `${row.id || ""}:${row.title || ""}:${row.skeleton ? 1 : 0}`)
+    .join(",");
+  const activeId =
+    (widget.context && widget.context.active_id) ||
+    (widget.data && widget.data.active_id) ||
+    (media[0] && media[0].id) ||
+    "";
   return [
     widget.id,
     widget.kind,
@@ -329,6 +394,9 @@ function overlaySignature(widget) {
     widget.body || "",
     widget.detail || "",
     progressKey,
+    mediaKey,
+    activeId,
+    widget.context && widget.context.relevant === false ? "0" : "1",
   ].join("|");
 }
 
@@ -350,29 +418,91 @@ function clearOverlayPolicyTimers() {
   }
 }
 
+function overlayEntityTopics(widget) {
+  const topics = new Set();
+  if (!widget) return topics;
+  const stop = new Set([
+    "the",
+    "and",
+    "for",
+    "movie",
+    "film",
+    "show",
+    "series",
+    "weather",
+    "download",
+    "downloads",
+    "part",
+    "untitled",
+  ]);
+  const addChunk = (chunk) => {
+    String(chunk || "")
+      .toLowerCase()
+      .match(/[a-z0-9']{3,}/g)
+      ?.forEach((t) => {
+        if (!stop.has(t)) topics.add(t);
+      });
+  };
+  if (widget.kind === "media") {
+    for (const item of mediaItemsOf(widget)) {
+      addChunk(item.title);
+      addChunk(item.show);
+    }
+  } else {
+    addChunk(widget.title);
+    if (widget.kind === "weather") {
+      addChunk(widget.data && widget.data.place);
+      addChunk(widget.data && widget.data.condition);
+    }
+    if (widget.kind === "downloads") {
+      for (const row of (widget.data && widget.data.downloads) || []) {
+        addChunk(row.title);
+      }
+    }
+  }
+  return topics;
+}
+
 function overlayTopics(widget) {
   const ctx = widget && widget.context;
   if (ctx && Array.isArray(ctx.topics) && ctx.topics.length) {
     return ctx.topics.map((t) => String(t).toLowerCase());
   }
   const topics = new Set([String(widget.kind || "").toLowerCase()]);
-  for (const chunk of [widget.title, widget.body, widget.detail]) {
-    String(chunk || "")
-      .toLowerCase()
-      .match(/[a-z0-9']{3,}/g)
-      ?.forEach((t) => topics.add(t));
-  }
+  overlayEntityTopics(widget).forEach((t) => topics.add(t));
   return [...topics];
 }
 
 function textTouchesOverlay(text, widget) {
   if (!text || !widget) return false;
-  const topics = new Set(overlayTopics(widget));
+  if (widget.kind === "media") {
+    for (const item of mediaItemsOf(widget)) {
+      if (titleMentionedInText(text, item.title) || titleMentionedInText(text, item.show)) {
+        return true;
+      }
+    }
+  }
+  const topics = overlayEntityTopics(widget);
   const tokens = String(text)
     .toLowerCase()
     .match(/[a-z0-9']{3,}/g);
-  if (!tokens) return false;
+  if (!tokens || !topics.size) return false;
   return tokens.some((t) => topics.has(t));
+}
+
+function titleMentionedInText(text, title) {
+  const raw = String(text || "").toLowerCase();
+  const titleL = String(title || "").trim().toLowerCase();
+  if (!raw || !titleL || titleL.length < 3) return false;
+  if (raw.includes(titleL)) return true;
+  const parts = titleL.match(/[a-z0-9']{3,}/g) || [];
+  const stop = new Set(["the", "and", "for", "part", "movie", "film", "show", "series"]);
+  const meaningful = parts.filter((p) => !stop.has(p));
+  if (meaningful.length >= 2) return meaningful.slice(0, 3).every((p) => raw.includes(p));
+  if (meaningful.length === 1) {
+    return new RegExp(`\\b${meaningful[0].replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i").test(raw);
+  }
+  return false;
 }
 
 function overlayIsRelevant(widget) {
@@ -437,6 +567,7 @@ function revealInfoOverlay() {
 
 function looksUnrelatedToOverlay(text, widget) {
   if (!text || !widget) return false;
+  if (isAckUtterance(text)) return false;
   if (textTouchesOverlay(text, widget)) return false;
   const kind = String(widget.kind || "");
   if (/\b(lights?|scenes?|turn (on|off)|dim |brightness|home assistant)\b/i.test(text)) return true;
@@ -444,6 +575,7 @@ function looksUnrelatedToOverlay(text, widget) {
     return true;
   }
   if (/\b(docker|containers?)\b/i.test(text)) return true;
+  if (/\b(workspace|chief of staff|open a pr|pull request)\b/i.test(text)) return true;
   if (kind === "weather" && /\b(movie|film|plex|playing|watch|radarr|sonarr|overseerr|infuse)\b/i.test(text)) {
     return true;
   }
@@ -453,16 +585,75 @@ function looksUnrelatedToOverlay(text, widget) {
   if (kind === "downloads" && /\b(weather|forecast|temperature|raining|humidity|lights?|scenes?)\b/i.test(text)) {
     return true;
   }
+  // Another title while a media card is up, but not in the stack → leave media domain
+  // only if it does not touch stacked titles (already checked). Generic "movie" talk
+  // alone should not keep a stale title forever — hide after grace via idle.
   return false;
 }
 
+function isAckUtterance(text) {
+  const raw = String(text || "").trim();
+  if (!raw || raw.length > 48) return false;
+  return /^(ok|okay|k|thanks|thank you|thx|got it|cool|nice|great|sure|yep|yeah|yup|alright|perfect|sweet|cheers|awesome|good|fine|noted|understood|sounds good|all good|no problem|np)[.!?]*$/i.test(
+    raw
+  );
+}
+
 /**
- * New user utterance — hide quickly when talk leaves the panel; keep/reveal when
- * it still touches on-screen topics. Server context on the next payload confirms.
+ * Focus a stacked media card when live talk names its title.
+ * Returns true when the active card changed.
+ */
+function focusMediaFromText(text, { reveal = true } = {}) {
+  const visual = pickVisualOverlay(state.widgets);
+  if (!visual || visual.kind !== "media" || !text) return false;
+  const items = mediaItemsOf(visual);
+  if (!items.length) return false;
+  const ranked = [...items].sort((a, b) => String(b.title || "").length - String(a.title || "").length);
+  let hit = null;
+  for (const item of ranked) {
+    if (titleMentionedInText(text, item.title) || titleMentionedInText(text, item.show)) {
+      hit = item;
+      break;
+    }
+  }
+  if (!hit) return false;
+  const data = visual.data || {};
+  const prev = String((visual.context && visual.context.active_id) || data.active_id || "");
+  if (prev === String(hit.id) && !state.infoSoftHidden) {
+    if (reveal) scheduleOverlayIdleHide();
+    return false;
+  }
+  data.active_id = hit.id;
+  data.item = hit;
+  data.items = items;
+  visual.data = data;
+  visual.title = hit.title || visual.title;
+  if (!visual.context) visual.context = {};
+  visual.context.active_id = hit.id;
+  visual.context.relevant = true;
+  if (reveal) {
+    if (state.infoHideTimer) {
+      clearTimeout(state.infoHideTimer);
+      state.infoHideTimer = null;
+    }
+    openInfoOverlay(visual);
+  }
+  return true;
+}
+
+/**
+ * New user/assistant utterance — hide quickly when talk leaves the panel; keep/reveal
+ * when it still touches on-screen topics. Server context on the next payload confirms.
  */
 function noteOverlayConversation(text) {
   const visual = pickVisualOverlay(state.widgets);
   if (!visual) return;
+  if (isAckUtterance(text)) {
+    scheduleOverlayIdleHide();
+    return;
+  }
+  const focused = focusMediaFromText(text, { reveal: true });
+  if (focused) return;
   const related = textTouchesOverlay(text, visual);
   if (related) {
     if (state.infoHideTimer) {
@@ -478,7 +669,7 @@ function noteOverlayConversation(text) {
     return;
   }
   if (!looksUnrelatedToOverlay(text, visual)) {
-    // Acknowledgments / side chat — leave visible until idle or server says otherwise.
+    // Side chat without a clear domain switch — leave visible until idle / server.
     scheduleOverlayIdleHide();
     return;
   }
@@ -489,6 +680,49 @@ function noteOverlayConversation(text) {
     if (state.infoPinned) return;
     softHideInfoOverlay();
   }, OVERLAY_IRRELEVANT_GRACE_MS);
+}
+
+function pruneLocalMediaExtras(widget) {
+  if (!widget || widget.kind !== "media") {
+    state.localMediaExtras = [];
+    return;
+  }
+  const data = widget.data || {};
+  const serverItems =
+    Array.isArray(data.items) && data.items.length ? data.items : data.item ? [data.item] : [];
+  const known = new Set(serverItems.map((row) => mediaItemKey(row)));
+  state.localMediaExtras = (state.localMediaExtras || []).filter(
+    (row) => !known.has(mediaItemKey(row))
+  );
+}
+
+function renderWidgets(widgets) {
+  const list = Array.isArray(widgets) ? widgets : [];
+  state.widgets = list;
+  const visual = pickVisualOverlay(list);
+  if (!visual) {
+    state.localMediaExtras = [];
+    closeInfoOverlay({ animate: true });
+    return;
+  }
+  pruneLocalMediaExtras(visual);
+  if (overlayIsRelevant(visual)) {
+    if (state.infoHideTimer) {
+      clearTimeout(state.infoHideTimer);
+      state.infoHideTimer = null;
+    }
+    openInfoOverlay(visual);
+    return;
+  }
+  // Keep content for reappear; fade out if currently visible.
+  if (!state.infoSoftHidden) {
+    if (state.infoSignature !== overlaySignature(visual)) {
+      const content = $("info-content");
+      if (content) content.innerHTML = overlayInnerHtml(visual);
+      state.infoSignature = overlaySignature(visual);
+    }
+    softHideInfoOverlay();
+  }
 }
 
 function weatherMarkup(widget) {
@@ -549,9 +783,8 @@ function mediaPosterFallback(title) {
   )}</div>`;
 }
 
-function mediaMarkup(widget) {
-  const item = (widget.data && widget.data.item) || {};
-  const title = widget.title || item.title || "Untitled";
+function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = false } = {}) {
+  const title = item.title || "Untitled";
   const year = item.year;
   const type = item.type || "movie";
   const summary = item.summary || "";
@@ -562,10 +795,16 @@ function mediaMarkup(widget) {
   const art = mediaArtUrl({ ...item, title });
   // /api/media/art returns real JPEG or SVG initials when the session cookie authorizes the GET.
   const poster = art
-    ? `<img class="info-poster" src="${escapeHtml(art)}" alt="" width="108" height="162" loading="lazy" />`
+    ? `<img class="info-poster" src="${escapeHtml(art)}" alt="" width="108" height="162" loading="${
+        active ? "eager" : "lazy"
+      }" />`
     : mediaPosterFallback(title);
   const bits = [];
-  if (summary) bits.push(`<p class="info-detail">${escapeHtml(summary)}</p>`);
+  if (item.skeleton && !summary) {
+    bits.push(`<p class="info-detail info-media-skeleton-line">Looking this up…</p>`);
+  } else if (summary) {
+    bits.push(`<p class="info-detail">${escapeHtml(summary)}</p>`);
+  }
   if (item.player) {
     bits.push(
       `<p class="info-detail">${escapeHtml(item.player)}${
@@ -576,17 +815,62 @@ function mediaMarkup(widget) {
   if (item.rating != null) {
     bits.push(`<p class="info-detail">Rating ${escapeHtml(item.rating)}</p>`);
   }
+  const classes = [
+    "info-media-card",
+    active ? "is-active" : "is-recessed",
+    item.skeleton ? "is-skeleton" : "",
+    stackIndex === 0 && active ? "is-front" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   return `
-    <div class="info-media">
-      ${poster}
-      <div class="info-media-copy">
-        <p class="info-kicker">${item.pending ? "Ready to play" : "Library"}</p>
-        <h2 class="info-title" id="info-title">${escapeHtml(title)}</h2>
-        ${meta ? `<p class="info-meta">${meta}</p>` : ""}
-        ${bits.join("")}
+    <article
+      class="${classes}"
+      data-media-id="${escapeHtml(String(item.id || mediaItemKey(item)))}"
+      style="--stack-i:${stackIndex}"
+      aria-hidden="${active ? "false" : "true"}"
+    >
+      <div class="info-media">
+        ${poster}
+        <div class="info-media-copy">
+          <p class="info-kicker">${
+            item.skeleton ? "Mentioned" : item.pending ? "Ready to play" : "Library"
+          }</p>
+          <h2 class="info-title"${labelled ? ' id="info-title"' : ""}>${escapeHtml(title)}</h2>
+          ${meta ? `<p class="info-meta">${meta}</p>` : ""}
+          ${bits.join("")}
+        </div>
       </div>
-    </div>
+    </article>
   `;
+}
+
+function mediaMarkup(widget) {
+  const items = mediaItemsOf(widget);
+  if (!items.length) {
+    const item = (widget.data && widget.data.item) || {};
+    return mediaCardMarkup(
+      { ...item, id: mediaItemKey(item), title: widget.title || item.title || "Untitled" },
+      { active: true, stackIndex: 0, labelled: true }
+    );
+  }
+  if (items.length === 1) {
+    return `<div class="info-media-stack is-single" data-count="1">${mediaCardMarkup(items[0], {
+      active: true,
+      stackIndex: 0,
+      labelled: true,
+    })}</div>`;
+  }
+  const cards = items
+    .map((item, index) =>
+      mediaCardMarkup(item, {
+        active: index === 0,
+        stackIndex: index,
+        labelled: index === 0,
+      })
+    )
+    .join("");
+  return `<div class="info-media-stack is-stacked" data-count="${items.length}">${cards}</div>`;
 }
 
 function downloadStatusClass(status) {
@@ -752,35 +1036,9 @@ function closeInfoOverlay({ animate = true } = {}) {
   }, 300);
 }
 
-function renderWidgets(widgets) {
-  const list = Array.isArray(widgets) ? widgets : [];
-  state.widgets = list;
-  const visual = pickVisualOverlay(list);
-  if (!visual) {
-    closeInfoOverlay({ animate: true });
-    return;
-  }
-  if (overlayIsRelevant(visual)) {
-    if (state.infoHideTimer) {
-      clearTimeout(state.infoHideTimer);
-      state.infoHideTimer = null;
-    }
-    openInfoOverlay(visual);
-    return;
-  }
-  // Keep content for reappear; fade out if currently visible.
-  if (!state.infoSoftHidden) {
-    if (state.infoSignature !== overlaySignature(visual)) {
-      const content = $("info-content");
-      if (content) content.innerHTML = overlayInnerHtml(visual);
-      state.infoSignature = overlaySignature(visual);
-    }
-    softHideInfoOverlay();
-  }
-}
-
 async function dismissWidget(id, { silent = false } = {}) {
   const next = state.widgets.filter((w) => w.id !== id);
+  state.localMediaExtras = [];
   renderWidgets(next);
   try {
     await api(`/api/widgets/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -1030,6 +1288,7 @@ async function talk(message, confirm = false) {
   });
   appendLog("hearth", out.reply);
   applyWidgetPayload(out);
+  if (out.reply) noteOverlayConversation(out.reply);
   return out;
 }
 
@@ -1098,8 +1357,24 @@ function onRealtimeEvent(event) {
   if (state.call?.bargeIn) {
     state.call.bargeIn.noteRealtimeEvent(type);
   }
+  if (
+    type === "response.output_audio_transcript.delta" ||
+    type === "response.audio_transcript.delta"
+  ) {
+    const delta = event.delta || "";
+    if (delta) {
+      state.liveAssistantTranscript = `${state.liveAssistantTranscript || ""}${delta}`;
+      noteOverlayConversation(state.liveAssistantTranscript);
+    }
+  }
   if (type === "response.output_audio_transcript.done" || type === "response.audio_transcript.done") {
-    appendLog("hearth", event.transcript);
+    const text = event.transcript || state.liveAssistantTranscript || "";
+    state.liveAssistantTranscript = "";
+    appendLog("hearth", text);
+    noteOverlayConversation(text);
+  }
+  if (type === "response.created") {
+    state.liveAssistantTranscript = "";
   }
   // User speech — requires session audio.input.transcription (see webrtc.session_config).
   if (

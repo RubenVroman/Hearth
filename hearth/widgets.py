@@ -271,86 +271,236 @@ def _downloads_widget(result: dict[str, Any]) -> Widget:
 
 
 
-def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
+_MEDIA_STACK_CAP = 5
+_SEARCH_HIT_CAP = 4
+
+
+def _media_item_id(row: dict[str, Any]) -> str:
+    rating_key = row.get("ratingKey")
+    if rating_key is not None and str(rating_key).strip():
+        return f"plex:{rating_key}"
+    tmdb = row.get("tmdbId")
+    if tmdb is not None and str(tmdb).strip():
+        media_type = str(row.get("type") or row.get("mediaType") or "movie")
+        return f"tmdb:{media_type}:{tmdb}"
+    title = str(row.get("title") or row.get("name") or "untitled").strip().lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in title).strip("-") or "untitled"
+    year = row.get("year")
+    if year is not None:
+        return f"title:{slug}:{year}"
+    return f"title:{slug}"
+
+
+def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any] | None:
+    title = row.get("title") or row.get("name")
+    if not title:
+        return None
+    # Overseerr uses mediaId as the TMDB id.
+    if row.get("tmdbId") is None and row.get("mediaId") is not None:
+        row = {**row, "tmdbId": row.get("mediaId")}
+    art = _art_fields(row)
+    item = {
+        "id": _media_item_id({**row, **art, "title": title}),
+        "title": title,
+        "type": row.get("type") or row.get("mediaType") or "movie",
+        "year": row.get("year"),
+        "show": row.get("show") or row.get("grandparentTitle"),
+        "summary": row.get("summary") or row.get("overview") or "",
+        "contentRating": row.get("contentRating"),
+        "rating": row.get("rating") or row.get("audienceRating"),
+        **art,
+        "source": source,
+        "skeleton": bool(row.get("skeleton")),
+    }
+    if row.get("player") is not None:
+        item["player"] = row.get("player")
+    if row.get("state") is not None:
+        item["state"] = row.get("state")
+    if row.get("pending"):
+        item["pending"] = True
+    return item
+
+
+def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize one or many hits from a media tool into stack cards."""
     if name == "plex_now_playing":
         sessions = data.get("sessions") or []
-        if not sessions:
-            return None
-        row = sessions[0]
-        art = _art_fields(row)
-        return {
-            "title": row.get("title"),
-            "type": row.get("type") or "movie",
-            "year": row.get("year"),
-            "show": row.get("show") or row.get("grandparentTitle"),
-            "summary": row.get("summary") or "",
-            "player": row.get("player"),
-            "state": row.get("state"),
-            **art,
-            "source": "plex",
-        }
+        out: list[dict[str, Any]] = []
+        for row in sessions[:_SEARCH_HIT_CAP]:
+            if not isinstance(row, dict):
+                continue
+            item = _normalize_media_item(
+                {
+                    **row,
+                    "show": row.get("show") or row.get("grandparentTitle"),
+                    "player": row.get("player"),
+                    "state": row.get("state"),
+                },
+                source="plex",
+            )
+            if item:
+                out.append(item)
+        return out
     if name == "plex_play":
-        item = data.get("item") or {}
-        if not item.get("title"):
-            return None
+        item_raw = data.get("item") or {}
+        if not isinstance(item_raw, dict) or not item_raw.get("title"):
+            return []
         client = data.get("client") or {}
-        art = _art_fields(item)
-        return {
-            "title": item.get("title"),
-            "type": item.get("type") or "movie",
-            "year": item.get("year"),
-            "show": item.get("grandparentTitle"),
-            "summary": item.get("summary") or "",
-            "contentRating": item.get("contentRating"),
-            "rating": item.get("rating") or item.get("audienceRating"),
-            **art,
-            "player": client.get("name"),
-            "source": "plex",
-            "pending": bool(data.get("needs_confirm") or data.get("would_call_with")),
-        }
+        item = _normalize_media_item(
+            {
+                **item_raw,
+                "player": client.get("name") if isinstance(client, dict) else None,
+                "pending": bool(data.get("needs_confirm") or data.get("would_call_with")),
+            },
+            source="plex",
+        )
+        return [item] if item else []
     if name in {"plex_search", "radarr_search", "sonarr_search", "overseerr_search"}:
         results = data.get("results") or []
         if not results:
-            return None
-        hit = results[0]
+            return []
         source = {
             "plex_search": "plex",
             "radarr_search": "radarr",
             "sonarr_search": "sonarr",
             "overseerr_search": "overseerr",
         }.get(name, "media")
-        # Overseerr uses mediaId as the TMDB id.
-        if hit.get("tmdbId") is None and hit.get("mediaId") is not None:
-            hit = {**hit, "tmdbId": hit.get("mediaId")}
-        art = _art_fields(hit)
-        return {
-            "title": hit.get("title") or hit.get("name"),
-            "type": hit.get("type") or hit.get("mediaType") or ("movie" if "radarr" in name else "show"),
-            "year": hit.get("year"),
-            "show": hit.get("grandparentTitle"),
-            "summary": hit.get("summary") or hit.get("overview") or "",
-            "contentRating": hit.get("contentRating"),
-            "rating": hit.get("rating") or hit.get("audienceRating"),
-            **art,
-            "source": source,
-            "result_count": len(results),
-        }
-    return None
+        default_type = "movie" if "radarr" in name else "show"
+        out = []
+        for hit in results[:_SEARCH_HIT_CAP]:
+            if not isinstance(hit, dict):
+                continue
+            row = {
+                **hit,
+                "type": hit.get("type") or hit.get("mediaType") or default_type,
+            }
+            item = _normalize_media_item(row, source=source)
+            if item:
+                out.append(item)
+        return out
+    return []
+
+
+def _merge_media_stack(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    active_id: str | None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Merge new cards into the stack; newest active title leads."""
+    by_id: dict[str, dict[str, Any]] = {}
+
+    def _absorb(row: dict[str, Any]) -> str | None:
+        item_id = str(row.get("id") or "")
+        if not item_id:
+            return None
+        prev = by_id.get(item_id)
+        if prev is None:
+            by_id[item_id] = dict(row)
+            return item_id
+        merged = {**prev, **{k: v for k, v in row.items() if v is not None and v != ""}}
+        if prev.get("summary") and not row.get("summary"):
+            merged["summary"] = prev["summary"]
+        if not row.get("skeleton"):
+            merged["skeleton"] = False
+        elif not prev.get("skeleton"):
+            merged["skeleton"] = False
+        by_id[item_id] = merged
+        return item_id
+
+    for row in existing:
+        if isinstance(row, dict):
+            _absorb(row)
+    incoming_ids: list[str] = []
+    for row in incoming:
+        item_id = _absorb(row)
+        if item_id:
+            incoming_ids.append(item_id)
+
+    if not by_id:
+        return [], ""
+
+    chosen = active_id if active_id and active_id in by_id else ""
+    if not chosen and incoming_ids:
+        chosen = incoming_ids[0]
+    if not chosen:
+        chosen = next(iter(by_id))
+
+    ordered_ids: list[str] = []
+    seen: set[str] = set()
+
+    def _push(item_id: str | None) -> None:
+        if not item_id or item_id not in by_id or item_id in seen:
+            return
+        ordered_ids.append(item_id)
+        seen.add(item_id)
+
+    _push(chosen)
+    for item_id in incoming_ids:
+        _push(item_id)
+    for row in existing:
+        if isinstance(row, dict):
+            _push(str(row.get("id") or ""))
+
+    ordered_ids = ordered_ids[:_MEDIA_STACK_CAP]
+    return [by_id[item_id] for item_id in ordered_ids], chosen
+
+
+def _media_panel_copy(active: dict[str, Any], items: list[dict[str, Any]], *, mode: Any = None) -> tuple[str, str, str]:
+    title = str(active.get("title") or "Untitled")
+    year = active.get("year")
+    media_type = str(active.get("type") or "movie")
+    bits = [media_type]
+    if year:
+        bits.append(str(year))
+    if active.get("show"):
+        bits.append(str(active["show"]))
+    body = " · ".join(bits)
+    detail_parts: list[str] = []
+    summary = (active.get("summary") or "").strip()
+    if summary:
+        detail_parts.append(summary[:220] + ("…" if len(summary) > 220 else ""))
+    if active.get("player") and active.get("state"):
+        detail_parts.append(f"{active['player']} · {active['state']}")
+    elif active.get("player"):
+        detail_parts.append(str(active["player"]))
+    if active.get("skeleton"):
+        detail_parts.append("looking up")
+    if mode == "mock":
+        detail_parts.append("mock")
+    if len(items) > 1:
+        detail_parts.append(f"{len(items)} on screen")
+    return title, body, " · ".join(detail_parts)
 
 
 def _media_widget(result: dict[str, Any]) -> Widget | None:
     name = str(result.get("name") or "media")
     data = result.get("data") or {}
     ok = bool(result.get("ok")) and data.get("ok") is not False
-    item = _pick_media_item(name, data)
-    if item is None:
+    incoming = _media_items_from_tool(name, data)
+    if not incoming:
         # Empty search / nothing playing — no overlay (voice/transcript still answers).
         return None
     if result.get("needs_confirm"):
-        item["pending"] = True
-    title = str(item.get("title") or "Untitled")
-    year = item.get("year")
-    media_type = str(item.get("type") or "movie")
+        incoming[0]["pending"] = True
+
+    existing_widget = runtime.get_widget("media")
+    existing_items: list[dict[str, Any]] = []
+    if existing_widget is not None and existing_widget.kind == "media":
+        raw_items = (existing_widget.data or {}).get("items")
+        if isinstance(raw_items, list) and raw_items:
+            existing_items = [row for row in raw_items if isinstance(row, dict)]
+        else:
+            prev = (existing_widget.data or {}).get("item")
+            if isinstance(prev, dict):
+                existing_items = [prev]
+
+    # Query / first hit becomes the spoken focus for this tool round-trip.
+    preferred = str(incoming[0].get("id") or "")
+    items, active_id = _merge_media_stack(existing_items, incoming, active_id=preferred)
+    active = next((row for row in items if str(row.get("id") or "") == active_id), items[0])
+    title, body, detail = _media_panel_copy(active, items, mode=data.get("mode"))
+
     if not ok:
         return runtime.upsert_widget(
             Widget(
@@ -360,28 +510,14 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
                 status="error",
                 body=str(data.get("error") or "Could not load media."),
                 detail="",
-                data={"tool": name, "item": item, **{k: v for k, v in data.items() if k != "results"}},
+                data={
+                    "tool": name,
+                    "item": active,
+                    "items": items,
+                    "active_id": active_id,
+                },
             )
         )
-    bits = [media_type]
-    if year:
-        bits.append(str(year))
-    if item.get("show"):
-        bits.append(str(item["show"]))
-    body = " · ".join(bits)
-    detail_parts = []
-    summary = (item.get("summary") or "").strip()
-    if summary:
-        detail_parts.append(summary[:220] + ("…" if len(summary) > 220 else ""))
-    if item.get("player") and item.get("state"):
-        detail_parts.append(f"{item['player']} · {item['state']}")
-    elif item.get("player"):
-        detail_parts.append(str(item["player"]))
-    if data.get("mode") == "mock":
-        detail_parts.append("mock")
-    n = item.get("result_count")
-    if isinstance(n, int) and n > 1:
-        detail_parts.append(f"{n} matches")
     return runtime.upsert_widget(
         Widget(
             id="media",
@@ -389,8 +525,13 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
             title=title,
             status="done",
             body=body,
-            detail=" · ".join(detail_parts),
-            data={"tool": name, "item": item},
+            detail=detail,
+            data={
+                "tool": name,
+                "item": active,
+                "items": items,
+                "active_id": active_id,
+            },
             # Soft-hide keeps this in memory for reappear; hard X still deletes.
             sticky=False,
         )
