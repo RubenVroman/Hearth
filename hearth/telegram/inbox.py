@@ -13,11 +13,15 @@ from hearth.telegram.intent import (
     MAX_BATCH,
     MAX_CANDIDATES,
     IntentDecision,
+    clarify_wants_numbered_list,
     instant_pick_decision,
     interpret_intent,
     is_explicit_title_year,
     looks_like_chatter,
     looks_like_concrete_title,
+    search_title_grounded,
+    subject_matches_user_title,
+    titles_match,
 )
 from hearth.telegram.memory import ChatMemory
 from hearth.telegram.parse import (
@@ -178,18 +182,81 @@ class TelegramInbox:
         return titles
 
     def _is_instant_catalog(self, parsed: ParsedRequest, view: MessageView) -> bool:
-        """No-doubt grabs: catalog id/URL, Title (YYYY), or show + season marker."""
+        """No-doubt grabs: catalog id/URL or explicit ``Title (YYYY)`` only.
+
+        Bare titles, season asks, and plot clues always go through gpt-4o with
+        catalog candidates in-loop. Live numbered picks are handled separately.
+        """
         if parsed.kind != "request":
             return False
         if parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id:
             return True
         if parsed.year and parsed.title and is_explicit_title_year(view.text):
             return True
-        # "Show S02E03" / "Show season 2" — concrete catalog ask, no model needed.
-        if parsed.title and parsed.season is not None:
-            return True
         return False
 
+    async def _catalog_candidates_for_message(
+        self,
+        view: MessageView,
+        parsed: ParsedRequest,
+        *,
+        rejected_titles: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Overseerr hits for this turn — only for concrete title-like asks.
+
+        Actor clauses are stripped from the query; the model still sees the
+        full user text (actor clues). Plot/reject sentences skip pre-search
+        so Dutch plots never become Overseerr queries.
+        """
+        raw = (view.text or "").strip()
+        if not looks_like_concrete_title(raw):
+            return []
+        seed = ""
+        if parsed.kind == "request" and parsed.title:
+            seed = catalog_search_title(parsed.title) or parsed.title
+        if not seed:
+            seed = catalog_search_title(raw) or raw
+        if not seed:
+            return []
+        try:
+            hits = await resolve_title(
+                seed,
+                year=parsed.year if parsed.kind == "request" else None,
+                media_kind=(
+                    parsed.media_kind
+                    if parsed.kind == "request" and parsed.media_kind in {"movie", "tv"}
+                    else ""
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("catalog-in-loop search failed: %s", redact(str(exc)))
+            return []
+        rows = self._dedupe_choices([h.as_dict() for h in hits])
+        seed_norm = normalize_title(seed)
+        grounded = [
+            row
+            for row in rows
+            if titles_match(str(row.get("title") or ""), seed)
+            or seed_norm in normalize_title(str(row.get("title") or ""))
+            or normalize_title(str(row.get("title") or "")) in seed_norm
+        ]
+        rows = (grounded or rows)[:MAX_CANDIDATES]
+        rejected_norm = {
+            normalize_title(t) for t in (rejected_titles or []) if str(t).strip()
+        }
+        if rejected_norm:
+            rows = [
+                row
+                for row in rows
+                if normalize_title(str(row.get("title") or "")) not in rejected_norm
+                and not any(
+                    normalize_title(str(row.get("title") or "")) in r
+                    or r in normalize_title(str(row.get("title") or ""))
+                    for r in rejected_norm
+                    if r
+                )
+            ]
+        return rows
     def _dedupe_choices(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Collapse indistinguishable options (same title+year+kind+id).
 
@@ -440,91 +507,16 @@ class TelegramInbox:
                 user_text=view.text,
             )
 
-        # Near-exact plain title: try TMDB first. Single unique hit → grab;
-        # distinct years/types → real disambiguation; miss → conversation hop.
-        # Skip plot sentences — those always go through the model.
-        if (
-            parsed.kind == "request"
-            and parsed.title
-            and not pending
-            and parsed.reason in {"plain_title", "trakt_movie_url", "trakt_show_url", "justwatch_url"}
-            and looks_like_concrete_title(view.text)
-        ):
-            clean_title = catalog_search_title(parsed.title) or parsed.title
-            title_hits = await resolve_title(
-                clean_title,
-                year=parsed.year,
-                media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
-            )
-            rows = self._dedupe_choices([h.as_dict() for h in title_hits])
-            if len(rows) == 1 or (rows and self._choices_are_indistinguishable(rows)):
-                if not self.rate.allow():
-                    return InboxResult(handled=True, reply=format_rate_limited())
-                if self.deduper.seen_title(view.chat_id, parsed.dedup_key()):
-                    return InboxResult(handled=True, reply="")
-                self.pending.pop(view.chat_id, None)
-                pick = rows[0]
-                resolved = ParsedRequest(
-                    kind="request",
-                    media_kind=(
-                        "tv"
-                        if str(pick.get("mediaType") or "") == "tv"
-                        else "movie"
-                    ),
-                    title=str(pick.get("title") or parsed.title),
-                    year=int(pick["year"]) if pick.get("year") not in (None, "") else None,
-                    tmdb_id=int(pick["tmdbId"]) if pick.get("tmdbId") not in (None, "") else None,
-                    tvdb_id=int(pick["tvdbId"]) if pick.get("tvdbId") not in (None, "") else None,
-                    reason="title_catalog_resolve",
-                    raw_text=parsed.raw_text,
-                )
-                result = await self._grab(view, resolved, exact=True)
-                self.memory.set_subject(
-                    view.chat_id,
-                    result.title or resolved.title,
-                    media_kind=resolved.media_kind,
-                    clear_rejected=True,
-                )
-                return self._finish(
-                    view,
-                    result,
-                    search_title=result.title or resolved.title,
-                    media_kind=resolved.media_kind,
-                    record_user=True,
-                    user_text=view.text,
-                )
-            if len(rows) > 1:
-                if not self.rate.allow():
-                    return InboxResult(handled=True, reply=format_rate_limited())
-                reply = format_ambiguous(parsed.title, rows)
-                kind = rows[0].get("mediaType") or "movie"
-                self._remember_pending(
-                    view,
-                    options=rows,
-                    media_kind=str(kind) if str(kind) in {"movie", "tv"} else "movie",
-                    query=parsed.title,
-                    reply=reply,
-                )
-                return self._finish(
-                    view,
-                    InboxResult(handled=True, reply=reply),
-                    search_title=parsed.title,
-                    media_kind=str(kind) if str(kind) in {"movie", "tv"} else "",
-                    offered=rows,
-                    record_user=True,
-                    user_text=view.text,
-                )
-
         # Magnets/greetings/empty already classified — ignore without a model hop
         # only when there is truly nothing conversational to resolve.
         if parsed.kind == "ignore" and not history and not pending:
             return InboxResult(handled=True, reply="")
 
-        # Everything else: AI conversation with ~8-turn memory.
-        # Non-instant reply while a 1–2 list is pending → pivot: remember those
-        # titles as rejected, clear the sticky list, call the model without
-        # forcing pick-from-candidates.
-        candidates_for_model: list[dict[str, Any]] | None = None
+        # Everything else: gpt-4o with Overseerr candidates on the SAME turn.
+        # Non-instant reply while a 1–N list is pending → pivot: remember those
+        # titles as rejected, clear the sticky list, then refill candidates from
+        # a fresh catalog search for the new user text.
+        catalog_hits: list[dict[str, Any]] = []
         pending_query = (pending.query if pending else subject_title) or ""
         last_bot = (
             pending.last_bot_reply
@@ -547,12 +539,40 @@ class TelegramInbox:
             pending = None
             pending_query = ""
             subject_title, subject_media_kind = "", ""
-            candidates_for_model = None
             memory_offered = []
             pivoted_off_list = True
+
+        # New/repeated title ask that does not match sticky subject → clear it
+        # so Da Vinci never leaks into a Christophers turn.
+        if (
+            subject_title
+            and looks_like_concrete_title(view.text)
+            and not subject_matches_user_title(subject_title, view.text)
+        ):
+            self.memory.remember_rejected(
+                view.chat_id,
+                [],
+                clear_offered=False,
+                clear_subject=True,
+            )
+            subject_title, subject_media_kind = "", ""
+            pending_query = ""
+
+        # Catalog-in-the-loop: search Overseerr (actor clause stripped) and pass
+        # real hits to the model as candidates this turn.
+        if not looks_like_chatter(view.text):
+            catalog_hits = await self._catalog_candidates_for_message(
+                view, parsed, rejected_titles=rejected
+            )
+
+        # Prefer fresh catalog hits; fall back to last offered list only when
+        # we did not just reject/pivot and catalog returned nothing.
+        if catalog_hits:
+            candidates_for_model: list[dict[str, Any]] | None = catalog_hits
+        elif not pivoted_off_list and memory_offered:
+            candidates_for_model = memory_offered
         else:
-            # Last offered set is context for picks — not after a reject pivot.
-            candidates_for_model = memory_offered or None
+            candidates_for_model = None
 
         intent = await interpret_intent(
             view.text,
@@ -567,35 +587,46 @@ class TelegramInbox:
         )
 
         # Soft-revive offered rows only when the model explicitly picks indices
-        # and we did not just reject the on-screen list.
+        # and we did not just reject the on-screen list — prefer this turn's
+        # catalog hits so picks map to real Overseerr rows.
         active_pending = pending
+        pick_rows = candidates_for_model or memory_offered
         if (
-            not pivoted_off_list
-            and active_pending is None
+            active_pending is None
             and intent.action in {"pick", "pick_many"}
             and intent.indices
-            and (candidates_for_model or memory_offered)
+            and pick_rows
         ):
-            rows = candidates_for_model or memory_offered
             active_pending = PendingDisambiguation(
                 chat_id=view.chat_id,
-                options=rows[:MAX_CANDIDATES],
-                media_kind=subject_media_kind or "movie",
-                query=subject_title or "",
+                options=pick_rows[:MAX_CANDIDATES],
+                media_kind=subject_media_kind
+                or str(pick_rows[0].get("mediaType") or "movie"),
+                query=subject_title
+                or (catalog_search_title(view.text) or view.text)[:120],
                 created_message_id=view.message_id,
                 last_bot_reply=last_bot,
             )
             self.pending[view.chat_id] = active_pending
 
         handled = await self._apply_intent(
-            view, parsed, intent, pending=active_pending
+            view,
+            parsed,
+            intent,
+            pending=active_pending,
+            catalog_hits=catalog_hits,
         )
         if handled is not None:
+            # Never re-stick an unrelated leftover subject on clarify/ignore.
+            finish_title = intent.search_title if intent.action == "search" else ""
+            if intent.action in {"pick", "pick_many"} and active_pending:
+                finish_title = active_pending.query or subject_title
             return self._finish(
                 view,
                 handled,
-                search_title=intent.search_title or subject_title,
+                search_title=finish_title,
                 media_kind=intent.media_kind or subject_media_kind,
+                offered=catalog_hits or None,
                 record_user=True,
                 user_text=view.text,
             )
@@ -630,14 +661,46 @@ class TelegramInbox:
         intent: IntentDecision,
         *,
         pending: PendingDisambiguation | None,
+        catalog_hits: list[dict[str, Any]] | None = None,
     ) -> InboxResult | None:
+        hits = list(catalog_hits or [])
         if intent.action == "ignore":
             return InboxResult(handled=True, reply="")
         if intent.action == "clarify":
+            # Unique close catalog hit → request that tmdb id (never list-less 1–N).
+            if hits and (
+                len(hits) == 1 or self._choices_are_indistinguishable(hits)
+            ):
+                if (
+                    clarify_wants_numbered_list(intent.clarify_question)
+                    or looks_like_concrete_title(view.text)
+                ):
+                    return await self._grab_catalog_row(view, hits[0], query=view.text)
+            # Multiple hits (or list-wording clarify with hits) → always name them.
+            if hits and (
+                len(hits) > 1
+                or clarify_wants_numbered_list(intent.clarify_question)
+            ):
+                query = (
+                    catalog_search_title(parsed.title or view.text)
+                    or parsed.title
+                    or view.text
+                    or "that"
+                )
+                reply = format_ambiguous(query, hits)
+                kind = str(hits[0].get("mediaType") or "movie")
+                self._remember_pending(
+                    view,
+                    options=hits,
+                    media_kind=kind if kind in {"movie", "tv"} else "movie",
+                    query=str(query)[:200],
+                    reply=reply,
+                )
+                return InboxResult(handled=True, reply=reply)
             question = intent.clarify_question or (
                 "Which movie or series did you mean? Send the title if you know it."
             )
-            # Never re-stick a rejected 1–2 list after a clarify pivot.
+            # Never re-stick a rejected 1–N list after a clarify pivot.
             if pending is None:
                 self.pending.pop(view.chat_id, None)
             return InboxResult(handled=True, reply=question)
@@ -646,6 +709,27 @@ class TelegramInbox:
         if intent.action == "pick_many" and pending and intent.indices:
             return await self._handle_indices(view, pending, intent.indices)
         if intent.action == "search" and intent.search_title:
+            # Extra guard: invented titles must not become the Overseerr query.
+            if hits and not search_title_grounded(
+                intent.search_title,
+                user_message=view.text,
+                candidates=hits,
+            ):
+                if len(hits) == 1 or self._choices_are_indistinguishable(hits):
+                    return await self._grab_catalog_row(
+                        view, hits[0], query=view.text
+                    )
+                query = catalog_search_title(view.text) or view.text
+                reply = format_ambiguous(query, hits)
+                kind = str(hits[0].get("mediaType") or "movie")
+                self._remember_pending(
+                    view,
+                    options=hits,
+                    media_kind=kind if kind in {"movie", "tv"} else "movie",
+                    query=str(query)[:200],
+                    reply=reply,
+                )
+                return InboxResult(handled=True, reply=reply)
             if not self.rate.allow():
                 return InboxResult(handled=True, reply=format_rate_limited())
             media_kind = (
@@ -653,6 +737,27 @@ class TelegramInbox:
                 if intent.media_kind in {"movie", "tv"}
                 else (parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "unknown")
             )
+            # Prefer an exact candidate match (tmdb id) when the model names one
+            # and the hit is unique — multiple years/types still need a list.
+            matched = next(
+                (
+                    row
+                    for row in hits
+                    if titles_match(str(row.get("title") or ""), intent.search_title)
+                ),
+                None,
+            )
+            if (
+                matched is not None
+                and not intent.select_all
+                and (len(hits) == 1 or self._choices_are_indistinguishable(hits))
+            ):
+                return await self._grab_catalog_row(
+                    view,
+                    matched,
+                    query=intent.search_title,
+                    media_kind_hint=media_kind,
+                )
             # Actor/cast clauses are clues for the model — strip from Overseerr query.
             search_title = catalog_search_title(intent.search_title) or intent.search_title
             self.memory.set_subject(
@@ -676,6 +781,45 @@ class TelegramInbox:
             )
         return None
 
+    async def _grab_catalog_row(
+        self,
+        view: MessageView,
+        row: dict[str, Any],
+        *,
+        query: str = "",
+        media_kind_hint: str = "",
+    ) -> InboxResult:
+        """Queue a known Overseerr/TMDB row by id — no fuzzy title re-search."""
+        if not self.rate.allow():
+            return InboxResult(handled=True, reply=format_rate_limited())
+        kind = str(
+            media_kind_hint
+            or row.get("mediaType")
+            or ("tv" if row.get("tvdbId") else "movie")
+        )
+        if kind not in {"movie", "tv"}:
+            kind = "movie"
+        title = str(row.get("title") or query or "Untitled")
+        year = int(row["year"]) if row.get("year") not in (None, "") else None
+        tmdb = row.get("tmdbId") or row.get("mediaId")
+        tvdb = row.get("tvdbId")
+        resolved = ParsedRequest(
+            kind="request",
+            media_kind=kind,  # type: ignore[arg-type]
+            title=title,
+            year=year,
+            tmdb_id=int(tmdb) if tmdb not in (None, "") else None,
+            tvdb_id=int(tvdb) if tvdb not in (None, "") else None,
+            reason="catalog_in_loop",
+        )
+        self.pending.pop(view.chat_id, None)
+        self.memory.set_subject(
+            view.chat_id,
+            title,
+            media_kind=kind,
+            clear_rejected=True,
+        )
+        return await self._grab(view, resolved, exact=True)
     async def _handle_pick(self, view: MessageView, parsed: ParsedRequest) -> InboxResult:
         pending = self._pending_for(view.chat_id)
         if not pending or parsed.pick_index is None:

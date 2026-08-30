@@ -243,7 +243,17 @@ async def test_inbox_queues_tmdb_link(inbox: TelegramInbox):
 
 
 @pytest.mark.asyncio
-async def test_inbox_queues_show(inbox: TelegramInbox):
+async def test_inbox_queues_show(inbox: TelegramInbox, monkeypatch):
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Slow Horses",
+            "media_kind": "tv",
+            "year": 2022,
+            "confidence": 0.95,
+        },
+    )
     result = await inbox.handle_message(_msg("Slow Horses season 2", message_id=13))
     assert result.grabbed is True
     assert "Overseerr" in result.reply
@@ -1652,10 +1662,16 @@ async def test_inbox_annihilation_year_goes_through_tmdb_resolve(
 async def test_inbox_daniel_sloss_near_exact_queues_without_dup_12(
     inbox: TelegramInbox, monkeypatch
 ):
-    """Near-exact special title → one grab; never a fake 1–2 of identical 2025 rows."""
+    """Near-exact special title → gpt-4o + catalog candidates → one grab."""
     calls = _patch_openai_intent(
         monkeypatch,
-        {"action": "clarify", "clarify_question": "Which movie or series did you mean?"},
+        {
+            "action": "search",
+            "search_title": "Daniel Sloss: Can't",
+            "media_kind": "movie",
+            "year": 2025,
+            "confidence": 0.95,
+        },
     )
     result = await inbox.handle_message(_msg("Daniel sloss can't", message_id=420))
     assert result.grabbed is True
@@ -1664,7 +1680,10 @@ async def test_inbox_daniel_sloss_near_exact_queues_without_dup_12(
     assert "Which one" not in result.reply
     assert "1." not in result.reply
     assert "2." not in result.reply
-    assert calls == []  # catalog resolve — no model / no fake clarify
+    assert calls, "bare title must call gpt-4o with catalog candidates"
+    payload = calls[0]["messages"][1]["content"]
+    assert "candidates" in payload
+    assert "Daniel Sloss" in payload or "Sloss" in payload
 
     # Colon form with Overseerr duplicate rows must also collapse + grab.
     inbox.deduper.reset()
@@ -1823,10 +1842,16 @@ async def test_inbox_reggie_dinkins_without_actor_still_tv(
 
     monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
 
-    # Concrete short title — catalog-first, no model.
+    # Bare TV title — gpt-4o with catalog candidates (no catalog-first skip).
     calls = _patch_openai_intent(
         monkeypatch,
-        {"action": "clarify", "clarify_question": "Which movie?"},
+        {
+            "action": "search",
+            "search_title": "The Fall and Rise of Reggie Dinkins",
+            "year": 2026,
+            "media_kind": "tv",
+            "confidence": 0.95,
+        },
     )
     result = await inbox.handle_message(
         _msg("The Fall and Rise of Reggie Dinkins", message_id=501)
@@ -1837,7 +1862,7 @@ async def test_inbox_reggie_dinkins_without_actor_still_tv(
     assert overseerr_requests
     assert overseerr_requests[0]["media_type"] == "tv"
     assert overseerr_requests[0]["media_id"] == 291334
-    assert calls == [] or result.grabbed  # concrete title may skip model
+    assert calls, "bare title must call gpt-4o"
 
 
 @pytest.mark.asyncio
@@ -1857,6 +1882,16 @@ async def test_inbox_friends_s1_still_queues_overseerr_tv(
 
     monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
 
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Friends",
+            "media_kind": "tv",
+            "year": 1994,
+            "confidence": 0.95,
+        },
+    )
     result = await inbox.handle_message(_msg("Friends s1", message_id=502))
     assert result.grabbed is True, result.reply
     assert "Friends" in result.reply
@@ -1864,3 +1899,200 @@ async def test_inbox_friends_s1_still_queues_overseerr_tv(
     assert overseerr_requests
     assert overseerr_requests[0]["media_type"] == "tv"
     assert overseerr_requests[0]["media_id"] == 1668
+
+
+# --- Christophers / invent-title / subject-leak (live Telegram 2026-08-30) ----
+
+
+def test_search_title_grounded_blocks_invented_guest():
+    from hearth.telegram.intent import search_title_grounded
+
+    candidates = [
+        {"title": "The Christophers", "year": 2025, "tmdbId": 1280010, "mediaType": "movie"}
+    ]
+    assert search_title_grounded(
+        "The Christophers",
+        user_message="The christophers with ian mckellan",
+        candidates=candidates,
+    )
+    assert not search_title_grounded(
+        "The Christopher Guest Movies",
+        user_message="The christophers with ian mckellan",
+        candidates=candidates,
+    )
+    assert not search_title_grounded(
+        "The Da Vinci Code (2006)",
+        user_message="The christophers with ian mckellan",
+        candidates=candidates,
+    )
+    # Plot ask with empty candidates may invent.
+    assert search_title_grounded(
+        "Harry Potter",
+        user_message="a movie about a boy with glasses who is a wizard",
+        candidates=[],
+    )
+
+
+def test_clarify_wants_numbered_list_detects_empty_prompt():
+    from hearth.telegram.intent import clarify_wants_numbered_list
+
+    assert clarify_wants_numbered_list(
+        "Which one — reply 1–3, 'all of them', or a clearer title?"
+    )
+    assert not clarify_wants_numbered_list("Which movie did you mean?")
+
+
+@pytest.mark.asyncio
+async def test_inbox_christophers_bare_queues_or_names_list(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Bare 'The christophers' → queue or a 1–N list that NAMES titles."""
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": (
+                "Which one — reply 1–3, 'all of them', or a clearer title?"
+            ),
+            "confidence": 0.7,
+        },
+    )
+    result = await inbox.handle_message(_msg("The christophers", message_id=600))
+    assert calls, "bare title must call gpt-4o"
+    payload = calls[0]["messages"][1]["content"]
+    assert "Christophers" in payload or "christophers" in payload.lower()
+    assert "candidates" in payload
+    if result.grabbed:
+        assert "Christophers" in result.reply
+        assert "Couldn't find" not in result.reply
+        assert "Guest" not in result.reply
+        assert "Da Vinci" not in result.reply
+    else:
+        assert "1." in result.reply
+        assert "Christophers" in result.reply
+        assert "reply 1" in result.reply.lower() or "Reply 1" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_christophers_with_mckellen_queues_never_guest(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Actor clue + invent Guest → still queue The Christophers, never Guest not-found."""
+    from hearth.telegram import inbox as inbox_mod
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Christopher Guest Movies",
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("The christophers with ian mckellan", message_id=601)
+    )
+    assert calls
+    payload = calls[0]["messages"][1]["content"]
+    assert "mckellan" in payload.lower() or "ian" in payload.lower()
+    assert "Christophers" in payload or "christophers" in payload.lower()
+    assert result.grabbed is True, result.reply
+    assert "Christophers" in result.reply
+    assert "2025" in result.reply
+    assert "Guest" not in result.reply
+    assert "Couldn't find" not in result.reply
+    assert overseerr_requests
+    assert overseerr_requests[0]["media_type"] == "movie"
+    assert overseerr_requests[0]["media_id"] == 1280010
+
+
+@pytest.mark.asyncio
+async def test_inbox_christophers_clears_davinci_subject_leak(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Leftover Da Vinci subject must not become the Overseerr query."""
+    inbox.memory.set_subject(-1001, "The Da Vinci Code", media_kind="movie")
+    inbox.memory.record_user(-1001, "nee niet die, leonardo")
+    inbox.memory.record_bot(
+        -1001,
+        "Queued The Da Vinci Code (2006) via Overseerr.",
+        search_title="The Da Vinci Code",
+        media_kind="movie",
+    )
+    subj, _ = inbox.memory.subject(-1001)
+    assert "Da Vinci" in subj
+
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Da Vinci Code (2006)",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("The christophers with ian mckellan", message_id=602)
+    )
+    assert calls
+    # Model payload must not keep Da Vinci as the active subject.
+    payload = calls[0]["messages"][1]["content"]
+    import json as _json
+
+    body = _json.loads(payload)
+    assert body.get("subject_title") in {"", None} or "Christophers" in str(
+        body.get("subject_title")
+    )
+    assert "Da Vinci" not in (body.get("subject_title") or "")
+    assert result.grabbed is True, result.reply
+    assert "Christophers" in result.reply
+    assert "Da Vinci" not in result.reply
+    assert "Couldn't find" not in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_clarify_with_hits_always_lists_titles(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Clarify 1–N without options is impossible when catalog hits exist."""
+    rows = [
+        {"title": "Heat", "year": 1995, "tmdbId": 1, "mediaId": 1, "mediaType": "movie"},
+        {"title": "Heat", "year": 1986, "tmdbId": 2, "mediaId": 2, "mediaType": "movie"},
+        {"title": "Heat", "year": 2023, "tmdbId": 3, "mediaId": 3, "mediaType": "movie"},
+    ]
+
+    async def multi(_query: str):
+        return {"mode": "mock", "service": "overseerr", "results": list(rows)}
+
+    monkeypatch.setattr("hearth.telegram.inbox.overseerr.search", multi)
+    monkeypatch.setattr("hearth.telegram.catalog.overseerr.search", multi)
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": (
+                "Which one — reply 1–3, 'all of them', or a clearer title?"
+            ),
+            "confidence": 0.6,
+        },
+    )
+    result = await inbox.handle_message(_msg("Heat", message_id=610))
+    assert result.grabbed is False
+    assert "1." in result.reply
+    assert "Heat (1995)" in result.reply or "1995" in result.reply
+    assert "1986" in result.reply or "2023" in result.reply
+    # Must not be the list-less prompt alone.
+    assert result.reply.strip() != (
+        "Which one — reply 1–3, 'all of them', or a clearer title?"
+    )
