@@ -18,8 +18,9 @@
   /*
    * iOS Safari / Home Screen PWAs often keep 100svh/100dvh (and sometimes
    * innerHeight) stale across orientationchange until a later resize. The
-   * orb-first fold and absolute header are keyed off --phone-fold so Ask the
-   * House stays in the right place as soon as the layout viewport updates.
+   * orb-first fold is keyed off --phone-fold so the listening sphere stays
+   * a full screen tall (under the fixed Look chrome) as soon as the layout
+   * viewport updates.
    */
   function syncPhoneFold() {
     if (isTyping()) return;

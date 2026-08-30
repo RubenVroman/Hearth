@@ -1,7 +1,8 @@
-"""Glass info overlays — weather / media only (no flickering update guards)."""
+"""Glass info overlays — weather / media / downloads (no flickering update guards)."""
 
 from hearth.agent.loop import route_intent
 from hearth.agent.registry import registry
+from hearth.fixtures import pipeline
 from hearth.runtime import runtime
 
 
@@ -15,12 +16,16 @@ def test_command_center_includes_info_overlay(client):
     assert "renderWidgets" in js.text
     assert "fadeMediaOverlayOnProgress" in js.text
     assert "/api/media/art" in js.text
+    assert "downloadsMarkup" in js.text
+    assert "info-download-bar" in js.text
+
     assert "/api/widgets/" in js.text
     assert "upsertLocalWidget" not in js.text
     assert 'kind: "action"' not in js.text
     css = client.get("/static/styles.css")
     assert ".info-overlay" in css.text
     assert ".info-glass" in css.text
+    assert ".info-download-list" in css.text
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
@@ -113,6 +118,45 @@ def test_now_playing_surfaces_media_overlay(client):
     body = chat.json()
     media = next(w for w in body["widgets"] if w["kind"] == "media")
     assert "Dune" in media["title"]
+
+
+def test_download_progress_surfaces_downloads_overlay(client):
+    chat = client.post("/api/chat", json={"message": "How far along is Annihilation?"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "radarr_queue"
+    downloads = next(w for w in body["widgets"] if w["kind"] == "downloads")
+    assert downloads["status"] == "done"
+    assert "Annihilation" in downloads["title"]
+    rows = downloads["data"]["downloads"]
+    assert len(rows) == 1
+    assert rows[0]["percent"] == 75.0
+    assert rows[0]["status"] == "downloading"
+    assert rows[0].get("sizeleft_label")
+    assert downloads["data"].get("empty") is None
+
+    listed = client.post("/api/chat", json={"message": "What's downloading right now?"})
+    assert listed.status_code == 200
+    panel = next(w for w in listed.json()["widgets"] if w["kind"] == "downloads")
+    assert len(panel["data"]["downloads"]) >= 1
+    assert panel["data"]["service"] == "radarr"
+
+
+def test_download_progress_empty_and_missing_are_calm(client, monkeypatch):
+    miss = client.post("/api/chat", json={"message": "Download progress for NotARealMovieXYZ"})
+    assert miss.status_code == 200
+    missing = next(w for w in miss.json()["widgets"] if w["kind"] == "downloads")
+    assert missing["data"]["empty"] == "missing"
+    assert missing["data"]["downloads"] == []
+    assert "not" in missing["body"].lower() or "not" in missing["detail"].lower()
+
+    monkeypatch.setattr(pipeline, "radarr_downloads", [])
+    idle = client.post("/api/chat", json={"message": "What's downloading right now?"})
+    assert idle.status_code == 200
+    quiet = next(w for w in idle.json()["widgets"] if w["kind"] == "downloads")
+    assert quiet["data"]["empty"] == "idle"
+    assert quiet["data"]["downloads"] == []
+    assert "nothing" in quiet["body"].lower()
 
 
 def test_dismiss_overlay(client):

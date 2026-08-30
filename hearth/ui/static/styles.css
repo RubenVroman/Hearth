@@ -400,7 +400,7 @@ input,
   color: var(--muted);
 }
 
-/* Centered glass info overlay — weather / movie only (no update-guard stack). */
+/* Centered glass info overlay — weather / media / downloads (no update-guard stack). */
 .info-overlay {
   position: fixed;
   inset: 0;
@@ -621,9 +621,127 @@ input,
   font-size: clamp(22px, 3.6vw, 28px);
 }
 
+/* Download queue progress — phone-first glass list. */
+.info-downloads {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.info-downloads .info-title {
+  font-size: clamp(24px, 5.5vw, 32px);
+}
+
+.info-downloads-empty {
+  margin: 10px 0 0;
+  font-size: clamp(16px, 4.2vw, 18px);
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.info-downloads.is-empty .info-title {
+  color: var(--ink);
+}
+
+.info-download-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.info-download-row {
+  min-width: 0;
+  padding: 12px 0 0;
+  border-top: 1px solid var(--line);
+}
+
+.info-download-list .info-download-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.info-download-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.info-download-title {
+  margin: 0;
+  min-width: 0;
+  font-size: clamp(16px, 4.2vw, 18px);
+  font-weight: 500;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.info-download-pct {
+  margin: 0;
+  flex: 0 0 auto;
+  font-family: var(--font-display);
+  font-size: clamp(22px, 5vw, 28px);
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: var(--ember-2);
+}
+
+.info-download-bar {
+  margin-top: 10px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(244, 234, 216, 0.1);
+  overflow: hidden;
+}
+
+.info-download-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--ember), var(--ember-2));
+  transition: width 320ms ease;
+}
+
+.info-download-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.info-download-status {
+  text-transform: capitalize;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+
+.info-download-row.status-failed .info-download-status,
+.info-download-row.status-stalled .info-download-status {
+  color: var(--error);
+}
+
+.info-download-row.status-completed .info-download-status,
+.info-download-row.status-importing .info-download-status {
+  color: var(--live);
+}
+
+.info-download-row.status-paused .info-download-pct,
+.info-download-row.status-queued .info-download-pct {
+  color: var(--muted);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .info-overlay,
   .info-glass {
+    transition: none;
+  }
+
+  .info-download-bar span {
     transition: none;
   }
 }
@@ -841,9 +959,11 @@ input,
 
 #memory-block.is-empty {
   display: none;
+}
 
 .transcript li[data-role="you"] .who {
-  color: var(--ember-2);}
+  color: var(--ember-2);
+}
 
 @keyframes pulse {
   0%,
@@ -956,12 +1076,12 @@ input,
   }
 
   /*
-   * First phone screen is the listening sphere alone. Brand / Look / Log out
-   * sit at the start of the second screen (scroll down), not over the orb.
+   * First phone screen: orb centered under a fixed chrome bar so Look / Log out
+   * stay reachable without scrolling. Composer and widgets follow in normal flow.
    */
   .top {
-    position: absolute;
-    top: var(--phone-fold);
+    position: fixed;
+    top: 0;
     left: 0;
     right: 0;
     z-index: 40;
@@ -970,7 +1090,14 @@ input,
     gap: 8px;
     align-items: center;
     padding: calc(8px + var(--safe-top)) max(16px, var(--safe-right)) 8px max(16px, var(--safe-left));
-    background: linear-gradient(180deg, var(--bg) 70%, transparent);
+    background: linear-gradient(180deg, var(--bg) 78%, transparent);
+    pointer-events: none;
+  }
+
+  .top .brand,
+  .top .pills,
+  .top .pill-btn {
+    pointer-events: auto;
   }
 
   .mark {
@@ -1025,7 +1152,8 @@ input,
 
   .hearth {
     order: 1;
-    flex: 0 0 auto;    width: 100%;
+    flex: 0 0 auto;
+    width: 100%;
     min-width: 0;
     min-height: 0;
     height: auto;
@@ -1038,7 +1166,7 @@ input,
     gap: 12px;
   }
 
-  /* Full first viewport: sphere only, centered. Scroll for the rest. */
+  /* Full first viewport: sphere centered below the fixed Look chrome. */
   .hearth-hero {
     display: flex;
     flex-direction: column;
@@ -1050,16 +1178,13 @@ input,
     margin-left: calc(-1 * max(16px, var(--safe-left)));
     margin-right: calc(-1 * max(16px, var(--safe-right)));
     min-height: var(--phone-fold);
-    padding: var(--safe-top) 0 var(--safe-bottom);
+    padding: calc(52px + var(--safe-top)) 0 calc(16px + var(--safe-bottom));
     box-sizing: border-box;
   }
 
-  /* Reserve room under the fold for the absolute .top bar at --phone-fold. */
+  /* Spacer retired — Look chrome is fixed on the first screen, not below the fold. */
   .phone-rest-anchor {
-    display: block;
-    flex-shrink: 0;
-    width: 100%;
-    height: calc(44px + var(--safe-top));
+    display: none;
   }
 
   .orb {
@@ -1212,6 +1337,14 @@ input,
     width: 88px;
   }
 
+  .info-download-pct {
+    font-size: clamp(20px, 6vw, 26px);
+  }
+
+  .info-download-bar {
+    height: 10px;
+  }
+
   .info-dismiss {
     min-width: 44px;
     min-height: 44px;
@@ -1310,7 +1443,8 @@ input,
 
   .transcript-toggle {
     min-height: 36px;
-    padding: 8px 2px;  }
+    padding: 8px 2px;
+  }
 
   body.login {
     min-height: 100dvh;
@@ -1970,6 +2104,15 @@ html[data-look="jarvis"] .kicker {
 html[data-look="jarvis"] .progress span {
   background: linear-gradient(90deg, transparent, var(--ember), var(--ember-2));
   box-shadow: 0 0 8px var(--ember);
+}
+
+html[data-look="jarvis"] .info-download-bar span {
+  box-shadow: 0 0 10px rgba(125, 211, 252, 0.35);
+}
+
+html[data-look="jarvis"] .info-glass,
+html[data-look="forge"] .info-glass {
+  border-color: rgba(244, 234, 216, 0.14);
 }
 
 html[data-look="jarvis"] .settings-choice.is-on,
