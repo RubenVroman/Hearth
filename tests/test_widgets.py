@@ -26,6 +26,7 @@ def test_command_center_includes_info_overlay(client):
     assert "softHideInfoOverlay" in js.text
     assert "noteOverlayConversation" in js.text
     assert "focusMediaFromText" in js.text
+    assert "cycleMedia" in js.text
     assert "info-media-stack" in js.text
     assert "is-soft-hidden" in js.text
     assert "renderWidgets" in js.text
@@ -48,7 +49,7 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v15" in sw.text
+    assert "hearth-shell-v16" in sw.text
     assert "info-infuse-btn" in js.text
     assert "playActiveInInfuse" in js.text
     assert "focusMediaById" in js.text
@@ -213,6 +214,17 @@ def test_animation_genre_browse_surfaces_media_stack(client):
     titles = {row.get("title") for row in items}
     assert "Spirited Away" in titles or "Spirited Away" in media["title"]
     assert "animation" in body["reply"].lower() or "Spirited" in body["reply"]
+    # Ask once → stacked cards with title + year, no confirm gate.
+    assert media["data"].get("presentation") == "stack"
+    assert media["data"].get("genre") == "Animation"
+    assert len(items) >= 2
+    for row in items:
+        assert row.get("title")
+        assert row.get("year") is not None
+    js = client.get("/static/app.js")
+    assert "cycleMedia" in js.text
+    assert "MEDIA_STACK_CAP = 12" in js.text
+    assert "Swipe or tap to flick through" in js.text
 
 
 def test_sci_fi_genre_browse_surfaces_media_stack(client):
@@ -228,15 +240,42 @@ def test_sci_fi_genre_browse_surfaces_media_stack(client):
     assert "Dune: Part Two" in titles or "The Endless" in titles
     assert media["data"]["active_id"]
     assert media["data"]["item"]["id"] == media["data"]["active_id"]
+    assert media["data"].get("presentation") == "stack"
+    assert media["data"].get("genre") == "Science Fiction"
+    assert len(items) >= 2
     # Active card carries Infuse-resolvable identifiers for the UI button.
     active = media["data"]["item"]
     assert active.get("title")
+    assert active.get("year") is not None
     assert active.get("ratingKey") or active.get("tmdbId")
 
     alias = client.post("/api/chat", json={"message": "show me science fiction movies"})
     assert alias.status_code == 200
     assert alias.json()["tools"][0]["name"] == "plex_browse_genre"
     assert alias.json()["tools"][0]["data"]["genre"] == "Science Fiction"
+
+
+def test_drama_genre_browse_replaces_stack_automatically(client):
+    """Genre browse replaces any prior media stack — ask once, see that genre."""
+    first = client.post("/api/chat", json={"message": "what sci-fi movies do we have"})
+    assert first.status_code == 200
+    assert any(w["kind"] == "media" for w in first.json()["widgets"])
+
+    chat = client.post("/api/chat", json={"message": "list drama movies"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "plex_browse_genre"
+    media = next(w for w in body["widgets"] if w["kind"] == "media")
+    assert media["data"].get("genre") == "Drama"
+    items = media["data"].get("items") or []
+    assert items
+    titles = {row.get("title") for row in items}
+    # Sci-fi-only titles from the previous browse must not linger.
+    assert "Dune: Part Two" not in titles
+    assert "The Brutalist" in titles or "Heat" in titles
+    for row in items:
+        assert row.get("title")
+        assert row.get("year") is not None
 
 
 def test_empty_genre_list_does_not_publish_media_overlay(client):

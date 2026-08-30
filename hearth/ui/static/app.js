@@ -53,8 +53,10 @@ const state = {
 const OVERLAY_IRRELEVANT_GRACE_MS = 650;
 /** Client idle soft-hide while still "relevant" but conversation is quiet (ms). */
 const OVERLAY_IDLE_HIDE_MS = 28000;
-/** Max stacked media cards in the glass overlay. */
-const MEDIA_STACK_CAP = 5;
+/** Max stacked media cards in the glass overlay (genre browse + search). */
+const MEDIA_STACK_CAP = 12;
+/** Horizontal swipe distance (px) to flick to the next/prev card. */
+const MEDIA_FLICK_PX = 56;
 
 function micStorageGet(key) {
   try {
@@ -607,7 +609,7 @@ function isAckUtterance(text) {
 }
 
 /**
- * Focus a stacked media card by id (tap / keyboard on recessed cards).
+ * Focus a stacked media card by id (tap / keyboard / flick on recessed cards).
  */
 function focusMediaById(mediaId, { reveal = true } = {}) {
   const visual = pickVisualOverlay(state.widgets);
@@ -626,6 +628,9 @@ function focusMediaById(mediaId, { reveal = true } = {}) {
   data.items = items;
   visual.data = data;
   visual.title = hit.title || visual.title;
+  const year = hit.year;
+  const type = hit.type || "movie";
+  visual.body = [type, year].filter(Boolean).join(" · ");
   if (!visual.context) visual.context = {};
   visual.context.active_id = hit.id;
   visual.context.relevant = true;
@@ -641,6 +646,24 @@ function focusMediaById(mediaId, { reveal = true } = {}) {
     openInfoOverlay(visual);
   }
   return true;
+}
+
+/**
+ * Cycle the stacked media cards (flick / arrow keys). Positive = next.
+ */
+function cycleMedia(delta) {
+  const visual = pickVisualOverlay(state.widgets);
+  if (!visual || visual.kind !== "media") return false;
+  const items = mediaItemsOf(visual);
+  if (items.length < 2) return false;
+  const activeId = String(
+    (visual.context && visual.context.active_id) || (visual.data && visual.data.active_id) || items[0].id || ""
+  );
+  let idx = items.findIndex((row) => String(row.id) === activeId);
+  if (idx < 0) idx = 0;
+  const next = items[(idx + delta + items.length * 8) % items.length];
+  if (!next) return false;
+  return focusMediaById(next.id, { reveal: true });
 }
 
 async function playActiveInInfuse() {
@@ -866,48 +889,57 @@ function mediaPosterFallback(title) {
   )}</div>`;
 }
 
-function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = false } = {}) {
+function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = false, genre = "" } = {}) {
   const title = item.title || "Untitled";
   const year = item.year;
   const type = item.type || "movie";
   const summary = item.summary || "";
-  const meta = [type, year, item.show, item.contentRating]
+  const meta = [year, type !== "movie" ? type : "", item.show, item.contentRating]
     .filter(Boolean)
     .map((v) => escapeHtml(v))
     .join(" · ");
   const art = mediaArtUrl({ ...item, title });
   // /api/media/art returns real JPEG or SVG initials when the session cookie authorizes the GET.
   const poster = art
-    ? `<img class="info-poster" src="${escapeHtml(art)}" alt="" width="108" height="162" loading="${
+    ? `<img class="info-poster" src="${escapeHtml(art)}" alt="" width="120" height="180" loading="${
         active ? "eager" : "lazy"
       }" />`
     : mediaPosterFallback(title);
   const bits = [];
-  if (item.skeleton && !summary) {
-    bits.push(`<p class="info-detail info-media-skeleton-line">Looking this up…</p>`);
-  } else if (summary) {
-    bits.push(`<p class="info-detail">${escapeHtml(summary)}</p>`);
-  }
-  if (item.player) {
-    bits.push(
-      `<p class="info-detail">${escapeHtml(item.player)}${
-        item.state ? ` · ${escapeHtml(item.state)}` : ""
-      }</p>`
-    );
-  }
-  if (item.rating != null) {
-    bits.push(`<p class="info-detail">Rating ${escapeHtml(item.rating)}</p>`);
-  }
-  const playable = !item.skeleton && (item.title || item.tmdbId || item.ratingKey);
-  if (active && playable) {
-    bits.push(
-      `<div class="info-media-actions">
+  if (active) {
+    if (item.skeleton && !summary) {
+      bits.push(`<p class="info-detail info-media-skeleton-line">Looking this up…</p>`);
+    } else if (summary) {
+      bits.push(`<p class="info-detail">${escapeHtml(summary)}</p>`);
+    }
+    if (item.player) {
+      bits.push(
+        `<p class="info-detail">${escapeHtml(item.player)}${
+          item.state ? ` · ${escapeHtml(item.state)}` : ""
+        }</p>`
+      );
+    }
+    if (item.rating != null) {
+      bits.push(`<p class="info-detail">Rating ${escapeHtml(item.rating)}</p>`);
+    }
+    const playable = !item.skeleton && (item.title || item.tmdbId || item.ratingKey);
+    if (playable) {
+      bits.push(
+        `<div class="info-media-actions">
         <button type="button" class="info-infuse-btn" data-infuse-play="1">
           Open in Infuse
         </button>
       </div>`
-    );
+      );
+    }
   }
+  const kicker = item.skeleton
+    ? "Mentioned"
+    : item.pending
+      ? "Ready to play"
+      : genre
+        ? escapeHtml(genre)
+        : "Library";
   const classes = [
     "info-media-card",
     active ? "is-active" : "is-recessed",
@@ -928,9 +960,7 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
       <div class="info-media">
         ${poster}
         <div class="info-media-copy">
-          <p class="info-kicker">${
-            item.skeleton ? "Mentioned" : item.pending ? "Ready to play" : "Library"
-          }</p>
+          <p class="info-kicker">${kicker}</p>
           <h2 class="info-title"${labelled ? ' id="info-title"' : ""}>${escapeHtml(title)}</h2>
           ${meta ? `<p class="info-meta">${meta}</p>` : ""}
           ${bits.join("")}
@@ -940,13 +970,40 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
   `;
 }
 
+function mediaStackCounter(items, activeId, total) {
+  if (!items || items.length < 2) return "";
+  let idx = items.findIndex((row) => String(row.id) === String(activeId || ""));
+  if (idx < 0) idx = 0;
+  const shown = items.length;
+  const totalN = total != null && Number(total) > shown ? Number(total) : shown;
+  const label =
+    totalN > shown ? `${idx + 1} / ${shown} · ${totalN} in library` : `${idx + 1} / ${shown}`;
+  const dots = items
+    .slice(0, Math.min(shown, 12))
+    .map(
+      (_, i) =>
+        `<span class="info-media-dot${i === idx ? " is-on" : ""}" aria-hidden="true"></span>`
+    )
+    .join("");
+  return `<div class="info-media-rail" aria-label="${escapeHtml(label)}">
+    <p class="info-media-count">${escapeHtml(label)}</p>
+    <div class="info-media-dots">${dots}</div>
+    <p class="info-media-hint">Swipe or tap to flick through</p>
+  </div>`;
+}
+
 function mediaMarkup(widget) {
   const items = mediaItemsOf(widget);
+  const data = widget.data || {};
+  const genre = data.genre || "";
+  const total = data.total;
+  const activeId =
+    (widget.context && widget.context.active_id) || data.active_id || (items[0] && items[0].id) || "";
   if (!items.length) {
-    const item = (widget.data && widget.data.item) || {};
+    const item = data.item || {};
     return mediaCardMarkup(
       { ...item, id: mediaItemKey(item), title: widget.title || item.title || "Untitled" },
-      { active: true, stackIndex: 0, labelled: true }
+      { active: true, stackIndex: 0, labelled: true, genre }
     );
   }
   if (items.length === 1) {
@@ -954,18 +1011,24 @@ function mediaMarkup(widget) {
       active: true,
       stackIndex: 0,
       labelled: true,
+      genre,
     })}</div>`;
   }
-  const cards = items
+  const visible = items.slice(0, 5);
+  const cards = visible
     .map((item, index) =>
       mediaCardMarkup(item, {
         active: index === 0,
         stackIndex: index,
         labelled: index === 0,
+        genre,
       })
     )
     .join("");
-  return `<div class="info-media-stack is-stacked" data-count="${items.length}">${cards}</div>`;
+  return `<div class="info-media-stack is-stacked" data-count="${items.length}" data-flick="1">
+    ${mediaStackCounter(items, activeId, total)}
+    <div class="info-media-deck">${cards}</div>
+  </div>`;
 }
 
 function downloadStatusClass(status) {
@@ -1205,12 +1268,98 @@ function bindInfoOverlay() {
     pinFromUser();
     focusMediaById(card.dataset.mediaId, { reveal: true });
   });
+
+  // Flick / swipe through the stacked genre (or search) cards.
+  let flick = null;
+  let suppressClickUntil = 0;
+  const content = $("info-content");
+  content?.addEventListener(
+    "pointerdown",
+    (ev) => {
+      if (!(ev.target instanceof Element)) return;
+      if (ev.target.closest("[data-infuse-play], .info-dismiss, button, a")) return;
+      const stack = ev.target.closest(".info-media-stack.is-stacked");
+      if (!stack) return;
+      flick = { x: ev.clientX, y: ev.clientY, id: ev.pointerId, moved: false };
+      try {
+        content.setPointerCapture(ev.pointerId);
+      } catch {
+        /* ignore capture failures on older engines */
+      }
+    },
+    { passive: true }
+  );
+  content?.addEventListener(
+    "pointermove",
+    (ev) => {
+      if (!flick || flick.id !== ev.pointerId) return;
+      const dx = ev.clientX - flick.x;
+      const dy = ev.clientY - flick.y;
+      if (Math.abs(dx) > 12 || Math.abs(dy) > 12) flick.moved = true;
+    },
+    { passive: true }
+  );
+  const endFlick = (ev) => {
+    if (!flick || flick.id !== ev.pointerId) return;
+    const dx = ev.clientX - flick.x;
+    const dy = ev.clientY - flick.y;
+    const wasFlick = flick.moved;
+    flick = null;
+    if (!wasFlick) return;
+    if (Math.abs(dx) < MEDIA_FLICK_PX && Math.abs(dy) < MEDIA_FLICK_PX) return;
+    // Prefer the dominant axis: horizontal or upward vertical advances.
+    suppressClickUntil = Date.now() + 400;
+    pinFromUser();
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      cycleMedia(dx < 0 ? 1 : -1);
+    } else if (dy < 0) {
+      cycleMedia(1);
+    } else {
+      cycleMedia(-1);
+    }
+  };
+  content?.addEventListener("pointerup", endFlick);
+  content?.addEventListener("pointercancel", () => {
+    flick = null;
+  });
+
+  // Re-bind click handler path: skip synthetic click right after a flick.
+  content?.addEventListener(
+    "click",
+    (ev) => {
+      if (Date.now() < suppressClickUntil) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+    },
+    true
+  );
+
   document.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Escape") return;
     const root = $("info-overlay");
     if (!root || root.hidden) return;
     if (!root.classList.contains("is-open") && !root.classList.contains("is-soft-hidden")) return;
-    dismiss();
+    if (ev.key === "Escape") {
+      dismiss();
+      return;
+    }
+    if (ev.key === "ArrowRight" || ev.key === "ArrowDown") {
+      const visual = pickVisualOverlay(state.widgets);
+      if (!visual || visual.kind !== "media") return;
+      if (mediaItemsOf(visual).length < 2) return;
+      ev.preventDefault();
+      pinFromUser();
+      cycleMedia(1);
+      return;
+    }
+    if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") {
+      const visual = pickVisualOverlay(state.widgets);
+      if (!visual || visual.kind !== "media") return;
+      if (mediaItemsOf(visual).length < 2) return;
+      ev.preventDefault();
+      pinFromUser();
+      cycleMedia(-1);
+    }
   });
 }
 
