@@ -30,6 +30,7 @@ from hearth.tools.ha import ha
 from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
 from hearth.tools.thuisbezorgd import thuisbezorgd
+from hearth.tools.websearch import selected_backend as web_search_backend
 from hearth.voice.gateway import voice_socket
 from hearth.voice import webrtc as realtime_rtc
 
@@ -141,6 +142,10 @@ async def status() -> dict[str, Any]:
             "configured": settings.thuisbezorgd_configured,
             "live_submit_ready": thuisbezorgd.live_submit_ready,
             "delivery_address": settings.delivery_address_configured,
+        },
+        "web_search": {
+            "configured": settings.web_search_live,
+            "backend": web_search_backend(),
         },
         "docker": {"socket": docker.live},
         "tools": registry.names(),
