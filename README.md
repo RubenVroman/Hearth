@@ -416,7 +416,7 @@ A dedicated house Telegram group can act as a movie/series/TV **request inbox**.
 - Only allowlisted `TELEGRAM_CHAT_IDS` are inboxes. Messages from other chats are ignored.
 - Catalog links (IMDb / TMDB / TVDB / Trakt / JustWatch), plain `tt…` / `tmdb:` / `tvdb:` ids, and titles like `Annihilation (2018)` or `Severance S02E03` are requests. The group itself is the confirmation — no extra Hearth UI confirm.
 - Magnets, `.torrent` files, and raw media attachments get a short in-group refusal (this is not a general downloader).
-- Ambiguous titles get a top-3 disambiguation; reply `1` / `2` / `3` to pick. Exact catalog ids grab immediately.
+- Ambiguous titles get a top-3 disambiguation; reply `1` / `2` / `3`, `all of them`, `the first one`, or `the new one`. Franchise one-shots like `the whole Harry Potter series` queue the related set. Intent uses `OPENAI_MODEL` (default `gpt-4o-mini`) when configured, with a local heuristic fallback. Exact catalog ids grab immediately.
 - Dedup (message id + title/year window), per-group rate limit, max title length, bot loop-prevention, and log redaction for `TELEGRAM_BOT_TOKEN` ship by default.
 - Progress polls Radarr/Sonarr queue tools only for titles this inbox queued. One early “started and healthy” ping around ~5%, then silence until done / failed (manual status asks still use `radarr_queue` / `sonarr_queue`).
 

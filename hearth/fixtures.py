@@ -362,6 +362,35 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "overview": "A biologist enters the Shimmer after her husband's return.",
         "status": "released",
     },
+    # Franchise set for Telegram intent follow-ups ("all of them", trilogy, etc.).
+    {
+        "title": "Harry Potter and the Sorcerer's Stone",
+        "year": 2001,
+        "tmdbId": 671,
+        "overview": "A boy discovers he is a wizard.",
+        "status": "released",
+    },
+    {
+        "title": "Harry Potter and the Chamber of Secrets",
+        "year": 2002,
+        "tmdbId": 672,
+        "overview": "The second year at Hogwarts.",
+        "status": "released",
+    },
+    {
+        "title": "Harry Potter and the Prisoner of Azkaban",
+        "year": 2004,
+        "tmdbId": 673,
+        "overview": "Sirius Black escapes Azkaban.",
+        "status": "released",
+    },
+    {
+        "title": "Harry Potter and the Goblet of Fire",
+        "year": 2005,
+        "tmdbId": 674,
+        "overview": "The Triwizard Tournament.",
+        "status": "released",
+    },
 ]
 
 MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
@@ -495,7 +524,7 @@ class MockPipeline:
 def _filter_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
     needle = (query or "").strip().lower()
     if not needle:
-        return deepcopy(items[:5])
+        return deepcopy(items)
     hits = [deepcopy(item) for item in items if needle in str(item.get("title", "")).lower()]
     return hits or [deepcopy(items[0]) | {"title": items[0]["title"], "matched": "fallback"}]
 
