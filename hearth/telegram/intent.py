@@ -86,6 +86,10 @@ _SYSTEM = (
     "Actions: passthrough, ignore, clarify, pick, pick_many, search. "
     "search sets search_title (and year when known; select_all=true for whole "
     "series/trilogy). Catalog year wins later — still include your best year. "
+    "search_title must be the catalog title only — strip trailing 'with Actor' / "
+    "'featuring' / 'starring' / 'met …' clauses (those are clues for you, not "
+    "part of the Overseerr query). media_kind is movie or tv when known; omit "
+    "when unsure (Overseerr returns both). "
     "If the user clearly names a concrete catalog title with no ambiguity, "
     "action=search with that title (or passthrough)."
 )

@@ -186,7 +186,8 @@ class Settings(BaseSettings):
         default=45.0,
         alias="TELEGRAM_PROGRESS_INTERVAL_SECONDS",
     )
-    # Prefer Overseerr when configured (feeds *arr); otherwise Radarr/Sonarr direct.
+    # Telegram Movies inbox always uses Overseerr for search + request (movie and
+    # TV). Kept for backward-compatible env; no longer gates Radarr/Sonarr grabs.
     telegram_prefer_overseerr: bool = Field(default=True, alias="TELEGRAM_PREFER_OVERSEERR")
 
     @property
