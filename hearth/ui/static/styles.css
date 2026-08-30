@@ -338,6 +338,93 @@ input,
   white-space: nowrap;
 }
 
+/* Lightweight status under the orb — hidden when idle so it never crowds the composer. */
+.activity {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 10px 0 0;
+  max-width: min(320px, 92vw);
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: var(--muted);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+  text-align: center;
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition:
+    opacity 220ms ease,
+    transform 220ms ease,
+    border-color 220ms ease,
+    color 220ms ease,
+    background 220ms ease;
+}
+
+.activity:not([hidden]) {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.activity.is-idle {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+.activity-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--ember);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--ember) 55%, transparent);
+}
+
+.activity.is-thinking .activity-dot,
+.activity.is-working .activity-dot,
+.activity.is-ha .activity-dot,
+.activity.is-web_search .activity-dot,
+.activity.is-cos .activity-dot {
+  animation: activity-pulse 1.1s ease-in-out infinite;
+}
+
+.activity.is-error {
+  color: color-mix(in srgb, #f0c4a8 70%, var(--ink));
+  border-color: color-mix(in srgb, #c45a12 35%, var(--line));
+}
+
+.activity.is-error .activity-dot {
+  background: #d9783a;
+  box-shadow: none;
+  animation: none;
+}
+
+.activity-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes activity-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 .hint {
   color: var(--muted);
   font-size: 13px;
@@ -1430,6 +1517,13 @@ input,
     white-space: nowrap;
   }
 
+  .activity {
+    margin-top: 8px;
+    max-width: min(280px, 86vw);
+    font-size: 11px;
+    padding: 5px 11px;
+  }
+
   /* Orb label already says Tap to talk — keep hint with the scrolled chrome. */
   .hint {
     position: static;
@@ -2125,6 +2219,24 @@ html[data-look="forge"] .mark {
 html[data-look="jarvis"] .house {
   letter-spacing: 0.36em;
   color: var(--ember-2);
+}
+
+html[data-look="jarvis"] .activity,
+html[data-look="forge"] .activity {
+  border-radius: 4px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 11px;
+}
+
+html[data-look="jarvis"] .activity {
+  border-color: color-mix(in srgb, var(--ember) 40%, transparent);
+  background: color-mix(in srgb, rgba(6, 18, 28, 0.78) 90%, transparent);
+}
+
+html[data-look="forge"] .activity {
+  border-color: color-mix(in srgb, var(--ember) 35%, transparent);
+  background: color-mix(in srgb, rgba(22, 12, 6, 0.82) 90%, transparent);
 }
 
 html[data-look="jarvis"] .pill,

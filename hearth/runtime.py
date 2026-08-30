@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -8,13 +10,99 @@ from typing import Any, Literal
 from hearth.config import settings
 
 AgentStatus = Literal["idle", "listening", "thinking", "speaking", "tool"]
+ActivityPhase = Literal[
+    "idle",
+    "listening",
+    "thinking",
+    "speaking",
+    "working",
+    "ha",
+    "web_search",
+    "cos",
+    "error",
+]
 VoiceMode = Literal["disconnected", "fallback", "live"]
 WidgetKind = Literal["weather", "media", "downloads"]
 WidgetStatus = Literal["pending", "running", "done", "error", "info"]
 
+# Brief hold so a failed backend call is readable without sticky alarms.
+ERROR_HOLD_SECONDS = 4.0
+
+# Tool families → UI activity (labels only — never secrets).
+_HA_TOOLS = frozenset(
+    {
+        "ha_list_entities",
+        "ha_get_state",
+        "ha_call_service",
+        "ha_device_control",
+        "ha_media_control",
+        "media_activity",
+        "house_media",
+        "house_network",
+    }
+)
+_WEB_SEARCH_TOOLS = frozenset({"web_search"})
+_COS_TOOLS = frozenset({"chief_of_staff"})
+
+_PHASE_LABELS: dict[ActivityPhase, str] = {
+    "idle": "",
+    "listening": "",
+    "thinking": "Working…",
+    "speaking": "",
+    "working": "Working…",
+    "ha": "Fetching from Home Assistant…",
+    "web_search": "Searching…",
+    "cos": "Escalating to Chief of Staff…",
+    "error": "Something went wrong",
+}
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def activity_for_tool(tool_name: str) -> tuple[ActivityPhase, str]:
+    """Map a house tool name to a UI phase + short label."""
+    name = (tool_name or "").strip()
+    if name in _WEB_SEARCH_TOOLS:
+        return "web_search", _PHASE_LABELS["web_search"]
+    if name in _COS_TOOLS:
+        return "cos", _PHASE_LABELS["cos"]
+    if name in _HA_TOOLS or name.startswith("ha_"):
+        return "ha", _PHASE_LABELS["ha"]
+    return "working", _PHASE_LABELS["working"]
+
+
+def brief_error_label(message: str = "", *, tool: str = "") -> str:
+    """Human-readable, non-scary error line for the status indicator."""
+    raw = (message or "").strip()
+    # Never echo keys / tokens into the browser chrome.
+    raw = re.sub(
+        r"(?i)(api[_-]?key|token|password|secret|authorization)\s*[=:]\s*\S+",
+        r"\1=…",
+        raw,
+    )
+    raw = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}\b", "sk-…", raw)
+    lower = raw.lower()
+    if "not configured" in lower:
+        return "Not configured"
+    if "timeout" in lower or "timed out" in lower:
+        return "Timed out"
+    if "network" in lower or "connection" in lower:
+        return "Connection failed"
+    if tool == "web_search" or "search" in lower:
+        return "Search failed"
+    if tool == "chief_of_staff" or "chief of staff" in lower:
+        return "Escalation failed"
+    if tool.startswith("ha_") or tool in _HA_TOOLS or "home assistant" in lower:
+        return "Home Assistant failed"
+    if raw:
+        # Keep it short — no stack traces or secrets in the chrome.
+        clip = raw.split("\n", 1)[0].strip()
+        if len(clip) > 48:
+            clip = clip[:45].rstrip() + "…"
+        return clip
+    return _PHASE_LABELS["error"]
 
 
 @dataclass
@@ -67,6 +155,24 @@ class Widget:
         }
 
 
+@dataclass
+class Activity:
+    """Shared UI status — labels only, safe for the browser."""
+
+    phase: ActivityPhase = "idle"
+    label: str = ""
+    tool: str = ""
+    updated_at: str = field(default_factory=_now)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "label": self.label,
+            "tool": self.tool,
+            "updated_at": self.updated_at,
+        }
+
+
 class Runtime:
     def __init__(self) -> None:
         self.started_at = _now()
@@ -79,11 +185,78 @@ class Runtime:
         self.widgets: dict[str, Widget] = {}
         self.pending: PendingConfirm | None = None
         self.openai_live: bool = False
+        self._activity = Activity()
+        self._error_until: float = 0.0
 
     def note(self, role: str, text: str, kind: str = "message") -> TranscriptLine:
         line = TranscriptLine(role=role, text=text, kind=kind)
         self.transcript.append(line)
         return line
+
+    def set_status(self, status: AgentStatus, *, tool: str = "") -> None:
+        """Update coarse agent status and the UI activity label together."""
+        self.agent_status = status
+        if status == "tool":
+            self.begin_tool(tool or "tool")
+            return
+        if status == "thinking":
+            self._set_activity("thinking", _PHASE_LABELS["thinking"])
+            return
+        if status == "listening":
+            # Keep a brief error visible until it expires.
+            if self._error_active():
+                return
+            self._set_activity("listening", "")
+            return
+        if status == "speaking":
+            if self._error_active():
+                return
+            self._set_activity("speaking", "")
+            return
+        # idle
+        if self._error_active():
+            return
+        self._set_activity("idle", "")
+
+    def begin_tool(self, tool_name: str) -> None:
+        phase, label = activity_for_tool(tool_name)
+        self.agent_status = "tool"
+        self._error_until = 0.0
+        self._set_activity(phase, label, tool=tool_name)
+
+    def end_tool(self, *, ok: bool = True, error: str = "", tool: str = "") -> None:
+        """After a tool returns — sticky brief error, or leave status for the caller."""
+        if ok:
+            return
+        self.flash_error(error, tool=tool or self._activity.tool)
+
+    def flash_error(self, message: str = "", *, tool: str = "", hold: float = ERROR_HOLD_SECONDS) -> None:
+        label = brief_error_label(message, tool=tool)
+        self._error_until = time.monotonic() + max(0.5, hold)
+        self._set_activity("error", label, tool=tool)
+
+    def activity_snapshot(self) -> dict[str, Any]:
+        """Resolve current activity, clearing expired errors."""
+        if self._activity.phase == "error" and not self._error_active():
+            self._error_until = 0.0
+            # Fall back to coarse agent status once the flash expires.
+            if self.agent_status == "tool":
+                self._set_activity("working", _PHASE_LABELS["working"], tool=self._activity.tool)
+            elif self.agent_status == "thinking":
+                self._set_activity("thinking", _PHASE_LABELS["thinking"])
+            elif self.agent_status == "listening":
+                self._set_activity("listening", "")
+            elif self.agent_status == "speaking":
+                self._set_activity("speaking", "")
+            else:
+                self._set_activity("idle", "")
+        return self._activity.as_dict()
+
+    def _error_active(self) -> bool:
+        return self._activity.phase == "error" and time.monotonic() < self._error_until
+
+    def _set_activity(self, phase: ActivityPhase, label: str, *, tool: str = "") -> None:
+        self._activity = Activity(phase=phase, label=label, tool=tool or "", updated_at=_now())
 
     def get_widget(self, widget_id: str) -> Widget | None:
         return self.widgets.get(widget_id)
@@ -140,6 +313,7 @@ class Runtime:
         return {
             "started_at": self.started_at,
             "agent": self.agent_status,
+            "activity": self.activity_snapshot(),
             "voice": {
                 "mode": self.voice_mode,
                 "path": self.voice_path,

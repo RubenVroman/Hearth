@@ -312,13 +312,16 @@ async def tools() -> dict[str, Any]:
 
 @app.post("/api/chat")
 async def chat(body: ChatBody) -> dict[str, Any]:
-    runtime.agent_status = "thinking"
+    runtime.set_status("thinking")
     try:
         out = await _agent.run(body.message, confirm=body.confirm)
         out.setdefault("widgets", runtime.list_widgets())
         return out
+    except Exception:  # noqa: BLE001
+        runtime.flash_error("Request failed")
+        raise
     finally:
-        runtime.agent_status = "idle"
+        runtime.set_status("idle")
 
 
 @app.post("/api/invoke")

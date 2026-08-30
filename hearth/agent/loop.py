@@ -24,7 +24,7 @@ class AgentLoop:
         self.history = []
 
     async def run(self, user_text: str, *, confirm: bool = False) -> dict[str, Any]:
-        runtime.agent_status = "thinking"
+        runtime.set_status("thinking")
         runtime.note("user", user_text)
         widget_bus.start_turn(user_text)
         text = user_text.strip()
@@ -43,7 +43,7 @@ class AgentLoop:
                     "tools": [result.as_dict()],
                 }
                 await _after_turn(text or pending.tool, out, channel="chat")
-                runtime.agent_status = "idle"
+                runtime.set_status("idle")
                 widget_bus.finish_turn(ok=True, detail="Confirmed.")
                 out["widgets"] = runtime.list_widgets()
                 return out
@@ -52,16 +52,17 @@ class AgentLoop:
                 try:
                     out = await self._run_openai(text)
                     await _after_turn(text, out, channel="chat")
-                    runtime.agent_status = "idle"
+                    runtime.set_status("idle")
                     widget_bus.finish_turn(ok=True, detail="Done.")
                     out["widgets"] = runtime.list_widgets()
                     return out
                 except Exception as exc:  # noqa: BLE001
                     runtime.note("system", f"OpenAI path failed, using local router: {exc}", kind="status")
+                    runtime.flash_error("Model call failed")
 
             out = await self._run_local(text)
             await _after_turn(text, out, channel="chat")
-            runtime.agent_status = "idle"
+            runtime.set_status("idle")
             widget_bus.finish_turn(ok=True, detail="Done.")
             out["widgets"] = runtime.list_widgets()
             return out
@@ -127,7 +128,7 @@ class AgentLoop:
                         ],
                     }
                 )
-                runtime.agent_status = "tool"
+                runtime.set_status("tool")
                 for tc in msg.tool_calls:
                     args = _parse_args(tc.function.arguments)
                     if tc.function.name == "chief_of_staff":
@@ -170,7 +171,7 @@ class AgentLoop:
             runtime.note("assistant", reply)
             return {"reply": reply, "mode": "local", "tools": used}
 
-        runtime.agent_status = "tool"
+        runtime.set_status("tool")
         result = await self.tools.call(plan["tool"], plan.get("args") or {})
         used.append(result.as_dict())
         reply = _format_tool_reply(used)

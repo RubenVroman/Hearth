@@ -77,7 +77,8 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runtime.pending = None
     runtime.last_tools.clear()
     runtime.transcript.clear()
-    runtime.agent_status = "idle"
+    runtime.set_status("idle")
+    runtime._error_until = 0.0
     from hearth.tools.websearch import reset_rate_limit
 
     reset_rate_limit()
