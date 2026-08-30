@@ -76,7 +76,7 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert ".pills .pill" in css
     assert ".is-empty" in css
     assert "min-height: 28vh" not in css
-    # Phone: first viewport is the listening sphere alone; chrome is below the fold.
+    # Phone: first viewport is the orb under fixed Look chrome.
     assert ".hearth-hero" in css
     assert "--phone-fold: 100dvh" in css
     assert "--phone-fold: 100svh" in css
@@ -113,6 +113,8 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert 'id: "look"' in settings_js
     assert 'value: "jarvis"' in settings_js
     assert 'value: "forge"' in settings_js
+    assert "document.documentElement" in settings_js
+    assert "data-${knob.id}" in settings_js or 'data-${knob.id}' in settings_js
     assert ".settings-sheet" in css
     assert 'html[data-theme="ash"]' in css
     assert 'html[data-look="jarvis"]' in css
@@ -132,10 +134,13 @@ def test_phone_orb_owns_first_viewport_alone():
     index_html = (UI / "index.html").read_text(encoding="utf-8")
     assert 'class="hearth-hero"' in index_html
     assert 'id="orb"' in index_html
-    # Hero is a full phone screen; header is parked at the measured fold (second screen).
+    # Hero is a full phone screen; Look chrome is fixed on the first screen.
     assert ".hearth-hero" in css and "min-height: var(--phone-fold)" in css
-    assert ".top" in css and "top: var(--phone-fold)" in css
     assert "--phone-fold: 100svh" in css
+    phone = _phone_media_block(css)
+    assert "position: fixed" in phone
+    assert "top: var(--phone-fold)" not in phone
+    assert "#settings-btn" in index_html or 'id="settings-btn"' in index_html
     # Fixed dock/widgets over the sphere are gone on phone.
     assert "bottom: calc(var(--dock-space) + var(--keyboard-inset) + 10px)" not in css
     assert ".composer-dock:focus-within" in css
@@ -153,10 +158,114 @@ def test_phone_fold_resyncs_on_orientation_change():
     assert "requestAnimationFrame" in pwa
     assert 'addEventListener("pageshow"' in pwa
     assert "min-height: var(--phone-fold)" in css
-    assert "top: var(--phone-fold)" in css
     # Do not freeze the fold to a stale height while the keyboard is open.
     assert "isTyping" in pwa
     assert "hearth-shell-v12" in (UI / "sw.js").read_text(encoding="utf-8")
+
+
+def _css_brace_depth(css: str) -> int:
+    """Return final brace depth after stripping comments and strings (0 = balanced)."""
+    depth = 0
+    in_comment = False
+    i = 0
+    n = len(css)
+    while i < n:
+        if in_comment:
+            if css.startswith("*/", i):
+                in_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if css.startswith("/*", i):
+            in_comment = True
+            i += 2
+            continue
+        ch = css[i]
+        if ch in "\"'":
+            quote = ch
+            i += 1
+            while i < n:
+                if css[i] == "\\":
+                    i += 2
+                    continue
+                if css[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    return depth
+
+
+def _phone_media_block(css: str) -> str:
+    marker = "@media (max-width: 960px)"
+    start = css.find(marker)
+    assert start != -1
+    i = css.find("{", start)
+    depth = 0
+    for j in range(i, len(css)):
+        if css[j] == "{":
+            depth += 1
+        elif css[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return css[start : j + 1]
+    raise AssertionError("unclosed phone media query")
+
+
+def test_styles_css_braces_balanced_so_look_rules_apply():
+    """Regression: an unclosed #memory-block.is-empty nested look + phone rules."""
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+    assert _css_brace_depth(css) == 0
+    assert css.count("{") == css.count("}")
+    # Look selectors must be top-level html[data-look=...], not nested under another rule.
+    jarvis = css.index('html[data-look="jarvis"]')
+    forge = css.index('html[data-look="forge"]')
+    memory = css.index("#memory-block.is-empty")
+    memory_close = css.find("}", memory)
+    assert memory_close != -1
+    assert memory_close < jarvis
+    assert 'display: none;\n}' in css[memory : memory_close + 1] or "display: none;\n}" in css[memory : memory + 80]
+    # Closed memory rule before look styles.
+    assert _css_brace_depth(css[:jarvis]) == 0
+    assert _css_brace_depth(css[:forge]) == 0
+
+
+def test_settings_apply_writes_html_data_look_attribute():
+    """Style knob must set html[data-look], matching CSS (not body / data-style)."""
+    settings_js = (UI / "settings.js").read_text(encoding="utf-8")
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+    assert 'id: "look"' in settings_js
+    assert 'id: "style"' not in settings_js
+    assert "document.documentElement" in settings_js
+    assert "root.dataset[knob.id] = value" in settings_js
+    assert "data-${knob.id}" in settings_js
+    assert 'html[data-look="jarvis"]' in css
+    assert 'html[data-look="forge"]' in css
+    assert "body[data-look" not in css
+    assert 'html[data-style=' not in css
+
+
+def test_phone_layout_keeps_look_reachable_and_orb_centered():
+    css = (UI / "styles.css").read_text(encoding="utf-8")
+    phone = _phone_media_block(css)
+    assert ".top" in phone
+    assert "position: fixed" in phone
+    assert "top: var(--phone-fold)" not in phone
+    assert ".hearth-hero" in phone
+    assert "min-height: var(--phone-fold)" in phone
+    assert "justify-content: center" in phone
+    assert ".composer-dock" in phone
+    assert "position: relative" in phone
+    # Look button exists in chrome; phone chrome is first-screen fixed.
+    index_html = (UI / "index.html").read_text(encoding="utf-8")
+    assert 'id="settings-btn"' in index_html
+    assert ">Look<" in index_html or "Look\n" in index_html
 
 
 def test_orb_focus_outline_is_circular():
