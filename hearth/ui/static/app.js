@@ -293,7 +293,7 @@ function escapeHtml(value) {
 
 function isVisualOverlay(widget) {
   const kind = widget && widget.kind;
-  return kind === "weather" || kind === "media";
+  return kind === "weather" || kind === "media" || kind === "downloads";
 }
 
 function pickVisualOverlay(widgets) {
@@ -305,6 +305,10 @@ function pickVisualOverlay(widgets) {
 
 function overlaySignature(widget) {
   if (!widget) return "";
+  const downloads = widget.data && Array.isArray(widget.data.downloads) ? widget.data.downloads : [];
+  const progressKey = downloads
+    .map((row) => `${row.title || ""}:${row.status || ""}:${row.percent ?? ""}`)
+    .join(",");
   return [
     widget.id,
     widget.kind,
@@ -313,6 +317,7 @@ function overlaySignature(widget) {
     widget.title || "",
     widget.body || "",
     widget.detail || "",
+    progressKey,
   ].join("|");
 }
 
@@ -404,9 +409,100 @@ function mediaMarkup(widget) {
   `;
 }
 
+function downloadStatusClass(status) {
+  const key = String(status || "unknown").toLowerCase();
+  if (
+    key === "queued" ||
+    key === "downloading" ||
+    key === "paused" ||
+    key === "importing" ||
+    key === "stalled" ||
+    key === "completed" ||
+    key === "failed" ||
+    key === "unknown"
+  ) {
+    return key;
+  }
+  return "unknown";
+}
+
+function downloadsMarkup(widget) {
+  const data = widget.data || {};
+  const downloads = Array.isArray(data.downloads) ? data.downloads : [];
+  const service = data.service === "sonarr" ? "Sonarr" : "Radarr";
+  const empty = data.empty;
+  const kicker = empty === "idle" || empty === "missing" ? "Downloads" : `${service} queue`;
+
+  if (!downloads.length) {
+    const calmTitle =
+      empty === "missing"
+        ? widget.title || data.query || "Not downloading"
+        : widget.title || service;
+    const calmBody =
+      empty === "missing"
+        ? widget.detail || `Not in the ${service} queue right now.`
+        : widget.body || "Nothing downloading";
+    const calmHint =
+      empty === "idle" ? widget.detail || "Queue is quiet." : empty === "missing" ? "" : widget.detail || "";
+    return `
+      <div class="info-downloads is-empty">
+        <p class="info-kicker">${escapeHtml(kicker)}</p>
+        <h2 class="info-title" id="info-title">${escapeHtml(calmTitle)}</h2>
+        <p class="info-downloads-empty">${escapeHtml(calmBody)}</p>
+        ${calmHint ? `<p class="info-detail">${escapeHtml(calmHint)}</p>` : ""}
+      </div>
+    `;
+  }
+
+  const rows = downloads
+    .map((row) => {
+      const status = row.status || "unknown";
+      const pct = row.percent != null && !Number.isNaN(Number(row.percent)) ? Number(row.percent) : null;
+      const pctLabel = pct != null ? `${pct}%` : "—";
+      const width = pct != null ? Math.max(0, Math.min(100, pct)) : 0;
+      const meta = [row.timeleft ? `${row.timeleft} left` : "", row.sizeleft_label ? `${row.sizeleft_label} left` : "", row.quality]
+        .filter(Boolean)
+        .map((v) => escapeHtml(v))
+        .join(" · ");
+      return `
+        <li class="info-download-row status-${escapeHtml(downloadStatusClass(status))}">
+          <div class="info-download-head">
+            <p class="info-download-title">${escapeHtml(row.title || "Untitled")}</p>
+            <p class="info-download-pct">${escapeHtml(String(pctLabel))}</p>
+          </div>
+          <div class="info-download-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+            ${pct != null ? `aria-valuenow="${escapeHtml(String(width))}"` : 'aria-valuetext="unknown"'}
+            aria-label="${escapeHtml(row.title || "Download")} progress">
+            <span style="width:${width}%"></span>
+          </div>
+          <p class="info-download-meta">
+            <span class="info-download-status">${escapeHtml(status)}</span>
+            ${meta ? `<span class="info-download-extra">${meta}</span>` : ""}
+          </p>
+        </li>
+      `;
+    })
+    .join("");
+
+  const heading =
+    downloads.length === 1 ? downloads[0].title || widget.title || service : widget.title || service;
+  const sub = downloads.length === 1 ? widget.body || "" : widget.body || `${downloads.length} active`;
+
+  return `
+    <div class="info-downloads">
+      <p class="info-kicker">${escapeHtml(kicker)}</p>
+      <h2 class="info-title" id="info-title">${escapeHtml(heading)}</h2>
+      ${sub ? `<p class="info-meta">${escapeHtml(sub)}</p>` : ""}
+      <ul class="info-download-list">${rows}</ul>
+      ${data.mode === "mock" ? `<p class="info-detail">mock</p>` : ""}
+    </div>
+  `;
+}
+
 function overlayInnerHtml(widget) {
   if (widget.kind === "weather") return weatherMarkup(widget);
   if (widget.kind === "media") return mediaMarkup(widget);
+  if (widget.kind === "downloads") return downloadsMarkup(widget);
   return `
     <p class="info-kicker">Info</p>
     <h2 class="info-title" id="info-title">${escapeHtml(widget.title || "")}</h2>
