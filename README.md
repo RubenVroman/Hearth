@@ -131,7 +131,30 @@ Reach Plex on the existing stack:
 
 ## OpenAI spend monitor
 
-Look → **OpenAI spend** shows real usage/cost for the house app. The browser never sees API keys; Hearth proxies OpenAI server-side.
+**Status: already shipped** (merged in [#39](https://github.com/RubenVroman/Hearth/pull/39)). There is no separate `/cost` page — the overview lives inside the Look settings sheet.
+
+### How to access
+
+1. Open **https://vault.taileff393.ts.net/** and sign in with the house login (cookie session).
+2. Tap **Look** in the top-bar pill actions (not a separate Settings nav item).
+3. In the sheet titled **Look & spend**, scroll to the **OpenAI spend** section.
+4. Use **Refresh** there to reload; data comes from `GET /api/openai/spend?days=30` (auth required).
+
+Without `OPENAI_ADMIN_KEY`, the section still opens and shows an explicit unavailable state for org costs/usage (plus any local ledger / list-pricing cards). It never invents dollar amounts.
+
+### Owning files
+
+| Layer | Path |
+| --- | --- |
+| Nav button + sheet chrome | `hearth/ui/static/index.html` (`#settings-btn` → “Look”; title “Look & spend”) |
+| Spend UI section | `hearth/ui/static/settings.js` (`buildSpendSection` / `renderSpend`) |
+| Styles | `hearth/ui/static/styles.css` (`.spend-*`) |
+| Client wiring | `hearth/ui/static/app.js` (`setSpendFetcher` → `/api/openai/spend`) |
+| FastAPI routes | `hearth/app.py` (`/api/openai/spend`, `/costs`, `/usage`, `/pricing`) |
+| Backend proxy + local ledger | `hearth/openai_usage.py` |
+| Tests | `tests/test_openai_usage.py` |
+
+### Data sources
 
 | Source | What you get | Requirement |
 | --- | --- | --- |
