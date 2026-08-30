@@ -53,6 +53,8 @@ def test_media_inventory_endpoint(client):
     status = client.get("/api/status")
     assert status.status_code == 200
     assert "radarr" in status.json()
+    assert "web_search" in status.json()
+    assert status.json()["web_search"]["backend"] == "mock"
     assert status.json()["ha"]["tv_entity"] == "media_player.lg_webos_tv"
     assert status.json()["ha"]["apple_tv_entity"] == "media_player.apple_tv"
     assert status.json()["ha"]["apple_tv_player"] == "infuse"

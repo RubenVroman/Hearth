@@ -684,6 +684,7 @@ def test_confirmation_policy_marks_only_high_risk_tools():
         "overseerr_request",
         "chief_of_staff",
         "workspace_write",
+        "web_search",
     }
     gated = {
         "thuisbezorgd_order",

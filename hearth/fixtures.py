@@ -219,6 +219,28 @@ MOCK_WEATHER: dict[str, Any] = {
     "observed_at": "2026-08-29T12:00",
 }
 
+# Compact live-web fixtures (used when no OpenAI/Brave key and mock-if-unconfigured).
+MOCK_WEB_SEARCH_RESULTS: list[dict[str, Any]] = [
+    {
+        "title": "JustWatch — streaming search",
+        "url": "https://www.justwatch.com/",
+        "snippet": "Where to watch movies and shows across Netflix, Disney+, Prime, and more.",
+        "source": "justwatch.com",
+    },
+    {
+        "title": "VRT NWS",
+        "url": "https://www.vrt.be/vrtnws/nl/",
+        "snippet": "Belgian news headlines and current events.",
+        "source": "vrt.be",
+    },
+    {
+        "title": "Wikipedia",
+        "url": "https://en.wikipedia.org/wiki/Main_Page",
+        "snippet": "Background articles. Not a live news wire.",
+        "source": "wikipedia.org",
+    },
+]
+
 
 MOCK_DOCKER_CONTAINERS: list[dict[str, Any]] = [
     {"Id": "plex01", "Names": ["/plex"], "Image": "lscr.io/linuxserver/plex", "State": "running", "Status": "Up 3 days"},

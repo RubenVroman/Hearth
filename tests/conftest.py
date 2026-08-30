@@ -37,6 +37,8 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "hearth_delivery_postcode", "")
     monkeypatch.setattr(settings, "hearth_delivery_city", "")
     monkeypatch.setattr(settings, "weather_force_mock", True)
+    monkeypatch.setattr(settings, "brave_search_api_key", "")
+    monkeypatch.setattr(settings, "web_search_force_mock", True)
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
     monkeypatch.setattr(settings, "memory_db_path", tmp_path / "hearth-memory.db")
     monkeypatch.setattr(settings, "memory_enabled", True)
@@ -71,6 +73,9 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runtime.last_tools.clear()
     runtime.transcript.clear()
     runtime.agent_status = "idle"
+    from hearth.tools.websearch import reset_rate_limit
+
+    reset_rate_limit()
     from hearth.memory.store import init_memory_db, reset_memory
 
     reset_memory()

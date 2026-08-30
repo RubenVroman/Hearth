@@ -105,6 +105,12 @@ class Settings(BaseSettings):
     weather_place: str = Field(default="Home", alias="HEARTH_WEATHER_PLACE")
     weather_force_mock: bool = Field(default=False, alias="HEARTH_WEATHER_MOCK")
 
+    # Live web search (house tool). Prefer OpenAI hosted web_search via OPENAI_API_KEY.
+    # Optional Brave key skips the extra model hop and returns structured snippets.
+    # Empty keys + HEARTH_MOCK_IF_UNCONFIGURED → fixtures; otherwise DuckDuckGo HTML lite.
+    brave_search_api_key: str = Field(default="", alias="BRAVE_SEARCH_API_KEY")
+    web_search_force_mock: bool = Field(default=False, alias="HEARTH_WEB_SEARCH_MOCK")
+
     # Chief of Staff escalate (repo/code/PR). Empty webhook = not configured.
     cos_webhook: str = Field(default="", alias="HEARTH_COS_WEBHOOK")
     cos_webhook_key: str = Field(default="", alias="HEARTH_COS_WEBHOOK_KEY")
@@ -156,6 +162,15 @@ class Settings(BaseSettings):
     @property
     def thuisbezorgd_configured(self) -> bool:
         return bool(self.thuisbezorgd_api_key.strip())
+
+    @property
+    def brave_search_configured(self) -> bool:
+        return bool(self.brave_search_api_key.strip())
+
+    @property
+    def web_search_live(self) -> bool:
+        """True when a live search backend key is present (OpenAI and/or Brave)."""
+        return self.openai_configured or self.brave_search_configured
 
     @property
     def delivery_address_configured(self) -> bool:

@@ -162,9 +162,9 @@ class AgentLoop:
             reply = (
                 "I can drive the house — lights, Denon, LG TV, play titles in Infuse on the "
                 "Apple TV (or Plex on LG), grab movies in Radarr or shows in Sonarr, request "
-                "via Overseerr, order food on Thuisbezorgd, Plex now-playing, workspace, docker "
-                "inspect. Repo, Gridways, Discord, calendar, and anything I can't do yet go to "
-                "Chief of Staff."
+                "via Overseerr, order food on Thuisbezorgd, live web search, Plex now-playing, "
+                "workspace, docker inspect. Repo, Gridways, Discord, calendar, and anything I "
+                "can't do yet go to Chief of Staff."
             )
             runtime.note("assistant", reply)
             return {"reply": reply, "mode": "local", "tools": used}
@@ -369,6 +369,15 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         if temp is None:
             return f"Weather{mock} at {place}: {condition}."
         return f"{place}{mock}: {temp}{unit}, {condition}."
+    if name == "web_search":
+        spoken = data.get("speak")
+        if spoken:
+            return spoken if mock == "" else f"{spoken.rstrip('.')}" + mock + "."
+        results = data.get("results") or []
+        if not results:
+            return f"No live web results{mock}."
+        titles = ", ".join(str(r.get("title") or r.get("source") or "result") for r in results[:4])
+        return f"Web{mock} found: {titles}."
     if name == "memory_remember":
         if data.get("ok"):
             return f"I'll remember {data.get('key')}: {data.get('value')}"
@@ -487,6 +496,17 @@ _LIGHTS = re.compile(r"\b(lights?|scenes?|rooms?|home assistant)\b", re.I)
 _WORKSPACE = re.compile(r"\b(workspace|skills?)\b", re.I)
 _WEATHER = re.compile(
     r"\b(weather|forecast|temperature|how hot|how cold|is it raining|is it snowing)\b",
+    re.I,
+)
+_WEB_SEARCH = re.compile(
+    r"\b("
+    r"search the web|web search|look(?: it)? up online|search online|"
+    r"google(?:\s+for)?|"
+    r"where (?:can i|to) watch|where(?:'s| is) .+ streaming|"
+    r"what(?:'s| is) streaming|just\s*watch|"
+    r"latest news|current events|news about|what(?:'s| is) in the news|"
+    r"who won|score of"
+    r")\b",
     re.I,
 )
 _ABOUT_MEDIA = re.compile(
@@ -675,6 +695,8 @@ def route_intent(text: str) -> dict[str, Any] | None:
         return {"tool": "docker_inspect", "args": {"container": m.group(1)}}
     if _PLAYING.search(raw) or (_PLEX_ONLY.search(raw) and not _GRAB.search(raw)):
         return {"tool": "plex_now_playing", "args": {}}
+    if _WEB_SEARCH.search(raw) and not _WEATHER.search(raw):
+        return {"tool": "web_search", "args": {"query": _web_search_query(raw)}}
     if _WEATHER.search(raw):
         return {"tool": "get_weather", "args": {}}
     about = _about_media_plan(raw)
@@ -856,6 +878,19 @@ _MEDIA_NOISE = re.compile(
 def _media_query(text: str) -> str:
     cleaned = _MEDIA_NOISE.sub(" ", text)
     return re.sub(r"\s+", " ", cleaned).strip(" .?!")
+
+
+_WEB_QUERY_PREFIX = re.compile(
+    r"^(please |can you |could you )?(search the web( for)?|web search( for)?|"
+    r"look( it)? up online( for)?|search online( for)?|google( for)?)\s+",
+    re.I,
+)
+
+
+def _web_search_query(text: str) -> str:
+    cleaned = _WEB_QUERY_PREFIX.sub("", text.strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .?!")
+    return cleaned or text.strip()
 
 
 # Re-export for tests / app

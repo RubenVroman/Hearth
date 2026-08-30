@@ -20,6 +20,8 @@ _ASSIGN_KEYS = (
     "HEARTH_ADMIN_EMAIL",
     "HEARTH_COS_WEBHOOK_KEY",
     "HEARTH_COS_WEBHOOK",
+    "BRAVE_SEARCH_API_KEY",
+    "TAVILY_API_KEY",
 )
 
 _LIVE_ATTRS = (
@@ -34,6 +36,7 @@ _LIVE_ATTRS = (
     "admin_password",
     "cos_webhook_key",
     "cos_webhook",
+    "brave_search_api_key",
 )
 
 Replacement = str | Callable[[Match[str]], str]

@@ -14,6 +14,7 @@ from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
 from hearth.tools.thuisbezorgd import thuisbezorgd
 from hearth.tools.weather import fetch_weather
+from hearth.tools.websearch import web_search
 from hearth.memory.tools import register_memory_tools
 
 
@@ -317,6 +318,10 @@ async def _get_weather(args: dict[str, Any]) -> dict[str, Any]:
     place = args.get("place")
     return await fetch_weather(place=str(place) if place else None)
 
+
+async def _web_search(args: dict[str, Any]) -> dict[str, Any]:
+    return await web_search(args)
+
 async def _end_call(args: dict[str, Any]) -> dict[str, Any]:
     """Signal close-of-call. Sideband / client tear down the live WebRTC session."""
     reason = str(args.get("reason") or "close_of_call").strip() or "close_of_call"
@@ -338,6 +343,37 @@ def register_builtin_tools() -> None:
                 },
             },
             handler=_get_weather,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="web_search",
+            description=(
+                "Search the live public web and return a short speakable summary "
+                "(title, snippet, source) of a few results. Use for current events, "
+                "news, sports scores, where-to-watch / streaming availability, and "
+                "anything that needs up-to-date internet — not the house Plex library, "
+                "not Home Assistant, not secrets or local/internal URLs."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query, e.g. where to watch The Bear in Belgium",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many results to keep (1–5, default 4).",
+                    },
+                    "locale": {
+                        "type": "string",
+                        "description": "Optional locale like nl-BE or en-US (defaults near the house).",
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=_web_search,
         )
     )
     registry.register(

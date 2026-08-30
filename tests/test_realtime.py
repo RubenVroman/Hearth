@@ -229,6 +229,7 @@ async def test_end_call_tool_marks_close_of_call():
     assert result.data["reason"] == "goodbye"
     tools = {t["name"] for t in registry.openai_realtime_tools()}
     assert "end_call" in tools
+    assert "web_search" in tools
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Lights/AVR/TV/Apple TV via HA, Infuse play on ATV, *arr/Overseerr grab/request, Plex now-playing + play-on-client, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Lights/AVR/TV/Apple TV via HA, Infuse play on ATV, *arr/Overseerr grab/request, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -74,8 +74,8 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 
 | Variable | Live vs stub |
 | --- | --- |
-| `OPENAI_API_KEY` | **Live** text agent (chat completions + tools) and GA Realtime WebRTC voice. Empty → local intent router + text fallback on `/ws/voice`. |
-| `OPENAI_MODEL` | Chat model. Default `gpt-4o-mini`. |
+| `OPENAI_API_KEY` | **Live** text agent (chat completions + tools) and GA Realtime WebRTC voice. Also the default backend for the `web_search` house tool (Responses API hosted web search). Empty → local intent router + text fallback on `/ws/voice`. |
+| `OPENAI_MODEL` | Chat model. Default `gpt-4o-mini`. Also used for OpenAI-backed `web_search`. |
 | `OPENAI_REALTIME_MODEL` | Conversational Realtime model. Default `gpt-realtime-2.1` (ChatGPT-app equivalent). |
 | `HA_URL` | Default `http://homeassistant:8123` (compose DNS). |
 | `HA_TOKEN` | **Live** HA REST. Empty → mocked lights/scenes/Denon/LG. |
@@ -96,6 +96,9 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `THUISBEZORGD_API_KEY` | **Live** partner JE-API-KEY. Empty → fixtures only. Just Eat Takeaway has no public self-serve consumer ordering API. |
 | `THUISBEZORGD_SESSION_TOKEN` / `EMAIL` / `PASSWORD` | Server-side consumer auth for live submit (with API key). Never sent to the browser; never logged. |
 | `THUISBEZORGD_API_BASE` / `TENANT` | Default `https://nl.api.just-eat.io` / `nl`. |
+| `HEARTH_WEATHER_LAT` / `LON` / `PLACE` | Open-Meteo house weather. Defaults near Ghent. |
+| `BRAVE_SEARCH_API_KEY` | Optional. If set, `web_search` uses Brave Search (structured title/snippet/url, 10s timeout) instead of OpenAI. Server-side only — never sent to the browser. |
+| `HEARTH_WEB_SEARCH_MOCK` | Force fixture results for `web_search`. Default `false`. |
 | `HEARTH_COS_WEBHOOK` | **Live** Chief of Staff POST. Empty → tool returns “not configured” (not fake success). |
 | `HEARTH_COS_WEBHOOK_KEY` | Optional. Sent as `Authorization: Bearer <key>`. |
 | `HEARTH_COS_REPO` | Default `RubenVroman/Hearth`. |
@@ -125,7 +128,7 @@ Reach Plex on the existing stack:
 
 Live voice is the **GA OpenAI Realtime API over WebRTC** — the same family as ChatGPT Advanced Voice / GPT Realtime. It is **not** hold-to-talk, and it is **not** the old beta websocket.
 
-**Live** (key present): the browser opens `RTCPeerConnection`, POSTs SDP to Hearth `POST /api/realtime/calls`, and Hearth forwards a multipart `sdp` + `session` to `https://api.openai.com/v1/realtime/calls` with the NAS `OPENAI_API_KEY`. No `OpenAI-Beta` header. Mic uses browser AEC (`echoCancellation`) plus a client speech-band barge-in gate (`/static/vad.js`): while Hearth is talking, the outbound track stays muted until consecutive speech-like frames are seen, so TV/HVAC/clatter should not cut playback. The GA session also enables `audio.input.noise_reduction` (`near_field`) before semantic VAD. Remote audio plays through a hidden `<audio>` element. House tools (`ha_*`, `plex_*`, `radarr_*`, `sonarr_*`, `overseerr_*`, `workspace_*`, `docker_*`, `chief_of_staff`, `end_call`, `memory_*`, Thuisbezorgd, weather) run on Hearth over a sideband `wss://api.openai.com/v1/realtime?call_id=…`.
+**Live** (key present): the browser opens `RTCPeerConnection`, POSTs SDP to Hearth `POST /api/realtime/calls`, and Hearth forwards a multipart `sdp` + `session` to `https://api.openai.com/v1/realtime/calls` with the NAS `OPENAI_API_KEY`. No `OpenAI-Beta` header. Mic uses browser AEC (`echoCancellation`) plus a client speech-band barge-in gate (`/static/vad.js`): while Hearth is talking, the outbound track stays muted until consecutive speech-like frames are seen, so TV/HVAC/clatter should not cut playback. The GA session also enables `audio.input.noise_reduction` (`near_field`) before semantic VAD. Remote audio plays through a hidden `<audio>` element. House tools (`ha_*`, `plex_*`, `radarr_*`, `sonarr_*`, `overseerr_*`, `workspace_*`, `docker_*`, `chief_of_staff`, `end_call`, `memory_*`, Thuisbezorgd, weather, `web_search`) run on Hearth over a sideband `wss://api.openai.com/v1/realtime?call_id=…`.
 
 **Close of call:** when the conversation is finished (goodbye / done / nothing left), the model calls `end_call`. After that response completes, Hearth closes the sideband and the UI hangs up the WebRTC peer connection so the session does not stay open idle.
 
@@ -161,6 +164,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
 - Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
 - Weather outside → `get_weather` (Open-Meteo; no API key)
+- Live web (news, current events, where-to-watch / streaming) → `web_search` (OpenAI hosted web search by default; optional Brave; DuckDuckGo HTML lite last resort). Search results only — Hearth does not fetch arbitrary pages.
 - “Tell me about / what’s the movie …” → `plex_search` (glass overlay with title, year, summary, poster)
 
 **Call Chief of Staff** (`chief_of_staff`)
@@ -287,7 +291,7 @@ Routine house actions **run immediately** — no second “confirm” step:
 - `radarr_add` / `sonarr_add` / `overseerr_request` — grab / request titles
 - `chief_of_staff` — escalate repo/feature/Gridways/calendar work
 - `workspace_write` — sandboxed VAULT writes (not git)
-- Searches, status, remember/list memory, food browse/cart
+- Searches, status, remember/list memory, food browse/cart, `web_search`
 
 High-risk / irreversible / paid actions **default to dry-run** until `confirm=true`
 (voice or UI Confirm chip):
@@ -303,6 +307,7 @@ Read-only / inspect:
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`, `plex_clients`
 - `radarr_search`, `sonarr_search`, `overseerr_search`
+- `web_search` — live public web (title, short snippet, source). Caps query length; refuses local/internal URLs and secret-fishing; does not fetch result pages.
 - `thuisbezorgd_restaurants`, `thuisbezorgd_menu`, `thuisbezorgd_cart`, `thuisbezorgd_auth_status`
 - `workspace_list`, `workspace_read`
 - `docker_ps`, `docker_inspect`
@@ -344,7 +349,7 @@ cp .env.example .env
 python -m hearth
 ```
 
-Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire and a `media` glass overlay. `{"message":"what's the weather"}` → `weather` overlay. `{"message":"tell me about the movie Dune"}` → `plex_search` + media overlay. `{"message":"play The Endless on the Apple TV"}` should start `infuse_play` immediately. `{"message":"play The Endless on the LG"}` should start `plex_play` immediately. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should queue `radarr_add` immediately (no action/update guard cards). `{"message":"forget that I like dim lights"}` / food checkout still dry-run until confirm.
+Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire and a `media` glass overlay. `{"message":"what's the weather"}` → `weather` overlay. `{"message":"search the web for where to watch The Bear"}` → `web_search`. `{"message":"tell me about the movie Dune"}` → `plex_search` + media overlay. `{"message":"play The Endless on the Apple TV"}` should start `infuse_play` immediately. `{"message":"play The Endless on the LG"}` should start `plex_play` immediately. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should queue `radarr_add` immediately (no action/update guard cards). `{"message":"forget that I like dim lights"}` / food checkout still dry-run until confirm.
 
 ## Home Assistant devices
 
@@ -369,9 +374,10 @@ Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve →
 | --- | --- |
 | FastAPI runtime + UI + compose (incl. HA) | Live |
 | Tool registry + agent loop | Live |
-| Local intent router (no API key) | Live — playing, play-on-TV, lights, *arr/Overseerr grab, docker, workspace, CoS escalate |
+| Local intent router (no API key) | Live — playing, play-on-TV, lights, *arr/Overseerr grab, docker, workspace, CoS escalate, web search |
 | OpenAI chat tools | Live when `OPENAI_API_KEY` is set |
 | Realtime voice (GA WebRTC + sideband tools) | Live when `OPENAI_API_KEY` is set; UI is tap-to-talk duplex |
+| `web_search` | Live via OpenAI hosted web search when `OPENAI_API_KEY` is set; optional `BRAVE_SEARCH_API_KEY` for structured results; otherwise fixtures (or DuckDuckGo HTML lite if mock is off). Never fetches result pages. |
 | `/ws/voice` text fallback | Live protocol; not the disabled beta websocket |
 | Whisper/TTS on fallback | Live when a key is set but Realtime is down |
 | HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
