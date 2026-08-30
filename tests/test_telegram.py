@@ -2096,3 +2096,442 @@ async def test_inbox_clarify_with_hits_always_lists_titles(
     assert result.reply.strip() != (
         "Which one — reply 1–3, 'all of them', or a clearer title?"
     )
+
+
+# --- list-less 1–1 / plot guess-confirm (live Telegram 2026-08-31) ------------
+
+
+def test_parse_model_json_never_defaults_to_reply_1_1():
+    from hearth.telegram.intent import _parse_model_json
+
+    parsed = _parse_model_json(
+        '{"action":"clarify","confidence":0.7}',
+        candidate_count=1,
+    )
+    assert parsed is not None
+    assert "1–1" not in (parsed.clarify_question or "")
+    assert "1-1" not in (parsed.clarify_question or "")
+    assert "reply 1" not in (parsed.clarify_question or "").lower()
+
+    # Live VAULT shape: model echoed the template with empty offered / count=0.
+    sanitized = _parse_model_json(
+        '{"action":"clarify","clarify_question":"Which one — reply 1–1, '
+        "'all of them', or a clearer title?\","
+        '"confidence":0.7}',
+        candidate_count=0,
+    )
+    assert sanitized is not None
+    assert sanitized.action in {"clarify", "search"}
+    assert "1–1" not in (sanitized.clarify_question or "")
+    assert "reply 1" not in (sanitized.clarify_question or "").lower()
+
+    # Clarify + guess → promote to search so inbox asks yes/no.
+    guessed = _parse_model_json(
+        '{"action":"clarify","clarify_question":"Which one — reply 1–1, '
+        "'all of them', or a clearer title?\","
+        '"search_title":"Alien","year":1979,"media_kind":"movie","confidence":0.7}',
+        candidate_count=0,
+    )
+    assert guessed is not None
+    assert guessed.action == "search"
+    assert guessed.search_title == "Alien"
+    assert guessed.year == 1979
+    assert "1–1" not in (guessed.clarify_question or "")
+
+    # Phantom single candidate + list-less clarify → guess that title.
+    phantom = _parse_model_json(
+        '{"action":"clarify","clarify_question":"Which one — reply 1–1, '
+        "'all of them', or a clearer title?\","
+        '"confidence":0.7}',
+        candidate_count=1,
+        candidates=[{"title": "Alien", "year": 1979, "mediaType": "movie"}],
+    )
+    assert phantom is not None
+    assert phantom.action == "search"
+    assert phantom.search_title == "Alien"
+    assert phantom.year == 1979
+
+
+def test_parse_model_json_ignore_media_ask_not_silent():
+    from hearth.telegram.intent import _parse_model_json
+
+    ignored = _parse_model_json(
+        '{"action":"ignore","confidence":0.9}',
+        candidate_count=0,
+        user_message="The coolest sci-fi you can fins",
+    )
+    assert ignored is not None
+    assert ignored.action != "ignore"
+    assert ignored.action in {"clarify", "search"}
+
+    with_guess = _parse_model_json(
+        '{"action":"ignore","search_title":"Dune","year":2021,'
+        '"media_kind":"movie","confidence":0.9}',
+        candidate_count=0,
+        user_message="The coolest sci-fi you can fins",
+    )
+    assert with_guess is not None
+    assert with_guess.action == "search"
+    assert with_guess.search_title == "Dune"
+
+    chatter = _parse_model_json(
+        '{"action":"ignore","confidence":1.0}',
+        candidate_count=0,
+        user_message="lol",
+    )
+    assert chatter is not None
+    assert chatter.action == "ignore"
+
+
+def test_looks_like_concrete_title_plot_vs_named():
+    from hearth.telegram.intent import looks_like_concrete_title, looks_like_media_ask
+
+    assert not looks_like_concrete_title("Old horror movie on a spaceship")
+    assert not looks_like_concrete_title("The coolest sci-fi you can fins")
+    assert looks_like_concrete_title("Harry potter 2")
+    assert looks_like_concrete_title(
+        "The fall and rise of reggie dinkins with daniel radcliff"
+    )
+    assert looks_like_media_ask("The coolest sci-fi you can fins")
+    assert looks_like_media_ask("Old horror movie on a spaceship")
+    assert not looks_like_media_ask("lol")
+    assert not looks_like_media_ask("thanks")
+
+
+@pytest.mark.asyncio
+async def test_inbox_after_harry_potter_spaceship_horror_asks_alien_not_1_1(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: leftover HP offered must not become list-less reply 1–1."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    alien = {
+        "title": "Alien",
+        "year": 1979,
+        "tmdbId": 348,
+        "mediaId": 348,
+        "mediaType": "movie",
+    }
+    chamber = {
+        "title": "Harry Potter and the Chamber of Secrets",
+        "year": 2002,
+        "tmdbId": 672,
+        "mediaId": 672,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "alien" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [alien]}
+        if "harry" in q or "chamber" in q or "potter" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [chamber]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    calls = _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "search",
+                "search_title": "Harry Potter and the Chamber of Secrets",
+                "year": 2002,
+                "media_kind": "movie",
+                "confidence": 0.95,
+            },
+            {
+                "action": "clarify",
+                "clarify_question": (
+                    "Which one — reply 1–1, 'all of them', or a clearer title?"
+                ),
+                "confidence": 0.6,
+            },
+            {
+                "action": "search",
+                "search_title": "Alien",
+                "year": 1979,
+                "media_kind": "movie",
+                "confidence": 0.92,
+            },
+        ],
+    )
+
+    hp = await inbox.handle_message(_msg("Harry potter 2", message_id=700))
+    assert hp.grabbed is True, hp.reply
+    assert "Chamber" in hp.reply or "2002" in hp.reply
+    assert inbox.memory.offered(-1001) == []
+    assert inbox.pending.get(-1001) is None
+    before_queue = len(pipeline.overseerr_queue)
+
+    # Simulate the live failure mode: model returns list-less 1–1 clarify while
+    # leftover offered would have been 1 HP row (we clear offered — still safe).
+    inbox.memory.set_subject(
+        -1001,
+        "Harry Potter and the Chamber of Secrets",
+        media_kind="movie",
+        offered=[chamber],
+    )
+    assert len(inbox.memory.offered(-1001)) == 1
+
+    plot = await inbox.handle_message(
+        _msg("Old horror movie on a spaceship", message_id=701)
+    )
+    assert len(calls) >= 2
+    import json as _json
+
+    payload = _json.loads(calls[1]["messages"][1]["content"])
+    # Must not feed leftover Harry Potter as candidates.
+    cands = payload.get("candidates") or []
+    assert not any("Harry" in str(c.get("title") or "") for c in cands)
+    assert "1–1" not in plot.reply
+    assert "1-1" not in plot.reply
+    assert "reply 1–1" not in plot.reply.lower()
+    assert "reply 1-1" not in plot.reply.lower()
+    assert "Harry Potter" not in plot.reply
+    assert plot.grabbed is False
+    assert len(pipeline.overseerr_queue) == before_queue
+    # Useful clarify (no Alien yet — model returned clarify). Then retry with search.
+    assert "?" in plot.reply or "mean" in plot.reply.lower() or "Which" in plot.reply
+
+    # Second plot turn with a real search_title → Alien confirm, still no queue.
+    ask = await inbox.handle_message(
+        _msg("Old horror movie on a spaceship", message_id=702)
+    )
+    assert ask.grabbed is False
+    assert "Alien" in ask.reply
+    assert "1979" in ask.reply
+    assert "1–1" not in ask.reply
+    assert "Harry Potter" not in ask.reply
+    assert len(pipeline.overseerr_queue) == before_queue
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert len(pending.options) == 1
+    assert "Alien" in str(pending.options[0].get("title") or "")
+
+    yes = await inbox.handle_message(_msg("yes", message_id=703))
+    assert yes.grabbed is True, yes.reply
+    assert "Alien" in yes.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 348
+
+
+@pytest.mark.asyncio
+async def test_inbox_unique_catalog_hit_clarify_1_n_grabs_or_names(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Unique catalog hit + model clarify 1–N → grab that hit, never list-less 1–1."""
+    rows = [
+        {
+            "title": "The Christophers",
+            "year": 2025,
+            "tmdbId": 1280010,
+            "mediaId": 1280010,
+            "mediaType": "movie",
+        }
+    ]
+
+    async def single(_query: str, *args, **kwargs):
+        return {"mode": "mock", "service": "overseerr", "results": list(rows)}
+
+    monkeypatch.setattr("hearth.telegram.inbox.overseerr.search", single)
+    monkeypatch.setattr("hearth.telegram.catalog.overseerr.search", single)
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": (
+                "Which one — reply 1–1, 'all of them', or a clearer title?"
+            ),
+            "confidence": 0.7,
+        },
+    )
+    result = await inbox.handle_message(_msg("The christophers", message_id=710))
+    assert "1–1" not in result.reply
+    assert "reply 1–1" not in result.reply.lower()
+    if result.grabbed:
+        assert "Christophers" in result.reply
+    else:
+        assert "Christophers" in result.reply
+        assert "1." in result.reply or "Did you mean" in result.reply or "?" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_plot_guess_yes_queues_no_means_next_clue(
+    inbox: TelegramInbox, monkeypatch
+):
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    alien = {
+        "title": "Alien",
+        "year": 1979,
+        "tmdbId": 348,
+        "mediaId": 348,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "alien" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [alien]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "search",
+                "search_title": "Alien",
+                "year": 1979,
+                "media_kind": "movie",
+                "confidence": 0.9,
+            },
+            {
+                "action": "clarify",
+                "clarify_question": "Ok — any other clue (year, actor)?",
+                "confidence": 0.8,
+            },
+        ],
+    )
+    ask = await inbox.handle_message(
+        _msg("Old horror movie on a spaceship", message_id=720)
+    )
+    assert ask.grabbed is False
+    assert "Alien" in ask.reply
+    assert "Did you mean" in ask.reply or "?" in ask.reply
+    before = len(pipeline.overseerr_queue)
+
+    no = await inbox.handle_message(_msg("no not that", message_id=721))
+    assert no.grabbed is False
+    assert len(pipeline.overseerr_queue) == before
+    assert "1–1" not in no.reply
+    assert "Alien" not in no.reply or "clue" in no.reply.lower() or "?" in no.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_live_vault_listless_1_1_with_empty_offered_guesses_alien(
+    inbox: TelegramInbox, monkeypatch
+):
+    """VAULT evidence: offered empty, bot still said reply 1–1 — ban + guess-ask."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    alien = {
+        "title": "Alien",
+        "year": 1979,
+        "tmdbId": 348,
+        "mediaId": 348,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "alien" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [alien]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    # Exact live clarify string; empty candidates / empty offered.
+    assert inbox.memory.offered(-1001) == []
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": (
+                "Which one — reply 1–1, 'all of them', or a clearer title?"
+            ),
+            "search_title": "Alien",
+            "year": 1979,
+            "media_kind": "movie",
+            "confidence": 0.7,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("Old horror movie on a spaceship", message_id=730)
+    )
+    assert result.grabbed is False
+    assert result.reply
+    assert "1–1" not in result.reply
+    assert "reply 1–1" not in result.reply.lower()
+    assert "Alien" in result.reply
+    assert "Did you mean" in result.reply or "?" in result.reply
+    assert inbox.memory.offered(-1001)  # confirm stores the guess
+    assert "Alien" in str(inbox.memory.offered(-1001)[0].get("title") or "")
+
+
+@pytest.mark.asyncio
+async def test_inbox_coolest_sci_fi_typo_not_silent_guess_and_ask(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live: 'The coolest sci-fi you can fins' stored no bot reply — must guess-ask."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    dune = {
+        "title": "Dune",
+        "year": 2021,
+        "tmdbId": 438631,
+        "mediaId": 438631,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "dune" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [dune]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    # Model wrongly ignores a plot/typo ask (live silence path).
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "ignore",
+            "search_title": "Dune",
+            "year": 2021,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("The coolest sci-fi you can fins", message_id=731)
+    )
+    assert result.reply, "plot/typo ask must not be silent"
+    assert result.grabbed is False
+    assert "1–1" not in result.reply
+    assert "Dune" in result.reply
+    assert "Did you mean" in result.reply or "?" in result.reply
+
+    # Pure ignore with no guess still must reply (useful question), not silence.
+    inbox.reset()
+    _patch_openai_intent(
+        monkeypatch,
+        {"action": "ignore", "confidence": 0.95},
+    )
+    again = await inbox.handle_message(
+        _msg("The coolest sci-fi you can fins", message_id=732)
+    )
+    assert again.reply
+    assert again.grabbed is False
+    assert "1–1" not in again.reply

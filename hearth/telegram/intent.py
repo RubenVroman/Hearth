@@ -2,12 +2,14 @@
 
 Instant path (no model) only when there is no reasonable doubt:
 catalog id/URL, explicit ``Title (YYYY)``, or a live numbered pick
-(``1``/``2``/``3``, ``all of them``, ``de eerste`` while a list is on screen).
+(``1``/``2``/``3``, ``all of them``, ``de eerste``, or ``yes`` while a
+list/guess is on screen).
 
 Everything else always calls gpt-4o with Overseerr catalog hits for this turn
 as ``candidates``, plus the last ~8 turns of this chat. No keyword gates, no
-franchise/actor maps. Unsure → clarify with a real 1–N list when hits exist;
-never invent a grab.
+franchise/actor maps. Plot/vibe asks → one best ``search_title`` guess; the
+inbox asks the user to confirm before queueing. Unsure with 2+ hits → clarify
+with a real 1–N list; never invent a grab or a list-less ``reply 1–1``.
 """
 
 from __future__ import annotations
@@ -60,6 +62,17 @@ _YEAR_PAREN = re.compile(r"\(\s*((?:19|20)\d{2})\s*\)")
 _CATALOG_ID = re.compile(r"\btt\d{7,}|\btmdb:\d+|\btvdb:\d+", re.I)
 _URLISH = re.compile(r"https?://", re.I)
 _ORDINAL_PICK = re.compile(r"^\s*#?\s*([1-9])\s*$")
+_CONFIRM_YES = re.compile(
+    r"^\s*(?:"
+    r"yes|yep|yeah|yup|sure|correct|right|"
+    r"that(?:'s| is|s)?\s+(?:it|the\s+one|correct|right)|"
+    r"ja|jawel|klopt|juist|"
+    r"dat\s+is\s+(?:hem|die|het|correct)|"
+    r"doe\s+(?:maar|die)|"
+    r"go\s+ahead"
+    r")\s*[.!?]*\s*$",
+    re.I,
+)
 _STOP_TOKENS = frozenset(
     {
         "a",
@@ -124,13 +137,21 @@ _SYSTEM = (
     "user's own words). NEVER invent a title that is not a candidate and not "
     "in the user message (e.g. do not turn Christophers+McKellen into "
     "Christopher Guest). If several candidates remain, action=clarify — the "
-    "bot will list them as 1–N. "
-    "When candidates are empty: resolve plot/character/premise to search_title "
-    "(catalog title; franchise name OK) and year + media_kind when known. "
-    "Do not echo the plot as search_title. Do not reuse subject_title when the "
-    "user clearly named a different title. "
+    "bot will list them as 1–N with real Title (year) rows. NEVER say "
+    "'reply 1–N' unless candidates has at least 2 rows. "
+    "When candidates are empty: for plot/vibe/description asks, return "
+    "action=search with your ONE best catalog guess as search_title (+ year + "
+    "media_kind when known). The bot will ASK the user to confirm that guess "
+    "before queueing — do not invent a numbered 1–N menu. Do not echo the "
+    "plot as search_title. Do not reuse subject_title when the user clearly "
+    "named or described a different title. "
     "Actor/artist names and misspellings are clues for you — never refuse because "
-    "of spelling. If unsure which title, action=clarify once with a useful question. "
+    "of spelling. If unsure which title and you have no good guess, action=clarify "
+    "once with a useful question (never 'reply 1–1' / list-less 1–N). "
+    "NEVER action=ignore for plot/vibe/description asks or title typos "
+    "(e.g. 'coolest sci-fi you can fins', 'old horror movie on a spaceship') — "
+    "always action=search with your best catalog guess so the bot can ask "
+    "yes/no. Ignore is only for pure chatter/emoji/meta with no media ask. "
     "Actions: passthrough, ignore, clarify, pick, pick_many, search. "
     "search sets search_title (and year when known; select_all=true for whole "
     "series/trilogy). Catalog year wins later — still include your best year. "
@@ -239,19 +260,31 @@ def looks_like_concrete_title(text: str) -> bool:
         flags=re.I,
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—|,.")
+    # Cast clauses are clues, not part of the title length budget.
+    cleaned = re.sub(
+        r"\b(?:with|featuring|starring|feat\.?|ft\.?|met)\s+.+$",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—|,.")
     words = cleaned.split()
     if len(words) > 8 or len(cleaned) > 80:
         return False
-    # Plot / descriptive cues → conversation hop, not catalog-first.
+    # Plot / descriptive / vibe cues → conversation hop, not catalog-first.
     descriptive = re.compile(
         r"\b("
         r"about|waar|waarin|film\s+met|movie\s+about|series\s+about|"
         r"die\s+film|zoek|looking\s+for|someone\s+who|iemand\s+die|"
-        r"puzzel|spiegel|tovenaar|wizard|harige|voeten"
+        r"puzzel|spiegel|tovenaar|wizard|harige|voeten|"
+        r"coolest|oldest|newest|classic\s+\w+\s+movie|"
+        r"old\s+\w+\s+movie|horror\s+movie|sci-?fi|"
+        r"spaceship|space\s+ship|you\s+can\s+f(?:i)?n[ds]|"
+        r"movie\s+on\s+a|film\s+on\s+a|on\s+a\s+spaceship"
         r")\b",
         re.I,
     )
-    if descriptive.search(cleaned):
+    if descriptive.search(cleaned) or descriptive.search(raw):
         return False
     return bool(re.search(r"[A-Za-zÀ-ÿ]", cleaned))
 
@@ -289,11 +322,56 @@ def is_explicit_title_year(text: str) -> bool:
     return True
 
 
+def looks_like_confirm_yes(text: str) -> bool:
+    """True for short yes / that's it confirmations of a single guess."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 40:
+        return False
+    return bool(_CONFIRM_YES.match(raw))
+
+
+def looks_like_media_ask(text: str) -> bool:
+    """True for title/plot/vibe asks that must never be silently ignored."""
+    raw = (text or "").strip()
+    if not raw or looks_like_chatter(raw):
+        return False
+    if _CATALOG_ID.search(raw) or _URLISH.search(raw) or is_explicit_title_year(raw):
+        return True
+    if looks_like_concrete_title(raw):
+        return True
+    # Plot / vibe / descriptive (incl. typos) — anything that is not chatter
+    # and has enough substance to be a media request.
+    if len(raw) >= 10 and re.search(r"[A-Za-zÀ-ÿ]", raw):
+        return True
+    return False
+
+
+def _default_clarify_question(candidate_count: int) -> str:
+    """Never emit list-less 1–N wording when fewer than 2 candidates exist."""
+    if candidate_count >= 2:
+        return (
+            f"Which one — reply 1–{min(3, candidate_count)}, "
+            "'all of them', or a clearer title?"
+        )
+    return "Which movie or series did you mean? Send the title if you know it."
+
+
+def _year_from_candidate(row: dict[str, Any]) -> int | None:
+    year = row.get("year")
+    try:
+        year_i = int(year) if year not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+    if year_i is not None and 1900 <= year_i <= 2100:
+        return year_i
+    return None
+
+
 def instant_pick_decision(
     text: str,
     candidates: list[dict[str, Any]] | None,
 ) -> IntentDecision | None:
-    """Live numbered-list shortcuts — only while candidates are on screen."""
+    """Live numbered-list / single-guess confirm shortcuts while options are on screen."""
     raw = (text or "").strip()
     if not raw or not candidates:
         return None
@@ -313,8 +391,21 @@ def instant_pick_decision(
             )
         return IntentDecision(
             action="clarify",
-            clarify_question=f"Pick a number from 1–{min(3, n)} (or say 'all of them').",
+            clarify_question=(
+                f"Pick a number from 1–{min(3, n)} (or say 'all of them')."
+                if n >= 2
+                else "Did you mean that title? Reply yes or send another clue."
+            ),
             confidence=0.9,
+            source="instant",
+        )
+
+    # Single on-screen guess: yes / that's it → queue it.
+    if n == 1 and looks_like_confirm_yes(raw):
+        return IntentDecision(
+            action="pick",
+            indices=[1],
+            confidence=1.0,
             source="instant",
         )
 
@@ -659,16 +750,15 @@ def _parse_model_json(
     if action == "pick" and len(indices) > 1:
         action = "pick_many"
     if action == "pick" and not indices:
-        return IntentDecision(
-            action="clarify",
-            clarify_question=clarify
-            or (
-                f"Which one — reply 1–{min(3, candidate_count)}?"
-                if candidate_count
-                else "Which title did you mean?"
-            ),
-            confidence=confidence,
-        )
+        # Unique candidate on screen → treat as that pick (never list-less 1–1).
+        if candidate_count == 1:
+            indices = [1]
+        else:
+            return IntentDecision(
+                action="clarify",
+                clarify_question=clarify or _default_clarify_question(candidate_count),
+                confidence=confidence,
+            )
     if action == "pick_many" and not indices:
         return IntentDecision(
             action="clarify",
@@ -698,13 +788,7 @@ def _parse_model_json(
             # Invented title while real hits exist — force clarify (inbox lists them).
             return IntentDecision(
                 action="clarify",
-                clarify_question=clarify
-                or (
-                    f"Which one — reply 1–{min(3, candidate_count)}, "
-                    "'all of them', or a clearer title?"
-                    if candidate_count
-                    else "Which movie or series did you mean? Send the title if you know it."
-                ),
+                clarify_question=clarify or _default_clarify_question(candidate_count),
                 confidence=confidence,
                 media_kind=media_kind,
             )
@@ -716,12 +800,57 @@ def _parse_model_json(
                 confidence=confidence,
                 media_kind=media_kind,
             )
-    if action == "clarify" and not clarify:
-        clarify = (
-            f"Which one — reply 1–{min(3, candidate_count)}, 'all of them', or a clearer title?"
-            if candidate_count
-            else "Which movie or series did you mean?"
-        )
+
+    # Plot/vibe/title asks must never be silently ignored (live: "coolest sci-fi
+    # you can fins" stored no bot reply). Promote to search/clarify instead.
+    if action == "ignore" and looks_like_media_ask(user_message):
+        if search_title:
+            action = "search"
+        else:
+            action = "clarify"
+            clarify = clarify or (
+                "Which movie or series did you mean? Send the title if you know it."
+            )
+
+    # Ban list-less "reply 1–N" / "1–1" forever when fewer than 2 real candidates.
+    # Live VAULT: offered was empty but the default template still fired with
+    # candidate_count=1 (or the model echoed "reply 1–1"). Prefer guess→ask.
+    if action == "clarify":
+        listless = (not clarify) or clarify_wants_numbered_list(clarify)
+        if candidate_count < 2 and listless:
+            phantom = None
+            rows = list(candidates or [])
+            if len(rows) == 1:
+                phantom = rows[0]
+            if search_title:
+                # Have a guess — inbox will ask "Did you mean …?" before queueing.
+                action = "search"
+                clarify = ""
+            elif phantom and str(phantom.get("title") or "").strip():
+                search_title = str(phantom.get("title") or "").strip()[:200]
+                if year is None:
+                    year = _year_from_candidate(phantom)
+                kind = str(
+                    phantom.get("mediaType") or phantom.get("media_kind") or ""
+                ).strip().lower()
+                if kind in {"movie", "tv"}:
+                    media_kind = kind
+                action = "search"
+                clarify = ""
+            else:
+                clarify = _default_clarify_question(0)
+        elif not clarify:
+            clarify = _default_clarify_question(candidate_count)
+        elif clarify_wants_numbered_list(clarify) and candidate_count < 2:
+            clarify = _default_clarify_question(0)
+
+    # Absolute last line of defense: never return list-less 1–N wording.
+    if clarify and clarify_wants_numbered_list(clarify) and candidate_count < 2:
+        if search_title:
+            action = "search"
+            clarify = ""
+        else:
+            clarify = _default_clarify_question(0)
 
     return IntentDecision(
         action=action,  # type: ignore[arg-type]
@@ -807,6 +936,8 @@ __all__ = [
     "is_explicit_title_year",
     "looks_like_chatter",
     "looks_like_concrete_title",
+    "looks_like_confirm_yes",
+    "looks_like_media_ask",
     "looks_like_collection_request",
     "looks_like_contextual_followup",
     "looks_like_descriptive_ask",
