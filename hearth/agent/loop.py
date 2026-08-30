@@ -544,7 +544,7 @@ _DOWNLOAD_PROGRESS_TITLE = re.compile(
     r"(?:check|show|get) (?:the )?(?:download|queue)(?: progress|status)? (?:for |on |of )|"
     r"is (?:the )?(?:download (?:of |for )?)?|"
     r"how(?:'s| is) (?:the )?(?:download (?:of |for )?)?"
-    r")(.+?)(?:\s+downloading)?$",
+    r")(.+?)(?:\s+downloading)?[.?!]*$",
     re.I,
 )
 _GRAB = re.compile(
@@ -775,6 +775,7 @@ def _download_progress_plan(raw: str) -> dict[str, Any] | None:
             title,
             flags=re.I,
         )
+        title = re.sub(r"\s+downloading$", "", title, flags=re.I)
         title = re.sub(r"\s+", " ", title).strip(" .?!'\"")
         if title.lower() in {
             "",

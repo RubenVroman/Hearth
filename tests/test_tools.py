@@ -287,6 +287,10 @@ async def test_intent_download_progress_routes_to_radarr_queue():
     show = route_intent("How far along is the Severance episode download?")
     assert show["tool"] == "sonarr_queue"
 
+    hows = route_intent("how's Annihilation downloading?")
+    assert hows["tool"] == "radarr_queue"
+    assert hows["args"]["query"].lower() == "annihilation"
+
     # Grab intents must still add, not report progress.
     grab = route_intent("download the movie Dune")
     assert grab["tool"] == "radarr_add"
@@ -654,7 +658,7 @@ async def test_ui_try_again_label_for_awaiting_client():
     assert 'reason === "awaiting_client"' in app_js
     assert "Try again — Plex is open" in app_js
     sw = Path("hearth/ui/static/sw.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v11" in sw
+    assert "hearth-shell-v12" in sw
 
 
 async def test_plex_play_live_proxies_play_media(monkeypatch):

@@ -9,7 +9,7 @@ from hearth.config import settings
 
 AgentStatus = Literal["idle", "listening", "thinking", "speaking", "tool"]
 VoiceMode = Literal["disconnected", "fallback", "live"]
-WidgetKind = Literal["weather", "media"]
+WidgetKind = Literal["weather", "media", "downloads"]
 WidgetStatus = Literal["pending", "running", "done", "error", "info"]
 
 
@@ -37,7 +37,7 @@ class PendingConfirm:
 
 @dataclass
 class Widget:
-    """Centered glass-panel overlay for rich visual content (weather, movie/TV)."""
+    """Centered glass-panel overlay for rich visual content (weather, media, downloads)."""
 
     id: str
     kind: WidgetKind | str
