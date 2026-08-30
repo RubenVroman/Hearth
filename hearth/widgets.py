@@ -16,6 +16,7 @@ _MEDIA_TOOLS = {
     "plex_now_playing",
     "plex_play",
     "plex_browse_genre",
+    "infuse_play",
     "radarr_search",
     "sonarr_search",
     "overseerr_search",
@@ -355,6 +356,25 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
             },
             source="plex",
         )
+        return [item] if item else []
+    if name == "infuse_play":
+        item_raw = data.get("item") or {}
+        if not isinstance(item_raw, dict):
+            item_raw = {}
+        title = item_raw.get("title") or data.get("query") or data.get("speak")
+        if not title and data.get("tmdbId") is not None:
+            title = f"TMDB {data.get('tmdbId')}"
+        if not title:
+            return []
+        row = {
+            **item_raw,
+            "title": title,
+            "tmdbId": item_raw.get("tmdbId") or data.get("tmdbId"),
+            "player": "Infuse",
+            "state": "opening" if data.get("played") else ("ready" if data.get("ok") is not False else None),
+            "pending": bool(data.get("needs_confirm") or data.get("would_call_with")),
+        }
+        item = _normalize_media_item(row, source="infuse")
         return [item] if item else []
     if name in {"plex_search", "plex_browse_genre", "radarr_search", "sonarr_search", "overseerr_search"}:
         results = data.get("results") or []

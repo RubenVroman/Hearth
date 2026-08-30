@@ -655,12 +655,63 @@ input,
     scale(calc(1 - var(--stack-i, 1) * 0.045));
   opacity: calc(1 - var(--stack-i, 1) * 0.28);
   filter: brightness(0.72);
-  pointer-events: none;
+  /* Clickable so users can bring a recessed recommendation forward. */
+  pointer-events: auto;
+  cursor: pointer;
 }
 
 .info-media-card {
   border-radius: 18px;
   padding: 4px;
+}
+
+.info-media-card.is-selectable:focus-visible {
+  outline: 1px solid rgba(224, 138, 58, 0.55);
+  outline-offset: 3px;
+}
+
+.info-media-actions {
+  margin-top: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.info-infuse-btn {
+  appearance: none;
+  border: 1px solid rgba(255, 206, 138, 0.28);
+  background: linear-gradient(
+    165deg,
+    rgba(224, 138, 58, 0.28) 0%,
+    rgba(120, 72, 28, 0.45) 100%
+  );
+  color: var(--ink, #f4ead8);
+  font: inherit;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  padding: 10px 14px;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.info-infuse-btn:hover,
+.info-infuse-btn:focus-visible {
+  border-color: rgba(255, 206, 138, 0.5);
+  background: linear-gradient(
+    165deg,
+    rgba(224, 138, 58, 0.4) 0%,
+    rgba(140, 84, 32, 0.55) 100%
+  );
+}
+
+.info-infuse-btn:focus-visible {
+  outline: 1px solid rgba(224, 138, 58, 0.55);
+  outline-offset: 2px;
+}
+
+.info-infuse-btn:disabled {
+  opacity: 0.65;
+  cursor: wait;
 }
 
 .info-media-card.is-skeleton .info-poster-fallback,

@@ -48,7 +48,14 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v14" in sw.text
+    assert "hearth-shell-v15" in sw.text
+    assert "info-infuse-btn" in js.text
+    assert "playActiveInInfuse" in js.text
+    assert "focusMediaById" in js.text
+    assert "data-infuse-play" in js.text
+    assert "setRefreshInterval" in js.text
+    assert ".info-infuse-btn" in css.text
+    assert ".info-media-card.is-selectable" in css.text
 
 
 def test_weather_ask_surfaces_weather_overlay(client):
@@ -206,6 +213,66 @@ def test_animation_genre_browse_surfaces_media_stack(client):
     titles = {row.get("title") for row in items}
     assert "Spirited Away" in titles or "Spirited Away" in media["title"]
     assert "animation" in body["reply"].lower() or "Spirited" in body["reply"]
+
+
+def test_sci_fi_genre_browse_surfaces_media_stack(client):
+    """Sci-fi / science fiction aliases must publish selectable media cards."""
+    chat = client.post("/api/chat", json={"message": "what sci-fi movies do we have"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "plex_browse_genre"
+    assert body["tools"][0]["data"]["genre"] == "Science Fiction"
+    media = next(w for w in body["widgets"] if w["kind"] == "media")
+    items = media["data"].get("items") or []
+    titles = {row.get("title") for row in items}
+    assert "Dune: Part Two" in titles or "The Endless" in titles
+    assert media["data"]["active_id"]
+    assert media["data"]["item"]["id"] == media["data"]["active_id"]
+    # Active card carries Infuse-resolvable identifiers for the UI button.
+    active = media["data"]["item"]
+    assert active.get("title")
+    assert active.get("ratingKey") or active.get("tmdbId")
+
+    alias = client.post("/api/chat", json={"message": "show me science fiction movies"})
+    assert alias.status_code == 200
+    assert alias.json()["tools"][0]["name"] == "plex_browse_genre"
+    assert alias.json()["tools"][0]["data"]["genre"] == "Science Fiction"
+
+
+def test_empty_genre_list_does_not_publish_media_overlay(client):
+    chat = client.post("/api/chat", json={"message": "list plex genres"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "plex_browse_genre"
+    assert body["tools"][0]["data"].get("listed_genres") is True
+    assert body["tools"][0]["data"].get("results") == []
+    assert not any(w["kind"] == "media" for w in body["widgets"])
+
+
+def test_ui_can_invoke_infuse_play_for_listed_title(client):
+    """Media stack → /api/invoke infuse_play (server-side HA deep link, no browser secrets)."""
+    browse = client.post("/api/chat", json={"message": "what sci-fi movies do we have"})
+    assert browse.status_code == 200
+    media = next(w for w in browse.json()["widgets"] if w["kind"] == "media")
+    item = media["data"]["item"]
+    args = {"query": item["title"]}
+    if item.get("tmdbId") is not None:
+        args["tmdbId"] = item["tmdbId"]
+    if item.get("ratingKey"):
+        args["ratingKey"] = item["ratingKey"]
+    out = client.post("/api/invoke", json={"tool": "infuse_play", "args": args})
+    assert out.status_code == 200
+    payload = out.json()
+    assert payload["name"] == "infuse_play"
+    assert payload["ok"] is True
+    assert payload["needs_confirm"] is False
+    assert payload["data"].get("played") is True
+    assert payload["data"].get("deep_link", "").startswith("infuse://")
+    # Overlay stays/updates with the Infuse title card.
+    widgets = payload.get("widgets") or []
+    media_after = next(w for w in widgets if w["kind"] == "media")
+    assert item["title"].split(":")[0] in media_after["title"] or item["title"] in media_after["title"]
+    assert "Open in Infuse" in client.get("/static/app.js").text
 
 
 def test_download_progress_surfaces_downloads_overlay(client):

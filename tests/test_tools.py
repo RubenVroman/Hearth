@@ -398,6 +398,31 @@ async def test_plex_browse_genre_anime_alias():
     assert result.data["total"] >= 3
 
 
+async def test_plex_browse_genre_sci_fi_alias():
+    for needle in ("sci-fi", "sci fi", "scifi", "Science Fiction", "science fiction"):
+        result = await registry.call("plex_browse_genre", {"genre": needle})
+        assert result.ok, needle
+        assert result.data["genre"] == "Science Fiction", needle
+        titles = {r["title"] for r in result.data["results"]}
+        assert "Dune: Part Two" in titles or "The Endless" in titles, needle
+
+
+def test_intent_sci_fi_movies_uses_plex_browse_genre():
+    from hearth.agent.loop import route_intent
+
+    for phrase in (
+        "what sci-fi movies do we have",
+        "list sci fi movies",
+        "show me science fiction movies",
+        "got any scifi movies",
+    ):
+        plan = route_intent(phrase)
+        assert plan is not None, phrase
+        assert plan["tool"] == "plex_browse_genre", phrase
+        assert plan["args"]["genre"] == "Science Fiction", phrase
+        assert plan["args"]["type"] == "movie", phrase
+
+
 async def test_plex_browse_genre_lists_genres_when_empty():
     result = await registry.call("plex_browse_genre", {"genre": ""})
     assert result.ok
@@ -716,7 +741,7 @@ async def test_ui_try_again_label_for_awaiting_client():
     assert 'reason === "awaiting_client"' in app_js
     assert "Try again — Plex is open" in app_js
     sw = Path("hearth/ui/static/sw.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v14" in sw
+    assert "hearth-shell-v15" in sw
 
 
 async def test_plex_play_live_proxies_play_media(monkeypatch):

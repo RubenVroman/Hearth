@@ -530,7 +530,7 @@ _PLEX_GENRE_BROWSE = re.compile(
     r"(?P<kind>movies?|films?|shows?|series)\b"
     r"|"
     r"(?P<genre2>animation|anime|comedy|horror|action|drama|thriller|romance|"
-    r"documentary|sci[\-\s]?fi|science fiction|fantasy|family|kids?|crime|adventure|"
+    r"documentary|sci[\-\s]?fi|scifi|science fiction|fantasy|family|kids?|crime|adventure|"
     r"mystery|western|war|music|musical|sport|sports|history|biography|biopic)\s+"
     r"(?P<kind2>movies?|films?|shows?|series)\b"
     r"|"
@@ -840,8 +840,8 @@ def _plex_genre_plan(raw: str) -> dict[str, Any] | None:
     media_type = "show" if kind in {"show", "shows", "series"} or (
         _SERIES.search(raw) and not _MOVIE.search(raw) and not kind
     ) else "movie"
-    # "sci fi" / "science fiction" normalize for Plex tag matching.
-    if re.fullmatch(r"sci[\-\s]?fi", genre, flags=re.I):
+    # "sci fi" / "scifi" / "science fiction" normalize for Plex tag matching.
+    if re.fullmatch(r"sci[\-\s]?fi|scifi|science\s+fiction", genre, flags=re.I):
         genre = "Science Fiction"
     return {"tool": "plex_browse_genre", "args": {"genre": genre, "type": media_type}}
 
