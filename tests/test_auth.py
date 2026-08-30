@@ -103,7 +103,7 @@ def test_login_page_and_static_are_public():
 
 
 def test_media_art_allows_refresh_cookie_like_img_tag():
-    """Overlay posters use <img src>/api/media/art> — no X-Auth-Token header.
+    """Overlay posters use <img src="/api/media/art"> — no X-Auth-Token header.
 
     The refresh cookie alone must authorize those GETs, otherwise the browser
     shows a broken-image question mark for every title.
