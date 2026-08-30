@@ -379,11 +379,57 @@ input,
   position: relative;
   z-index: 2;
   padding: 8px 0 calc(36px + var(--safe-bottom));
+  min-width: 0;
+}
+
+/* Hidden until there is at least one turn — no empty Conversation chrome. */
+.transcript.is-empty {
+  display: none;
+}
+
+.transcript-details {
+  margin: 0;
+  min-width: 0;
+}
+
+.transcript-toggle {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 6px 0;
+  font-size: 11px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--muted);
+  user-select: none;
+}
+
+.transcript-toggle::-webkit-details-marker {
+  display: none;
+}
+
+.transcript-toggle::after {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-right: 1.5px solid var(--muted);
+  border-bottom: 1.5px solid var(--muted);
+  transform: rotate(45deg);
+  opacity: 0.65;
+  transition: transform 0.15s ease;
+}
+
+.transcript-details[open] > .transcript-toggle::after {
+  transform: rotate(-135deg);
+  translate: 0 2px;
 }
 
 .transcript ol {
   list-style: none;
-  margin: 0;
+  margin: 10px 0 0;
   padding: 0;
   max-height: 180px;
   overflow: auto;
@@ -402,6 +448,10 @@ input,
   text-transform: uppercase;
   color: var(--muted);
   margin-right: 10px;
+}
+
+.transcript li[data-role="you"] .who {
+  color: var(--ember-2);
 }
 
 @keyframes pulse {
@@ -559,10 +609,10 @@ input,
 
   .hearth {
     order: 1;
-    flex: 1 0 auto;
+    flex: 1 1 auto;
     width: 100%;
     min-width: 0;
-    min-height: 100%;
+    min-height: 0;
     height: auto;
     position: relative;
     display: flex;
@@ -572,23 +622,14 @@ input,
     padding-top: 0;
   }
 
-  .transcript {
-    order: 2;
-    padding: 0;
-    min-height: 0;
-  }
-
-  .rail-media {
-    order: 3;
-  }
-
-  .rail-rooms {
-    order: 4;
-    padding-bottom: 8px;
-  }
-
-  .is-empty {
-    display: none !important;
+  /* Idle phone: orb owns the first screen. A collapsed Conversation toggle
+     (or house rails) only steals a thin strip — never a blank transcript panel. */
+  .stage:not(:has(#transcript:not(.is-empty))):not(:has(#rail-media:not(.is-empty))):not(
+      :has(#rail-rooms:not(.is-empty))
+    )
+    .hearth {
+    min-height: 100%;
+    flex: 1 0 auto;
   }
 
   .orb {
@@ -596,8 +637,67 @@ input,
     left: auto;
     top: auto;
     transform: none;
+    flex-shrink: 0;
     width: min(72vw, 280px);
     height: min(72vw, 280px);
+  }
+
+  .transcript {
+    order: 2;
+    flex: 0 0 auto;
+    position: relative;
+    z-index: 1;
+    margin: 0;
+    padding: 0;
+    min-height: 0;
+    max-height: none;
+    background: transparent;
+    border: 0;
+  }
+
+  .transcript-details[open] {
+    padding: 12px 14px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    max-height: min(34vh, 220px);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    isolation: isolate;
+  }
+
+  .transcript-details[open] > .transcript-toggle {
+    flex-shrink: 0;
+    padding-top: 0;
+    padding-bottom: 4px;
+  }
+
+  .transcript-details[open] > ol {
+    margin-top: 6px;
+    max-height: none;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .rail-media {
+    order: 3;
+    position: relative;
+    z-index: 0;
+    flex: 0 0 auto;
+    margin-top: 4px;
+  }
+
+  .rail-rooms {
+    order: 4;
+    position: relative;
+    z-index: 0;
+    flex: 0 0 auto;
+    padding-bottom: 8px;
+  }
+
+  .is-empty {
+    display: none !important;
   }
 
   .orb-core {
@@ -697,7 +797,12 @@ input,
   }
 
   .transcript ol {
-    max-height: min(28vh, 180px);
+    max-height: min(22vh, 150px);
+  }
+
+  .transcript-toggle {
+    min-height: 36px;
+    padding: 8px 2px;
   }
 
   body.login {
