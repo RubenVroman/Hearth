@@ -414,7 +414,7 @@ Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve →
 
 ## Telegram drop-group inbox
 
-A dedicated house Telegram group can act as a movie/series/TV **request inbox**. Anything that looks like a title or catalog link is queued through the existing Overseerr / Radarr / Sonarr tools. Status (queued, progress, done, failed) is posted back into the **same** group. There is no WhatsApp / WAHA / Baileys path — Telegram Bot API only.
+A dedicated house Telegram group can act as a movie/series/TV **request inbox**. Titles and catalog links are searched and requested through **Overseerr** (movie and TV via `mediaType`). Radarr/Sonarr are used only for download progress / queue status on titles this inbox queued. Status (queued, progress, done, failed) is posted back into the **same** group. There is no WhatsApp / WAHA / Baileys path — Telegram Bot API only.
 
 ### Setup (Ruben)
 

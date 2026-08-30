@@ -203,9 +203,9 @@ def inbox(monkeypatch, tmp_path) -> TelegramInbox:
     monkeypatch.setattr(settings, "telegram_bot_token", "1:test-token")
     monkeypatch.setattr(settings, "telegram_chat_ids", "-1001")
     monkeypatch.setattr(settings, "telegram_user_ids", "")
-    monkeypatch.setattr(settings, "telegram_prefer_overseerr", False)
+    monkeypatch.setattr(settings, "telegram_prefer_overseerr", True)
     monkeypatch.setattr(settings, "telegram_rate_limit_per_minute", 20)
-    monkeypatch.setattr(settings, "overseerr_api_key", "")
+    monkeypatch.setattr(settings, "overseerr_api_key", "")  # mock Overseerr path
     pipeline.radarr_queue.clear()
     pipeline.sonarr_queue.clear()
     pipeline.overseerr_queue.clear()
@@ -229,8 +229,8 @@ async def test_inbox_queues_movie_title(inbox: TelegramInbox):
     result = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=11))
     assert result.grabbed is True
     assert "Queued The Brutalist" in result.reply
-    assert "Radarr" in result.reply
-    assert pipeline.radarr_queue
+    assert "Overseerr" in result.reply
+    assert pipeline.overseerr_queue
 
 
 @pytest.mark.asyncio
@@ -246,8 +246,11 @@ async def test_inbox_queues_tmdb_link(inbox: TelegramInbox):
 async def test_inbox_queues_show(inbox: TelegramInbox):
     result = await inbox.handle_message(_msg("Slow Horses season 2", message_id=13))
     assert result.grabbed is True
-    assert "Sonarr" in result.reply
-    assert pipeline.sonarr_queue
+    assert "Overseerr" in result.reply
+    assert pipeline.overseerr_queue
+    assert any(
+        (row.get("mediaType") or "") == "tv" for row in pipeline.overseerr_queue
+    )
 
 
 @pytest.mark.asyncio
@@ -286,15 +289,16 @@ async def test_inbox_ambiguous_then_pick(inbox: TelegramInbox, monkeypatch):
     async def multi(_query: str):
         return {
             "mode": "mock",
-            "service": "radarr",
+            "service": "overseerr",
             "results": [
-                {"title": "Heat", "year": 1995, "tmdbId": 1},
-                {"title": "Heat", "year": 1986, "tmdbId": 2},
-                {"title": "Heat", "year": 2023, "tmdbId": 3},
+                {"title": "Heat", "year": 1995, "tmdbId": 1, "mediaId": 1, "mediaType": "movie"},
+                {"title": "Heat", "year": 1986, "tmdbId": 2, "mediaId": 2, "mediaType": "movie"},
+                {"title": "Heat", "year": 2023, "tmdbId": 3, "mediaId": 3, "mediaType": "movie"},
             ],
         }
 
-    monkeypatch.setattr("hearth.telegram.inbox.radarr.search", multi)
+    monkeypatch.setattr("hearth.telegram.inbox.overseerr.search", multi)
+    monkeypatch.setattr("hearth.telegram.catalog.overseerr.search", multi)
     _patch_openai_intent(
         monkeypatch,
         {
@@ -339,7 +343,7 @@ async def test_inbox_user_allowlist(inbox: TelegramInbox, monkeypatch):
     ok = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=60, user_id=42))
     assert ok.grabbed is True
     inbox.deduper.reset()
-    pipeline.radarr_queue.clear()
+    pipeline.overseerr_queue.clear()
     denied = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=61, user_id=99))
     assert denied.grabbed is False
     assert denied.reply == ""
@@ -435,9 +439,9 @@ async def test_inbox_harry_potter_then_all_of_them(inbox: TelegramInbox, monkeyp
     all_of = await inbox.handle_message(_msg("all of them", message_id=101))
     assert all_of.grabbed is True
     assert "Queued" in all_of.reply
-    assert len(pipeline.radarr_queue) >= 3
+    assert len(pipeline.overseerr_queue) >= 3
     assert all(
-        "Harry Potter" in str(row.get("title") or "") for row in pipeline.radarr_queue
+        "Harry Potter" in str(row.get("title") or "") for row in pipeline.overseerr_queue
     )
 
 
@@ -456,7 +460,7 @@ async def test_inbox_followup_de_eerste_instant(inbox: TelegramInbox, monkeypatc
     pick = await inbox.handle_message(_msg("de eerste", message_id=111))
     assert pick.grabbed is True
     assert "2001" in pick.reply or "Sorcerer" in pick.reply or "Harry Potter" in pick.reply
-    assert len(pipeline.radarr_queue) == 1
+    assert len(pipeline.overseerr_queue) == 1
 
 
 @pytest.mark.asyncio
@@ -475,7 +479,7 @@ async def test_inbox_whole_series_via_model(inbox: TelegramInbox, monkeypatch):
         _msg("the whole Harry Potter series", message_id=120)
     )
     assert result.grabbed is True
-    assert len(pipeline.radarr_queue) >= 3
+    assert len(pipeline.overseerr_queue) >= 3
 
 
 @pytest.mark.asyncio
@@ -580,37 +584,83 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
     return calls
 
 
-def _imitation_and_davinci_radarr(monkeypatch) -> list[str]:
-    """Radarr stub: Imitation Game 1–2 + Da Vinci Code single hit."""
+def _imitation_and_davinci_overseerr(monkeypatch) -> list[str]:
+    """Overseerr stub: Imitation Game 1–2 + Da Vinci Code single hit."""
+    from hearth.telegram import catalog as catalog_mod
     from hearth.telegram import inbox as inbox_mod
 
     imitation = [
-        {"title": "The Imitation Game", "year": 2014, "tmdbId": 205596},
-        {"title": "The Imitation Game", "year": 1980, "tmdbId": 999001},
+        {
+            "title": "The Imitation Game",
+            "year": 2014,
+            "tmdbId": 205596,
+            "mediaId": 205596,
+            "mediaType": "movie",
+        },
+        {
+            "title": "The Imitation Game",
+            "year": 1980,
+            "tmdbId": 999001,
+            "mediaId": 999001,
+            "mediaType": "movie",
+        },
     ]
-    davinci = [{"title": "The Da Vinci Code", "year": 2006, "tmdbId": 591}]
+    davinci = [
+        {
+            "title": "The Da Vinci Code",
+            "year": 2006,
+            "tmdbId": 591,
+            "mediaId": 591,
+            "mediaType": "movie",
+        }
+    ]
     queries: list[str] = []
-    original = inbox_mod.radarr.search
+    original = inbox_mod.overseerr.search
 
     async def _capture(query: str, *args, **kwargs):
         queries.append(str(query))
         q = (query or "").lower()
         if "imitation" in q:
-            return {"mode": "mock", "service": "radarr", "results": list(imitation)}
+            return {"mode": "mock", "service": "overseerr", "results": list(imitation)}
         if "da vinci" in q or "davinci" in q:
-            return {"mode": "mock", "service": "radarr", "results": list(davinci)}
-        if q.startswith("tmdb:"):
+            return {"mode": "mock", "service": "overseerr", "results": list(davinci)}
+        if q.isdigit() or q.startswith("tmdb:"):
             try:
-                want = int(q.split(":", 1)[1])
+                want = int(q.split(":")[-1])
             except ValueError:
                 want = None
             rows = [r for r in imitation + davinci if r.get("tmdbId") == want]
             if rows:
-                return {"mode": "mock", "service": "radarr", "results": rows}
+                return {"mode": "mock", "service": "overseerr", "results": rows}
         return await original(query, *args, **kwargs)
 
-    monkeypatch.setattr(inbox_mod.radarr, "search", _capture)
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _capture)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _capture)
     return queries
+
+
+# Back-compat alias for older test names in this file.
+_imitation_and_davinci_radarr = _imitation_and_davinci_overseerr
+
+
+def _wrap_overseerr_search(monkeypatch) -> list[str]:
+    """Capture Overseerr search queries so tests can forbid raw Dutch plot strings."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    queries: list[str] = []
+    original = inbox_mod.overseerr.search
+
+    async def _capture(query: str, *args, **kwargs):
+        queries.append(str(query))
+        return await original(query, *args, **kwargs)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _capture)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _capture)
+    return queries
+
+
+_wrap_radarr_search = _wrap_overseerr_search
 
 
 @pytest.mark.asyncio
@@ -687,21 +737,6 @@ async def test_inbox_descriptive_wizard_resolves_to_harry_potter(
     )
     assert "sk-test" not in result.reply
     assert "OPENAI" not in result.reply
-
-
-def _wrap_radarr_search(monkeypatch) -> list[str]:
-    """Capture Radarr search queries so tests can forbid raw Dutch plot strings."""
-    from hearth.telegram import inbox as inbox_mod
-
-    queries: list[str] = []
-    original = inbox_mod.radarr.search
-
-    async def _capture(query: str, *args, **kwargs):
-        queries.append(str(query))
-        return await original(query, *args, **kwargs)
-
-    monkeypatch.setattr(inbox_mod.radarr, "search", _capture)
-    return queries
 
 
 @pytest.mark.asyncio
@@ -865,10 +900,10 @@ async def test_inbox_bare_nee_after_disambiguation_clarifies_no_grab(
         ],
     )
     await inbox.handle_message(_msg(dutch, message_id=320))
-    before_queue = len(pipeline.radarr_queue)
+    before_queue = len(pipeline.overseerr_queue)
     nee = await inbox.handle_message(_msg("nee", message_id=321))
     assert nee.grabbed is False
-    assert len(pipeline.radarr_queue) == before_queue
+    assert len(pipeline.overseerr_queue) == before_queue
     assert "Ok" in nee.reply or "Which" in nee.reply or "?" in nee.reply
     # Must not stay stuck on the Imitation Game 1–2 prompt.
     assert "Imitation Game" not in nee.reply
@@ -1007,33 +1042,53 @@ async def test_inbox_chat_memory_lotr_all_of_them_not_potter(
 ):
     """Later LOTR subject wins — 'all of them' must target LOTR, not leftover Potter."""
     lotr_rows = [
-        {"title": "The Lord of the Rings: The Fellowship of the Ring", "year": 2001, "tmdbId": 120},
-        {"title": "The Lord of the Rings: The Two Towers", "year": 2002, "tmdbId": 121},
-        {"title": "The Lord of the Rings: The Return of the King", "year": 2003, "tmdbId": 122},
+        {
+            "title": "The Lord of the Rings: The Fellowship of the Ring",
+            "year": 2001,
+            "tmdbId": 120,
+            "mediaId": 120,
+            "mediaType": "movie",
+        },
+        {
+            "title": "The Lord of the Rings: The Two Towers",
+            "year": 2002,
+            "tmdbId": 121,
+            "mediaId": 121,
+            "mediaType": "movie",
+        },
+        {
+            "title": "The Lord of the Rings: The Return of the King",
+            "year": 2003,
+            "tmdbId": 122,
+            "mediaId": 122,
+            "mediaType": "movie",
+        },
     ]
 
+    from hearth.telegram import catalog as catalog_mod
     from hearth.telegram import inbox as inbox_mod
 
     queries: list[str] = []
-    original = inbox_mod.radarr.search
+    original = inbox_mod.overseerr.search
 
     async def _capture(query: str, *args, **kwargs):
         queries.append(str(query))
         q = (query or "").lower()
         if "lord" in q or ("ring" in q and "harry" not in q):
-            return {"mode": "mock", "service": "radarr", "results": list(lotr_rows)}
-        if q.startswith("tmdb:"):
+            return {"mode": "mock", "service": "overseerr", "results": list(lotr_rows)}
+        if q.isdigit() or q.startswith("tmdb:"):
             try:
-                want = int(q.split(":", 1)[1])
+                want = int(q.split(":")[-1])
             except ValueError:
                 want = None
             if want is not None:
                 hit = [row for row in lotr_rows if row.get("tmdbId") == want]
                 if hit:
-                    return {"mode": "mock", "service": "radarr", "results": hit}
+                    return {"mode": "mock", "service": "overseerr", "results": hit}
         return await original(query, *args, **kwargs)
 
-    monkeypatch.setattr(inbox_mod.radarr, "search", _capture)
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _capture)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _capture)
 
     _patch_openai_intent(
         monkeypatch,
@@ -1141,7 +1196,7 @@ async def test_inbox_descriptive_unsure_clarifies(inbox: TelegramInbox, monkeypa
     )
     assert result.grabbed is False
     assert "Did you mean" in result.reply or "Which" in result.reply
-    assert len(pipeline.radarr_queue) == 0
+    assert len(pipeline.overseerr_queue) == 0
     assert "sk-test" not in result.reply
 
 
@@ -1161,7 +1216,7 @@ async def test_inbox_descriptive_low_confidence_search_clarifies(
         _msg("a film about a kid who finds a magic school", message_id=221)
     )
     assert result.grabbed is False
-    assert len(pipeline.radarr_queue) == 0
+    assert len(pipeline.overseerr_queue) == 0
     assert "title" in result.reply.lower() or "Which" in result.reply
 
 
@@ -1182,7 +1237,7 @@ async def test_inbox_followups_still_work_with_descriptive_layer(
     assert "Which one" in ask.reply
     all_of = await inbox.handle_message(_msg("all of them", message_id=231))
     assert all_of.grabbed is True
-    assert len(pipeline.radarr_queue) >= 3
+    assert len(pipeline.overseerr_queue) >= 3
 
 
 def test_status_endpoint_includes_telegram(client, monkeypatch):
@@ -1388,7 +1443,7 @@ def test_search_query_never_returns_raw_imdb_id():
 async def test_inbox_imdb_cape_fear_resolves_tv_not_tt_string(
     inbox: TelegramInbox, monkeypatch
 ):
-    """IMDb URL must TMDB-resolve to Cape Fear TV 2026 — never Radarr search tt…."""
+    """IMDb URL must Overseerr-resolve to Cape Fear TV 2026 — never Radarr search tt…."""
     from hearth.telegram import catalog as catalog_mod
     from hearth.telegram import inbox as inbox_mod
 
@@ -1409,17 +1464,14 @@ async def test_inbox_imdb_cape_fear_resolves_tv_not_tt_string(
         }
 
     monkeypatch.setattr(catalog_mod, "tmdb_find", _fake_find)
-    monkeypatch.setattr(settings, "telegram_prefer_overseerr", True)
-    monkeypatch.setattr(settings, "overseerr_api_key", "ov-test")
 
     radarr_queries: list[str] = []
-    original_radarr = inbox_mod.radarr.search
 
-    async def _radarr_capture(query: str, *args, **kwargs):
+    async def _radarr_forbid(query: str, *args, **kwargs):
         radarr_queries.append(str(query))
-        return await original_radarr(query, *args, **kwargs)
+        raise AssertionError(f"inbox must not Radarr-search: {query!r}")
 
-    monkeypatch.setattr(inbox_mod.radarr, "search", _radarr_capture)
+    monkeypatch.setattr(inbox_mod.radarr, "search", _radarr_forbid)
 
     overseerr_requests: list[dict] = []
     original_req = inbox_mod.overseerr.request
@@ -1439,12 +1491,12 @@ async def test_inbox_imdb_cape_fear_resolves_tv_not_tt_string(
     assert "Cape Fear" in result.reply
     assert "2026" in result.reply
     assert "tt34675596" not in result.reply
-    assert not any("tt34675596" == q.strip().lower() for q in radarr_queries)
-    assert not any(q.strip().lower() == "tt34675596" for q in radarr_queries)
+    assert radarr_queries == []
     assert overseerr_requests
     assert overseerr_requests[0]["media_type"] == "tv"
     assert overseerr_requests[0]["media_id"] == 241001
-    assert pipeline.overseerr_queue or result.service == "sonarr"
+    assert pipeline.overseerr_queue
+    assert "Overseerr" in result.reply
 
 
 @pytest.mark.asyncio
@@ -1497,8 +1549,6 @@ async def test_inbox_daniel_sloss_near_exact_queues_without_dup_12(
     inbox: TelegramInbox, monkeypatch
 ):
     """Near-exact special title → one grab; never a fake 1–2 of identical 2025 rows."""
-    monkeypatch.setattr(settings, "telegram_prefer_overseerr", True)
-    monkeypatch.setattr(settings, "overseerr_api_key", "ov-test")
     calls = _patch_openai_intent(
         monkeypatch,
         {"action": "clarify", "clarify_question": "Which movie or series did you mean?"},
@@ -1552,3 +1602,161 @@ async def test_disambiguation_options_include_years(inbox: TelegramInbox, monkey
     result = await inbox.handle_message(_msg(dutch, message_id=430))
     assert "2014" in result.reply
     assert "1980" in result.reply or "Which one" in result.reply
+
+
+# --- Overseerr-only TV fallback (Reggie Dinkins / Friends) --------------------
+
+
+def test_catalog_search_title_strips_actor_clause():
+    from hearth.telegram.catalog import catalog_search_title
+
+    assert (
+        catalog_search_title(
+            "The fall and rise of reggie dinkins with daniel radcliff"
+        )
+        == "The fall and rise of reggie dinkins"
+    )
+    assert catalog_search_title("Gone with the Wind") == "Gone with the Wind"
+    assert (
+        catalog_search_title("The Fall and Rise of Reggie Dinkins")
+        == "The Fall and Rise of Reggie Dinkins"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbox_reggie_dinkins_with_actor_queues_overseerr_tv(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Known TV title+year must not format_not_found when movie ask has no hit."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    radarr_queries: list[str] = []
+
+    async def _radarr_forbid(query: str, *args, **kwargs):
+        radarr_queries.append(str(query))
+        raise AssertionError(f"inbox must not Radarr-search title: {query!r}")
+
+    monkeypatch.setattr(inbox_mod.radarr, "search", _radarr_forbid)
+
+    overseerr_searches: list[str] = []
+    original_search = inbox_mod.overseerr.search
+
+    async def _search_capture(query: str, *args, **kwargs):
+        overseerr_searches.append(str(query))
+        return await original_search(query, *args, **kwargs)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search_capture)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search_capture)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # gpt-4o returns clean title + year; actor clause stripped from Overseerr query.
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Fall and Rise of Reggie Dinkins",
+            "year": 2026,
+            "media_kind": "movie",  # implied movie must still find the TV hit
+            "confidence": 0.95,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg(
+            "The fall and rise of reggie dinkins with daniel radcliff",
+            message_id=500,
+        )
+    )
+    assert result.grabbed is True, result.reply
+    assert "Couldn't find" not in result.reply
+    assert "Reggie Dinkins" in result.reply
+    assert "2026" in result.reply
+    assert "Overseerr" in result.reply
+    assert radarr_queries == []
+    assert overseerr_requests
+    assert overseerr_requests[0]["media_type"] == "tv"
+    assert overseerr_requests[0]["media_id"] == 291334
+    assert any(
+        (row.get("mediaType") or "") == "tv"
+        and (row.get("id") == 291334 or row.get("tmdbId") == 291334)
+        for row in pipeline.overseerr_queue
+    )
+    # Search string must not include the actor misspelling.
+    assert overseerr_searches
+    assert all("radcliff" not in q.lower() for q in overseerr_searches)
+    assert all("daniel" not in q.lower() for q in overseerr_searches)
+
+
+@pytest.mark.asyncio
+async def test_inbox_reggie_dinkins_without_actor_still_tv(
+    inbox: TelegramInbox, monkeypatch
+):
+    from hearth.telegram import inbox as inbox_mod
+
+    async def _radarr_forbid(query: str, *args, **kwargs):
+        raise AssertionError(f"inbox must not Radarr-search: {query!r}")
+
+    monkeypatch.setattr(inbox_mod.radarr, "search", _radarr_forbid)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # Concrete short title — catalog-first, no model.
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "clarify", "clarify_question": "Which movie?"},
+    )
+    result = await inbox.handle_message(
+        _msg("The Fall and Rise of Reggie Dinkins", message_id=501)
+    )
+    assert result.grabbed is True, result.reply
+    assert "Couldn't find" not in result.reply
+    assert "Overseerr" in result.reply
+    assert overseerr_requests
+    assert overseerr_requests[0]["media_type"] == "tv"
+    assert overseerr_requests[0]["media_id"] == 291334
+    assert calls == [] or result.grabbed  # concrete title may skip model
+
+
+@pytest.mark.asyncio
+async def test_inbox_friends_s1_still_queues_overseerr_tv(
+    inbox: TelegramInbox, monkeypatch
+):
+    from hearth.telegram import inbox as inbox_mod
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    result = await inbox.handle_message(_msg("Friends s1", message_id=502))
+    assert result.grabbed is True, result.reply
+    assert "Friends" in result.reply
+    assert "Overseerr" in result.reply
+    assert overseerr_requests
+    assert overseerr_requests[0]["media_type"] == "tv"
+    assert overseerr_requests[0]["media_id"] == 1668

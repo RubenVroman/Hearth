@@ -1,9 +1,11 @@
-"""Resolve catalog ids and titles to TMDB-backed title + year + media kind.
+"""Resolve catalog ids and titles via Overseerr (TMDB-backed movie + TV).
+
+Telegram Movies inbox searches and requests through Overseerr only — it returns
+``mediaType`` movie|tv and can request either. Radarr/Sonarr are not used for
+title lookup or queueing here (they remain for download progress / queue tools).
 
 Never search a raw ``tt…`` / bare id string as a movie title. Prefer TMDB
-primary release / first_air_date year. Uses Overseerr when configured (it
-speaks TMDB), plus Radarr/Sonarr ``imdb:`` / ``tmdb:`` / ``tvdb:`` lookups —
-no new env keys.
+primary release / first_air_date year. No new env keys.
 """
 
 from __future__ import annotations
@@ -13,16 +15,40 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from hearth.config import settings
 from hearth.memory.redact import redact
 from hearth.telegram.parse import ParsedRequest, normalize_title
-from hearth.tools.arr import overseerr, radarr, sonarr
+from hearth.tools.arr import overseerr
 
 log = logging.getLogger("hearth.telegram")
 
 MediaKind = Literal["movie", "tv"]
 
 _YEAR_RE = re.compile(r"^(19|20)\d{2}$")
+
+# Trailing cast clues for gpt-4o — never part of the Overseerr search string.
+# Skip mid-title "with the …" (Gone with the Wind).
+_CAST_STOP = frozenset({"the", "a", "an", "my", "his", "her", "our", "their", "no", "me"})
+_FEATURING = re.compile(
+    r"\s+(?:featuring|starring|feat\.?|ft\.?)\s+.+$",
+    re.I,
+)
+_WITH_PERSON = re.compile(
+    r"\s+(?:with|met)\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]+)"
+    r"(?:\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]+)+\s*$",
+    re.I,
+)
+
+
+def catalog_search_title(title: str) -> str:
+    """Strip trailing actor/cast clauses from a catalog search string."""
+    raw = (title or "").strip()
+    if not raw:
+        return ""
+    cleaned = _FEATURING.sub("", raw).strip(" -–—|,.")
+    match = _WITH_PERSON.search(cleaned)
+    if match and match.group(1).lower() not in _CAST_STOP:
+        cleaned = cleaned[: match.start()].strip(" -–—|,.")
+    return cleaned or raw
 
 
 @dataclass(frozen=True)
@@ -60,7 +86,6 @@ def _year_from(value: Any) -> int | None:
     text = str(value).strip()
     if _YEAR_RE.match(text):
         return int(text)
-    # ISO date → first four digits
     if len(text) >= 4 and _YEAR_RE.match(text[:4]):
         return int(text[:4])
     try:
@@ -98,7 +123,6 @@ def _hit_from_row(
         tvdb_i = int(tvdb) if tvdb not in (None, "") else None
     except (TypeError, ValueError):
         tvdb_i = None
-    # Overseerr / TMDB find rows: id is tmdb; ignore non-media junk.
     if row.get("mediaType") in {"movie", "tv"}:
         media_kind = row["mediaType"]  # type: ignore[assignment]
     if row.get("matched") == "fallback":
@@ -119,19 +143,16 @@ async def tmdb_find(
     *,
     external_source: str = "imdb_id",
 ) -> dict[str, Any]:
-    """TMDB ``/find`` shape. Prefer Overseerr live proxy; mockable in tests.
+    """TMDB ``/find`` shape via Overseerr search (movie + tv).
 
-    Returns ``{"movie_results": [...], "tv_results": [...]}`` (TMDB layout).
-    Empty dict when nothing is configured / found — callers fall back to *arr.
+    Returns ``{"movie_results": [...], "tv_results": [...]}``.
+    Empty dict when nothing is found — never Radarr-searches a ``tt…`` string.
     """
     external_id = (external_id or "").strip()
     if not external_id:
         return {"movie_results": [], "tv_results": []}
 
-    # Overseerr does not expose /find publicly; when live, probe movie+tv via
-    # its search + detail endpoints is lossy for IMDb. Leave a hook for tests
-    # and optional future proxy. Production path uses *arr imdb: below.
-    if settings.overseerr_configured and external_source == "imdb_id":
+    if external_source == "imdb_id":
         try:
             found = await overseerr.search(external_id)
             rows = list(found.get("results") or [])
@@ -154,7 +175,6 @@ def _hits_from_tmdb_find(
     for row in payload.get("movie_results") or []:
         if not isinstance(row, dict):
             continue
-        # Normalize TMDB find movie shape → title/year/tmdbId
         norm = {
             "title": row.get("title") or row.get("name"),
             "year": row.get("year")
@@ -162,7 +182,7 @@ def _hits_from_tmdb_find(
             "tmdbId": row.get("tmdbId") or row.get("mediaId") or row.get("id"),
             "mediaType": "movie",
         }
-        hit = _hit_from_row(norm, media_kind="movie", imdb_id=imdb_id, source="tmdb_find")
+        hit = _hit_from_row(norm, media_kind="movie", imdb_id=imdb_id, source="overseerr")
         if hit:
             hits.append(hit)
     for row in payload.get("tv_results") or []:
@@ -175,37 +195,14 @@ def _hits_from_tmdb_find(
             "tmdbId": row.get("tmdbId") or row.get("mediaId") or row.get("id"),
             "mediaType": "tv",
         }
-        hit = _hit_from_row(norm, media_kind="tv", imdb_id=imdb_id, source="tmdb_find")
+        hit = _hit_from_row(norm, media_kind="tv", imdb_id=imdb_id, source="overseerr")
         if hit:
             hits.append(hit)
     return hits
 
 
-async def _arr_imdb_hits(imdb_id: str) -> list[CatalogHit]:
-    """Radarr + Sonarr ``imdb:`` lookups (TMDB-backed metadata, existing keys)."""
-    hits: list[CatalogHit] = []
-    term = imdb_id if imdb_id.lower().startswith("imdb:") else f"imdb:{imdb_id}"
-    try:
-        movie = await radarr.search(term)
-        for row in movie.get("results") or []:
-            hit = _hit_from_row(row, media_kind="movie", imdb_id=imdb_id, source="radarr")
-            if hit:
-                hits.append(hit)
-    except Exception as exc:  # noqa: BLE001
-        log.info("radarr imdb lookup failed: %s", redact(str(exc)))
-    try:
-        show = await sonarr.search(term)
-        for row in show.get("results") or []:
-            hit = _hit_from_row(row, media_kind="tv", imdb_id=imdb_id, source="sonarr")
-            if hit:
-                hits.append(hit)
-    except Exception as exc:  # noqa: BLE001
-        log.info("sonarr imdb lookup failed: %s", redact(str(exc)))
-    return hits
-
-
 async def find_by_imdb(imdb_id: str) -> list[CatalogHit]:
-    """Resolve an IMDb id to catalog hit(s) — movie AND tv."""
+    """Resolve an IMDb id via Overseerr — movie AND tv."""
     imdb_id = (imdb_id or "").strip().lower()
     if not imdb_id:
         return []
@@ -213,131 +210,72 @@ async def find_by_imdb(imdb_id: str) -> list[CatalogHit]:
         imdb_id = f"tt{imdb_id}" if imdb_id.isdigit() else imdb_id
 
     payload = await tmdb_find(imdb_id, external_source="imdb_id")
-    hits = _hits_from_tmdb_find(payload, imdb_id=imdb_id)
-    if hits:
-        return _dedupe_hits(hits)
-
-    return _dedupe_hits(await _arr_imdb_hits(imdb_id))
+    return _dedupe_hits(_hits_from_tmdb_find(payload, imdb_id=imdb_id))
 
 
 async def find_by_tmdb(tmdb_id: int, *, media_kind: str = "") -> list[CatalogHit]:
     hits: list[CatalogHit] = []
-    kinds: list[MediaKind]
-    if media_kind in {"movie", "tv"}:
-        kinds = [media_kind]  # type: ignore[list-item]
-    else:
-        kinds = ["movie", "tv"]
-
-    if settings.overseerr_configured or True:
-        # Overseerr / mock search by numeric id often fails; use *arr tmdb: + overseerr detail.
-        pass
-
-    if "movie" in kinds:
-        try:
-            found = await radarr.search(f"tmdb:{int(tmdb_id)}")
-            for row in found.get("results") or []:
-                if row.get("tmdbId") == int(tmdb_id) or not row.get("tmdbId"):
-                    hit = _hit_from_row(
-                        {**row, "tmdbId": row.get("tmdbId") or tmdb_id},
-                        media_kind="movie",
-                        source="radarr",
-                    )
-                    if hit:
-                        hits.append(hit)
-        except Exception as exc:  # noqa: BLE001
-            log.info("radarr tmdb lookup failed: %s", redact(str(exc)))
-
-    if "tv" in kinds and settings.overseerr_configured:
-        try:
-            found = await overseerr.search(str(tmdb_id))
-            for row in found.get("results") or []:
-                if (row.get("mediaType") or "") != "tv":
+    try:
+        found = await overseerr.search(str(int(tmdb_id)))
+        for row in found.get("results") or []:
+            mt = str(row.get("mediaType") or "")
+            if mt not in {"movie", "tv"}:
+                continue
+            if media_kind in {"movie", "tv"} and mt != media_kind:
+                continue
+            rid = row.get("tmdbId") or row.get("mediaId") or row.get("id")
+            try:
+                if int(rid) != int(tmdb_id):
                     continue
-                if row.get("tmdbId") == int(tmdb_id) or row.get("mediaId") == int(tmdb_id):
-                    hit = _hit_from_row(row, media_kind="tv", source="overseerr")
-                    if hit:
-                        hits.append(hit)
-        except Exception as exc:  # noqa: BLE001
-            log.info("overseerr tmdb tv lookup failed: %s", redact(str(exc)))
+            except (TypeError, ValueError):
+                continue
+            hit = _hit_from_row(row, media_kind=mt, source="overseerr")  # type: ignore[arg-type]
+            if hit:
+                hits.append(hit)
+    except Exception as exc:  # noqa: BLE001
+        log.info("overseerr tmdb lookup failed: %s", redact(str(exc)))
 
+    if not hits and media_kind in {"movie", "tv"}:
+        # Still allow direct id queue when Overseerr search is empty but kind is known.
+        hits = [
+            CatalogHit(
+                title=f"TMDB {tmdb_id}",
+                year=None,
+                media_kind=media_kind,  # type: ignore[arg-type]
+                tmdb_id=int(tmdb_id),
+                source="parsed",
+            )
+        ]
     return _dedupe_hits(hits)
 
 
 async def find_by_tvdb(tvdb_id: int) -> list[CatalogHit]:
+    """TVDB id → Overseerr search (numeric / tvdb: term)."""
     hits: list[CatalogHit] = []
-    try:
-        found = await sonarr.search(str(int(tvdb_id)))
-        for row in found.get("results") or []:
-            if row.get("tvdbId") == int(tvdb_id):
-                hit = _hit_from_row(row, media_kind="tv", source="sonarr")
+    for term in (f"tvdb:{int(tvdb_id)}", str(int(tvdb_id))):
+        try:
+            found = await overseerr.search(term)
+            for row in found.get("results") or []:
+                if (row.get("mediaType") or "") != "tv":
+                    continue
+                if row.get("tvdbId") is not None and int(row["tvdbId"]) != int(tvdb_id):
+                    continue
+                hit = _hit_from_row(row, media_kind="tv", source="overseerr")
                 if hit:
                     hits.append(hit)
-        if not hits:
-            broad = await sonarr.search("")
-            for row in broad.get("results") or []:
-                if row.get("tvdbId") == int(tvdb_id):
-                    hit = _hit_from_row(row, media_kind="tv", source="sonarr")
-                    if hit:
-                        hits.append(hit)
-    except Exception as exc:  # noqa: BLE001
-        log.info("sonarr tvdb lookup failed: %s", redact(str(exc)))
+        except Exception as exc:  # noqa: BLE001
+            log.info("overseerr tvdb lookup failed: %s", redact(str(exc)))
+        if hits:
+            break
     return _dedupe_hits(hits)
 
 
-async def resolve_title(
-    title: str,
+def _filter_title_year(
+    hits: list[CatalogHit],
     *,
-    year: int | None = None,
-    media_kind: str = "",
+    title: str,
+    year: int | None,
 ) -> list[CatalogHit]:
-    """Search by title; prefer TMDB/catalog year. Multiple years → all returned."""
-    title = (title or "").strip()
-    if not title:
-        return []
-
-    hits: list[CatalogHit] = []
-    want_movie = media_kind != "tv"
-    want_tv = media_kind != "movie"
-
-    if settings.overseerr_configured or settings.telegram_prefer_overseerr:
-        try:
-            found = await overseerr.search(title)
-            for row in found.get("results") or []:
-                mt = str(row.get("mediaType") or "")
-                if mt == "movie" and want_movie:
-                    hit = _hit_from_row(row, media_kind="movie", source="overseerr")
-                    if hit:
-                        hits.append(hit)
-                elif mt == "tv" and want_tv:
-                    hit = _hit_from_row(row, media_kind="tv", source="overseerr")
-                    if hit:
-                        hits.append(hit)
-        except Exception as exc:  # noqa: BLE001
-            log.info("overseerr title search failed: %s", redact(str(exc)))
-
-    if want_movie and not hits:
-        try:
-            found = await radarr.search(title)
-            for row in found.get("results") or []:
-                hit = _hit_from_row(row, media_kind="movie", source="radarr")
-                if hit:
-                    hits.append(hit)
-        except Exception as exc:  # noqa: BLE001
-            log.info("radarr title search failed: %s", redact(str(exc)))
-
-    if want_tv and (not hits or media_kind == "tv"):
-        try:
-            found = await sonarr.search(title)
-            for row in found.get("results") or []:
-                hit = _hit_from_row(row, media_kind="tv", source="sonarr")
-                if hit:
-                    hits.append(hit)
-        except Exception as exc:  # noqa: BLE001
-            log.info("sonarr title search failed: %s", redact(str(exc)))
-
-    hits = _dedupe_hits(hits)
-    hits = [h for h in hits if True]  # matched=fallback already dropped in _hit_from_row
-    # Prefer exact title matches (normalize punctuation so "can't" ≈ "Can't").
     needle = normalize_title(title)
     needle_loose = re.sub(r"[^a-z0-9à-ÿ]+", " ", needle).strip()
 
@@ -363,18 +301,48 @@ async def resolve_title(
     return hits
 
 
+async def resolve_title(
+    title: str,
+    *,
+    year: int | None = None,
+    media_kind: str = "",
+) -> list[CatalogHit]:
+    """Search Overseerr by title (movie + TV). Prefer catalog year."""
+    title = catalog_search_title(title)
+    if not title:
+        return []
+
+    hits: list[CatalogHit] = []
+    try:
+        found = await overseerr.search(title)
+        for row in found.get("results") or []:
+            mt = str(row.get("mediaType") or "")
+            if mt not in {"movie", "tv"}:
+                continue
+            hit = _hit_from_row(row, media_kind=mt, source="overseerr")  # type: ignore[arg-type]
+            if hit:
+                hits.append(hit)
+    except Exception as exc:  # noqa: BLE001
+        log.info("overseerr title search failed: %s", redact(str(exc)))
+
+    hits = _dedupe_hits(hits)
+    hits = _filter_title_year(hits, title=title, year=year)
+    return prefer_hits(hits, implied_kind=media_kind if media_kind in {"movie", "tv"} else "")
+
+
 def prefer_hits(
     hits: list[CatalogHit],
     *,
     implied_kind: str = "",
 ) -> list[CatalogHit]:
-    """If both movie and TV exist, prefer the implied type (IMDb/TMDB URL)."""
+    """If both movie and TV exist, prefer the implied type; else disambiguate."""
     if not hits:
         return []
     if implied_kind in {"movie", "tv"}:
         typed = [h for h in hits if h.media_kind == implied_kind]
         if typed:
             return typed
+        # Implied kind missed (e.g. movie ask for a TV-only title) — keep the rest.
     kinds = {h.media_kind for h in hits}
     if len(kinds) > 1:
         # Ambiguous type — keep one of each kind for disambiguation (title+year+type).
@@ -425,7 +393,7 @@ def hit_to_parsed(
 
 
 async def resolve_parsed(parsed: ParsedRequest) -> tuple[list[CatalogHit], str]:
-    """Resolve a parsed catalog id / title into CatalogHit(s).
+    """Resolve a parsed catalog id / title into CatalogHit(s) via Overseerr.
 
     Returns ``(hits, error_label)``. ``error_label`` is a human title for
     not-found messages — never a raw ``tt…`` id.
@@ -443,7 +411,6 @@ async def resolve_parsed(parsed: ParsedRequest) -> tuple[list[CatalogHit], str]:
             implied_kind=implied,
         )
         if not hits and implied:
-            # Still allow direct id queue when lookup is empty but kind is known.
             hits = [
                 CatalogHit(
                     title=parsed.title or f"TMDB {parsed.tmdb_id}",
@@ -462,18 +429,16 @@ async def resolve_parsed(parsed: ParsedRequest) -> tuple[list[CatalogHit], str]:
         return hits, label
 
     if parsed.title:
-        hits = prefer_hits(
-            await resolve_title(
-                parsed.title,
-                year=parsed.year,
-                media_kind=implied,
-            ),
-            implied_kind=implied,
+        search = catalog_search_title(parsed.title)
+        hits = await resolve_title(
+            search,
+            year=parsed.year,
+            media_kind=implied,
         )
         label = (
-            f"{parsed.title} ({parsed.year})"
-            if parsed.year
-            else (parsed.title or "that title")
+            f"{search} ({parsed.year})"
+            if parsed.year and search
+            else (search or parsed.title or "that title")
         )
         return hits, label
 
@@ -482,6 +447,7 @@ async def resolve_parsed(parsed: ParsedRequest) -> tuple[list[CatalogHit], str]:
 
 __all__ = [
     "CatalogHit",
+    "catalog_search_title",
     "find_by_imdb",
     "find_by_tmdb",
     "find_by_tvdb",

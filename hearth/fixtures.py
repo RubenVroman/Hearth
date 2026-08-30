@@ -407,6 +407,7 @@ MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
         "title": "Severance",
         "year": 2022,
         "tvdbId": 371980,
+        "tmdbId": 95396,
         "overview": "Mark Scout leads a team whose memories are split.",
         "status": "continuing",
         "posterPath": "/pPHpeI2X1qEd1CS1SeyrdhZ4qnT.jpg",
@@ -415,8 +416,28 @@ MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
         "title": "Slow Horses",
         "year": 2022,
         "tvdbId": 397382,
+        "tmdbId": 95479,
         "overview": "Misfit spies at MI5's Slough House.",
         "status": "continuing",
+    },
+    {
+        "title": "Friends",
+        "year": 1994,
+        "tvdbId": 79168,
+        "tmdbId": 1668,
+        "overview": "Six friends in New York.",
+        "status": "ended",
+        "mediaType": "tv",
+    },
+    {
+        "title": "The Fall and Rise of Reggie Dinkins",
+        "year": 2026,
+        "tvdbId": 449334,
+        "tmdbId": 291334,
+        "imdbId": "tt36153709",
+        "overview": "Daniel Radcliffe and Tracy Morgan in an NBC comedy series.",
+        "status": "upcoming",
+        "mediaType": "tv",
     },
     {
         "title": "Cape Fear",
@@ -503,6 +524,19 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
         "posterPath": "/cape-fear-2026.jpg",
     },
     {
+        "id": 291334,
+        "mediaType": "tv",
+        "title": "The Fall and Rise of Reggie Dinkins",
+        "year": 2026,
+        "imdbId": "tt36153709",
+    },
+    {
+        "id": 1668,
+        "mediaType": "tv",
+        "title": "Friends",
+        "year": 1994,
+    },
+    {
         "id": 1520001,
         "mediaType": "movie",
         "title": "Daniel Sloss: Can't",
@@ -518,6 +552,21 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
         "imdbId": "tt35000001",
     },
 ]
+
+
+def _as_overseerr_row(item: dict[str, Any], media_type: str) -> dict[str, Any]:
+    """Mirror a Radarr/Sonarr catalog row into Overseerr search shape (offline mock)."""
+    tmdb = item.get("tmdbId") or item.get("id")
+    return {
+        "id": tmdb or item.get("tvdbId"),
+        "mediaType": media_type,
+        "title": item.get("title"),
+        "year": item.get("year"),
+        "tmdbId": tmdb,
+        "tvdbId": item.get("tvdbId"),
+        "imdbId": item.get("imdbId"),
+        "posterPath": item.get("posterPath"),
+    }
 
 
 class MockPipeline:
@@ -537,7 +586,30 @@ class MockPipeline:
         return _filter_title(MOCK_SONARR_LOOKUP, query)
 
     def search_overseerr(self, query: str) -> list[dict[str, Any]]:
-        return _filter_title(MOCK_OVERSEERR_RESULTS, query)
+        """Telegram inbox resolves movie + TV through Overseerr only.
+
+        Explicit MOCK_OVERSEERR rows win; otherwise mirror *arr catalog fixtures so
+        offline tests keep working without duplicating every title.
+        """
+        primary = _filter_title(MOCK_OVERSEERR_RESULTS, query)
+        real = [h for h in primary if h.get("matched") != "fallback"]
+        if real:
+            return real
+
+        movies = [
+            _as_overseerr_row(m, "movie")
+            for m in _filter_title(MOCK_RADARR_LOOKUP, query)
+            if m.get("matched") != "fallback"
+        ]
+        shows = [
+            _as_overseerr_row(s, "tv")
+            for s in _filter_title(MOCK_SONARR_LOOKUP, query)
+            if s.get("matched") != "fallback"
+        ]
+        merged = movies + shows
+        if merged:
+            return merged
+        return primary
 
     def add_radarr(self, item: dict[str, Any]) -> dict[str, Any]:
         queued = {**item, "queued": True}

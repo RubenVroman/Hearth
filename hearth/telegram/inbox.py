@@ -28,6 +28,7 @@ from hearth.telegram.parse import (
 )
 from hearth.telegram.catalog import (
     CatalogHit,
+    catalog_search_title,
     hit_to_parsed,
     resolve_parsed,
     resolve_title,
@@ -449,8 +450,9 @@ class TelegramInbox:
             and parsed.reason in {"plain_title", "trakt_movie_url", "trakt_show_url", "justwatch_url"}
             and looks_like_concrete_title(view.text)
         ):
+            clean_title = catalog_search_title(parsed.title) or parsed.title
             title_hits = await resolve_title(
-                parsed.title,
+                clean_title,
                 year=parsed.year,
                 media_kind=parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "",
             )
@@ -651,16 +653,18 @@ class TelegramInbox:
                 if intent.media_kind in {"movie", "tv"}
                 else (parsed.media_kind if parsed.media_kind in {"movie", "tv"} else "unknown")
             )
+            # Actor/cast clauses are clues for the model — strip from Overseerr query.
+            search_title = catalog_search_title(intent.search_title) or intent.search_title
             self.memory.set_subject(
                 view.chat_id,
-                intent.search_title,
+                search_title,
                 media_kind=media_kind if media_kind in {"movie", "tv"} else "",
                 clear_rejected=True,
             )
             synthetic = ParsedRequest(
                 kind="request",
                 media_kind=media_kind,  # type: ignore[arg-type]
-                title=intent.search_title,
+                title=search_title,
                 year=intent.year,
                 reason="intent_search",
             )
@@ -706,7 +710,7 @@ class TelegramInbox:
             return await self._grab(view, self._synthetic_from_pick(pending, picks[0]), exact=True)
 
         queued_titles: list[str] = []
-        via = "Radarr"
+        via = "Overseerr"
         for pick in picks:
             synthetic = self._synthetic_from_pick(pending, pick)
             result = await self._grab(view, synthetic, exact=True, skip_rate=True)
@@ -714,10 +718,6 @@ class TelegramInbox:
                 queued_titles.append(
                     f"{result.title} ({result.year})" if result.year else result.title
                 )
-                via = {
-                    "radarr": "Radarr",
-                    "sonarr": "Sonarr",
-                }.get(result.service, result.service or via)
             elif result.reply.startswith("Queued "):
                 queued_titles.append(result.title or pick.get("title") or "")
         if queued_titles:
@@ -726,7 +726,7 @@ class TelegramInbox:
                 reply=format_queued_many(queued_titles, via),
                 grabbed=True,
                 titles=queued_titles,
-                service=via.lower(),
+                service="overseerr",
             )
         # Nothing new queued — surface the last useful reply or a short summary.
         return InboxResult(
@@ -766,74 +766,24 @@ class TelegramInbox:
         media_kind = parsed.media_kind
         exact_id = bool(parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id or exact)
 
-        # Prefer Overseerr when configured (feeds *arr). Fall back to Radarr/Sonarr.
-        use_overseerr = settings.telegram_prefer_overseerr and settings.overseerr_configured
-
-        if media_kind == "unknown" and not parsed.tvdb_id:
-            # Heuristic: season markers already set tv; otherwise try movie first.
-            media_kind = "movie" if parsed.season is None else "tv"
+        # Telegram Movies inbox: Overseerr only for search + request (movie and TV).
+        # Radarr/Sonarr stay for download progress / queue tools, not title lookup.
+        if media_kind == "unknown" and parsed.season is not None:
+            media_kind = "tv"
+        elif media_kind == "unknown" and parsed.tvdb_id:
+            media_kind = "tv"
 
         try:
-            if use_overseerr and not parsed.tvdb_id:
-                return await self._grab_overseerr(
-                    view, parsed, media_kind, exact_id=exact_id, select_all=select_all
-                )
-            if media_kind == "tv" or parsed.tvdb_id:
-                return await self._grab_sonarr(
-                    view, parsed, exact_id=exact_id, select_all=select_all
-                )
-            return await self._grab_radarr(
-                view, parsed, exact_id=exact_id, select_all=select_all
+            return await self._grab_overseerr(
+                view, parsed, media_kind, exact_id=exact_id, select_all=select_all
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("telegram grab failed: %s", redact(str(exc)))
             query = parsed.display_label() or parsed.title or "that"
             return InboxResult(
                 handled=True,
-                reply=f"Couldn't queue '{query}' — *arr look-up failed.",
+                reply=f"Couldn't queue '{query}' — Overseerr look-up failed.",
             )
-
-    async def _search_hits(
-        self,
-        parsed: ParsedRequest,
-        media_kind: str,
-    ) -> tuple[str, list[dict[str, Any]]]:
-        if media_kind == "tv" or parsed.tvdb_id:
-            if parsed.tvdb_id:
-                found = await sonarr.search(str(parsed.tvdb_id))
-                rows = [r for r in (found.get("results") or []) if r.get("tvdbId") == parsed.tvdb_id]
-                if rows:
-                    return "sonarr", rows
-                # Fixture / broad scan by id.
-                broad = await sonarr.search("")
-                rows = [r for r in (broad.get("results") or []) if r.get("tvdbId") == parsed.tvdb_id]
-                return "sonarr", rows
-            query = parsed.title or parsed.search_query()
-            if parsed.year and parsed.title:
-                # Keep year out of the *arr term — filter by year after lookup.
-                query = parsed.title
-            found = await sonarr.search(query)
-            return "sonarr", list(found.get("results") or [])
-
-        if parsed.tmdb_id:
-            found = await radarr.search(f"tmdb:{parsed.tmdb_id}")
-            rows = [r for r in (found.get("results") or []) if r.get("tmdbId") == parsed.tmdb_id]
-            if rows:
-                return "radarr", rows
-            broad = await radarr.search("")
-            rows = [r for r in (broad.get("results") or []) if r.get("tmdbId") == parsed.tmdb_id]
-            return "radarr", rows
-
-        query = parsed.title or parsed.search_query()
-        if parsed.year and parsed.title:
-            # Keep year out of the *arr term — filter by year after lookup.
-            query = parsed.title
-        if not query and parsed.tmdb_id:
-            query = f"tmdb:{parsed.tmdb_id}"
-        if not query:
-            return "radarr", []
-        found = await radarr.search(query)
-        return "radarr", list(found.get("results") or [])
 
     def _drop_fixture_fallbacks(self, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Mock pipeline may attach matched=fallback when nothing fits — treat as miss."""
@@ -933,137 +883,6 @@ class TelegramInbox:
         self.pending[view.chat_id] = synthetic_pending
         return await self._handle_indices(view, synthetic_pending, indices)
 
-    async def _grab_radarr(
-        self,
-        view: MessageView,
-        parsed: ParsedRequest,
-        *,
-        exact_id: bool,
-        select_all: bool = False,
-    ) -> InboxResult:
-        _service, hits = await self._search_hits(parsed, "movie")
-        choices = self._dedupe_choices(self._filter_hits(hits, parsed, exact_id=exact_id))
-        if not choices:
-            return InboxResult(
-                handled=True,
-                reply=format_not_found(parsed.display_label()),
-            )
-        if select_all and len(choices) > 1 and not exact_id:
-            return await self._queue_many(
-                view,
-                parsed.title or parsed.search_query(),
-                "movie",
-                choices,
-            )
-        if len(choices) > 1 and not exact_id and not self._choices_are_indistinguishable(choices):
-            reply = format_ambiguous(parsed.title or parsed.search_query() or parsed.display_label(), choices)
-            self._remember_pending(
-                view,
-                options=choices,
-                media_kind="movie",
-                query=parsed.title or parsed.search_query() or parsed.display_label(),
-                reply=reply,
-            )
-            return InboxResult(handled=True, reply=reply)
-        pick = choices[0]
-        title = str(pick.get("title") or parsed.title or "Untitled")
-        year = pick.get("year") if pick.get("year") is not None else parsed.year
-        year_i = int(year) if year not in (None, "") else None
-        if pick.get("inLibrary") or pick.get("hasFile"):
-            return InboxResult(handled=True, reply=format_already(title, library=True))
-        if await self._already_queued(title, "radarr"):
-            return InboxResult(handled=True, reply=format_already(title, queued=True))
-        # Also skip if mock pipeline already queued the same title.
-        from hearth.fixtures import pipeline
-
-        if any(
-            normalize_title(str(row.get("title") or "")) == normalize_title(title)
-            for row in pipeline.radarr_queue
-        ):
-            return InboxResult(handled=True, reply=format_already(title, queued=True))
-
-        tmdb = pick.get("tmdbId") or parsed.tmdb_id
-        result = await radarr.add(title, tmdb_id=int(tmdb) if tmdb else None)
-        if result.get("ok") is False:
-            return InboxResult(
-                handled=True,
-                reply=format_not_found(parsed.display_label() or title),
-            )
-        self.progress.track(view.chat_id, title, "radarr", year_i)
-        return InboxResult(
-            handled=True,
-            reply=format_queued(title, year_i, "Radarr"),
-            grabbed=True,
-            title=title,
-            service="radarr",
-            year=year_i,
-        )
-
-    async def _grab_sonarr(
-        self,
-        view: MessageView,
-        parsed: ParsedRequest,
-        *,
-        exact_id: bool,
-        select_all: bool = False,
-    ) -> InboxResult:
-        _service, hits = await self._search_hits(parsed, "tv")
-        choices = self._dedupe_choices(self._filter_hits(hits, parsed, exact_id=exact_id))
-        if not choices:
-            return InboxResult(
-                handled=True,
-                reply=format_not_found(parsed.display_label()),
-            )
-        if select_all and len(choices) > 1 and not exact_id:
-            return await self._queue_many(
-                view,
-                parsed.title or parsed.search_query(),
-                "tv",
-                choices,
-            )
-        if len(choices) > 1 and not exact_id and not self._choices_are_indistinguishable(choices):
-            reply = format_ambiguous(parsed.title or parsed.search_query() or parsed.display_label(), choices)
-            self._remember_pending(
-                view,
-                options=choices,
-                media_kind="tv",
-                query=parsed.title or parsed.search_query() or parsed.display_label(),
-                reply=reply,
-            )
-            return InboxResult(handled=True, reply=reply)
-        pick = choices[0]
-        title = str(pick.get("title") or parsed.title or "Untitled")
-        year = pick.get("year") if pick.get("year") is not None else parsed.year
-        year_i = int(year) if year not in (None, "") else None
-        if pick.get("inLibrary"):
-            return InboxResult(handled=True, reply=format_already(title, library=True))
-        if await self._already_queued(title, "sonarr"):
-            return InboxResult(handled=True, reply=format_already(title, queued=True))
-        from hearth.fixtures import pipeline
-
-        if any(
-            normalize_title(str(row.get("title") or "")) == normalize_title(title)
-            for row in pipeline.sonarr_queue
-        ):
-            return InboxResult(handled=True, reply=format_already(title, queued=True))
-
-        tvdb = pick.get("tvdbId") or parsed.tvdb_id
-        result = await sonarr.add(title, tvdb_id=int(tvdb) if tvdb else None)
-        if result.get("ok") is False:
-            return InboxResult(
-                handled=True,
-                reply=format_not_found(parsed.display_label() or title),
-            )
-        self.progress.track(view.chat_id, title, "sonarr", year_i)
-        return InboxResult(
-            handled=True,
-            reply=format_queued(title, year_i, "Sonarr"),
-            grabbed=True,
-            title=title,
-            service="sonarr",
-            year=year_i,
-        )
-
     async def _grab_overseerr(
         self,
         view: MessageView,
@@ -1073,17 +892,24 @@ class TelegramInbox:
         exact_id: bool,
         select_all: bool = False,
     ) -> InboxResult:
-        query = parsed.title or parsed.search_query()
+        # Overseerr search term: title only (no actor clause, no raw tt…).
+        query = catalog_search_title(parsed.title or "") or parsed.title or parsed.search_query()
         if parsed.tmdb_id and media_kind in {"movie", "tv"}:
-            # Prefer id-based Overseerr request after catalog resolve.
             query = query or str(parsed.tmdb_id)
+        elif parsed.imdb_id and not query:
+            query = parsed.imdb_id
+
         found = await overseerr.search(query) if query else {"results": []}
-        hits = list(found.get("results") or [])
+        hits = [row for row in (found.get("results") or []) if row.get("matched") != "fallback"]
+
+        # Prefer implied kind when present; if empty, keep both movie and TV.
         if media_kind in {"movie", "tv"}:
             want = "movie" if media_kind == "movie" else "tv"
             typed = [row for row in hits if (row.get("mediaType") or "") == want]
             if typed:
                 hits = typed
+            # else: implied kind missed — keep other type (TV-only title under movie ask)
+
         choices = self._dedupe_choices(self._filter_hits(hits, parsed, exact_id=exact_id))
         if parsed.tmdb_id:
             id_hits = [
@@ -1105,13 +931,9 @@ class TelegramInbox:
                     }
                 ]
         if not choices:
-            # Fall back to direct *arr if Overseerr has nothing.
-            if media_kind == "tv":
-                return await self._grab_sonarr(
-                    view, parsed, exact_id=exact_id, select_all=select_all
-                )
-            return await self._grab_radarr(
-                view, parsed, exact_id=exact_id, select_all=select_all
+            return InboxResult(
+                handled=True,
+                reply=format_not_found(parsed.display_label() or query or "that"),
             )
         if select_all and len(choices) > 1 and not exact_id:
             return await self._queue_many(
@@ -1143,6 +965,19 @@ class TelegramInbox:
         media_type = str(pick.get("mediaType") or media_kind or "movie")
         if media_type not in {"movie", "tv"}:
             media_type = "movie"
+        # Progress tools still read *arr queues — skip if already downloading there.
+        progress_service = "radarr" if media_type == "movie" else "sonarr"
+        if await self._already_queued(title, progress_service):
+            return InboxResult(handled=True, reply=format_already(title, queued=True))
+        from hearth.fixtures import pipeline
+
+        if any(
+            normalize_title(str(row.get("title") or row.get("name") or ""))
+            == normalize_title(title)
+            for row in pipeline.overseerr_queue
+        ):
+            return InboxResult(handled=True, reply=format_already(title, queued=True))
+
         media_id = pick.get("mediaId") or pick.get("tmdbId") or parsed.tmdb_id
         result = await overseerr.request(
             title,
@@ -1154,13 +989,12 @@ class TelegramInbox:
                 handled=True,
                 reply=format_not_found(parsed.display_label() or title),
             )
-        service = "radarr" if media_type == "movie" else "sonarr"
-        self.progress.track(view.chat_id, title, service, year_i)
+        self.progress.track(view.chat_id, title, progress_service, year_i)
         return InboxResult(
             handled=True,
             reply=format_queued(title, year_i, "Overseerr"),
             grabbed=True,
             title=title,
-            service=service,
+            service=progress_service,
             year=year_i,
         )
