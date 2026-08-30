@@ -400,6 +400,14 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "overview": "Stand-up special by Daniel Sloss.",
         "status": "released",
     },
+    {
+        "title": "The Christophers",
+        "year": 2025,
+        "tmdbId": 1280010,
+        "imdbId": "tt32000101",
+        "overview": "Ian McKellen stars in The Christophers.",
+        "status": "released",
+    },
 ]
 
 MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
@@ -550,6 +558,13 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
         "title": "Daniel Sloss: Can't",
         "year": 2025,
         "imdbId": "tt35000001",
+    },
+    {
+        "id": 1280010,
+        "mediaType": "movie",
+        "title": "The Christophers",
+        "year": 2025,
+        "imdbId": "tt32000101",
     },
 ]
 

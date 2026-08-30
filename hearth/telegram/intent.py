@@ -4,8 +4,9 @@ Instant path (no model) only when there is no reasonable doubt:
 catalog id/URL, explicit ``Title (YYYY)``, or a live numbered pick
 (``1``/``2``/``3``, ``all of them``, ``de eerste`` while a list is on screen).
 
-Everything else always calls a smart/fast model with the last ~8 turns of
-this chat. No keyword gates, no franchise/actor maps. Unsure → clarify;
+Everything else always calls gpt-4o with Overseerr catalog hits for this turn
+as ``candidates``, plus the last ~8 turns of this chat. No keyword gates, no
+franchise/actor maps. Unsure → clarify with a real 1–N list when hits exist;
 never invent a grab.
 """
 
@@ -59,6 +60,46 @@ _YEAR_PAREN = re.compile(r"\(\s*((?:19|20)\d{2})\s*\)")
 _CATALOG_ID = re.compile(r"\btt\d{7,}|\btmdb:\d+|\btvdb:\d+", re.I)
 _URLISH = re.compile(r"https?://", re.I)
 _ORDINAL_PICK = re.compile(r"^\s*#?\s*([1-9])\s*$")
+_STOP_TOKENS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "of",
+        "to",
+        "in",
+        "on",
+        "for",
+        "with",
+        "met",
+        "featuring",
+        "starring",
+        "feat",
+        "ft",
+        "movie",
+        "movies",
+        "film",
+        "films",
+        "series",
+        "show",
+        "tv",
+        "all",
+        "them",
+        "one",
+        "de",
+        "het",
+        "een",
+        "die",
+        "dat",
+    }
+)
+_CLARIFY_LIST_HINT = re.compile(
+    r"(?:reply|pick|kies|antwoord).{0,24}\b1\s*[-–—]\s*\d+"
+    r"|\b1\s*[-–—]\s*\d+\b.{0,16}(?:or|of|,'|\")",
+    re.I,
+)
 
 _SYSTEM = (
     "You interpret short Telegram messages for a house movie/TV download bot. "
@@ -69,18 +110,25 @@ _SYSTEM = (
     "thanks, ok, cool, short jokes about the bot. Do NOT ask which movie. "
     "You are in a multi-turn conversation: use recent_history (NL+EN) to resolve "
     "plot descriptions, pronouns, corrections, actor/artist clues, and misspellings. "
-    "subject_title is the last resolved title — drop it when the user rejects it. "
+    "subject_title is the last resolved title — drop it when the user starts a "
+    "NEW title ask that does not match it, or when they reject it. "
     "rejected_titles must NEVER be re-offered as search_title or implied picks. "
     "When the user rejects the current/last suggestion (nee/niet die/not that/"
     "no not X) and adds new clues, return action=search with a NEW search_title "
     "from the original plot + new clues; do not ask them to pick 1–2 for a "
     "rejected film. Bare nee/no with no new info → action=clarify with a short "
     "useful question (not a 1–2 list). "
-    "When candidates are listed and the user clearly picks among them, use "
-    "pick/pick_many with 1-based indices only — never invent ids. "
+    "candidates are real Overseerr/TMDB hits for THIS user message (same turn). "
+    "When candidates are listed: pick/pick_many with 1-based indices, OR "
+    "action=search with search_title that MATCHES a candidate title (or the "
+    "user's own words). NEVER invent a title that is not a candidate and not "
+    "in the user message (e.g. do not turn Christophers+McKellen into "
+    "Christopher Guest). If several candidates remain, action=clarify — the "
+    "bot will list them as 1–N. "
     "When candidates are empty: resolve plot/character/premise to search_title "
     "(catalog title; franchise name OK) and year + media_kind when known. "
-    "Do not echo the plot as search_title. "
+    "Do not echo the plot as search_title. Do not reuse subject_title when the "
+    "user clearly named a different title. "
     "Actor/artist names and misspellings are clues for you — never refuse because "
     "of spelling. If unsure which title, action=clarify once with a useful question. "
     "Actions: passthrough, ignore, clarify, pick, pick_many, search. "
@@ -91,7 +139,7 @@ _SYSTEM = (
     "part of the Overseerr query). media_kind is movie or tv when known; omit "
     "when unsure (Overseerr returns both). "
     "If the user clearly names a concrete catalog title with no ambiguity, "
-    "action=search with that title (or passthrough)."
+    "action=search with that title (or pick the matching candidate)."
 )
 
 
@@ -312,9 +360,94 @@ def _candidate_blob(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "year": row.get("year"),
                 "tmdbId": row.get("tmdbId") or row.get("mediaId"),
                 "tvdbId": row.get("tvdbId"),
+                "mediaType": row.get("mediaType") or row.get("media_kind") or "",
             }
         )
     return rows
+
+
+def _norm_title(value: str) -> str:
+    text = re.sub(r"[^a-z0-9à-ÿ]+", " ", (value or "").lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _significant_tokens(value: str) -> set[str]:
+    return {
+        tok
+        for tok in _norm_title(value).split()
+        if len(tok) >= 3 and tok not in _STOP_TOKENS and not tok.isdigit()
+    }
+
+
+def titles_match(left: str, right: str) -> bool:
+    """Loose title equality for candidate / subject checks."""
+    a = _norm_title(left)
+    b = _norm_title(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Drop leading articles once more after year stripping.
+    a2 = re.sub(r"^(?:the|a|an|de|het|een)\s+", "", a)
+    b2 = re.sub(r"^(?:the|a|an|de|het|een)\s+", "", b)
+    return bool(a2 and b2 and a2 == b2)
+
+
+def search_title_grounded(
+    search_title: str,
+    *,
+    user_message: str,
+    candidates: list[dict[str, Any]] | None,
+) -> bool:
+    """True when search_title matches a candidate or shares tokens with the user.
+
+    Blocks invented titles like ``The Christopher Guest Movies`` when the user
+    said Christophers + McKellen and candidates contain The Christophers.
+    Plot asks with empty candidates may invent a catalog title. Concrete title
+    asks must still share tokens with the user message (Da Vinci must not
+    survive a Christophers ask).
+    """
+    title = (search_title or "").strip()
+    if not title:
+        return False
+    rows = list(candidates or [])
+    if any(titles_match(title, str(row.get("title") or "")) for row in rows):
+        return True
+    user_tokens = _significant_tokens(user_message)
+    title_tokens = _significant_tokens(title)
+    shared = bool(user_tokens and title_tokens and (user_tokens & title_tokens))
+    if shared:
+        return True
+    if not rows:
+        # Plot / character resolve may invent when the user did not name a title.
+        if looks_like_concrete_title(user_message):
+            return False
+        return True
+    return False
+
+
+def clarify_wants_numbered_list(question: str) -> bool:
+    """True when a clarify string asks for 1–N without listing the rows."""
+    raw = (question or "").strip()
+    if not raw:
+        return False
+    if _CLARIFY_LIST_HINT.search(raw):
+        return True
+    return bool(re.search(r"\breply\s+1\s*[-–—]\s*\d+\b", raw, re.I))
+
+
+def subject_matches_user_title(subject_title: str, user_message: str) -> bool:
+    """True when the sticky subject still refers to the user's current title ask."""
+    subject = (subject_title or "").strip()
+    if not subject:
+        return True
+    if titles_match(subject, user_message):
+        return True
+    subj_tokens = _significant_tokens(subject)
+    user_tokens = _significant_tokens(user_message)
+    if not subj_tokens or not user_tokens:
+        return False
+    return bool(subj_tokens & user_tokens)
 
 
 def _offline_fallback(
@@ -424,7 +557,8 @@ async def interpret_intent(
                 },
             ],
             response_format={"type": "json_object"},
-            max_tokens=200,
+            # Candidates + history need headroom; gpt-4o is cheap for this hop.
+            max_tokens=450,
             temperature=0,
         )
         drafted = (response.choices[0].message.content or "").strip()
@@ -432,6 +566,8 @@ async def interpret_intent(
             drafted,
             candidate_count=len(candidates or []),
             rejected_titles=rejected,
+            user_message=raw,
+            candidates=candidates,
         )
         if parsed is None:
             return IntentDecision(
@@ -456,6 +592,8 @@ def _parse_model_json(
     *,
     candidate_count: int,
     rejected_titles: list[str] | None = None,
+    user_message: str = "",
+    candidates: list[dict[str, Any]] | None = None,
 ) -> IntentDecision | None:
     try:
         data = json.loads(raw)
@@ -552,6 +690,24 @@ def _parse_model_json(
                 confidence=confidence,
                 media_kind=media_kind,
             )
+        if not search_title_grounded(
+            search_title,
+            user_message=user_message,
+            candidates=candidates,
+        ):
+            # Invented title while real hits exist — force clarify (inbox lists them).
+            return IntentDecision(
+                action="clarify",
+                clarify_question=clarify
+                or (
+                    f"Which one — reply 1–{min(3, candidate_count)}, "
+                    "'all of them', or a clearer title?"
+                    if candidate_count
+                    else "Which movie or series did you mean? Send the title if you know it."
+                ),
+                confidence=confidence,
+                media_kind=media_kind,
+            )
         if confidence < MIN_RESOLVE_CONFIDENCE:
             return IntentDecision(
                 action="clarify",
@@ -644,6 +800,7 @@ __all__ = [
     "MAX_CANDIDATES",
     "MIN_RESOLVE_CONFIDENCE",
     "TELEGRAM_INTENT_MODEL",
+    "clarify_wants_numbered_list",
     "heuristic_intent",
     "instant_pick_decision",
     "interpret_intent",
@@ -654,5 +811,8 @@ __all__ = [
     "looks_like_contextual_followup",
     "looks_like_descriptive_ask",
     "looks_like_followup",
+    "search_title_grounded",
+    "subject_matches_user_title",
     "telegram_intent_model",
+    "titles_match",
 ]
