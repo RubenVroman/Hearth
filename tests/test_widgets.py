@@ -1,9 +1,10 @@
-"""Glass info overlays — weather / media only (no flickering update guards)."""
+"""Glass info overlays — weather / media / downloads (no flickering update guards)."""
 
 from datetime import datetime, timedelta, timezone
 
 from hearth.agent.loop import route_intent
 from hearth.agent.registry import registry
+from hearth.fixtures import pipeline
 from hearth.overlay_context import evaluate_widget, text_matches_topics, topics_for_widget
 from hearth.runtime import Widget, runtime
 
@@ -19,6 +20,11 @@ def test_command_center_includes_info_overlay(client):
     assert "noteOverlayConversation" in js.text
     assert "is-soft-hidden" in js.text
     assert "renderWidgets" in js.text
+    assert "/api/media/art" in js.text
+    assert "downloadsMarkup" in js.text
+    assert "info-download-bar" in js.text
+    assert "fadeMediaOverlayOnProgress" not in js.text
+
     assert "/api/widgets/" in js.text
     assert "upsertLocalWidget" not in js.text
     assert 'kind: "action"' not in js.text
@@ -26,6 +32,7 @@ def test_command_center_includes_info_overlay(client):
     assert ".info-overlay" in css.text
     assert ".info-glass" in css.text
     assert ".info-overlay.is-soft-hidden" in css.text
+    assert ".info-download-list" in css.text
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
@@ -78,10 +85,45 @@ def test_movie_ask_surfaces_media_overlay(client):
     assert item.get("summary")
     assert item.get("ratingKey") == "1001"
     assert media["context"]["relevant"] is True
+    assert item.get("tmdbId") == 693134
+    assert item.get("posterPath")
+    assert media.get("sticky") is False
 
     thumb = client.get("/api/plex/thumb/1001")
     assert thumb.status_code == 200
     assert "image/" in thumb.headers.get("content-type", "")
+
+    art = client.get("/api/media/art", params={"ratingKey": "1001", "tmdbId": 693134})
+    assert art.status_code == 200
+    assert "image/" in art.headers.get("content-type", "")
+
+
+def test_media_overlay_soft_hides_on_next_turn(client):
+    """#27 policy: unrelated/ack turns keep media for reappear; do not hard-delete."""
+    first = client.post("/api/chat", json={"message": "tell me about the movie Dune"})
+    assert first.status_code == 200
+    assert any(w["kind"] == "media" for w in first.json()["widgets"])
+
+    second = client.post("/api/chat", json={"message": "thanks"})
+    assert second.status_code == 200
+    # Soft-hide memory: widget remains; relevance may stay active for a brief ack.
+    assert runtime.get_widget("media") is not None
+    kinds = {w["kind"] for w in second.json()["widgets"]}
+    assert "media" in kinds
+
+
+def test_media_art_endpoint_accepts_tmdb_and_falls_back(client):
+    ok = client.get(
+        "/api/media/art",
+        params={"tmdbId": 693134, "mediaType": "movie", "title": "Dune: Part Two"},
+    )
+    assert ok.status_code == 200
+    ctype = ok.headers.get("content-type", "")
+    assert ctype.startswith("image/")
+    # Real TMDB JPEG when CDN reachable; SVG placeholder otherwise.
+    assert ctype in {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/svg+xml"} or ctype.startswith(
+        "image/"
+    )
 
 
 def test_now_playing_surfaces_media_overlay(client):
@@ -90,6 +132,45 @@ def test_now_playing_surfaces_media_overlay(client):
     body = chat.json()
     media = next(w for w in body["widgets"] if w["kind"] == "media")
     assert "Dune" in media["title"]
+
+
+def test_download_progress_surfaces_downloads_overlay(client):
+    chat = client.post("/api/chat", json={"message": "How far along is Annihilation?"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "radarr_queue"
+    downloads = next(w for w in body["widgets"] if w["kind"] == "downloads")
+    assert downloads["status"] == "done"
+    assert "Annihilation" in downloads["title"]
+    rows = downloads["data"]["downloads"]
+    assert len(rows) == 1
+    assert rows[0]["percent"] == 75.0
+    assert rows[0]["status"] == "downloading"
+    assert rows[0].get("sizeleft_label")
+    assert downloads["data"].get("empty") is None
+
+    listed = client.post("/api/chat", json={"message": "What's downloading right now?"})
+    assert listed.status_code == 200
+    panel = next(w for w in listed.json()["widgets"] if w["kind"] == "downloads")
+    assert len(panel["data"]["downloads"]) >= 1
+    assert panel["data"]["service"] == "radarr"
+
+
+def test_download_progress_empty_and_missing_are_calm(client, monkeypatch):
+    miss = client.post("/api/chat", json={"message": "Download progress for NotARealMovieXYZ"})
+    assert miss.status_code == 200
+    missing = next(w for w in miss.json()["widgets"] if w["kind"] == "downloads")
+    assert missing["data"]["empty"] == "missing"
+    assert missing["data"]["downloads"] == []
+    assert "not" in missing["body"].lower() or "not" in missing["detail"].lower()
+
+    monkeypatch.setattr(pipeline, "radarr_downloads", [])
+    idle = client.post("/api/chat", json={"message": "What's downloading right now?"})
+    assert idle.status_code == 200
+    quiet = next(w for w in idle.json()["widgets"] if w["kind"] == "downloads")
+    assert quiet["data"]["empty"] == "idle"
+    assert quiet["data"]["downloads"] == []
+    assert "nothing" in quiet["body"].lower()
 
 
 def test_dismiss_overlay(client):

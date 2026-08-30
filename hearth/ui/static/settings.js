@@ -140,6 +140,8 @@
     const root = document.documentElement;
     for (const knob of KNOBS) {
       const value = values[knob.id] ?? knob.default;
+      // Always on <html> so selectors like html[data-look="jarvis"] match.
+      root.setAttribute(`data-${knob.id}`, value);
       root.dataset[knob.id] = value;
     }
     const look = values.look || "hearth";

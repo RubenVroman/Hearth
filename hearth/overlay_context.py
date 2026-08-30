@@ -34,6 +34,7 @@ _KIND_TOOLS: dict[str, frozenset[str]] = {
             "house_media",
         }
     ),
+    "downloads": frozenset({"radarr_queue", "sonarr_queue"}),
 }
 
 _KIND_LEXICON: dict[str, frozenset[str]] = {
@@ -80,6 +81,21 @@ _KIND_LEXICON: dict[str, frozenset[str]] = {
             "library",
             "playback",
             "stream",
+        }
+    ),
+    "downloads": frozenset(
+        {
+            "download",
+            "downloads",
+            "downloading",
+            "queue",
+            "progress",
+            "percent",
+            "radarr",
+            "sonarr",
+            "grab",
+            "torrent",
+            "usenet",
         }
     ),
 }
@@ -217,6 +233,17 @@ def topics_for_widget(widget: Widget) -> list[str]:
             for token in _tokenize(str(item.get(key) or "")):
                 if token not in _STOP:
                     topics.add(token)
+    if kind == "downloads":
+        for row in list(data.get("downloads") or [])[:8]:
+            if not isinstance(row, dict):
+                continue
+            for token in _tokenize(str(row.get("title") or "")):
+                if token not in _STOP:
+                    topics.add(token)
+        query = data.get("query")
+        for token in _tokenize(str(query or "")):
+            if token not in _STOP:
+                topics.add(token)
     # Prefer short, readable order: kind first, then alpha.
     ordered = sorted(topics, key=lambda t: (0 if t == kind else 1, t))
     return ordered[:48]
@@ -248,11 +275,16 @@ def unrelated_domain(text: str, kind: str) -> str | None:
             continue
         if pattern.search(raw):
             return domain
-    # Cross-kind: weather ask while media is up (and vice versa).
-    other = "media" if kind == "weather" else "weather" if kind == "media" else ""
-    if other and text_matches_topics(raw, _KIND_LEXICON.get(other, ())):
-        # Only treat as switch if it doesn't also hit this widget's entity topics.
-        return other
+    # Cross-kind: weather ask while media/downloads is up (and vice versa).
+    others = {
+        "weather": ("media", "downloads"),
+        "media": ("weather", "downloads"),
+        "downloads": ("weather", "media"),
+    }.get(kind, ())
+    for other in others:
+        if text_matches_topics(raw, _KIND_LEXICON.get(other, ())):
+            # Only treat as switch if it doesn't also hit this widget's entity topics.
+            return other
     return None
 
 

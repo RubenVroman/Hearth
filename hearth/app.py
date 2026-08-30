@@ -18,7 +18,6 @@ from hearth.auth.db import init_db
 from hearth.auth.gate import http_authorized, is_public_path, ws_authorized
 from hearth.auth.routers import auth_router
 from hearth.config import settings
-from hearth.fixtures import MOCK_PLEX_LIBRARY
 from hearth.memory.prune import prune_loop
 from hearth.memory.retrieve import search as memory_search, status_snapshot as memory_status_snapshot
 from hearth.memory.store import export_snapshot, forget as memory_forget_row, init_memory_db, remember_preference
@@ -194,29 +193,7 @@ async def widgets() -> dict[str, Any]:
     return {"widgets": runtime.list_widgets()}
 
 
-@app.get("/api/plex/thumb/{rating_key}")
-async def plex_thumb(rating_key: str) -> Response:
-    """Poster proxy — Plex token never leaves the server."""
-    key = str(rating_key or "").strip()
-    if not key or not key.isdigit():
-        raise HTTPException(status_code=400, detail="invalid ratingKey")
-    fetched = await plex.thumb_bytes(key)
-    if fetched is not None:
-        body, content_type = fetched
-        return Response(
-            content=body,
-            media_type=content_type,
-            headers={"Cache-Control": "private, max-age=3600"},
-        )
-    # Fixture / offline placeholder — no secrets, still looks like a poster tile.
-    title = next(
-        (
-            str(row.get("title") or "")
-            for row in MOCK_PLEX_LIBRARY
-            if str(row.get("ratingKey")) == key
-        ),
-        "Hearth",
-    )
+def _poster_placeholder_svg(title: str) -> Response:
     initials = "".join(part[0] for part in title.split()[:2] if part).upper() or "H"
     safe_title = (
         title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
@@ -238,6 +215,46 @@ async def plex_thumb(rating_key: str) -> Response:
         media_type="image/svg+xml",
         headers={"Cache-Control": "private, max-age=300"},
     )
+
+
+@app.get("/api/media/art")
+async def media_art(
+    ratingKey: str | None = Query(default=None, alias="ratingKey"),
+    tmdbId: int | None = Query(default=None, alias="tmdbId"),
+    mediaType: str = Query(default="movie", alias="mediaType"),
+    posterPath: str | None = Query(default=None, alias="posterPath"),
+    title: str | None = Query(default=None),
+) -> Response:
+    """Poster/backdrop proxy — Plex / *arr / Overseerr / TMDB CDN; keys stay server-side."""
+    from hearth.tools.media_art import fetch_poster_bytes, fixture_title_for_art
+
+    fetched = await fetch_poster_bytes(
+        rating_key=ratingKey,
+        tmdb_id=tmdbId,
+        media_type=mediaType or "movie",
+        poster_path=posterPath,
+    )
+    if fetched is not None:
+        body, content_type = fetched
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+    label = (title or "").strip() or fixture_title_for_art(
+        rating_key=ratingKey,
+        tmdb_id=tmdbId,
+    )
+    return _poster_placeholder_svg(label)
+
+
+@app.get("/api/plex/thumb/{rating_key}")
+async def plex_thumb(rating_key: str) -> Response:
+    """Poster proxy — Plex token never leaves the server. Prefers real art via /api/media/art."""
+    key = str(rating_key or "").strip()
+    if not key or not key.isdigit():
+        raise HTTPException(status_code=400, detail="invalid ratingKey")
+    return await media_art(ratingKey=key, tmdbId=None, mediaType="movie", posterPath=None, title=None)
 
 
 @app.delete("/api/widgets/{widget_id}")
