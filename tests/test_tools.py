@@ -374,6 +374,64 @@ async def test_plex_search_returns_rating_key():
     assert hit.get("guid")
 
 
+async def test_plex_browse_genre_animation_is_speakable():
+    result = await registry.call("plex_browse_genre", {"genre": "Animation"})
+    assert result.ok
+    assert result.data["mode"] == "mock"
+    assert result.data["genre"] == "Animation"
+    assert result.data["total"] == 3
+    titles = {r["title"] for r in result.data["results"]}
+    assert "Spirited Away" in titles
+    assert "Toy Story" in titles
+    assert "Howl's Moving Castle" in titles
+    speak = result.data["speak"].lower()
+    assert "3" in speak
+    assert "animation" in speak
+    assert "spirited away" in speak
+    assert "toy story" in speak
+
+
+async def test_plex_browse_genre_anime_alias():
+    result = await registry.call("plex_browse_genre", {"genre": "anime"})
+    assert result.ok
+    assert result.data["genre"] == "Animation"
+    assert result.data["total"] >= 3
+
+
+async def test_plex_browse_genre_lists_genres_when_empty():
+    result = await registry.call("plex_browse_genre", {"genre": ""})
+    assert result.ok
+    assert result.data.get("listed_genres") is True
+    names = {g["title"] for g in result.data["genres"]}
+    assert "Animation" in names
+    assert "Drama" in names
+    assert "animation" in result.data["speak"].lower()
+
+
+async def test_plex_browse_genre_unknown_is_clear():
+    result = await registry.call("plex_browse_genre", {"genre": "NotARealGenreXYZ"})
+    assert not result.ok
+    assert "couldn't find" in result.data["speak"].lower()
+
+
+def test_intent_animation_movies_uses_plex_browse_genre():
+    from hearth.agent.loop import route_intent
+
+    plan = route_intent("what animation movies do we have")
+    assert plan is not None
+    assert plan["tool"] == "plex_browse_genre"
+    assert plan["args"]["genre"].lower() == "animation"
+    assert plan["args"]["type"] == "movie"
+
+    plan2 = route_intent("list comedy films")
+    assert plan2["tool"] == "plex_browse_genre"
+    assert plan2["args"]["genre"].lower() == "comedy"
+
+    plan3 = route_intent("list plex genres")
+    assert plan3["tool"] == "plex_browse_genre"
+    assert plan3["args"]["genre"] == ""
+
+
 async def test_plex_clients_lists_apple_tv_and_lg():
     result = await registry.call("plex_clients", {})
     assert result.ok

@@ -76,6 +76,20 @@ async def _plex_clients(_args: dict[str, Any]) -> dict[str, Any]:
     return await plex.clients()
 
 
+async def _plex_browse_genre(args: dict[str, Any]) -> dict[str, Any]:
+    media_type = str(args.get("type") or args.get("media_type") or "movie")
+    limit = args.get("limit")
+    try:
+        limit_n = int(limit) if limit is not None else 24
+    except (TypeError, ValueError):
+        limit_n = 24
+    return await plex.browse_genre(
+        str(args.get("genre") or ""),
+        media_type=media_type,
+        limit=limit_n,
+    )
+
+
 async def _plex_play(args: dict[str, Any]) -> dict[str, Any]:
     rating = args.get("ratingKey") or args.get("rating_key")
     offset = args.get("offset_ms") or args.get("offset") or 0
@@ -526,6 +540,40 @@ def register_builtin_tools() -> None:
             ),
             parameters={"type": "object", "properties": {}},
             handler=_plex_clients,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="plex_browse_genre",
+            description=(
+                "Browse the Plex movie (or show) library by genre. "
+                "Use for Animation / Comedy / Horror / … lists — e.g. 'what animation "
+                "movies do we have'. Returns a speakable summary (count + a few titles "
+                "with years), not a huge dump. Omit genre (or pass list) to list available "
+                "genres. Prefer this over plex_search when the ask is about a genre, not "
+                "a specific title."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "genre": {
+                        "type": "string",
+                        "description": (
+                            "Genre name, e.g. Animation, Comedy, Science Fiction. "
+                            "Empty / 'list' lists available genres."
+                        ),
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "movie (default) or show",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max titles to return in results (spoken list stays short)",
+                    },
+                },
+            },
+            handler=_plex_browse_genre,
         )
     )
     registry.register(

@@ -27,6 +27,7 @@ _KIND_TOOLS: dict[str, frozenset[str]] = {
             "plex_now_playing",
             "plex_play",
             "plex_clients",
+            "plex_browse_genre",
             "radarr_search",
             "radarr_add",
             "sonarr_search",
@@ -85,6 +86,10 @@ _KIND_LEXICON: dict[str, frozenset[str]] = {
             "library",
             "playback",
             "stream",
+            "genre",
+            "genres",
+            "animation",
+            "anime",
         }
     ),
     "downloads": frozenset(

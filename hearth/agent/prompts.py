@@ -18,6 +18,8 @@ Do it yourself (house):
   (device=tv|avr|apple_tv). Prefer this over raw ha_call_service.
 - House media snapshot (TV + AVR + Apple TV + Plex, speakable) → house_media.
 - What's playing on Plex → plex_now_playing. (Infuse has no now-playing API — do not invent one.)
+- Browse the library by genre (Animation, Comedy, …) → plex_browse_genre. Speak the count and a
+  short title list (with years), not every hit. Omit genre to list available genres.
 - Play a title on Apple TV / Infuse → infuse_play (default). Ruben uses Infuse (Firecore), not
   the Plex tvOS app. Resolves title → TMDB (Plex Guids / Radarr / Overseerr), opens
   infuse://…?play via HA Apple TV play_media. Runs immediately — no confirm step.
@@ -29,6 +31,7 @@ Do it yourself (house):
   If no Plex clients are online, tell {settings.owner} to open Plex — keep the same title/player
   and call plex_play again with confirm=true (or Try again). Confirm / Try again re-polls briefly.
   If the title is not in the Plex library, say so — do not silently queue Radarr unless asked to grab it.
+- Library by genre (“animation movies”, “what comedy films do we have”) → plex_browse_genre.
 - Weather / forecast outside → get_weather.
 - Live web (news, current events, sports, where-to-watch / streaming, anything that
   needs the internet) → web_search. Speak a short summary of a few sources. Do not

@@ -8,7 +8,12 @@ from urllib.parse import urlparse
 import httpx
 
 from hearth.config import settings
-from hearth.fixtures import MOCK_PLEX_CLIENTS, MOCK_PLEX_LIBRARY, MOCK_PLEX_SESSIONS
+from hearth.fixtures import (
+    MOCK_PLEX_CLIENTS,
+    MOCK_PLEX_LIBRARY,
+    MOCK_PLEX_SECTIONS,
+    MOCK_PLEX_SESSIONS,
+)
 
 # Prefer living-room TVs when no explicit player is named.
 _PREFERRED_CLIENT_HINTS = (
@@ -20,6 +25,23 @@ _PREFERRED_CLIENT_HINTS = (
     "livingroom",
     "shield",
 )
+
+# Speakable genre browse — titles in the spoken summary, not a huge dump.
+_SPEAK_TITLE_LIMIT = 6
+_DEFAULT_BROWSE_LIMIT = 24
+_MAX_BROWSE_LIMIT = 50
+
+# Soft aliases so voice can say "anime" / "sci-fi" and still hit Plex tags.
+_GENRE_ALIASES: dict[str, tuple[str, ...]] = {
+    "anime": ("animation", "anime"),
+    "animation": ("animation", "anime"),
+    "sci fi": ("science fiction", "sci-fi", "sci fi"),
+    "sci-fi": ("science fiction", "sci-fi", "sci fi"),
+    "science fiction": ("science fiction", "sci-fi", "sci fi"),
+    "kids": ("family", "kids", "children", "childrens"),
+    "kid": ("family", "kids", "children", "childrens"),
+    "children": ("family", "kids", "children", "childrens"),
+}
 
 
 class Plex:
@@ -110,6 +132,225 @@ class Plex:
                     "mode": "mock",
                     "error": str(exc),
                     "results": _mock_search(query, limit),
+                }
+            raise
+
+    async def sections(self) -> dict[str, Any]:
+        """List Plex library sections (Movies, TV Shows, …). Token stays server-side."""
+        if not self.live:
+            return {"mode": "mock", "sections": list(MOCK_PLEX_SECTIONS)}
+        client = await self._http()
+        try:
+            response = await client.get("/library/sections")
+            response.raise_for_status()
+            return {"mode": "live", "sections": _sections(response.json())}
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                return {
+                    "mode": "mock",
+                    "error": str(exc),
+                    "sections": list(MOCK_PLEX_SECTIONS),
+                }
+            raise
+
+    async def genres(self, media_type: str = "movie") -> dict[str, Any]:
+        """List genres for a movie or show library section."""
+        kind = _normalize_media_type(media_type)
+        sections_result = await self.sections()
+        section = _pick_section(sections_result.get("sections") or [], kind)
+        if section is None:
+            speak = f"No {kind} library section found on Plex."
+            return {
+                "ok": False,
+                "mode": sections_result.get("mode"),
+                "media_type": kind,
+                "genres": [],
+                "error": speak,
+                "speak": speak,
+            }
+
+        if not self.live:
+            genres = _mock_genres(kind)
+            return {
+                "ok": True,
+                "mode": "mock",
+                "media_type": kind,
+                "section": section,
+                "genres": genres,
+                "speak": _speak_genres(genres, kind),
+            }
+
+        client = await self._http()
+        try:
+            response = await client.get(f"/library/sections/{section['key']}/genre")
+            response.raise_for_status()
+            genres = _genres(response.json())
+            return {
+                "ok": True,
+                "mode": "live",
+                "media_type": kind,
+                "section": section,
+                "genres": genres,
+                "speak": _speak_genres(genres, kind),
+            }
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                genres = _mock_genres(kind)
+                return {
+                    "ok": True,
+                    "mode": "mock",
+                    "error": str(exc),
+                    "media_type": kind,
+                    "section": section,
+                    "genres": genres,
+                    "speak": _speak_genres(genres, kind),
+                }
+            raise
+
+    async def browse_genre(
+        self,
+        genre: str = "",
+        *,
+        media_type: str = "movie",
+        limit: int = _DEFAULT_BROWSE_LIMIT,
+    ) -> dict[str, Any]:
+        """Browse the Plex library by genre with a speakable summary.
+
+        Empty ``genre`` lists available genres. Otherwise resolves the genre
+        (case-insensitive + soft aliases) and returns titles + year + count.
+        """
+        kind = _normalize_media_type(media_type)
+        try:
+            cap = max(1, min(int(limit or _DEFAULT_BROWSE_LIMIT), _MAX_BROWSE_LIMIT))
+        except (TypeError, ValueError):
+            cap = _DEFAULT_BROWSE_LIMIT
+
+        needle = (genre or "").strip()
+        genres_result = await self.genres(kind)
+        available = genres_result.get("genres") or []
+        section = genres_result.get("section")
+
+        if not needle or needle.lower() in {"list", "all", "genres", "?"}:
+            if genres_result.get("ok") is False:
+                return genres_result
+            return {
+                "ok": True,
+                "mode": genres_result.get("mode"),
+                "media_type": kind,
+                "section": section,
+                "genres": available,
+                "results": [],
+                "count": 0,
+                "total": 0,
+                "listed_genres": True,
+                "speak": genres_result.get("speak") or _speak_genres(available, kind),
+            }
+
+        if genres_result.get("ok") is False:
+            return genres_result
+
+        matched = _match_genre(needle, available)
+        if matched is None:
+            names = ", ".join(str(g.get("title")) for g in available[:12] if g.get("title"))
+            speak = (
+                f"I couldn't find a {kind} genre matching {needle}. "
+                f"Available: {names or 'none'}."
+            )
+            return {
+                "ok": False,
+                "mode": genres_result.get("mode"),
+                "media_type": kind,
+                "genre": needle,
+                "genres": available,
+                "section": section,
+                "results": [],
+                "count": 0,
+                "total": 0,
+                "error": speak,
+                "speak": speak,
+            }
+
+        genre_title = str(matched.get("title") or needle)
+        genre_key = matched.get("key") or matched.get("id")
+
+        if not self.live:
+            hits = _mock_browse_genre(genre_title, kind)
+            clipped = hits[:cap]
+            return {
+                "ok": True,
+                "mode": "mock",
+                "media_type": kind,
+                "genre": genre_title,
+                "genre_key": genre_key,
+                "section": section,
+                "genres": available,
+                "results": clipped,
+                "count": len(clipped),
+                "total": len(hits),
+                "speak": _speak_browse(genre_title, kind, clipped, total=len(hits)),
+            }
+
+        if section is None:
+            speak = f"No {kind} library section found on Plex."
+            return {
+                "ok": False,
+                "mode": genres_result.get("mode"),
+                "media_type": kind,
+                "genre": genre_title,
+                "genres": available,
+                "results": [],
+                "count": 0,
+                "total": 0,
+                "error": speak,
+                "speak": speak,
+            }
+
+        client = await self._http()
+        params: dict[str, Any] = {"genre": genre_key}
+        plex_type = _plex_type_id(kind)
+        if plex_type is not None:
+            params["type"] = plex_type
+        try:
+            response = await client.get(
+                f"/library/sections/{section['key']}/all",
+                params=params,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            container = payload.get("MediaContainer") or {}
+            metadata = container.get("Metadata") or []
+            total = int(container.get("totalSize") or container.get("size") or len(metadata))
+            results = [_item_summary(m) for m in metadata[:cap]]
+            return {
+                "ok": True,
+                "mode": "live",
+                "media_type": kind,
+                "genre": genre_title,
+                "genre_key": genre_key,
+                "section": section,
+                "genres": available,
+                "results": results,
+                "count": len(results),
+                "total": total,
+                "speak": _speak_browse(genre_title, kind, results, total=total),
+            }
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                hits = _mock_browse_genre(genre_title, kind)
+                clipped = hits[:cap]
+                return {
+                    "ok": True,
+                    "mode": "mock",
+                    "error": str(exc),
+                    "media_type": kind,
+                    "genre": genre_title,
+                    "genre_key": genre_key,
+                    "section": section,
+                    "genres": available,
+                    "results": clipped,
+                    "count": len(clipped),
+                    "total": len(hits),
+                    "speak": _speak_browse(genre_title, kind, clipped, total=len(hits)),
                 }
             raise
 
@@ -653,6 +894,7 @@ def _item_summary(m: dict[str, Any]) -> dict[str, Any]:
         "posterPath": m.get("posterPath"),
         "season": int(season) if season is not None else None,
         "episode": int(episode) if episode is not None else None,
+        "genres": _genre_tags(m),
     }
 
 
@@ -1002,6 +1244,212 @@ def _no_clients_result(
         "sessions": sessions or [],
         "mode": mode,
     }
+
+
+def _normalize_media_type(media_type: str | None) -> str:
+    kind = str(media_type or "movie").strip().lower().replace("-", " ")
+    if kind in {"show", "shows", "tv", "series", "television", "episode", "season"}:
+        return "show"
+    return "movie"
+
+
+def _plex_type_id(media_type: str) -> int | None:
+    kind = _normalize_media_type(media_type)
+    if kind == "movie":
+        return 1
+    if kind == "show":
+        return 2
+    return None
+
+
+def _kind_label(media_type: str, *, count: int | None = None) -> str:
+    kind = _normalize_media_type(media_type)
+    if kind == "show":
+        if count == 1:
+            return "show"
+        return "shows"
+    if count == 1:
+        return "movie"
+    return "movies"
+
+
+def _sections(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = (payload.get("MediaContainer") or {}).get("Directory") or []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        key = row.get("key")
+        if key is None:
+            continue
+        out.append(
+            {
+                "key": str(key),
+                "title": row.get("title") or row.get("name") or f"Section {key}",
+                "type": row.get("type") or "movie",
+                "agent": row.get("agent"),
+                "uuid": row.get("uuid"),
+            }
+        )
+    return out
+
+
+def _pick_section(sections: list[dict[str, Any]], media_type: str) -> dict[str, Any] | None:
+    kind = _normalize_media_type(media_type)
+    for section in sections:
+        if str(section.get("type") or "").lower() == kind:
+            return section
+    return None
+
+
+def _genres(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = (payload.get("MediaContainer") or {}).get("Directory") or []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        title = row.get("title") or row.get("tag") or row.get("name")
+        key = row.get("key") or row.get("id")
+        if not title:
+            continue
+        entry: dict[str, Any] = {
+            "title": str(title),
+            "key": str(key) if key is not None else str(title),
+        }
+        if row.get("size") is not None:
+            try:
+                entry["size"] = int(row["size"])
+            except (TypeError, ValueError):
+                pass
+        out.append(entry)
+    out.sort(key=lambda g: str(g.get("title") or "").lower())
+    return out
+
+
+def _genre_tags(m: dict[str, Any]) -> list[str]:
+    raw = m.get("Genre") or m.get("genres") or []
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    tags: list[str] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            tag = entry.get("tag") or entry.get("title") or entry.get("name")
+        else:
+            tag = entry
+        text = str(tag or "").strip()
+        if text and text not in tags:
+            tags.append(text)
+    return tags
+
+
+def _mock_genres(media_type: str) -> list[dict[str, Any]]:
+    kind = _normalize_media_type(media_type)
+    counts: dict[str, int] = {}
+    for row in MOCK_PLEX_LIBRARY:
+        row_type = str(row.get("type") or "")
+        if kind == "movie" and row_type != "movie":
+            continue
+        if kind == "show" and row_type not in {"show", "episode", "season"}:
+            continue
+        for tag in _genre_tags(row):
+            counts[tag] = counts.get(tag, 0) + 1
+    out = [
+        {"title": title, "key": title, "size": size}
+        for title, size in sorted(counts.items(), key=lambda kv: kv[0].lower())
+    ]
+    return out
+
+
+def _mock_browse_genre(genre: str, media_type: str) -> list[dict[str, Any]]:
+    kind = _normalize_media_type(media_type)
+    aliases = _genre_alias_set(genre)
+    hits: list[dict[str, Any]] = []
+    for row in MOCK_PLEX_LIBRARY:
+        row_type = str(row.get("type") or "")
+        if kind == "movie" and row_type != "movie":
+            continue
+        if kind == "show" and row_type not in {"show", "episode", "season"}:
+            continue
+        tags = {t.lower() for t in _genre_tags(row)}
+        if tags & aliases:
+            hits.append(_item_summary(row))
+    hits.sort(key=lambda h: (str(h.get("title") or "").lower(), h.get("year") or 0))
+    return hits
+
+
+def _genre_alias_set(genre: str) -> set[str]:
+    normalized = " ".join(str(genre or "").lower().replace("-", " ").split())
+    aliases = {normalized} if normalized else set()
+    for key, values in _GENRE_ALIASES.items():
+        if normalized == key or normalized in values:
+            aliases.update(values)
+            aliases.add(key)
+    return aliases
+
+
+def _match_genre(needle: str, genres: list[dict[str, Any]]) -> dict[str, Any] | None:
+    aliases = _genre_alias_set(needle)
+    if not aliases:
+        return None
+    # Exact title / key first.
+    for genre in genres:
+        title = str(genre.get("title") or "").lower()
+        key = str(genre.get("key") or "").lower()
+        if title in aliases or key in aliases:
+            return genre
+        if title.replace("-", " ") in aliases:
+            return genre
+    # Soft substring (e.g. "sci" → "Science Fiction") only when unique.
+    soft = [
+        g
+        for g in genres
+        if any(
+            alias in str(g.get("title") or "").lower().replace("-", " ")
+            or str(g.get("title") or "").lower().replace("-", " ") in alias
+            for alias in aliases
+            if len(alias) >= 3
+        )
+    ]
+    if len(soft) == 1:
+        return soft[0]
+    return None
+
+
+def _speak_genres(genres: list[dict[str, Any]], media_type: str) -> str:
+    kind = _kind_label(media_type)
+    if not genres:
+        return f"No {kind} genres found in the Plex library."
+    names = [str(g.get("title")) for g in genres if g.get("title")]
+    shown = names[:12]
+    extra = len(names) - len(shown)
+    listed = ", ".join(shown)
+    if extra > 0:
+        listed = f"{listed}, and {extra} more"
+    return f"{kind.capitalize()} genres in Plex: {listed}."
+
+
+def _speak_browse(
+    genre: str,
+    media_type: str,
+    results: list[dict[str, Any]],
+    *,
+    total: int,
+) -> str:
+    kind_one = _kind_label(media_type, count=1)
+    kind_many = _kind_label(media_type, count=total if total else None)
+    if total <= 0 or not results:
+        return f"No {genre} {kind_many} in the Plex library."
+    bits: list[str] = []
+    for row in results[:_SPEAK_TITLE_LIMIT]:
+        title = row.get("title") or "Untitled"
+        year = row.get("year")
+        bits.append(f"{title} ({year})" if year else str(title))
+    spoken_titles = ", ".join(bits)
+    remaining = max(total - len(bits), 0)
+    if total == 1:
+        return f"You have 1 {genre} {kind_one} in Plex: {spoken_titles}."
+    if remaining > 0:
+        return (
+            f"You have {total} {genre} {kind_many} in Plex. "
+            f"Here are a few: {spoken_titles}, and {remaining} more."
+        )
+    return f"You have {total} {genre} {kind_many} in Plex: {spoken_titles}."
 
 
 plex = Plex()
