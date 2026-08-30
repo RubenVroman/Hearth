@@ -157,6 +157,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Pause / stop / skip while Infuse is up → `infuse_transport` (HA Apple TV remote — not Infuse REST)
 - Play on **LG / Shield / an explicit Plex client** → `plex_play` (optional `plex_search` / `plex_clients`). PMS-proxied `playMedia`. Starts immediately; if no clients are online, Hearth keeps the play ready and **Try again** / confirm re-polls until the client appears.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
+- Download **progress** / Radarr queue / “how's X downloading” → `radarr_queue` (optional title; reports percent / ETA, or completed / missing / not-in-Radarr)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
 - Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
@@ -302,7 +303,7 @@ Read-only / inspect:
 - `house_media` — speakable TV + AVR + Apple TV + Plex inventory (`GET /api/media`)
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`, `plex_clients`
-- `radarr_search`, `sonarr_search`, `overseerr_search`
+- `radarr_search`, `radarr_queue`, `sonarr_search`, `overseerr_search`
 - `thuisbezorgd_restaurants`, `thuisbezorgd_menu`, `thuisbezorgd_cart`, `thuisbezorgd_auth_status`
 - `workspace_list`, `workspace_read`
 - `docker_ps`, `docker_inspect`
@@ -344,7 +345,7 @@ cp .env.example .env
 python -m hearth
 ```
 
-Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire and a `media` glass overlay. `{"message":"what's the weather"}` → `weather` overlay. `{"message":"tell me about the movie Dune"}` → `plex_search` + media overlay. `{"message":"play The Endless on the Apple TV"}` should start `infuse_play` immediately. `{"message":"play The Endless on the LG"}` should start `plex_play` immediately. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should queue `radarr_add` immediately (no action/update guard cards). `{"message":"forget that I like dim lights"}` / food checkout still dry-run until confirm.
+Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire and a `media` glass overlay. `{"message":"what's the weather"}` → `weather` overlay. `{"message":"tell me about the movie Dune"}` → `plex_search` + media overlay. `{"message":"play The Endless on the Apple TV"}` should start `infuse_play` immediately. `{"message":"play The Endless on the LG"}` should start `plex_play` immediately. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should queue `radarr_add` immediately (no action/update guard cards). `{"message":"check the progress of Annihilation"}` → `radarr_queue` (percent / time left, or completed / missing / not-in-Radarr). `{"message":"forget that I like dim lights"}` / food checkout still dry-run until confirm.
 
 ## Home Assistant devices
 

@@ -333,6 +333,15 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     if name == "radarr_add":
         added = data.get("added") or {}
         return f"I'll grab {added.get('title') or 'that'} in Radarr{mock}."
+    if name == "radarr_queue":
+        spoken = data.get("speak")
+        if spoken:
+            if mock and spoken.endswith("."):
+                return spoken[:-1] + " (mock)."
+            return f"{spoken}{mock}" if mock else spoken
+        if data.get("empty"):
+            return f"Nothing downloading in Radarr{mock}."
+        return f"Radarr queue{mock}."
     if name == "sonarr_search":
         titles = ", ".join(
             f"{r.get('title')} ({r.get('year')})" for r in (data.get("results") or [])[:4] if r.get("title")
@@ -525,6 +534,30 @@ _GRAB = re.compile(
     r"|\badd .{0,80}\b(to|in) (radarr|sonarr|overseerr|the library|the queue)\b",
     re.I,
 )
+_DOWNLOAD_PROGRESS = re.compile(
+    r"("
+    r"\b(?:radarr\s+)?(?:download\s+)?queue\b|"
+    r"\bdownload(?:ing)?\s+progress\b|"
+    r"\bprogress\s+of\b|"
+    r"\bprogress\s+for\b|"
+    r"\bhow(?:'s|s| is)\b.{0,60}\b(?:download(?:ing)?|progress)\b|"
+    r"\b(?:check|what(?:'s| is)|show(?: me)?)\b.{0,60}\b(?:download(?:ing)?\s+)?(?:progress|queue)\b|"
+    r"\bwhat(?:'s| is)\b.{0,40}\bdownload(?:ing)?\b|"
+    r"\bis\b.{0,40}\b(?:still\s+)?download(?:ing)?\b|"
+    r"\bhow far\b.{0,40}\b(?:download|downloading|along)\b"
+    r")",
+    re.I,
+)
+_PROGRESS_TITLE = re.compile(
+    r"(?:"
+    r"(?:progress|status|queue)\s+(?:of|for|on)\s+(.+?)|"
+    r"(?:check|how(?:'s|s| is)|what(?:'s| is)|show(?: me)?)\s+(?:the\s+)?"
+    r"(?:download(?:ing)?\s+)?(?:progress|status)\s+(?:of|for|on)\s+(.+?)|"
+    r"how(?:'s|s| is)\s+(.+?)\s+(?:download(?:ing)?|coming along|coming)|"
+    r"is\s+(.+?)\s+(?:still\s+)?download(?:ing)?"
+    r")(?:\s*[?.!]|$)",
+    re.I,
+)
 _FOOD = re.compile(
     r"\b("
     r"thuisbezorgd|just\s*eat|takeaway|"
@@ -598,6 +631,13 @@ def route_intent(text: str) -> dict[str, Any] | None:
     if remember:
         rest = remember.group(1).strip(" .?!")
         return {"tool": "memory_remember", "args": {"text": rest, "value": rest, "key": rest}}
+    # Before _GRAB — “download progress” must not become radarr_add.
+    if _DOWNLOAD_PROGRESS.search(raw):
+        title = _progress_title(raw)
+        args: dict[str, Any] = {}
+        if title:
+            args["query"] = title
+        return {"tool": "radarr_queue", "args": args}
     if _GRAB.search(raw):
         query = _media_query(raw)
         if _OVERSEERR.search(raw):
@@ -856,6 +896,47 @@ _MEDIA_NOISE = re.compile(
 def _media_query(text: str) -> str:
     cleaned = _MEDIA_NOISE.sub(" ", text)
     return re.sub(r"\s+", " ", cleaned).strip(" .?!")
+
+
+_PROGRESS_NOISE = re.compile(
+    r"\b("
+    r"please|can you|could you|hey|check|show(?: me)?|tell me|"
+    r"the|a|an|download(?:ing)?|progress|status|queue|radarr|"
+    r"of|for|on|how(?:'s|s| is)|what(?:'s| is)|still|movie|film"
+    r")\b",
+    re.I,
+)
+
+
+def _progress_title(text: str) -> str:
+    """Pull a movie title out of a download-progress ask, if any."""
+    match = _PROGRESS_TITLE.search(text.strip())
+    if match:
+        for group in match.groups():
+            if group:
+                chunk = group
+                # "Annihilation—the download progress" → keep the title side.
+                chunk = re.split(r"[—–\-|:]", chunk, maxsplit=1)[0]
+                title = re.sub(r"\s+", " ", chunk).strip(" .?!'\"")
+                title = re.sub(
+                    r"\b(the )?(movie|film|download(?:ing)?|progress|in radarr)\b",
+                    " ",
+                    title,
+                    flags=re.I,
+                )
+                title = re.sub(r"\s+", " ", title).strip(" .?!'\"-—")
+                if title and title.lower() not in {"it", "that", "this", "something", "everything"}:
+                    return title
+    # Fallback: strip progress noise and hope a title remains.
+    cleaned = _PROGRESS_NOISE.sub(" ", text)
+    cleaned = re.split(r"[—–\|:]", cleaned, maxsplit=1)[0]
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .?!'\"")
+    if cleaned and cleaned.lower() not in {"it", "that", "this", "something", "everything"}:
+        # Avoid returning the whole sentence when no title was present
+        # (“what's downloading”, “radarr queue”).
+        if len(cleaned.split()) <= 6:
+            return cleaned
+    return ""
 
 
 # Re-export for tests / app

@@ -9,6 +9,19 @@ import httpx
 from hearth.config import settings
 from hearth.fixtures import pipeline
 
+# Spoken / tool statuses for active downloads and library fallbacks.
+DOWNLOAD_STATUSES = (
+    "queued",
+    "downloading",
+    "paused",
+    "importing",
+    "stalled",
+    "completed",
+    "failed",
+    "missing",
+    "unknown",
+)
+
 
 def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -17,6 +30,223 @@ def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
         "tmdbId": item.get("tmdbId") or item.get("id"),
         "status": item.get("status"),
         "overview": (item.get("overview") or "")[:180],
+    }
+
+
+def _bytes_label(value: Any) -> str | None:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(n)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return None
+
+
+def _queue_percent(size: Any, sizeleft: Any) -> float | None:
+    try:
+        if size is None or sizeleft is None:
+            return None
+        total = float(size)
+        left = float(sizeleft)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return 100.0 if left <= 0 else None
+    done = ((total - left) / total) * 100.0
+    return round(max(0.0, min(100.0, done)), 1)
+
+
+def _status_messages_text(item: dict[str, Any]) -> str:
+    messages = item.get("statusMessages") or []
+    bits: list[str] = []
+    for row in messages:
+        if isinstance(row, dict):
+            bits.append(str(row.get("title") or ""))
+            for msg in row.get("messages") or []:
+                bits.append(str(msg))
+        else:
+            bits.append(str(row))
+    return " ".join(bits).lower()
+
+
+def normalize_download_status(item: dict[str, Any]) -> str:
+    """Map *arr queue fields → queued/downloading/paused/importing/stalled/completed/failed/unknown."""
+    status = str(item.get("status") or "").strip().lower()
+    state = str(item.get("trackedDownloadState") or "").strip().lower()
+    tracked = str(item.get("trackedDownloadStatus") or "").strip().lower()
+    messages = _status_messages_text(item)
+
+    if state in {"failed", "failedpending"} or status == "failed":
+        return "failed"
+    if status == "paused" or state == "paused":
+        return "paused"
+    if state in {"importpending", "importing"}:
+        return "importing"
+    if state == "imported" or (status == "completed" and state in {"", "downloaded"}):
+        return "completed"
+    if "stall" in messages or (tracked == "warning" and "stall" in (status + state + messages)):
+        return "stalled"
+    if status in {"queued", "delay"} or state in {"queued"}:
+        return "queued"
+    if status == "downloading" or state == "downloading":
+        if "stall" in messages:
+            return "stalled"
+        return "downloading"
+    if status == "completed":
+        return "completed"
+    if status in DOWNLOAD_STATUSES:
+        return status
+    return "unknown"
+
+
+def _queue_title(item: dict[str, Any]) -> str:
+    movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+    return str(
+        movie.get("title")
+        or item.get("title")
+        or item.get("sourceTitle")
+        or "Unknown"
+    )
+
+
+def _quality_name(item: dict[str, Any]) -> str | None:
+    quality = item.get("quality")
+    if not isinstance(quality, dict):
+        return str(quality) if quality else None
+    inner = quality.get("quality")
+    if isinstance(inner, dict) and inner.get("name"):
+        return str(inner["name"])
+    if quality.get("name"):
+        return str(quality["name"])
+    return None
+
+
+def _summarize_queue_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a Radarr /api/v3/queue record for voice/status replies."""
+    movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+    size = item.get("size")
+    sizeleft = item.get("sizeleft") if "sizeleft" in item else item.get("sizeLeft")
+    percent = _queue_percent(size, sizeleft)
+    title = _queue_title(item)
+    year = movie.get("year") or item.get("year")
+    status = normalize_download_status(item)
+    timeleft = item.get("timeleft") or item.get("timeLeft")
+    return {
+        "id": item.get("id"),
+        "title": title,
+        "year": year,
+        "release": item.get("title"),
+        "percent": percent,
+        "size": _bytes_label(size),
+        "size_bytes": size,
+        "sizeleft": _bytes_label(sizeleft),
+        "sizeleft_bytes": sizeleft,
+        "status": status,
+        "trackedDownloadStatus": item.get("trackedDownloadStatus"),
+        "trackedDownloadState": item.get("trackedDownloadState"),
+        "timeleft": timeleft,
+        "downloadClient": item.get("downloadClient") or item.get("downloadClientName"),
+        "indexer": item.get("indexer"),
+        "quality": _quality_name(item),
+        "protocol": item.get("protocol"),
+        "tmdbId": movie.get("tmdbId"),
+    }
+
+
+def _fuzzy_title_match(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    needle = (query or "").strip().lower()
+    if not needle:
+        return list(items)
+    exact: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
+    tokens = [tok for tok in needle.split() if tok]
+    for row in items:
+        title = str(row.get("title") or "").lower()
+        release = str(row.get("release") or "").lower()
+        hay = f"{title} {release}".strip()
+        if needle == title:
+            exact.append(row)
+        elif needle in hay or (tokens and all(tok in hay for tok in tokens)):
+            partial.append(row)
+        elif tokens and any(tok in hay for tok in tokens if len(tok) > 2):
+            partial.append(row)
+    return exact or partial
+
+
+def _speak_queue(
+    items: list[dict[str, Any]],
+    *,
+    query: str = "",
+    empty_reason: str = "",
+) -> str:
+    if not items:
+        if query:
+            return empty_reason or f"{query} is not downloading in Radarr right now."
+        return empty_reason or "The Radarr download queue is empty."
+    bits: list[str] = []
+    for row in items[:5]:
+        title = row.get("title") or "a title"
+        year = row.get("year")
+        label = f"{title} ({year})" if year else str(title)
+        percent = row.get("percent")
+        status = row.get("status") or "downloading"
+        timeleft = row.get("timeleft")
+        if status == "completed" and percent is None:
+            piece = f"{label} is already on disk in Radarr (completed)"
+        elif status == "missing":
+            piece = f"{label} is in Radarr but missing a file — not downloading right now"
+        elif percent is not None:
+            piece = f"{label} is {percent}% complete ({status})"
+        else:
+            piece = f"{label} is {status}"
+        if timeleft and status == "downloading":
+            piece += f", about {timeleft} left"
+        quality = row.get("quality")
+        if quality:
+            piece += f", {quality}"
+        indexer = row.get("indexer")
+        if indexer:
+            piece += f" via {indexer}"
+        elif row.get("downloadClient"):
+            piece += f" via {row['downloadClient']}"
+        bits.append(piece)
+    if len(items) == 1:
+        return bits[0] + "."
+    return "Radarr queue: " + "; ".join(bits) + "."
+
+
+def _library_status_item(movie: dict[str, Any]) -> dict[str, Any]:
+    has_file = bool(movie.get("hasFile"))
+    status = "completed" if has_file else "missing"
+    return {
+        "id": movie.get("id"),
+        "title": movie.get("title"),
+        "year": movie.get("year"),
+        "release": None,
+        "percent": 100.0 if has_file else None,
+        "size": None,
+        "size_bytes": None,
+        "sizeleft": None,
+        "sizeleft_bytes": None,
+        "status": status,
+        "trackedDownloadStatus": None,
+        "trackedDownloadState": None,
+        "timeleft": None,
+        "downloadClient": None,
+        "indexer": None,
+        "quality": None,
+        "protocol": None,
+        "tmdbId": movie.get("tmdbId"),
+        "source": "library",
     }
 
 
@@ -194,6 +424,126 @@ class StarrClient:
                     "added": _summarize_series(item),
                 }
             raise
+
+    async def queue(self, query: str = "") -> dict[str, Any]:
+        """Active download queue + optional per-title progress (Radarr).
+
+        Uses GET /api/v3/queue?includeMovie=true. When a title is asked for and
+        is not in the queue, falls back to GET /api/v3/movie so Hearth can say
+        completed / missing / not in Radarr instead of escalating.
+        """
+        query = (query or "").strip()
+        if self.kind != "radarr":
+            return {
+                "ok": False,
+                "service": self.kind,
+                "error": "download queue progress is only wired for Radarr right now",
+            }
+
+        if not self.live:
+            return await self._queue_payload(
+                pipeline.list_radarr_downloads(),
+                query=query,
+                mode="mock",
+            )
+
+        client = await self._http()
+        try:
+            response = await client.get(
+                "/api/v3/queue",
+                params={"page": 1, "pageSize": 50, "includeMovie": "true"},
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+            if isinstance(payload, list):
+                rows = payload
+            else:
+                rows = payload.get("records") or payload.get("Records") or []
+            return await self._queue_payload(rows, query=query, mode="live")
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                return await self._queue_payload(
+                    pipeline.list_radarr_downloads(),
+                    query=query,
+                    mode="mock",
+                    error=str(exc),
+                )
+            raise
+
+    async def _queue_payload(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        query: str = "",
+        mode: str,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        summarized = [_summarize_queue_item(row) for row in rows if isinstance(row, dict)]
+        matched = _fuzzy_title_match(summarized, query) if query else list(summarized)
+        empty = len(matched) == 0
+        empty_reason = ""
+        library_hit: dict[str, Any] | None = None
+
+        if empty and query:
+            library_hit = await self._library_title_status(query, mode=mode)
+            if library_hit:
+                matched = [library_hit]
+                empty = False
+            else:
+                empty_reason = f"{query} is not in Radarr (and not downloading)."
+        elif empty:
+            empty_reason = "The Radarr download queue is empty."
+
+        out: dict[str, Any] = {
+            "ok": True,
+            "mode": mode,
+            "service": "radarr",
+            "query": query or None,
+            "count": len(matched),
+            "items": matched,
+            "matched": bool(query) and not empty,
+            "empty": empty,
+            "speak": _speak_queue(matched, query=query, empty_reason=empty_reason),
+        }
+        if library_hit:
+            out["library"] = True
+        if error:
+            out["error"] = error
+        return out
+
+    async def _library_title_status(self, query: str, *, mode: str) -> dict[str, Any] | None:
+        """When a title isn't in the download queue, check Radarr's movie library."""
+        if mode == "mock" or not self.live:
+            hits = pipeline.find_radarr_library(query)
+            if not hits:
+                return None
+            return _library_status_item(hits[0])
+
+        client = await self._http()
+        try:
+            response = await client.get("/api/v3/movie")
+            response.raise_for_status()
+            rows = response.json() or []
+            if not isinstance(rows, list):
+                return None
+            summarized = [
+                {
+                    "title": row.get("title"),
+                    "year": row.get("year"),
+                    "tmdbId": row.get("tmdbId"),
+                    "id": row.get("id"),
+                    "hasFile": row.get("hasFile"),
+                    "monitored": row.get("monitored"),
+                }
+                for row in rows
+                if isinstance(row, dict)
+            ]
+            hits = _fuzzy_title_match(summarized, query)
+            if not hits:
+                return None
+            return _library_status_item(hits[0])
+        except Exception:  # noqa: BLE001
+            return None
 
     async def _root_folder(self, client: httpx.AsyncClient) -> str:
         response = await client.get("/api/v3/rootFolder")

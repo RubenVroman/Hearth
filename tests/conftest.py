@@ -53,13 +53,14 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "cookie_samesite", "lax")
     monkeypatch.setattr(settings, "admin_email", TEST_ADMIN_EMAIL)
     monkeypatch.setattr(settings, "admin_password", TEST_ADMIN_PASSWORD)
-    from hearth.fixtures import mock_thuisbezorgd
+    from hearth.fixtures import mock_thuisbezorgd, pipeline
     from hearth.tools.thuisbezorgd import thuisbezorgd
 
     mock_thuisbezorgd.clear_cart()
     mock_thuisbezorgd.orders.clear()
     mock_thuisbezorgd._order_seq = 0
     thuisbezorgd._session_token = ""
+    pipeline.reset_radarr_downloads()
     (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
     (tmp_path / "skills" / "vault_echo.py").write_text(
         Path(__file__).resolve().parents[1].joinpath("workspace/skills/vault_echo.py").read_text(),

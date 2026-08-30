@@ -254,6 +254,68 @@ MOCK_RADARR_LOOKUP: list[dict[str, Any]] = [
         "overview": "Two brothers return to a UFO death cult.",
         "status": "released",
     },
+    {
+        "title": "Annihilation",
+        "year": 2018,
+        "tmdbId": 300668,
+        "overview": "A biologist enters the Shimmer after her husband's return.",
+        "status": "released",
+    },
+]
+
+# Active Radarr download-client queue (not the “added to library” list).
+# Used by radarr_queue when RADARR_API_KEY is empty / mock mode.
+MOCK_RADARR_DOWNLOAD_QUEUE: list[dict[str, Any]] = [
+    {
+        "id": 101,
+        "title": "Annihilation.2018.1080p.BluRay.x264",
+        "movie": {"title": "Annihilation", "year": 2018, "tmdbId": 300668},
+        "size": 8_500_000_000,
+        "sizeleft": 2_125_000_000,
+        "status": "downloading",
+        "trackedDownloadStatus": "ok",
+        "trackedDownloadState": "downloading",
+        "timeleft": "00:42:15",
+        "downloadClient": "qBittorrent",
+        "indexer": "MockIndexer",
+        "protocol": "torrent",
+        "quality": {"quality": {"name": "Bluray-1080p"}},
+    },
+    {
+        "id": 102,
+        "title": "Dune.Part.Two.2024.2160p.WEB-DL",
+        "movie": {"title": "Dune: Part Two", "year": 2024, "tmdbId": 693134},
+        "size": 42_000_000_000,
+        "sizeleft": 6_300_000_000,
+        "status": "downloading",
+        "trackedDownloadStatus": "ok",
+        "trackedDownloadState": "downloading",
+        "timeleft": "01:18:00",
+        "downloadClient": "qBittorrent",
+        "indexer": "MockIndexer",
+        "protocol": "torrent",
+        "quality": {"quality": {"name": "WEBDL-2160p"}},
+    },
+]
+
+# Library titles for queue fallback (completed / missing, not actively downloading).
+MOCK_RADARR_LIBRARY: list[dict[str, Any]] = [
+    {
+        "id": 201,
+        "title": "The Endless",
+        "year": 2017,
+        "tmdbId": 430231,
+        "hasFile": True,
+        "monitored": True,
+    },
+    {
+        "id": 202,
+        "title": "The Brutalist",
+        "year": 2024,
+        "tmdbId": 974950,
+        "hasFile": False,
+        "monitored": True,
+    },
 ]
 
 MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
@@ -286,6 +348,7 @@ class MockPipeline:
         self.radarr_queue: list[dict[str, Any]] = []
         self.sonarr_queue: list[dict[str, Any]] = []
         self.overseerr_queue: list[dict[str, Any]] = []
+        self.radarr_downloads: list[dict[str, Any]] = deepcopy(MOCK_RADARR_DOWNLOAD_QUEUE)
 
     def search_radarr(self, query: str) -> list[dict[str, Any]]:
         return _filter_title(MOCK_RADARR_LOOKUP, query)
@@ -310,6 +373,27 @@ class MockPipeline:
         queued = {**item, "requested": True}
         self.overseerr_queue.append(queued)
         return queued
+
+    def list_radarr_downloads(self) -> list[dict[str, Any]]:
+        return deepcopy(self.radarr_downloads)
+
+    def clear_radarr_downloads(self) -> None:
+        self.radarr_downloads = []
+
+    def reset_radarr_downloads(self) -> None:
+        self.radarr_downloads = deepcopy(MOCK_RADARR_DOWNLOAD_QUEUE)
+
+    def find_radarr_library(self, query: str) -> list[dict[str, Any]]:
+        needle = (query or "").strip().lower()
+        if not needle:
+            return []
+        hits = [
+            deepcopy(item)
+            for item in MOCK_RADARR_LIBRARY
+            if needle in str(item.get("title", "")).lower()
+            or all(tok in str(item.get("title", "")).lower() for tok in needle.split() if tok)
+        ]
+        return hits
 
 
 def _filter_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:

@@ -31,6 +31,9 @@ Do it yourself (house):
   If the title is not in the Plex library, say so — do not silently queue Radarr unless asked to grab it.
 - Weather / forecast outside → get_weather.
 - Download / grab / get a movie → radarr_search then radarr_add (runs immediately).
+- Download progress / Radarr queue / “how's X downloading” → radarr_queue (optional query
+  for a title; empty queue, completed/missing library hit, or not-in-Radarr returns a clear
+  speak line — say that, do not escalate).
 - Download / grab a show or season → sonarr_search then sonarr_add (runs immediately).
 - “Request X” / Overseerr as the request front door → overseerr_search / overseerr_request.
 - Food / Thuisbezorgd / “order pizza” → thuisbezorgd_restaurants → thuisbezorgd_menu →
