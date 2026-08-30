@@ -841,9 +841,11 @@ input,
 
 #memory-block.is-empty {
   display: none;
+}
 
 .transcript li[data-role="you"] .who {
-  color: var(--ember-2);}
+  color: var(--ember-2);
+}
 
 @keyframes pulse {
   0%,
@@ -956,12 +958,12 @@ input,
   }
 
   /*
-   * First phone screen is the listening sphere alone. Brand / Look / Log out
-   * sit at the start of the second screen (scroll down), not over the orb.
+   * First phone screen: orb centered under a fixed chrome bar so Look / Log out
+   * stay reachable without scrolling. Composer and widgets follow in normal flow.
    */
   .top {
-    position: absolute;
-    top: var(--phone-fold);
+    position: fixed;
+    top: 0;
     left: 0;
     right: 0;
     z-index: 40;
@@ -970,7 +972,14 @@ input,
     gap: 8px;
     align-items: center;
     padding: calc(8px + var(--safe-top)) max(16px, var(--safe-right)) 8px max(16px, var(--safe-left));
-    background: linear-gradient(180deg, var(--bg) 70%, transparent);
+    background: linear-gradient(180deg, var(--bg) 78%, transparent);
+    pointer-events: none;
+  }
+
+  .top .brand,
+  .top .pills,
+  .top .pill-btn {
+    pointer-events: auto;
   }
 
   .mark {
@@ -1025,7 +1034,8 @@ input,
 
   .hearth {
     order: 1;
-    flex: 0 0 auto;    width: 100%;
+    flex: 0 0 auto;
+    width: 100%;
     min-width: 0;
     min-height: 0;
     height: auto;
@@ -1038,7 +1048,7 @@ input,
     gap: 12px;
   }
 
-  /* Full first viewport: sphere only, centered. Scroll for the rest. */
+  /* Full first viewport: sphere centered below the fixed Look chrome. */
   .hearth-hero {
     display: flex;
     flex-direction: column;
@@ -1050,16 +1060,13 @@ input,
     margin-left: calc(-1 * max(16px, var(--safe-left)));
     margin-right: calc(-1 * max(16px, var(--safe-right)));
     min-height: var(--phone-fold);
-    padding: var(--safe-top) 0 var(--safe-bottom);
+    padding: calc(52px + var(--safe-top)) 0 calc(16px + var(--safe-bottom));
     box-sizing: border-box;
   }
 
-  /* Reserve room under the fold for the absolute .top bar at --phone-fold. */
+  /* Spacer retired — Look chrome is fixed on the first screen, not below the fold. */
   .phone-rest-anchor {
-    display: block;
-    flex-shrink: 0;
-    width: 100%;
-    height: calc(44px + var(--safe-top));
+    display: none;
   }
 
   .orb {
@@ -1310,7 +1317,8 @@ input,
 
   .transcript-toggle {
     min-height: 36px;
-    padding: 8px 2px;  }
+    padding: 8px 2px;
+  }
 
   body.login {
     min-height: 100dvh;
