@@ -70,6 +70,12 @@ async def maybe_summarize(session_id: str) -> dict | None:
                 ],
                 max_tokens=220,
             )
+            try:
+                from hearth.openai_usage import record_chat_usage
+
+                record_chat_usage(response, model=settings.openai_model, kind="summary")
+            except Exception:  # noqa: BLE001
+                pass
             drafted = (response.choices[0].message.content or "").strip()
             if drafted:
                 text = redact(drafted)[:1500]

@@ -108,6 +108,12 @@ class AgentLoop:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
             response = await client.chat.completions.create(**kwargs)
+            try:
+                from hearth.openai_usage import record_chat_usage
+
+                record_chat_usage(response, model=settings.openai_model, kind="chat")
+            except Exception:  # noqa: BLE001 — never break the house loop for metering
+                pass
             choice = response.choices[0]
             msg = choice.message
             if msg.tool_calls:

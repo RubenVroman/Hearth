@@ -1988,6 +1988,97 @@ html[data-motion="still"] .orb.live .orb-ring {
   min-height: 44px;
 }
 
+.spend-intro,
+.spend-status,
+.spend-meta,
+.spend-note,
+.spend-unavailable,
+.spend-metric {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.spend-status {
+  color: var(--ink);
+  letter-spacing: 0.04em;
+}
+
+.spend-status[data-mode="unavailable"],
+.spend-status[data-mode="local_estimate_only"] {
+  color: var(--ember-2);
+}
+
+.spend-status[data-mode="openai_billed"] {
+  color: var(--live);
+}
+
+.spend-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.spend-card {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+}
+
+.spend-card.is-unavailable {
+  border-style: dashed;
+}
+
+.spend-card-title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.spend-metric {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.spend-metric.soft {
+  font-size: 13px;
+  color: var(--ember-2);
+}
+
+.spend-list {
+  margin: 8px 0 0;
+  padding: 0 0 0 1.1em;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.spend-link {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--ember-2);
+  font-size: 12px;
+}
+
+.spend-actions {
+  margin-top: 10px;
+}
+
+.spend-refresh {
+  text-transform: none;
+  letter-spacing: 0.06em;
+}
+
+.spend-guidance {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
 body.settings-open {
   overflow: hidden;
 }

@@ -57,6 +57,12 @@ async def embed_texts(texts: list[str]) -> list[list[float]] | None:
             model=settings.memory_embedding_model,
             input=cleaned,
         )
+        try:
+            from hearth.openai_usage import record_embedding_usage
+
+            record_embedding_usage(response, model=settings.memory_embedding_model)
+        except Exception:  # noqa: BLE001
+            pass
         by_index = {item.index: list(item.embedding) for item in response.data}
         return [by_index[i] for i in range(len(cleaned))]
     except Exception:  # noqa: BLE001 — house keeps working on FTS

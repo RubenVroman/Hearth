@@ -24,6 +24,7 @@ from hearth.memory.retrieve import status_snapshot as memory_status_snapshot
 from hearth.memory.store import export_snapshot, init_memory_db, remember_preference
 from hearth.memory.store import forget as memory_forget_row
 from hearth.memory.tools import register_memory_tools
+from hearth.openai_usage import spend_monitor
 from hearth.runtime import runtime
 from hearth.telegram import telegram_inbox
 from hearth.tools.arr import overseerr, radarr, sonarr
@@ -125,6 +126,7 @@ async def status() -> dict[str, Any]:
         "owner": settings.owner,
         "version": __version__,
         "openai": settings.openai_configured,
+        "openai_admin": settings.openai_admin_configured,
         "realtime": {
             "path": "webrtc-ga",
             "model": settings.openai_realtime_model,
@@ -159,6 +161,36 @@ async def status() -> dict[str, Any]:
         "workspace": str(settings.workspace_path.resolve()),
         "memory": memory_status_snapshot(),
     }
+
+
+@app.get("/api/openai/spend")
+async def openai_spend(days: int = Query(default=30, ge=1, le=180)) -> dict[str, Any]:
+    """OpenAI org costs/usage (admin key) + local measured-token ledger + list pricing.
+
+    Never invents billed amounts. Keys stay on the server.
+    """
+    return await spend_monitor(days=days)
+
+
+@app.get("/api/openai/costs")
+async def openai_costs(days: int = Query(default=30, ge=1, le=180)) -> dict[str, Any]:
+    from hearth.openai_usage import fetch_organization_costs
+
+    return await fetch_organization_costs(days=days)
+
+
+@app.get("/api/openai/usage")
+async def openai_usage(days: int = Query(default=30, ge=1, le=180)) -> dict[str, Any]:
+    from hearth.openai_usage import fetch_organization_completions_usage
+
+    return await fetch_organization_completions_usage(days=days)
+
+
+@app.get("/api/openai/pricing")
+async def openai_pricing() -> dict[str, Any]:
+    from hearth.openai_usage import official_list_pricing
+
+    return official_list_pricing()
 
 
 @app.get("/api/now-playing")

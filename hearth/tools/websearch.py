@@ -448,6 +448,13 @@ async def _search_openai(query: str, *, limit: int, locale: dict[str, str]) -> d
         # Hosted search unavailable — last-resort HTML search, not a crash.
         return await _search_duckduckgo(query, limit=limit)
 
+    try:
+        from hearth.openai_usage import record_responses_usage
+
+        record_responses_usage(response, model=settings.openai_model, kind="web_search")
+    except Exception:  # noqa: BLE001
+        pass
+
     results = _openai_results(response, limit=limit)
     summary = _clip(str(getattr(response, "output_text", "") or ""), SPEAK_LEN)
     if not results and not summary:
