@@ -268,6 +268,25 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
             return f"No Plex clients online{mock}."
         names = ", ".join(str(c.get("name") or "unknown") for c in clients[:6])
         return f"Plex clients{mock}: {names}."
+    if name == "plex_browse_genre":
+        spoken = data.get("speak")
+        if spoken:
+            return spoken if mock == "" else f"{spoken.rstrip('.')}" + mock + "."
+        if data.get("listed_genres"):
+            genres = data.get("genres") or []
+            names = ", ".join(str(g.get("title") or "") for g in genres[:8] if g.get("title"))
+            return f"Plex genres{mock}: {names or 'none'}."
+        results = data.get("results") or []
+        genre = data.get("genre") or "that genre"
+        if not results:
+            return f"No {genre} titles in the Plex library{mock}."
+        titles = ", ".join(
+            f"{r.get('title')} ({r.get('year')})" if r.get("year") else str(r.get("title"))
+            for r in results[:4]
+            if r.get("title")
+        )
+        total = data.get("total") or len(results)
+        return f"{total} {genre} in Plex{mock}: {titles}."
     if name == "plex_play":
         spoken = data.get("speak")
         if spoken:
@@ -497,6 +516,29 @@ _PLEX_CLIENTS = re.compile(
     r"\b(plex clients|which (plex )?(players?|clients?)|list (plex )?(players?|clients?))\b",
     re.I,
 )
+_PLEX_GENRES_LIST = re.compile(
+    r"\b(?:list|show|what(?:'s| are)|which)\s+(?:the\s+|our\s+|plex\s+)?(?:movie\s+|film\s+|tv\s+|show\s+)?genres?\b"
+    r"|\bgenres?\s+(?:in|on)\s+(?:the\s+)?(?:plex\s+)?(?:library|movies?)\b",
+    re.I,
+)
+_PLEX_GENRE_BROWSE = re.compile(
+    r"\b(?:"
+    r"(?:list|show(?:\s+me)?|browse|what(?:'s| are)|which|any|have we got|do we have|"
+    r"got any|are there)\s+"
+    r"(?:all\s+)?(?:the\s+|our\s+|my\s+)?"
+    r"(?P<genre>[a-z][\w &'\-]{0,40}?)\s+"
+    r"(?P<kind>movies?|films?|shows?|series)\b"
+    r"|"
+    r"(?P<genre2>animation|anime|comedy|horror|action|drama|thriller|romance|"
+    r"documentary|sci[\-\s]?fi|science fiction|fantasy|family|kids?|crime|adventure|"
+    r"mystery|western|war|music|musical|sport|sports|history|biography|biopic)\s+"
+    r"(?P<kind2>movies?|films?|shows?|series)\b"
+    r"|"
+    r"(?:movies?|films?|shows?|series)\s+(?:in|by|from)\s+(?:the\s+)?"
+    r"(?P<genre3>[a-z][\w &'\-]{0,40}?)\s+genre\b"
+    r")",
+    re.I,
+)
 _PLEX_ONLY = re.compile(r"\bplex\b", re.I)
 _DOCKER = re.compile(r"\b(docker|containers?)\b", re.I)
 _LIGHTS = re.compile(r"\b(lights?|scenes?|rooms?|home assistant)\b", re.I)
@@ -685,6 +727,9 @@ def route_intent(text: str) -> dict[str, Any] | None:
             return {"tool": "plex_play", "args": {"query": title}}
     if _PLEX_CLIENTS.search(raw):
         return {"tool": "plex_clients", "args": {}}
+    genre_plan = _plex_genre_plan(raw)
+    if genre_plan is not None:
+        return genre_plan
     if _MEDIA_STATUS.search(raw):
         return {"tool": "house_media", "args": {}}
     mute = _MUTE.search(raw)
@@ -739,6 +784,66 @@ def route_intent(text: str) -> dict[str, Any] | None:
     if _LIGHTS.search(raw):
         return {"tool": "ha_list_entities", "args": {}}
     return None
+
+
+def _plex_genre_plan(raw: str) -> dict[str, Any] | None:
+    """Route genre browse / list-genres asks to plex_browse_genre."""
+    if _PLEX_GENRES_LIST.search(raw):
+        media_type = "show" if _SERIES.search(raw) and not _MOVIE.search(raw) else "movie"
+        return {"tool": "plex_browse_genre", "args": {"genre": "", "type": media_type}}
+
+    match = _PLEX_GENRE_BROWSE.search(raw)
+    if not match:
+        return None
+    # Don't steal play / grab / download-progress phrasing.
+    if _GRAB.search(raw) or _PLAY_ON_TV.search(raw) or _PLAY_TITLE.search(raw) or _DOWNLOAD_PROGRESS.search(raw):
+        return None
+
+    genre = (
+        match.groupdict().get("genre")
+        or match.groupdict().get("genre2")
+        or match.groupdict().get("genre3")
+        or ""
+    ).strip(" .?!'\"")
+    kind = (
+        match.groupdict().get("kind")
+        or match.groupdict().get("kind2")
+        or ""
+    ).strip().lower()
+
+    genre = re.sub(r"\s+", " ", genre).strip()
+    # Drop leading filler the regex may have left ("all the Animation").
+    genre = re.sub(r"^(all|the|our|my|some|any)\s+", "", genre, flags=re.I).strip()
+    if not genre or genre.lower() in {
+        "a",
+        "an",
+        "the",
+        "some",
+        "any",
+        "good",
+        "new",
+        "old",
+        "best",
+        "recent",
+        "plex",
+        "library",
+        "movie",
+        "movies",
+        "film",
+        "films",
+        "show",
+        "shows",
+        "series",
+    }:
+        return None
+
+    media_type = "show" if kind in {"show", "shows", "series"} or (
+        _SERIES.search(raw) and not _MOVIE.search(raw) and not kind
+    ) else "movie"
+    # "sci fi" / "science fiction" normalize for Plex tag matching.
+    if re.fullmatch(r"sci[\-\s]?fi", genre, flags=re.I):
+        genre = "Science Fiction"
+    return {"tool": "plex_browse_genre", "args": {"genre": genre, "type": media_type}}
 
 
 def _about_media_plan(raw: str) -> dict[str, Any] | None:

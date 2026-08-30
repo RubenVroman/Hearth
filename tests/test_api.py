@@ -77,6 +77,32 @@ def test_media_inventory_endpoint(client):
     assert status.json()["ha"]["apple_tv_player"] == "infuse"
 
 
+def test_plex_genre_library_endpoints(client):
+    genres = client.get("/api/plex/genres")
+    assert genres.status_code == 200
+    body = genres.json()
+    assert body["ok"] is True
+    names = {g["title"] for g in body["genres"]}
+    assert "Animation" in names
+    assert "animation" in body["speak"].lower()
+
+    library = client.get("/api/plex/library", params={"genre": "Animation"})
+    assert library.status_code == 200
+    lib = library.json()
+    assert lib["ok"] is True
+    assert lib["genre"] == "Animation"
+    assert lib["total"] == 3
+    titles = {r["title"] for r in lib["results"]}
+    assert "Spirited Away" in titles
+    assert "3" in lib["speak"] and "Animation" in lib["speak"]
+
+    chat = client.post("/api/chat", json={"message": "what animation movies do we have"})
+    assert chat.status_code == 200
+    chat_body = chat.json()
+    assert chat_body["tools"][0]["name"] == "plex_browse_genre"
+    assert "Spirited Away" in chat_body["reply"] or "animation" in chat_body["reply"].lower()
+
+
 def test_chat_turn_on_tv_uses_media_control(client):
     chat = client.post("/api/chat", json={"message": "turn on the TV"})
     assert chat.status_code == 200

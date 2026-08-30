@@ -15,6 +15,7 @@ _MEDIA_TOOLS = {
     "plex_search",
     "plex_now_playing",
     "plex_play",
+    "plex_browse_genre",
     "radarr_search",
     "sonarr_search",
     "overseerr_search",
@@ -355,17 +356,20 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
             source="plex",
         )
         return [item] if item else []
-    if name in {"plex_search", "radarr_search", "sonarr_search", "overseerr_search"}:
+    if name in {"plex_search", "plex_browse_genre", "radarr_search", "sonarr_search", "overseerr_search"}:
         results = data.get("results") or []
         if not results:
             return []
         source = {
             "plex_search": "plex",
+            "plex_browse_genre": "plex",
             "radarr_search": "radarr",
             "sonarr_search": "sonarr",
             "overseerr_search": "overseerr",
         }.get(name, "media")
-        default_type = "movie" if "radarr" in name else "show"
+        default_type = "movie" if "radarr" in name or name == "plex_browse_genre" else "show"
+        if name == "plex_browse_genre" and str(data.get("media_type") or "").lower() == "show":
+            default_type = "show"
         out = []
         for hit in results[:_SEARCH_HIT_CAP]:
             if not isinstance(hit, dict):

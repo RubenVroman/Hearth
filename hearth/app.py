@@ -159,6 +159,22 @@ async def now_playing() -> dict[str, Any]:
     return await plex.now_playing()
 
 
+@app.get("/api/plex/genres")
+async def plex_genres(type: str = Query(default="movie")) -> dict[str, Any]:
+    """List genres for the Plex movie or show library. Token stays server-side."""
+    return await plex.genres(type)
+
+
+@app.get("/api/plex/library")
+async def plex_library_by_genre(
+    genre: str = Query(default=""),
+    type: str = Query(default="movie"),
+    limit: int = Query(default=24, ge=1, le=50),
+) -> dict[str, Any]:
+    """Browse Plex library by genre (speakable). Empty genre lists available genres."""
+    return await plex.browse_genre(genre, media_type=type, limit=limit)
+
+
 @app.get("/api/media")
 async def media_inventory() -> dict[str, Any]:
     """TV + AVR + Apple TV (HA) + Plex — speakable house media snapshot."""

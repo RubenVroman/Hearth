@@ -196,6 +196,18 @@ def test_now_playing_surfaces_media_overlay(client):
     assert "Dune" in media["title"]
 
 
+def test_animation_genre_browse_surfaces_media_stack(client):
+    chat = client.post("/api/chat", json={"message": "list animation movies"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] == "plex_browse_genre"
+    media = next(w for w in body["widgets"] if w["kind"] == "media")
+    items = media["data"].get("items") or []
+    titles = {row.get("title") for row in items}
+    assert "Spirited Away" in titles or "Spirited Away" in media["title"]
+    assert "animation" in body["reply"].lower() or "Spirited" in body["reply"]
+
+
 def test_download_progress_surfaces_downloads_overlay(client):
     chat = client.post("/api/chat", json={"message": "How far along is Annihilation?"})
     assert chat.status_code == 200
