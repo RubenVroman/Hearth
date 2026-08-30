@@ -31,6 +31,7 @@ from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
 from hearth.tools.thuisbezorgd import thuisbezorgd
 from hearth.tools.websearch import selected_backend as web_search_backend
+from hearth.telegram import telegram_inbox
 from hearth.voice.gateway import voice_socket
 from hearth.voice import webrtc as realtime_rtc
 
@@ -50,6 +51,7 @@ async def lifespan(_app: FastAPI):
     register_memory_tools()
     stop_prune = asyncio.Event()
     prune_task = asyncio.create_task(prune_loop(stop_prune))
+    await telegram_inbox.start()
     yield
     stop_prune.set()
     prune_task.cancel()
@@ -57,6 +59,7 @@ async def lifespan(_app: FastAPI):
         await prune_task
     except (asyncio.CancelledError, Exception):  # noqa: BLE001
         pass
+    await telegram_inbox.stop()
     await ha.aclose()
     await plex.aclose()
     await docker.aclose()
@@ -147,6 +150,7 @@ async def status() -> dict[str, Any]:
             "configured": settings.web_search_live,
             "backend": web_search_backend(),
         },
+        "telegram": telegram_inbox.status_snapshot(),
         "docker": {"socket": docker.live},
         "tools": registry.names(),
         "workspace": str(settings.workspace_path.resolve()),
@@ -421,6 +425,27 @@ async def realtime_calls(request: Request) -> Response:
 async def realtime_hangup(call_id: str) -> dict[str, Any]:
     await realtime_rtc.hangup(call_id)
     return {"ok": True, "path": "webrtc-ga", "call_id": call_id}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request) -> JSONResponse:
+    """Optional localhost webhook — long-polling is the default. Funnel stays off."""
+    if not settings.telegram_webhook_local or not settings.telegram_configured:
+        raise HTTPException(status_code=404, detail="not found")
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="loopback only")
+    expected = (settings.telegram_webhook_path or "/telegram/webhook").rstrip("/") or "/telegram/webhook"
+    if request.url.path.rstrip("/") != expected:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="invalid json") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid update")
+    result = await telegram_inbox.handle_webhook_update(payload)
+    return JSONResponse(result)
 
 
 class RealtimeToolBody(BaseModel):

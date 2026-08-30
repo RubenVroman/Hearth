@@ -39,6 +39,11 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "weather_force_mock", True)
     monkeypatch.setattr(settings, "brave_search_api_key", "")
     monkeypatch.setattr(settings, "web_search_force_mock", True)
+    monkeypatch.setattr(settings, "telegram_bot_token", "")
+    monkeypatch.setattr(settings, "telegram_chat_ids", "")
+    monkeypatch.setattr(settings, "telegram_user_ids", "")
+    monkeypatch.setattr(settings, "telegram_poll", True)
+    monkeypatch.setattr(settings, "telegram_webhook_local", False)
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
     monkeypatch.setattr(settings, "memory_db_path", tmp_path / "hearth-memory.db")
     monkeypatch.setattr(settings, "memory_enabled", True)
@@ -76,6 +81,10 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from hearth.tools.websearch import reset_rate_limit
 
     reset_rate_limit()
+    from hearth.telegram import telegram_inbox
+
+    telegram_inbox.inbox.reset()
+    telegram_inbox.running = False
     from hearth.memory.store import init_memory_db, reset_memory
 
     reset_memory()

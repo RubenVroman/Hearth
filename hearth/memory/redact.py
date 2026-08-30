@@ -22,6 +22,10 @@ _ASSIGN_KEYS = (
     "HEARTH_COS_WEBHOOK",
     "BRAVE_SEARCH_API_KEY",
     "TAVILY_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "THUISBEZORGD_API_KEY",
+    "THUISBEZORGD_PASSWORD",
+    "THUISBEZORGD_SESSION_TOKEN",
 )
 
 _LIVE_ATTRS = (
@@ -37,6 +41,10 @@ _LIVE_ATTRS = (
     "cos_webhook_key",
     "cos_webhook",
     "brave_search_api_key",
+    "telegram_bot_token",
+    "thuisbezorgd_api_key",
+    "thuisbezorgd_password",
+    "thuisbezorgd_session_token",
 )
 
 Replacement = str | Callable[[Match[str]], str]

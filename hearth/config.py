@@ -141,6 +141,37 @@ class Settings(BaseSettings):
     thuisbezorgd_password: str = Field(default="", alias="THUISBEZORGD_PASSWORD")
     thuisbezorgd_session_token: str = Field(default="", alias="THUISBEZORGD_SESSION_TOKEN")
 
+    # Telegram drop-group inbox (movies/series/TV → *arr/Overseerr). Off unless
+    # TELEGRAM_BOT_TOKEN + at least one TELEGRAM_CHAT_IDS entry are set.
+    # Long-polling is the default; no public webhook / Funnel.
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_ids: str = Field(default="", alias="TELEGRAM_CHAT_IDS")
+    # Optional comma-separated Telegram user ids (house members). Empty = any
+    # member of an allowlisted group may request (bot still ignored).
+    telegram_user_ids: str = Field(default="", alias="TELEGRAM_USER_IDS")
+    telegram_poll: bool = Field(default=True, alias="TELEGRAM_POLL")
+    # Optional localhost-only webhook (not the default). Bind stays on 127.0.0.1.
+    telegram_webhook_local: bool = Field(default=False, alias="TELEGRAM_WEBHOOK_LOCAL")
+    telegram_webhook_path: str = Field(
+        default="/telegram/webhook",
+        alias="TELEGRAM_WEBHOOK_PATH",
+    )
+    telegram_rate_limit_per_minute: int = Field(
+        default=6,
+        alias="TELEGRAM_RATE_LIMIT_PER_MINUTE",
+    )
+    telegram_dedup_window_seconds: float = Field(
+        default=120.0,
+        alias="TELEGRAM_DEDUP_WINDOW_SECONDS",
+    )
+    telegram_max_title_length: int = Field(default=200, alias="TELEGRAM_MAX_TITLE_LENGTH")
+    telegram_progress_interval_seconds: float = Field(
+        default=45.0,
+        alias="TELEGRAM_PROGRESS_INTERVAL_SECONDS",
+    )
+    # Prefer Overseerr when configured (feeds *arr); otherwise Radarr/Sonarr direct.
+    telegram_prefer_overseerr: bool = Field(default=True, alias="TELEGRAM_PREFER_OVERSEERR")
+
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key.strip())
@@ -185,6 +216,32 @@ class Settings(BaseSettings):
             and self.hearth_delivery_postcode.strip()
             and self.hearth_delivery_city.strip()
         )
+
+    @staticmethod
+    def _parse_id_list(raw: str) -> list[int]:
+        out: list[int] = []
+        for part in (raw or "").replace(";", ",").split(","):
+            bit = part.strip()
+            if not bit:
+                continue
+            try:
+                out.append(int(bit))
+            except ValueError:
+                continue
+        return out
+
+    @property
+    def telegram_chat_id_list(self) -> list[int]:
+        return self._parse_id_list(self.telegram_chat_ids)
+
+    @property
+    def telegram_user_id_list(self) -> list[int]:
+        """Empty list means no user allowlist (any group member may request)."""
+        return self._parse_id_list(self.telegram_user_ids)
+
+    @property
+    def telegram_configured(self) -> bool:
+        return bool(self.telegram_bot_token.strip() and self.telegram_chat_id_list)
 
 
 settings = Settings()
