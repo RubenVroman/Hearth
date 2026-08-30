@@ -546,7 +546,7 @@ async def test_ui_try_again_label_for_awaiting_client():
     assert 'reason === "awaiting_client"' in app_js
     assert "Try again — Plex is open" in app_js
     sw = Path("hearth/ui/static/sw.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v9" in sw
+    assert "hearth-shell-v10" in sw
 
 
 async def test_plex_play_live_proxies_play_media(monkeypatch):
