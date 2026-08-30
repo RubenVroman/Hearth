@@ -31,13 +31,15 @@ _SPEAK_TITLE_LIMIT = 6
 _DEFAULT_BROWSE_LIMIT = 24
 _MAX_BROWSE_LIMIT = 50
 
-# Soft aliases so voice can say "anime" / "sci-fi" and still hit Plex tags.
+# Soft aliases so voice can say "anime" / "sci-fi" / "scifi" and still hit Plex tags.
+_SCI_FI_ALIASES = ("science fiction", "sci-fi", "sci fi", "scifi")
 _GENRE_ALIASES: dict[str, tuple[str, ...]] = {
     "anime": ("animation", "anime"),
     "animation": ("animation", "anime"),
-    "sci fi": ("science fiction", "sci-fi", "sci fi"),
-    "sci-fi": ("science fiction", "sci-fi", "sci fi"),
-    "science fiction": ("science fiction", "sci-fi", "sci fi"),
+    "sci fi": _SCI_FI_ALIASES,
+    "sci-fi": _SCI_FI_ALIASES,
+    "scifi": _SCI_FI_ALIASES,
+    "science fiction": _SCI_FI_ALIASES,
     "kids": ("family", "kids", "children", "childrens"),
     "kid": ("family", "kids", "children", "childrens"),
     "children": ("family", "kids", "children", "childrens"),

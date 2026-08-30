@@ -38,6 +38,8 @@ const state = {
   infoIdleTimer: null,
   /** Live assistant transcript buffer for mid-utterance card focus. */
   liveAssistantTranscript: "",
+  /** Status poll timer — faster while a voice call is live so overlays appear promptly. */
+  refreshTimer: null,
   /** Client-only provisional media cards (title skeletons) pending tool fill-in. */
   localMediaExtras: [],
 };
@@ -600,6 +602,82 @@ function isAckUtterance(text) {
 }
 
 /**
+ * Focus a stacked media card by id (tap / keyboard on recessed cards).
+ */
+function focusMediaById(mediaId, { reveal = true } = {}) {
+  const visual = pickVisualOverlay(state.widgets);
+  if (!visual || visual.kind !== "media" || !mediaId) return false;
+  const items = mediaItemsOf(visual);
+  const hit = items.find((row) => String(row.id || mediaItemKey(row)) === String(mediaId));
+  if (!hit) return false;
+  const data = visual.data || {};
+  const prev = String((visual.context && visual.context.active_id) || data.active_id || "");
+  if (prev === String(hit.id) && !state.infoSoftHidden) {
+    if (reveal) scheduleOverlayIdleHide();
+    return false;
+  }
+  data.active_id = hit.id;
+  data.item = hit;
+  data.items = items;
+  visual.data = data;
+  visual.title = hit.title || visual.title;
+  if (!visual.context) visual.context = {};
+  visual.context.active_id = hit.id;
+  visual.context.relevant = true;
+  // Re-order so the focused card is front in the stack markup.
+  const rest = items.filter((row) => String(row.id) !== String(hit.id));
+  data.items = [hit, ...rest];
+  if (reveal) {
+    if (state.infoHideTimer) {
+      clearTimeout(state.infoHideTimer);
+      state.infoHideTimer = null;
+    }
+    state.infoSignature = "";
+    openInfoOverlay(visual);
+  }
+  return true;
+}
+
+async function playActiveInInfuse() {
+  const visual = pickVisualOverlay(state.widgets);
+  if (!visual || visual.kind !== "media") return;
+  const item = (visual.data && visual.data.item) || mediaItemsOf(visual)[0];
+  if (!item || !item.title) {
+    appendLog("system", "Nothing to open in Infuse.");
+    return;
+  }
+  const args = { query: String(item.title) };
+  if (item.tmdbId != null && item.tmdbId !== "") args.tmdbId = Number(item.tmdbId);
+  if (item.ratingKey) args.ratingKey = String(item.ratingKey);
+  if (item.type === "show" || item.type === "episode" || item.type === "season") {
+    if (item.season != null) args.season = Number(item.season);
+    if (item.episode != null) args.episode = Number(item.episode);
+  }
+  const btn = $("info-content")?.querySelector("[data-infuse-play]");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Opening…";
+  }
+  try {
+    const out = await invoke("infuse_play", args);
+    const data = out.data || out.output || out;
+    const speak = (data && data.speak) || out.speak || "";
+    if (speak) appendLog("hearth", speak);
+    else if (out.ok === false || (data && data.ok === false)) {
+      appendLog("system", (data && data.error) || "Infuse play failed.");
+    }
+    applyWidgetPayload(out);
+    refresh();
+  } catch (err) {
+    appendLog("system", `Infuse play failed: ${err.message}`);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Open in Infuse";
+    }
+  }
+}
+
+/**
  * Focus a stacked media card when live talk names its title.
  * Returns true when the active card changed.
  */
@@ -815,11 +893,22 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
   if (item.rating != null) {
     bits.push(`<p class="info-detail">Rating ${escapeHtml(item.rating)}</p>`);
   }
+  const playable = !item.skeleton && (item.title || item.tmdbId || item.ratingKey);
+  if (active && playable) {
+    bits.push(
+      `<div class="info-media-actions">
+        <button type="button" class="info-infuse-btn" data-infuse-play="1">
+          Open in Infuse
+        </button>
+      </div>`
+    );
+  }
   const classes = [
     "info-media-card",
     active ? "is-active" : "is-recessed",
     item.skeleton ? "is-skeleton" : "",
     stackIndex === 0 && active ? "is-front" : "",
+    !active ? "is-selectable" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -829,6 +918,7 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
       data-media-id="${escapeHtml(String(item.id || mediaItemKey(item)))}"
       style="--stack-i:${stackIndex}"
       aria-hidden="${active ? "false" : "true"}"
+      ${!active ? 'tabindex="0" role="button" aria-label="Show this title"' : ""}
     >
       <div class="info-media">
         ${poster}
@@ -1080,6 +1170,35 @@ function bindInfoOverlay() {
   });
   $("info-glass")?.addEventListener("pointerdown", () => {
     pinFromUser();
+  });
+  // Selectable stacked cards + Infuse play (event delegation survives re-renders).
+  $("info-content")?.addEventListener("click", (ev) => {
+    const target = ev.target;
+    if (!(target instanceof Element)) return;
+    const playBtn = target.closest("[data-infuse-play]");
+    if (playBtn) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      pinFromUser();
+      playActiveInInfuse();
+      return;
+    }
+    const card = target.closest(".info-media-card.is-selectable, .info-media-card.is-recessed");
+    if (card && card.dataset.mediaId) {
+      ev.preventDefault();
+      pinFromUser();
+      focusMediaById(card.dataset.mediaId, { reveal: true });
+    }
+  });
+  $("info-content")?.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    const target = ev.target;
+    if (!(target instanceof Element)) return;
+    const card = target.closest(".info-media-card.is-selectable");
+    if (!card || !card.dataset.mediaId) return;
+    ev.preventDefault();
+    pinFromUser();
+    focusMediaById(card.dataset.mediaId, { reveal: true });
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
@@ -1395,7 +1514,19 @@ function onRealtimeEvent(event) {
     stopConversation();
     return;
   }
-  if (state.call?.sidebandOk) return;
+  // Sideband runs house tools on the server; still refresh overlays promptly so
+  // media / weather panels appear during the live call (not only on the 8s poll).
+  if (state.call?.sidebandOk) {
+    if (
+      type === "response.function_call_arguments.done" ||
+      type === "response.done" ||
+      type === "response.output_audio_transcript.done" ||
+      type === "response.audio_transcript.done"
+    ) {
+      refresh();
+    }
+    return;
+  }
   if (type !== "response.function_call_arguments.done") return;
   relayTool(event);
 }
@@ -1543,11 +1674,13 @@ async function startConversation() {
     : "Live WebRTC conversation. Real speech interrupts; TV/HVAC noise should not. Tap to hang up.";
   $("voice-pill").textContent = "voice webrtc-ga";
   $("voice-pill").classList.add("live");
+  setRefreshInterval(1200);
 }
 
 async function stopConversation() {
   const call = state.call;
   state.call = null;
+  setRefreshInterval(8000);
   $("orb").classList.remove("live", "hot");
   $("orb").setAttribute("aria-label", "Tap to talk");
   $("orb-label").textContent = "Tap to talk";
@@ -1689,6 +1822,14 @@ function onPageHide() {
 
 window.addEventListener("pagehide", onPageHide);
 
+function setRefreshInterval(ms) {
+  if (state.refreshTimer) {
+    clearInterval(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+  state.refreshTimer = setInterval(refresh, ms);
+}
+
 async function boot() {
   if (window.HearthSettings) window.HearthSettings.mount();
   bindInfoOverlay();
@@ -1704,7 +1845,7 @@ async function boot() {
     micStorageClear(MIC_STORAGE.denied);
   }
   refresh();
-  setInterval(refresh, 8000);
+  setRefreshInterval(8000);
 }
 
 boot();
