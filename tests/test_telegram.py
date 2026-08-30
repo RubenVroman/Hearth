@@ -341,6 +341,88 @@ async def test_inbox_not_found(inbox: TelegramInbox):
     assert "Couldn't find" in result.reply
 
 
+# --- intent / follow-ups ----------------------------------------------------
+
+
+def test_heuristic_all_of_them_and_ordinals():
+    from hearth.telegram.intent import heuristic_intent
+
+    candidates = [
+        {"title": "Harry Potter and the Sorcerer's Stone", "year": 2001, "tmdbId": 671},
+        {"title": "Harry Potter and the Chamber of Secrets", "year": 2002, "tmdbId": 672},
+        {"title": "Harry Potter and the Prisoner of Azkaban", "year": 2004, "tmdbId": 673},
+    ]
+    all_of = heuristic_intent("all of them", candidates=candidates)
+    assert all_of.action == "pick_many"
+    assert all_of.indices == [1, 2, 3]
+
+    first = heuristic_intent("just the first one", candidates=candidates)
+    assert first.action == "pick"
+    assert first.indices == [1]
+
+    newest = heuristic_intent("the new one", candidates=candidates)
+    assert newest.action == "pick"
+    assert newest.indices == [3]
+
+    series = heuristic_intent("the whole Harry Potter series")
+    assert series.action == "search"
+    assert "Harry Potter" in series.search_title
+    assert series.select_all is True
+
+
+@pytest.mark.asyncio
+async def test_inbox_harry_potter_then_all_of_them(inbox: TelegramInbox):
+    ask = await inbox.handle_message(_msg("Harry Potter", message_id=100))
+    assert ask.grabbed is False
+    assert "Which one" in ask.reply
+    assert "all of them" in ask.reply.lower()
+    assert inbox.pending.get(-1001) is not None
+    assert len(inbox.pending[-1001].options) >= 3
+
+    all_of = await inbox.handle_message(_msg("all of them", message_id=101))
+    assert all_of.grabbed is True
+    assert "Queued" in all_of.reply
+    assert len(pipeline.radarr_queue) >= 3
+    assert all(
+        "Harry Potter" in str(row.get("title") or "") for row in pipeline.radarr_queue
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbox_followup_first_one(inbox: TelegramInbox):
+    await inbox.handle_message(_msg("Harry Potter", message_id=110))
+    pick = await inbox.handle_message(_msg("the first one", message_id=111))
+    assert pick.grabbed is True
+    assert "2001" in pick.reply or "Sorcerer" in pick.reply or "Harry Potter" in pick.reply
+    assert len(pipeline.radarr_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbox_whole_series_one_shot(inbox: TelegramInbox):
+    result = await inbox.handle_message(
+        _msg("the whole Harry Potter series", message_id=120)
+    )
+    assert result.grabbed is True
+    assert len(pipeline.radarr_queue) >= 3
+
+
+@pytest.mark.asyncio
+async def test_inbox_ambiguous_yes_clarifies(inbox: TelegramInbox):
+    await inbox.handle_message(_msg("Harry Potter", message_id=130))
+    yes = await inbox.handle_message(_msg("yes", message_id=131))
+    assert yes.grabbed is False
+    assert "all of them" in yes.reply.lower() or "Which" in yes.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_numeric_pick_still_works_with_franchise(inbox: TelegramInbox):
+    ask = await inbox.handle_message(_msg("Harry Potter", message_id=140))
+    assert "1." in ask.reply
+    pick = await inbox.handle_message(_msg("2", message_id=141))
+    assert pick.grabbed is True
+    assert "Chamber" in pick.reply or "2002" in pick.reply or "Harry Potter" in pick.reply
+
+
 def test_status_endpoint_includes_telegram(client, monkeypatch):
     monkeypatch.setattr(settings, "telegram_bot_token", "")
     monkeypatch.setattr(settings, "telegram_chat_ids", "")

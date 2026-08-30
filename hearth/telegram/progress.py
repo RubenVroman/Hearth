@@ -58,13 +58,29 @@ def format_not_found(query: str) -> str:
 
 
 def format_ambiguous(query: str, options: list[dict[str, Any]]) -> str:
-    lines = [f"Which one for '{query}'? Reply 1–{min(3, len(options))}:"]
-    for idx, row in enumerate(options[:3], start=1):
+    show = min(3, len(options))
+    lines = [f"Which one for '{query}'? Reply 1–{show}:"]
+    for idx, row in enumerate(options[:show], start=1):
         title = row.get("title") or "Untitled"
         year = row.get("year")
         label = f"{title} ({year})" if year else str(title)
         lines.append(f"{idx}. {label}")
+    if len(options) > 1:
+        extra = f" ({len(options)} matches)" if len(options) > show else ""
+        lines.append(
+            f"Or say 'all of them'{extra}, 'the first one', or 'the new one'."
+        )
     return "\n".join(lines)
+
+
+def format_queued_many(titles: list[str], via: str) -> str:
+    if not titles:
+        return f"Nothing new to queue via {via}."
+    if len(titles) == 1:
+        return format_queued(titles[0], None, via)
+    preview = ", ".join(titles[:5])
+    more = f" (+{len(titles) - 5} more)" if len(titles) > 5 else ""
+    return f"Queued {len(titles)} via {via}: {preview}{more}."
 
 
 def format_already(title: str, *, queued: bool = False, library: bool = False) -> str:

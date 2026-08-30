@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from hearth.config import settings
 from hearth.memory.redact import redact
+from hearth.telegram.intent import (
+    MAX_BATCH,
+    MAX_CANDIDATES,
+    IntentDecision,
+    interpret_intent,
+    looks_like_collection_request,
+    looks_like_followup,
+)
 from hearth.telegram.parse import (
     MessageView,
     ParsedRequest,
@@ -20,6 +29,7 @@ from hearth.telegram.progress import (
     format_ambiguous,
     format_not_found,
     format_queued,
+    format_queued_many,
     format_rate_limited,
     format_reject_download,
 )
@@ -27,6 +37,9 @@ from hearth.telegram.safeguards import Deduper, RateLimiter, chat_allowed, user_
 from hearth.tools.arr import overseerr, radarr, sonarr
 
 log = logging.getLogger("hearth.telegram")
+
+# Short follow-up window so "all of them" / "the new one" stay grounded.
+PENDING_TTL_S = 15 * 60
 
 
 @dataclass
@@ -36,6 +49,8 @@ class PendingDisambiguation:
     media_kind: str
     query: str
     created_message_id: int
+    created_at: float = field(default_factory=time.monotonic)
+    last_bot_reply: str = ""
 
 
 @dataclass
@@ -46,6 +61,7 @@ class InboxResult:
     title: str = ""
     service: str = ""
     year: int | None = None
+    titles: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -73,6 +89,33 @@ class TelegramInbox:
         if (view.chat_id, view.message_id) in self.outbound_message_ids:
             return True
         return False
+
+    def _pending_for(self, chat_id: int) -> PendingDisambiguation | None:
+        pending = self.pending.get(chat_id)
+        if pending is None:
+            return None
+        if time.monotonic() - pending.created_at > PENDING_TTL_S:
+            del self.pending[chat_id]
+            return None
+        return pending
+
+    def _remember_pending(
+        self,
+        view: MessageView,
+        *,
+        options: list[dict[str, Any]],
+        media_kind: str,
+        query: str,
+        reply: str,
+    ) -> None:
+        self.pending[view.chat_id] = PendingDisambiguation(
+            chat_id=view.chat_id,
+            options=options[:MAX_CANDIDATES],
+            media_kind=media_kind,
+            query=query,
+            created_message_id=view.message_id,
+            last_bot_reply=reply[:400],
+        )
 
     async def handle_message(self, message: dict[str, Any]) -> InboxResult:
         view, parsed = parse_message(
@@ -103,6 +146,30 @@ class TelegramInbox:
         if parsed.kind == "disambiguation_pick":
             return await self._handle_pick(view, parsed)
 
+        pending = self._pending_for(view.chat_id)
+        needs_intent = bool(pending) and (
+            looks_like_followup(view.text)
+            or parsed.kind == "ignore"
+            or (
+                parsed.kind == "request"
+                and not (parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id or parsed.year)
+            )
+        )
+        if not needs_intent and looks_like_collection_request(view.text):
+            needs_intent = True
+
+        if needs_intent:
+            intent = await interpret_intent(
+                view.text,
+                candidates=pending.options if pending else None,
+                pending_query=pending.query if pending else "",
+                last_bot_reply=pending.last_bot_reply if pending else "",
+                force=bool(pending),
+            )
+            handled = await self._apply_intent(view, parsed, intent, pending=pending)
+            if handled is not None:
+                return handled
+
         if parsed.kind == "ignore":
             return InboxResult(handled=True, reply="")
 
@@ -118,18 +185,123 @@ class TelegramInbox:
         if self.deduper.seen_title(view.chat_id, parsed.dedup_key()):
             return InboxResult(handled=True, reply="")
 
+        # New concrete request replaces stale disambiguation context.
+        self.pending.pop(view.chat_id, None)
         return await self._grab(view, parsed)
 
+    async def _apply_intent(
+        self,
+        view: MessageView,
+        parsed: ParsedRequest,
+        intent: IntentDecision,
+        *,
+        pending: PendingDisambiguation | None,
+    ) -> InboxResult | None:
+        if intent.action == "ignore":
+            return InboxResult(handled=True, reply="")
+        if intent.action == "clarify":
+            question = intent.clarify_question or (
+                "Which one — reply with a number, 'all of them', or a clearer title?"
+            )
+            return InboxResult(handled=True, reply=question)
+        if intent.action == "pick" and pending and intent.indices:
+            return await self._handle_indices(view, pending, intent.indices[:1])
+        if intent.action == "pick_many" and pending and intent.indices:
+            return await self._handle_indices(view, pending, intent.indices)
+        if intent.action == "search" and intent.search_title:
+            if not self.rate.allow():
+                return InboxResult(handled=True, reply=format_rate_limited())
+            synthetic = ParsedRequest(
+                kind="request",
+                media_kind="movie",
+                title=intent.search_title,
+                reason="intent_search",
+            )
+            self.pending.pop(view.chat_id, None)
+            return await self._grab(
+                view,
+                synthetic,
+                select_all=intent.select_all,
+            )
+        # passthrough: if this looked like a follow-up but intent gave up, ask.
+        if pending and looks_like_followup(view.text) and parsed.kind != "request":
+            return InboxResult(
+                handled=True,
+                reply=(
+                    f"Which one — reply 1–{min(3, len(pending.options))}, "
+                    "'all of them', or a clearer title?"
+                ),
+            )
+        return None
+
     async def _handle_pick(self, view: MessageView, parsed: ParsedRequest) -> InboxResult:
-        pending = self.pending.get(view.chat_id)
+        pending = self._pending_for(view.chat_id)
         if not pending or parsed.pick_index is None:
             return InboxResult(handled=True, reply="")
-        idx = parsed.pick_index - 1
-        if idx < 0 or idx >= len(pending.options):
-            return InboxResult(handled=True, reply="Pick 1, 2, or 3 from the list.")
-        pick = pending.options[idx]
+        return await self._handle_indices(view, pending, [parsed.pick_index])
+
+    async def _handle_indices(
+        self,
+        view: MessageView,
+        pending: PendingDisambiguation,
+        indices: list[int],
+    ) -> InboxResult:
+        picks: list[dict[str, Any]] = []
+        for pick_index in indices[:MAX_BATCH]:
+            idx = pick_index - 1
+            if idx < 0 or idx >= len(pending.options):
+                return InboxResult(
+                    handled=True,
+                    reply=f"Pick 1–{min(3, len(pending.options))} from the list "
+                    "(or say 'all of them').",
+                )
+            picks.append(pending.options[idx])
+        if not picks:
+            return InboxResult(handled=True, reply="")
+        if not self.rate.allow():
+            return InboxResult(handled=True, reply=format_rate_limited())
+
+        # Consume pending before queueing so retries don't double-apply.
         del self.pending[view.chat_id]
-        synthetic = ParsedRequest(
+
+        if len(picks) == 1:
+            return await self._grab(view, self._synthetic_from_pick(pending, picks[0]), exact=True)
+
+        queued_titles: list[str] = []
+        via = "Radarr"
+        for pick in picks:
+            synthetic = self._synthetic_from_pick(pending, pick)
+            result = await self._grab(view, synthetic, exact=True, skip_rate=True)
+            if result.grabbed and result.title:
+                queued_titles.append(
+                    f"{result.title} ({result.year})" if result.year else result.title
+                )
+                via = {
+                    "radarr": "Radarr",
+                    "sonarr": "Sonarr",
+                }.get(result.service, result.service or via)
+            elif result.reply.startswith("Queued "):
+                queued_titles.append(result.title or pick.get("title") or "")
+        if queued_titles:
+            return InboxResult(
+                handled=True,
+                reply=format_queued_many(queued_titles, via),
+                grabbed=True,
+                titles=queued_titles,
+                service=via.lower(),
+            )
+        # Nothing new queued — surface the last useful reply or a short summary.
+        return InboxResult(
+            handled=True,
+            reply=f"Nothing new to queue for '{pending.query}'.",
+        )
+
+    def _synthetic_from_pick(
+        self,
+        pending: PendingDisambiguation,
+        pick: dict[str, Any],
+    ) -> ParsedRequest:
+        return ParsedRequest(
             kind="request",
             media_kind=pending.media_kind if pending.media_kind in {"movie", "tv"} else (
                 "tv" if pick.get("mediaType") == "tv" or pick.get("tvdbId") else "movie"
@@ -142,9 +314,6 @@ class TelegramInbox:
             tvdb_id=int(pick["tvdbId"]) if pick.get("tvdbId") else None,
             reason="disambiguation_choice",
         )
-        if not self.rate.allow():
-            return InboxResult(handled=True, reply=format_rate_limited())
-        return await self._grab(view, synthetic, exact=True)
 
     async def _grab(
         self,
@@ -152,7 +321,10 @@ class TelegramInbox:
         parsed: ParsedRequest,
         *,
         exact: bool = False,
+        select_all: bool = False,
+        skip_rate: bool = False,
     ) -> InboxResult:
+        del skip_rate  # reserved; batch path rate-limits once up-front
         media_kind = parsed.media_kind
         exact_id = bool(parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id or exact)
 
@@ -165,10 +337,16 @@ class TelegramInbox:
 
         try:
             if use_overseerr and not parsed.tvdb_id:
-                return await self._grab_overseerr(view, parsed, media_kind, exact_id=exact_id)
+                return await self._grab_overseerr(
+                    view, parsed, media_kind, exact_id=exact_id, select_all=select_all
+                )
             if media_kind == "tv" or parsed.tvdb_id:
-                return await self._grab_sonarr(view, parsed, exact_id=exact_id)
-            return await self._grab_radarr(view, parsed, exact_id=exact_id)
+                return await self._grab_sonarr(
+                    view, parsed, exact_id=exact_id, select_all=select_all
+                )
+            return await self._grab_radarr(
+                view, parsed, exact_id=exact_id, select_all=select_all
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("telegram grab failed: %s", redact(str(exc)))
             query = parsed.search_query() or parsed.title or "that"
@@ -254,25 +432,35 @@ class TelegramInbox:
                 return exact[:1]
 
         if parsed.title:
+            needle = normalize_title(parsed.title)
             exact_title = [
                 row
                 for row in hits
-                if normalize_title(str(row.get("title") or "")) == normalize_title(parsed.title)
+                if normalize_title(str(row.get("title") or "")) == needle
             ]
             if len(exact_title) == 1:
                 return exact_title
             if len(exact_title) > 1 and not parsed.year:
-                return exact_title[:3]
-            # Substring hits from *arr search — single clear hit ok; many → disambiguate.
+                return exact_title[:MAX_CANDIDATES]
+            # Substring / franchise hits — keep a bounded set for "all of them".
+            related = [
+                row
+                for row in hits
+                if needle and needle in normalize_title(str(row.get("title") or ""))
+            ]
+            if related:
+                if len(related) == 1:
+                    return related
+                return related[:MAX_CANDIDATES]
             if not exact_title:
                 if len(hits) == 1:
                     return hits
-                return hits[:3]
+                return hits[:MAX_CANDIDATES]
 
         # Single hit is fine; multiple fuzzy hits need disambiguation.
         if len(hits) == 1:
             return hits
-        return hits[:3]
+        return hits[:MAX_CANDIDATES]
 
     async def _already_queued(self, title: str, service: str) -> bool:
         client = radarr if service == "radarr" else sonarr
@@ -282,12 +470,33 @@ class TelegramInbox:
             return False
         return bool(payload.get("downloads"))
 
+    async def _queue_many(
+        self,
+        view: MessageView,
+        pending_query: str,
+        media_kind: str,
+        choices: list[dict[str, Any]],
+    ) -> InboxResult:
+        """Queue every choice through the existing single-title grab path."""
+        synthetic_pending = PendingDisambiguation(
+            chat_id=view.chat_id,
+            options=choices,
+            media_kind=media_kind,
+            query=pending_query,
+            created_message_id=view.message_id,
+        )
+        indices = list(range(1, min(len(choices), MAX_BATCH) + 1))
+        # Stash then consume via the shared multi-pick path.
+        self.pending[view.chat_id] = synthetic_pending
+        return await self._handle_indices(view, synthetic_pending, indices)
+
     async def _grab_radarr(
         self,
         view: MessageView,
         parsed: ParsedRequest,
         *,
         exact_id: bool,
+        select_all: bool = False,
     ) -> InboxResult:
         _service, hits = await self._search_hits(parsed, "movie")
         choices = self._filter_hits(hits, parsed, exact_id=exact_id)
@@ -296,18 +505,23 @@ class TelegramInbox:
                 handled=True,
                 reply=format_not_found(parsed.search_query() or parsed.title or "that"),
             )
+        if select_all and len(choices) > 1 and not exact_id:
+            return await self._queue_many(
+                view,
+                parsed.title or parsed.search_query(),
+                "movie",
+                choices,
+            )
         if len(choices) > 1 and not exact_id:
-            self.pending[view.chat_id] = PendingDisambiguation(
-                chat_id=view.chat_id,
+            reply = format_ambiguous(parsed.title or parsed.search_query(), choices)
+            self._remember_pending(
+                view,
                 options=choices,
                 media_kind="movie",
                 query=parsed.title or parsed.search_query(),
-                created_message_id=view.message_id,
+                reply=reply,
             )
-            return InboxResult(
-                handled=True,
-                reply=format_ambiguous(parsed.title or parsed.search_query(), choices),
-            )
+            return InboxResult(handled=True, reply=reply)
         pick = choices[0]
         title = str(pick.get("title") or parsed.title or "Untitled")
         year = pick.get("year") if pick.get("year") is not None else parsed.year
@@ -348,6 +562,7 @@ class TelegramInbox:
         parsed: ParsedRequest,
         *,
         exact_id: bool,
+        select_all: bool = False,
     ) -> InboxResult:
         _service, hits = await self._search_hits(parsed, "tv")
         choices = self._filter_hits(hits, parsed, exact_id=exact_id)
@@ -356,18 +571,23 @@ class TelegramInbox:
                 handled=True,
                 reply=format_not_found(parsed.search_query() or parsed.title or "that"),
             )
+        if select_all and len(choices) > 1 and not exact_id:
+            return await self._queue_many(
+                view,
+                parsed.title or parsed.search_query(),
+                "tv",
+                choices,
+            )
         if len(choices) > 1 and not exact_id:
-            self.pending[view.chat_id] = PendingDisambiguation(
-                chat_id=view.chat_id,
+            reply = format_ambiguous(parsed.title or parsed.search_query(), choices)
+            self._remember_pending(
+                view,
                 options=choices,
                 media_kind="tv",
                 query=parsed.title or parsed.search_query(),
-                created_message_id=view.message_id,
+                reply=reply,
             )
-            return InboxResult(
-                handled=True,
-                reply=format_ambiguous(parsed.title or parsed.search_query(), choices),
-            )
+            return InboxResult(handled=True, reply=reply)
         pick = choices[0]
         title = str(pick.get("title") or parsed.title or "Untitled")
         year = pick.get("year") if pick.get("year") is not None else parsed.year
@@ -408,6 +628,7 @@ class TelegramInbox:
         media_kind: str,
         *,
         exact_id: bool,
+        select_all: bool = False,
     ) -> InboxResult:
         query = parsed.search_query() or parsed.title
         if parsed.tmdb_id and not query:
@@ -431,20 +652,29 @@ class TelegramInbox:
         if not choices:
             # Fall back to direct *arr if Overseerr has nothing.
             if media_kind == "tv":
-                return await self._grab_sonarr(view, parsed, exact_id=exact_id)
-            return await self._grab_radarr(view, parsed, exact_id=exact_id)
+                return await self._grab_sonarr(
+                    view, parsed, exact_id=exact_id, select_all=select_all
+                )
+            return await self._grab_radarr(
+                view, parsed, exact_id=exact_id, select_all=select_all
+            )
+        if select_all and len(choices) > 1 and not exact_id:
+            return await self._queue_many(
+                view,
+                parsed.title or query,
+                media_kind if media_kind in {"movie", "tv"} else "movie",
+                choices,
+            )
         if len(choices) > 1 and not exact_id:
-            self.pending[view.chat_id] = PendingDisambiguation(
-                chat_id=view.chat_id,
+            reply = format_ambiguous(parsed.title or query, choices)
+            self._remember_pending(
+                view,
                 options=choices,
                 media_kind=media_kind,
                 query=parsed.title or query,
-                created_message_id=view.message_id,
+                reply=reply,
             )
-            return InboxResult(
-                handled=True,
-                reply=format_ambiguous(parsed.title or query, choices),
-            )
+            return InboxResult(handled=True, reply=reply)
         pick = choices[0]
         title = str(pick.get("title") or parsed.title or "Untitled")
         year = pick.get("year") if pick.get("year") is not None else parsed.year
