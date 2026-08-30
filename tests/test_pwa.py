@@ -84,7 +84,7 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "order: 0" in css
     assert "margin-bottom: 8px" in css
     assert "has-confirm" in (UI / "app.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v7" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v8" in (UI / "sw.js").read_text(encoding="utf-8")
     assert 'id="logout-btn"' in index_html
     assert 'id="agent-pill"' in index_html
     assert 'id="settings-btn"' in index_html
@@ -102,7 +102,7 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "localStorage" in settings_js
     assert ".settings-sheet" in css
     assert 'html[data-theme="ash"]' in css
-    assert "hearth-shell-v7" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v8" in (UI / "sw.js").read_text(encoding="utf-8")
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200

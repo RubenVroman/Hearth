@@ -463,6 +463,22 @@ _WEATHER = re.compile(
     r"\b(weather|forecast|temperature|how hot|how cold|is it raining|is it snowing)\b",
     re.I,
 )
+_ABOUT_MEDIA = re.compile(
+    r"\b(?:"
+    r"tell me about|what(?:'s| is| about)|"
+    r"info(?:rmation)? (?:on|about)|"
+    r"look up|search (?:plex |the library )?(?:for )?"
+    r")\b",
+    re.I,
+)
+_ABOUT_MEDIA_TITLE = re.compile(
+    r"\b(?:"
+    r"tell me about|what(?:'s| is)(?: the)?(?: movie| film| show)?|"
+    r"info(?:rmation)? (?:on|about)|"
+    r"look up|search (?:plex |the library )?(?:for )?"
+    r")\s+(.+)$",
+    re.I,
+)
 _TURN_ON = re.compile(r"\bturn on\s+(.+)$", re.I)
 _TURN_OFF = re.compile(r"\bturn off\s+(.+)$", re.I)
 _VOLUME = re.compile(
@@ -620,12 +636,43 @@ def route_intent(text: str) -> dict[str, Any] | None:
         return {"tool": "plex_now_playing", "args": {}}
     if _WEATHER.search(raw):
         return {"tool": "get_weather", "args": {}}
+    about = _about_media_plan(raw)
+    if about is not None:
+        return about
     if _DOCKER.search(raw):
         return {"tool": "docker_ps", "args": {}}
     if _WORKSPACE.search(raw):
         return {"tool": "workspace_list", "args": {}}
     if _LIGHTS.search(raw):
         return {"tool": "ha_list_entities", "args": {}}
+    return None
+
+
+def _about_media_plan(raw: str) -> dict[str, Any] | None:
+    """Route “tell me about / what’s … movie” asks to plex_search for the glass overlay."""
+    if not _ABOUT_MEDIA.search(raw):
+        return None
+    # Avoid stealing pure weather / food / light questions that also matched softly.
+    if _WEATHER.search(raw) or _FOOD.search(raw) or _LIGHTS.search(raw) or _DOCKER.search(raw):
+        return None
+    if _GRAB.search(raw) or _PLAY_ON_TV.search(raw):
+        return None
+    match = _ABOUT_MEDIA_TITLE.search(raw)
+    if not match:
+        return None
+    title = _play_title_clean(match.group(1))
+    title = re.sub(
+        r"\b(the )?(movie|film|show|series|in (plex|the library))\b",
+        " ",
+        title,
+        flags=re.I,
+    )
+    title = re.sub(r"\s+", " ", title).strip(" .?!'\"")
+    if not title or title.lower() in {"it", "that", "this", "something", "a movie", "a film"}:
+        return None
+    # Prefer plex library detail for visualization; grab/download still uses _GRAB above.
+    if _MOVIE.search(raw) or _SERIES.search(raw) or _PLEX_ONLY.search(raw) or len(title.split()) <= 6:
+        return {"tool": "plex_search", "args": {"query": title}}
     return None
 
 

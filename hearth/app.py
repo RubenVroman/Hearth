@@ -18,6 +18,7 @@ from hearth.auth.db import init_db
 from hearth.auth.gate import http_authorized, is_public_path, ws_authorized
 from hearth.auth.routers import auth_router
 from hearth.config import settings
+from hearth.fixtures import MOCK_PLEX_LIBRARY
 from hearth.memory.prune import prune_loop
 from hearth.memory.retrieve import search as memory_search, status_snapshot as memory_status_snapshot
 from hearth.memory.store import export_snapshot, forget as memory_forget_row, init_memory_db, remember_preference
@@ -185,6 +186,52 @@ async def transcript() -> dict[str, Any]:
 @app.get("/api/widgets")
 async def widgets() -> dict[str, Any]:
     return {"widgets": runtime.list_widgets()}
+
+
+@app.get("/api/plex/thumb/{rating_key}")
+async def plex_thumb(rating_key: str) -> Response:
+    """Poster proxy — Plex token never leaves the server."""
+    key = str(rating_key or "").strip()
+    if not key or not key.isdigit():
+        raise HTTPException(status_code=400, detail="invalid ratingKey")
+    fetched = await plex.thumb_bytes(key)
+    if fetched is not None:
+        body, content_type = fetched
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+    # Fixture / offline placeholder — no secrets, still looks like a poster tile.
+    title = next(
+        (
+            str(row.get("title") or "")
+            for row in MOCK_PLEX_LIBRARY
+            if str(row.get("ratingKey")) == key
+        ),
+        "Hearth",
+    )
+    initials = "".join(part[0] for part in title.split()[:2] if part).upper() or "H"
+    safe_title = (
+        title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="400" height="600" viewBox="0 0 400 600">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3a1608"/>
+      <stop offset="55%" stop-color="#c45a12"/>
+      <stop offset="100%" stop-color="#ffd7a1"/>
+    </linearGradient>
+  </defs>
+  <rect width="400" height="600" fill="url(#g)"/>
+  <text x="200" y="280" text-anchor="middle" font-family="Georgia, serif" font-size="72" fill="#f4ead8" opacity="0.92">{initials}</text>
+  <text x="200" y="520" text-anchor="middle" font-family="Georgia, serif" font-size="22" fill="#f4ead8" opacity="0.75">{safe_title[:28]}</text>
+</svg>"""
+    return Response(
+        content=svg.encode("utf-8"),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
 
 
 @app.delete("/api/widgets/{widget_id}")

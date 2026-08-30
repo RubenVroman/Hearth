@@ -68,6 +68,7 @@ MOCK_PLEX_SESSIONS: dict[str, Any] = {
                 "ratingKey": "1001",
                 "key": "/library/metadata/1001",
                 "guid": "plex://movie/dune-part-two",
+                "summary": "Paul Atreides unites with Chani and the Fremen while seeking revenge against the conspirators who destroyed his family.",
                 "duration": 16600000,
                 "viewOffset": 4920000,
                 "Player": {
@@ -91,6 +92,9 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "ratingKey": "1001",
         "key": "/library/metadata/1001",
         "guid": "plex://movie/dune-part-two",
+        "summary": "Paul Atreides unites with Chani and the Fremen while seeking revenge against the conspirators who destroyed his family.",
+        "contentRating": "PG-13",
+        "audienceRating": 8.8,
     },
     {
         "title": "The Endless",
@@ -99,6 +103,9 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "ratingKey": "2042",
         "key": "/library/metadata/2042",
         "guid": "plex://movie/the-endless",
+        "summary": "Two brothers return to the UFO death cult they fled from years earlier to discover the group’s secret.",
+        "contentRating": "NR",
+        "audienceRating": 6.5,
     },
     {
         "title": "The Brutalist",
@@ -107,6 +114,9 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "ratingKey": "1002",
         "key": "/library/metadata/1002",
         "guid": "plex://movie/the-brutalist",
+        "summary": "A Hungarian-born Jewish architect starts over in America.",
+        "contentRating": "R",
+        "audienceRating": 7.9,
     },
     # Two exact-title editions so ambiguous library matches can be tested.
     {
@@ -116,6 +126,9 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "ratingKey": "3001",
         "key": "/library/metadata/3001",
         "guid": "plex://movie/heat-1995",
+        "summary": "A group of professional bank robbers start to feel the heat from police when they unknowingly leave a clue at their latest heist.",
+        "contentRating": "R",
+        "audienceRating": 8.3,
     },
     {
         "title": "Heat",
@@ -124,6 +137,9 @@ MOCK_PLEX_LIBRARY: list[dict[str, Any]] = [
         "ratingKey": "3002",
         "key": "/library/metadata/3002",
         "guid": "plex://movie/heat-1986",
+        "summary": "An ex-mercenary living in Las Vegas is hired to protect an old friend.",
+        "contentRating": "R",
+        "audienceRating": 5.7,
     },
 ]
 

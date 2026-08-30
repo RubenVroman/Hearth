@@ -153,6 +153,8 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
 - Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
+- Weather outside → `get_weather` (Open-Meteo; no API key)
+- “Tell me about / what’s the movie …” → `plex_search` (glass overlay with title, year, summary, poster)
 
 **Call Chief of Staff** (`chief_of_staff`)
 
@@ -174,6 +176,27 @@ Webhook payload:
 ```
 
 Auth: `Authorization: Bearer <HEARTH_COS_WEBHOOK_KEY>` when the key is set. Writes still default to dry-run until `confirm=true` (voice or UI confirm is enough). If `HEARTH_COS_WEBHOOK` is empty, the tool says it is not configured.
+
+## Glass info overlay
+
+The old “update guard” widget stack (Thinking / Action / Update cards beside the orb) is gone — it remounted on every status poll and flickered.
+
+In its place, a single **centered glass panel** opens only when there is rich visual content:
+
+| Kind | Source tools | Shows |
+| --- | --- | --- |
+| `weather` | `get_weather` | Place, temperature, condition, humidity / wind |
+| `media` | `plex_search`, `plex_now_playing`, `plex_play`, `radarr_search`, `sonarr_search`, `overseerr_search` | Title, type/year, summary, optional poster |
+
+Payload path (unchanged transport, narrower kinds):
+
+1. Tool runs on the server → `hearth/widgets.publish_tool` upserts a `Widget` on `runtime` (`kind` = `weather` \| `media` only).
+2. Chat / invoke / realtime / `GET /api/status` return `widgets: [...]`.
+3. The UI (`#info-overlay`) picks the latest visual widget, renders frosted glass markup, and **skips DOM work when `id` + `updated_at` are unchanged** so 8s status polls do not flicker.
+4. Dismiss: ×, backdrop, or Esc → `DELETE /api/widgets/{id}`.
+5. Poster art: `GET /api/plex/thumb/{ratingKey}` proxies Plex thumbnails (token stays on the NAS). Fixture mode returns an SVG placeholder.
+
+Ordinary confirms still use the bottom **Confirm** button — not the glass panel.
 
 ## House memory
 
@@ -259,7 +282,7 @@ cp .env.example .env
 python -m hearth
 ```
 
-Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire. `{"message":"play The Endless on the Apple TV"}` dry-runs `plex_play` until confirm. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should dry-run `radarr_add`.
+Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire and a `media` glass overlay. `{"message":"what's the weather"}` → `weather` overlay. `{"message":"tell me about the movie Dune"}` → `plex_search` + media overlay. `{"message":"play The Endless on the Apple TV"}` dry-runs `plex_play` until confirm. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should dry-run `radarr_add` (no action/update guard cards).
 
 ## Home Assistant devices
 

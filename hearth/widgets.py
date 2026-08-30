@@ -1,85 +1,60 @@
-"""Map house turns and tool results into contextual UI widgets."""
+"""Map rich tool results into visual info overlays (weather, movie/TV).
+
+Action / “update guard” panels were removed — they flickered on status polls
+and were not useful. Only content that benefits from visualization is published.
+"""
 
 from __future__ import annotations
 
-import re
 from typing import Any
-from uuid import uuid4
 
 from hearth.runtime import Widget, runtime
 
-# Tools that deserve a dedicated in-progress / result panel.
-_ACTION_TOOLS = {
-    "radarr_add",
+# Tools that deserve a centered glass-panel visualization.
+_MEDIA_TOOLS = {
+    "plex_search",
+    "plex_now_playing",
+    "plex_play",
     "radarr_search",
-    "sonarr_add",
     "sonarr_search",
-    "overseerr_request",
     "overseerr_search",
-    "ha_call_service",
-    "chief_of_staff",
-    "docker_stop",
-    "workspace_write",
-    "workspace_delete",
 }
 
-_TURN_ID = "turn-active"
+_VISUAL_KINDS = frozenset({"weather", "media"})
 
 
 def new_id(prefix: str = "w") -> str:
+    from uuid import uuid4
+
     return f"{prefix}-{uuid4().hex[:10]}"
 
 
-def start_turn(message: str) -> Widget:
-    """Show a compact working panel as soon as Ruben asks something."""
-    preview = re.sub(r"\s+", " ", (message or "").strip())
-    if len(preview) > 72:
-        preview = preview[:69] + "…"
-    body = preview or "Working on it."
-    return runtime.upsert_widget(
-        Widget(
-            id=_TURN_ID,
-            kind="action",
-            title="House",
-            status="running",
-            body=body,
-            detail="Thinking…",
-            data={"phase": "turn"},
-            dismissible=True,
-            sticky=False,
-        )
-    )
+def start_turn(message: str) -> Widget | None:
+    """No-op: thinking / update guards are gone."""
+    _ = message
+    return None
 
 
 def finish_turn(*, ok: bool = True, detail: str = "") -> Widget | None:
-    existing = runtime.get_widget(_TURN_ID)
-    if existing is None:
-        return None
-    return runtime.upsert_widget(
-        Widget(
-            id=_TURN_ID,
-            kind="action",
-            title=existing.title,
-            status="done" if ok else "error",
-            body=existing.body,
-            detail=detail or ("Done." if ok else "Something went wrong."),
-            data={**existing.data, "phase": "done"},
-            dismissible=True,
-            sticky=False,
-        )
-    )
+    """No-op: thinking / update guards are gone."""
+    _ = ok, detail
+    return None
 
 
 def publish_tool(result: dict[str, Any]) -> Widget | None:
-    """Upsert a widget from a tool result dict (ToolResult.as_dict())."""
+    """Upsert a visual overlay from a tool result dict (ToolResult.as_dict())."""
     name = str(result.get("name") or "")
     if not name:
         return None
     if name == "get_weather":
         return _weather_widget(result)
-    if name in _ACTION_TOOLS or result.get("needs_confirm"):
-        return _action_widget(result)
-    return _generic_widget(result)
+    if name in _MEDIA_TOOLS:
+        return _media_widget(result)
+    return None
+
+
+def is_visual(kind: str | None) -> bool:
+    return (kind or "") in _VISUAL_KINDS
 
 
 def _weather_widget(result: dict[str, Any]) -> Widget:
@@ -126,138 +101,124 @@ def _weather_widget(result: dict[str, Any]) -> Widget:
     )
 
 
-def _action_title(name: str) -> str:
-    labels = {
-        "radarr_add": "Grabbing movie",
-        "radarr_search": "Searching movies",
-        "sonarr_add": "Grabbing show",
-        "sonarr_search": "Searching shows",
-        "overseerr_request": "Requesting media",
-        "overseerr_search": "Searching Overseerr",
-        "ha_call_service": "House action",
-        "chief_of_staff": "Chief of Staff",
-        "docker_stop": "Docker",
-        "workspace_write": "Workspace",
-        "workspace_delete": "Workspace",
-    }
-    return labels.get(name, name.replace("_", " ").title())
-
-
-def _action_body(name: str, data: dict[str, Any], *, needs_confirm: bool) -> tuple[str, str]:
-    preview = data.get("would_call_with") or {}
-    if needs_confirm:
-        if name in {"radarr_add", "sonarr_add", "overseerr_request"}:
-            query = preview.get("query") or data.get("query") or "that"
-            return f"{query}", "Waiting for confirm"
-        if name == "ha_call_service":
-            entity = preview.get("entity_id") or "device"
-            service = preview.get("service") or "act"
-            return f"{service} · {entity}", "Waiting for confirm"
-        if name == "chief_of_staff":
-            task = preview.get("task") or preview.get("said") or "that"
-            return str(task)[:90], "Waiting for confirm"
-        return str(preview or name)[:90], "Waiting for confirm"
-
-    if name == "radarr_add":
-        added = data.get("added") or {}
-        return str(added.get("title") or preview.get("query") or "Movie"), "Queued in Radarr"
-    if name == "sonarr_add":
-        added = data.get("added") or {}
-        return str(added.get("title") or preview.get("query") or "Show"), "Queued in Sonarr"
-    if name == "overseerr_request":
-        item = data.get("requested") or {}
-        return str(item.get("title") or preview.get("query") or "Request"), "Sent to Overseerr"
-    if name in {"radarr_search", "sonarr_search", "overseerr_search"}:
+def _pick_media_item(name: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    if name == "plex_now_playing":
+        sessions = data.get("sessions") or []
+        if not sessions:
+            return None
+        row = sessions[0]
+        return {
+            "title": row.get("title"),
+            "type": row.get("type") or "movie",
+            "year": row.get("year"),
+            "show": row.get("show") or row.get("grandparentTitle"),
+            "summary": row.get("summary") or "",
+            "player": row.get("player"),
+            "state": row.get("state"),
+            "ratingKey": row.get("ratingKey"),
+            "thumb": bool(row.get("ratingKey")),
+            "source": "plex",
+        }
+    if name == "plex_play":
+        item = data.get("item") or {}
+        if not item.get("title"):
+            return None
+        client = data.get("client") or {}
+        return {
+            "title": item.get("title"),
+            "type": item.get("type") or "movie",
+            "year": item.get("year"),
+            "show": item.get("grandparentTitle"),
+            "summary": item.get("summary") or "",
+            "contentRating": item.get("contentRating"),
+            "rating": item.get("rating") or item.get("audienceRating"),
+            "ratingKey": item.get("ratingKey"),
+            "thumb": bool(item.get("ratingKey")),
+            "player": client.get("name"),
+            "source": "plex",
+            "pending": bool(data.get("needs_confirm") or data.get("would_call_with")),
+        }
+    if name in {"plex_search", "radarr_search", "sonarr_search", "overseerr_search"}:
         results = data.get("results") or []
-        n = len(results)
-        first = (results[0].get("title") if results else None) or "No matches"
-        return str(first), f"{n} result{'s' if n != 1 else ''}"
-    if name == "ha_call_service":
-        entity = (data.get("entity") or {})
-        label = entity.get("entity_id") or data.get("entity_id") or "entity"
-        state = entity.get("state") or "updated"
-        return f"{label}", f"State: {state}"
-    if name == "chief_of_staff":
-        if data.get("configured") is False:
-            return str(data.get("error") or "Not configured"), "Needs setup"
-        repo = data.get("repo") or "repo"
-        return f"Escalated · {repo}", "Handed off"
-    if data.get("error"):
-        return str(data.get("error"))[:120], "Failed"
-    return name.replace("_", " "), "Done"
+        if not results:
+            return None
+        hit = results[0]
+        source = {
+            "plex_search": "plex",
+            "radarr_search": "radarr",
+            "sonarr_search": "sonarr",
+            "overseerr_search": "overseerr",
+        }.get(name, "media")
+        return {
+            "title": hit.get("title") or hit.get("name"),
+            "type": hit.get("type") or hit.get("mediaType") or ("movie" if "radarr" in name else "show"),
+            "year": hit.get("year"),
+            "show": hit.get("grandparentTitle"),
+            "summary": hit.get("summary") or hit.get("overview") or "",
+            "contentRating": hit.get("contentRating"),
+            "rating": hit.get("rating") or hit.get("audienceRating"),
+            "ratingKey": hit.get("ratingKey"),
+            "tmdbId": hit.get("tmdbId"),
+            "thumb": bool(hit.get("ratingKey")),
+            "source": source,
+            "result_count": len(results),
+        }
+    return None
 
 
-def _action_widget(result: dict[str, Any]) -> Widget:
-    name = str(result.get("name") or "action")
-    data = result.get("data") or {}
-    needs_confirm = bool(result.get("needs_confirm"))
-    ok = bool(result.get("ok"))
-    if needs_confirm:
-        status = "pending"
-    elif not ok or data.get("ok") is False:
-        status = "error"
-    else:
-        status = "done"
-    body, detail = _action_body(name, data, needs_confirm=needs_confirm)
-    if data.get("mode") == "mock" and detail and "mock" not in detail.lower():
-        detail = f"{detail} · mock"
-    return runtime.upsert_widget(
-        Widget(
-            id=f"action-{name}",
-            kind="action",
-            title=_action_title(name),
-            status=status,
-            body=body,
-            detail=detail,
-            data={"tool": name, **({k: v for k, v in data.items() if k != "would_call_with"})},
-            sticky=needs_confirm,
-        )
-    )
-
-
-def _generic_widget(result: dict[str, Any]) -> Widget:
-    name = str(result.get("name") or "tool")
+def _media_widget(result: dict[str, Any]) -> Widget | None:
+    name = str(result.get("name") or "media")
     data = result.get("data") or {}
     ok = bool(result.get("ok")) and data.get("ok") is not False
-    title = name.replace("_", " ").title()
+    item = _pick_media_item(name, data)
+    if item is None:
+        # Empty search / nothing playing — no overlay (voice/transcript still answers).
+        return None
+    if result.get("needs_confirm"):
+        item["pending"] = True
+    title = str(item.get("title") or "Untitled")
+    year = item.get("year")
+    media_type = str(item.get("type") or "movie")
     if not ok:
-        body = str(data.get("error") or data)[:140]
-        status = "error"
-        detail = "Failed"
-    else:
-        # Compact summary for generic tools (plex, docker, lights, …)
-        if name == "plex_now_playing":
-            sessions = data.get("sessions") or []
-            if sessions:
-                body = str(sessions[0].get("title") or "Playing")
-                detail = str(sessions[0].get("player") or sessions[0].get("state") or "")
-            else:
-                body = "Nothing playing"
-                detail = ""
-        elif name == "docker_ps":
-            containers = data.get("containers") or []
-            body = f"{len(containers)} containers"
-            detail = ", ".join(str(c.get("name") or c.get("id")) for c in containers[:4])
-        elif name == "ha_list_entities":
-            states = data.get("states") or []
-            body = f"{len(states)} entities"
-            detail = ""
-        else:
-            body = "Finished"
-            detail = name
-        status = "done"
-        if data.get("mode") == "mock" and detail:
-            detail = f"{detail} · mock"
-        elif data.get("mode") == "mock":
-            detail = "mock"
+        return runtime.upsert_widget(
+            Widget(
+                id="media",
+                kind="media",
+                title=title,
+                status="error",
+                body=str(data.get("error") or "Could not load media."),
+                detail="",
+                data={"tool": name, "item": item, **{k: v for k, v in data.items() if k != "results"}},
+            )
+        )
+    bits = [media_type]
+    if year:
+        bits.append(str(year))
+    if item.get("show"):
+        bits.append(str(item["show"]))
+    body = " · ".join(bits)
+    detail_parts = []
+    summary = (item.get("summary") or "").strip()
+    if summary:
+        detail_parts.append(summary[:220] + ("…" if len(summary) > 220 else ""))
+    if item.get("player") and item.get("state"):
+        detail_parts.append(f"{item['player']} · {item['state']}")
+    elif item.get("player"):
+        detail_parts.append(str(item["player"]))
+    if data.get("mode") == "mock":
+        detail_parts.append("mock")
+    n = item.get("result_count")
+    if isinstance(n, int) and n > 1:
+        detail_parts.append(f"{n} matches")
     return runtime.upsert_widget(
         Widget(
-            id=f"tool-{name}",
-            kind="generic",
+            id="media",
+            kind="media",
             title=title,
-            status=status,
+            status="done",
             body=body,
-            detail=detail,
-            data={"tool": name},
+            detail=" · ".join(detail_parts),
+            data={"tool": name, "item": item},
+            sticky=True,
         )
     )

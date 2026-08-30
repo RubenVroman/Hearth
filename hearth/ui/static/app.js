@@ -28,7 +28,8 @@ const state = {
   realtime: { path: "webrtc-ga", model: "gpt-realtime-2.1", beta: false },
   accessToken: "",
   widgets: [],
-  widgetTimers: {},
+  infoSignature: "",
+  infoCloseTimer: null,
 };
 
 function micStorageGet(key) {
@@ -290,84 +291,194 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
-function kindLabel(kind) {
-  if (kind === "weather") return "Weather";
-  if (kind === "action") return "Action";
-  return "Update";
+function isVisualOverlay(widget) {
+  const kind = widget && widget.kind;
+  return kind === "weather" || kind === "media";
 }
 
-function clearWidgetTimer(id) {
-  const timer = state.widgetTimers[id];
-  if (timer) {
-    clearTimeout(timer);
-    delete state.widgetTimers[id];
+function pickVisualOverlay(widgets) {
+  const list = (Array.isArray(widgets) ? widgets : []).filter(isVisualOverlay);
+  if (!list.length) return null;
+  // Most recently updated wins (list is insertion-ordered from the server).
+  return list[list.length - 1];
+}
+
+function overlaySignature(widget) {
+  if (!widget) return "";
+  return [
+    widget.id,
+    widget.kind,
+    widget.updated_at || "",
+    widget.status || "",
+    widget.title || "",
+    widget.body || "",
+    widget.detail || "",
+  ].join("|");
+}
+
+function clearInfoCloseTimer() {
+  if (state.infoCloseTimer) {
+    clearTimeout(state.infoCloseTimer);
+    state.infoCloseTimer = null;
   }
 }
 
-function scheduleAutoDismiss(widget) {
-  clearWidgetTimer(widget.id);
-  if (widget.sticky) return;
-  if (widget.status !== "done" && widget.status !== "error") return;
-  state.widgetTimers[widget.id] = setTimeout(() => {
-    dismissWidget(widget.id, { silent: true });
-  }, 12000);
+function weatherMarkup(widget) {
+  const data = widget.data || {};
+  const temp = data.temperature;
+  const unit = data.temperature_unit || "°C";
+  const condition = data.condition || widget.body || "—";
+  const place = widget.title || data.place || "Outside";
+  const stats = [];
+  if (data.humidity != null) {
+    stats.push(`<span>Humidity<strong>${escapeHtml(data.humidity)}%</strong></span>`);
+  }
+  if (data.wind_speed != null) {
+    stats.push(
+      `<span>Wind<strong>${escapeHtml(data.wind_speed)} ${escapeHtml(
+        data.wind_unit || "km/h"
+      )}</strong></span>`
+    );
+  }
+  if (data.mode === "mock") {
+    stats.push(`<span>Source<strong>mock</strong></span>`);
+  }
+  const tempLabel = temp != null ? `${escapeHtml(temp)}<span class="info-weather-unit">${escapeHtml(unit)}</span>` : "—";
+  return `
+    <div class="info-weather">
+      <p class="info-kicker">Weather</p>
+      <p class="info-title" id="info-title">${escapeHtml(place)}</p>
+      <p class="info-weather-temp">${tempLabel}</p>
+      <p class="info-weather-condition">${escapeHtml(condition)}</p>
+      ${stats.length ? `<div class="info-weather-stats">${stats.join("")}</div>` : ""}
+    </div>
+  `;
+}
+
+function mediaMarkup(widget) {
+  const item = (widget.data && widget.data.item) || {};
+  const title = widget.title || item.title || "Untitled";
+  const year = item.year;
+  const type = item.type || "movie";
+  const summary = item.summary || "";
+  const ratingKey = item.ratingKey;
+  const initials = String(title)
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((p) => p[0] || "")
+    .join("")
+    .toUpperCase();
+  const meta = [type, year, item.show, item.contentRating]
+    .filter(Boolean)
+    .map((v) => escapeHtml(v))
+    .join(" · ");
+  const poster = ratingKey
+    ? `<img class="info-poster" src="/api/plex/thumb/${encodeURIComponent(
+        ratingKey
+      )}" alt="" width="108" height="162" loading="lazy" />`
+    : `<div class="info-poster info-poster-fallback" aria-hidden="true">${escapeHtml(
+        initials || "·"
+      )}</div>`;
+  const bits = [];
+  if (summary) bits.push(`<p class="info-detail">${escapeHtml(summary)}</p>`);
+  if (item.player) {
+    bits.push(
+      `<p class="info-detail">${escapeHtml(item.player)}${
+        item.state ? ` · ${escapeHtml(item.state)}` : ""
+      }</p>`
+    );
+  }
+  if (item.rating != null) {
+    bits.push(`<p class="info-detail">Rating ${escapeHtml(item.rating)}</p>`);
+  }
+  return `
+    <div class="info-media">
+      ${poster}
+      <div class="info-media-copy">
+        <p class="info-kicker">${item.pending ? "Ready to play" : "Library"}</p>
+        <h2 class="info-title" id="info-title">${escapeHtml(title)}</h2>
+        ${meta ? `<p class="info-meta">${meta}</p>` : ""}
+        ${bits.join("")}
+      </div>
+    </div>
+  `;
+}
+
+function overlayInnerHtml(widget) {
+  if (widget.kind === "weather") return weatherMarkup(widget);
+  if (widget.kind === "media") return mediaMarkup(widget);
+  return `
+    <p class="info-kicker">Info</p>
+    <h2 class="info-title" id="info-title">${escapeHtml(widget.title || "")}</h2>
+    <p class="info-body">${escapeHtml(widget.body || "")}</p>
+    ${widget.detail ? `<p class="info-detail">${escapeHtml(widget.detail)}</p>` : ""}
+  `;
+}
+
+function openInfoOverlay(widget) {
+  const root = $("info-overlay");
+  const content = $("info-content");
+  if (!root || !content || !widget) return;
+  clearInfoCloseTimer();
+  const signature = overlaySignature(widget);
+  const alreadyOpen = root.classList.contains("is-open") && !root.classList.contains("is-closing");
+  if (alreadyOpen && state.infoSignature === signature) {
+    return;
+  }
+  content.innerHTML = overlayInnerHtml(widget);
+  state.infoSignature = signature;
+  root.hidden = false;
+  root.setAttribute("aria-hidden", "false");
+  root.classList.remove("is-closing");
+  // Force style flush so enter transition runs when opening from hidden.
+  if (!alreadyOpen) {
+    void root.offsetWidth;
+  }
+  root.classList.add("is-open");
+}
+
+function closeInfoOverlay({ animate = true } = {}) {
+  const root = $("info-overlay");
+  if (!root || root.hidden) {
+    state.infoSignature = "";
+    return;
+  }
+  clearInfoCloseTimer();
+  state.infoSignature = "";
+  if (!animate || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    root.classList.remove("is-open", "is-closing");
+    root.hidden = true;
+    root.setAttribute("aria-hidden", "true");
+    const content = $("info-content");
+    if (content) content.innerHTML = "";
+    return;
+  }
+  root.classList.add("is-closing");
+  root.classList.remove("is-open");
+  state.infoCloseTimer = setTimeout(() => {
+    root.classList.remove("is-closing");
+    root.hidden = true;
+    root.setAttribute("aria-hidden", "true");
+    const content = $("info-content");
+    if (content) content.innerHTML = "";
+    state.infoCloseTimer = null;
+  }, 300);
 }
 
 function renderWidgets(widgets) {
   const list = Array.isArray(widgets) ? widgets : [];
   state.widgets = list;
-  const root = $("widget-stack");
-  if (!root) return;
-  const seen = new Set(list.map((w) => w.id));
-  for (const id of Object.keys(state.widgetTimers)) {
-    if (!seen.has(id)) clearWidgetTimer(id);
+  const visual = pickVisualOverlay(list);
+  if (!visual) {
+    closeInfoOverlay({ animate: true });
+    return;
   }
-  root.innerHTML = "";
-  for (const widget of list) {
-    const el = document.createElement("article");
-    el.className = `widget widget-${widget.kind || "generic"}`;
-    el.dataset.id = widget.id;
-    el.dataset.status = widget.status || "info";
-    el.setAttribute("role", "status");
-    const dismissible = widget.dismissible !== false;
-    el.innerHTML = `
-      <div class="widget-head">
-        <span class="widget-kind">${escapeHtml(kindLabel(widget.kind))}</span>
-        <span class="widget-status">${escapeHtml(widget.status || "info")}</span>
-        ${
-          dismissible
-            ? `<button type="button" class="widget-dismiss" aria-label="Dismiss ${escapeHtml(
-                widget.title || "widget"
-              )}">×</button>`
-            : ""
-        }
-      </div>
-      <h3 class="widget-title">${escapeHtml(widget.title || "")}</h3>
-      <p class="widget-body">${escapeHtml(widget.body || "")}</p>
-      ${widget.detail ? `<p class="widget-detail">${escapeHtml(widget.detail)}</p>` : ""}
-    `;
-    const btn = el.querySelector(".widget-dismiss");
-    if (btn) {
-      btn.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        dismissWidget(widget.id);
-      });
-    }
-    root.appendChild(el);
-    scheduleAutoDismiss(widget);
-  }
-  setEmpty("widget-stack", list.length === 0);
-}
-
-function upsertLocalWidget(widget) {
-  const next = [...state.widgets.filter((w) => w.id !== widget.id), widget];
-  renderWidgets(next);
+  openInfoOverlay(visual);
 }
 
 async function dismissWidget(id, { silent = false } = {}) {
-  clearWidgetTimer(id);
-  renderWidgets(state.widgets.filter((w) => w.id !== id));
+  const next = state.widgets.filter((w) => w.id !== id);
+  renderWidgets(next);
   try {
     await api(`/api/widgets/${encodeURIComponent(id)}`, { method: "DELETE" });
   } catch (err) {
@@ -379,6 +490,28 @@ function applyWidgetPayload(payload) {
   if (payload && Array.isArray(payload.widgets)) {
     renderWidgets(payload.widgets);
   }
+}
+
+function bindInfoOverlay() {
+  const dismiss = () => {
+    const visual = pickVisualOverlay(state.widgets);
+    if (visual) dismissWidget(visual.id);
+    else closeInfoOverlay({ animate: true });
+  };
+  $("info-dismiss")?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    dismiss();
+  });
+  $("info-backdrop")?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    dismiss();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    const root = $("info-overlay");
+    if (!root || root.hidden || !root.classList.contains("is-open")) return;
+    dismiss();
+  });
 }
 
 function renderNowPlaying(payload) {
@@ -615,15 +748,6 @@ $("composer").addEventListener("submit", async (ev) => {
   if (!text) return;
   input.value = "";
   appendLog("you", text);
-  upsertLocalWidget({
-    id: "turn-active",
-    kind: "action",
-    title: "House",
-    status: "running",
-    body: text.length > 72 ? `${text.slice(0, 69)}…` : text,
-    detail: "Thinking…",
-    dismissible: true,
-  });
   if (
     sendRealtime({
       type: "conversation.item.create",
@@ -651,40 +775,8 @@ function onRealtimeEvent(event) {
   if (state.call?.bargeIn) {
     state.call.bargeIn.noteRealtimeEvent(type);
   }
-  if (type === "response.created") {
-    upsertLocalWidget({
-      id: "turn-active",
-      kind: "action",
-      title: "House",
-      status: "running",
-      body: "Listening to the house…",
-      detail: "Working…",
-      dismissible: true,
-    });
-  }
-  if (type === "response.function_call_arguments.done") {
-    const name = event.name || "tool";
-    upsertLocalWidget({
-      id: `action-${name}`,
-      kind: "action",
-      title: name.replace(/_/g, " "),
-      status: "running",
-      body: "Running…",
-      detail: name,
-      dismissible: true,
-    });
-  }
   if (type === "response.output_audio_transcript.done" || type === "response.audio_transcript.done") {
     appendLog("hearth", event.transcript);
-    upsertLocalWidget({
-      id: "turn-active",
-      kind: "action",
-      title: "House",
-      status: "done",
-      body: "Answered",
-      detail: "Done.",
-      dismissible: true,
-    });
   }
   // User speech — requires session audio.input.transcription (see webrtc.session_config).
   if (
@@ -692,33 +784,10 @@ function onRealtimeEvent(event) {
     type === "conversation.item.audio_transcription.completed"
   ) {
     appendLog("you", event.transcript);
-    if (event.transcript) {
-      upsertLocalWidget({
-        id: "turn-active",
-        kind: "action",
-        title: "House",
-        status: "running",
-        body:
-          event.transcript.length > 72
-            ? `${event.transcript.slice(0, 69)}…`
-            : event.transcript,
-        detail: "Thinking…",
-        dismissible: true,
-      });
-    }
   }
   if (type === "error") {
     const message = event.error?.message || event.message || "realtime error";
     appendLog("system", message);
-    upsertLocalWidget({
-      id: "turn-active",
-      kind: "action",
-      title: "House",
-      status: "error",
-      body: message,
-      detail: "Failed",
-      dismissible: true,
-    });
   }
   if (type === "response.function_call_arguments.done" && event.name === "end_call") {
     if (state.call) state.call.pendingHangup = true;
@@ -1023,6 +1092,7 @@ window.addEventListener("pagehide", onPageHide);
 
 async function boot() {
   if (window.HearthSettings) window.HearthSettings.mount();
+  bindInfoOverlay();
   const ok = await refreshAccessToken();
   if (!ok) {
     bounceToLogin();
