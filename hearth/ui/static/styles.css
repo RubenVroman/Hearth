@@ -1084,7 +1084,6 @@ input,
     padding: 10px 16px;
   }
 
-<<<<<<< HEAD
   .widget-stack {
     position: relative;
     left: auto;
@@ -1097,10 +1096,10 @@ input,
     max-height: none;
     overflow: visible;
     pointer-events: auto;
-=======
+  }
+
   .info-overlay {
     padding-bottom: calc(var(--dock-space) + 16px + var(--keyboard-inset));
->>>>>>> origin/cursor/glass-info-overlay-cd24
   }
 
   .info-glass {
