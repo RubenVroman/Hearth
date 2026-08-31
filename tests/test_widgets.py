@@ -49,11 +49,18 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v19" in sw.text
+    assert "hearth-shell-v20" in sw.text
     assert "info-infuse-btn" in js.text
     assert "playActiveInInfuse" in js.text
     assert "focusMediaById" in js.text
     assert "data-infuse-play" in js.text
+    assert "emptyMediaMarkup" in js.text
+    assert "mediaStatusBanner" in js.text
+    assert "contentEmpty" in js.text
+    assert "activeMediaItem" in js.text
+    assert "showLocalMediaOverlay" in js.text
+    assert "data-media-id=" in js.text
+    assert "playActiveInInfuse(playBtn.getAttribute" in js.text
     assert "setRefreshInterval" in js.text
     assert ".info-infuse-btn" in css.text
     assert ".info-media-card.is-selectable" in css.text
@@ -62,6 +69,11 @@ def test_command_center_includes_info_overlay(client):
     assert ".info-media-carousel" in css.text
     assert "#info-content[data-settled" in css.text
     assert "Swipe or tap cards to browse" in js.text
+    assert ".info-media-banner" in css.text
+    assert ".info-media-empty" in css.text
+    assert "min-height: 120px" in css.text
+    assert "--stack-i" not in css.text
+    assert "var(--slot" in css.text
     assert ".info-media-link" in css.text
     assert "Suggested" in js.text
     assert "info-media-link" in js.text
@@ -210,6 +222,51 @@ def test_now_playing_surfaces_media_overlay(client):
     body = chat.json()
     media = next(w for w in body["widgets"] if w["kind"] == "media")
     assert "Dune" in media["title"]
+
+
+def test_ambiguous_play_surfaces_pickable_media_overlay(client):
+    """Play with multiple title matches must open cards — never a blank glass."""
+    runtime.widgets.clear()
+    chat = client.post("/api/chat", json={"message": "play Heat on the Apple TV"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] in {"plex_play", "infuse_play"}
+    tool = body["tools"][0]
+    assert tool["data"].get("ambiguous_titles") or tool["data"].get("ambiguous")
+    media = next(w for w in body["widgets"] if w["kind"] == "media")
+    items = media["data"].get("items") or []
+    assert len(items) >= 2
+    titles = {str(row.get("title") or "") for row in items}
+    assert "Heat" in titles
+    assert media["data"].get("pick") is True
+    assert media["status"] in {"info", "error"}
+    assert media["body"]
+    # Every candidate is Infuse-playable from the glass button.
+    for row in items:
+        assert row.get("title")
+        assert row.get("ratingKey") or row.get("tmdbId")
+    js = client.get("/static/app.js")
+    assert "mediaStatusBanner" in js.text
+    assert "Ready to play" in js.text
+
+
+def test_play_movie_surfaces_infuse_controls(client):
+    """Successful play publishes a non-empty media card with play controls."""
+    runtime.widgets.clear()
+    chat = client.post("/api/chat", json={"message": "play The Endless on the Apple TV"})
+    assert chat.status_code == 200
+    body = chat.json()
+    assert body["tools"][0]["name"] in {"plex_play", "infuse_play"}
+    media = next(w for w in body["widgets"] if w["kind"] == "media")
+    items = media["data"].get("items") or []
+    assert items
+    assert "Endless" in media["title"] or any("Endless" in str(i.get("title")) for i in items)
+    active = media["data"].get("item") or items[0]
+    assert active.get("title")
+    assert active.get("ratingKey") or active.get("tmdbId")
+    js = client.get("/static/app.js")
+    assert "Open in Infuse" in js.text
+    assert "emptyMediaMarkup" in js.text
 
 
 def test_animation_genre_browse_surfaces_media_stack(client):
