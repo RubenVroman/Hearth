@@ -23,6 +23,7 @@ from typing import Any, Literal
 
 from hearth.config import settings
 from hearth.memory.redact import redact
+from hearth.telegram.catalog import catalog_search_title
 
 log = logging.getLogger("hearth.telegram")
 
@@ -203,6 +204,14 @@ _SYSTEM = (
     "action=search THAT prior catalog title (+ year when known) — never "
     "action=clarify with 'any year, actor, or other clue' when the title was "
     "already given. "
+    "Bare short exact titles (even one word) → action=search that catalog "
+    "title (+ year when known), or pick the matching candidate. Never reply "
+    "with 'any year, actor, or other clue' or 'send an IMDb/TMDB link' for a "
+    "title the user already named — catalog/TMDB run after you. "
+    "Asks to list/looks-like/name a few titles that resemble a named seed "
+    "('name a few that look like Land') → action=search that seed title "
+    "(or clarify listing exact/prefix catalog matches for it). Never the "
+    "canned clue template — they already gave the seed. "
     "Never clarify with 'send the title if you know it' when candidates, "
     "last_bot_reply, subject_title, pending_query, or recent_history already "
     "name a guessed/queued title, or when the user asked you to find/confirm/"
@@ -332,6 +341,15 @@ def looks_like_concrete_title(text: str) -> bool:
     raw = (text or "").strip()
     if not raw or looks_like_chatter(raw):
         return False
+    # Confirmations / bare rejects are not catalog titles.
+    if looks_like_confirm_yes(raw):
+        return False
+    if re.fullmatch(
+        r"(?:n+e+e+|n+o+|nope|nah|niet|no\s+thanks)\s*[.!?]*",
+        raw,
+        flags=re.I,
+    ):
+        return False
     # "another one" / "find one" are recommend asks — never treat as a title.
     if looks_like_recommend_ask(raw):
         return False
@@ -382,11 +400,30 @@ def looks_like_concrete_title(text: str) -> bool:
         r"coolest|oldest|newest|classic\s+\w+\s+movie|"
         r"old\s+\w+\s+movie|horror\s+movie|sci-?fi|"
         r"spaceship|space\s+ship|you\s+can\s+f(?:i)?n[ds]|"
-        r"movie\s+on\s+a|film\s+on\s+a|on\s+a\s+spaceship"
+        r"movie\s+on\s+a|film\s+on\s+a|on\s+a\s+spaceship|"
+        r"bring\s+it|download\s+it|queue\s+it|get\s+it|"
+        r"name\s+a\s+few|look(?:s)?\s+like|similar\s+to|"
+        r"a\s+few\s+that|lijkt\s+op|een\s+paar"
         r")\b",
         re.I,
     )
     if descriptive.search(cleaned) or descriptive.search(raw):
+        return False
+    # Imperative confirm/download of "it/that" — not a title name.
+    if re.search(
+        r"\b(?:sure|ok|okay|ja|yes)\b.+\b(?:bring|download|queue|get|doe)\b",
+        raw,
+        re.I,
+    ):
+        return False
+    # "Yes… duh" / "yes please" — yes + punctuation/commentary, not a title.
+    if re.match(r"^\s*y+e+s+[.…!?,:]+", raw, re.I):
+        return False
+    if re.match(
+        r"^\s*y+e+s+\s+(?:duh|please|pls|thanks|thx)\b",
+        raw,
+        re.I,
+    ):
         return False
     return bool(re.search(r"[A-Za-zÀ-ÿ]", cleaned))
 
@@ -1049,12 +1086,57 @@ def _parse_model_json(
             # search_title is a reject/new-ask pivot (recommend or clue update).
             # Actor/plot refinements that name a title absent from fuzzy hits
             # also pivot — do not force La La Land when the model said Land.
+            # Single Did-you-mean pending: ungrounded different title on a
+            # confirm turn must NOT invent La La Land — pick the on-screen row.
+            # Only pivot when the USER message itself grounds the new title
+            # (shared tokens), a recommend ask, or an actor/year they typed.
+            user_grounds_new = bool(
+                _significant_tokens(user_message)
+                & _significant_tokens(search_title)
+            )
+            if (
+                candidates_are_pending
+                and candidate_count == 1
+                and not recommend
+                and not looks_like_recommend_ask(user_message)
+                and not user_grounds_new
+            ):
+                return IntentDecision(
+                    action="pick",
+                    indices=[1],
+                    confidence=confidence,
+                    media_kind=media_kind
+                    or str(
+                        (candidates or [{}])[0].get("mediaType")
+                        or (candidates or [{}])[0].get("media_kind")
+                        or ""
+                    ),
+                    people=people,
+                    search_title=str((candidates or [{}])[0].get("title") or "")[
+                        :200
+                    ],
+                    year=_year_from_candidate((candidates or [{}])[0]),
+                )
             allow_pending_pivot = (
                 candidates_are_pending
                 and search_title.strip().lower() not in rejected_norm
                 and not any(
                     titles_match(search_title, str(row.get("title") or ""))
                     for row in (candidates or [])
+                )
+                and (
+                    recommend
+                    or looks_like_recommend_ask(user_message)
+                    or user_grounds_new
+                    or (
+                        bool(people)
+                        and any(
+                            p.lower() in user_message.lower()
+                            for p in people
+                            if p
+                        )
+                    )
+                    or (year is not None and str(year) in user_message)
                 )
             )
             allow_clue_pivot = (
@@ -1106,8 +1188,66 @@ def _parse_model_json(
     # Live VAULT: offered was empty but the default template still fired with
     # candidate_count=1 (or the model echoed "reply 1–1"). Prefer guess→ask.
     if action == "clarify":
+        # Bare concrete title ask + canned/empty clarify → search that title.
+        # Never leave "Any year, actor…" as the first reply for "Land".
+        # Do NOT promote when a live pending list/guess is on screen (pick path),
+        # or when the user is confirming/rejecting rather than naming a title.
+        canned_clarify = (not clarify) or any(
+            bit in (clarify or "").lower()
+            for bit in (
+                "any year, actor, or other clue",
+                "want another in that vibe",
+                "send the title if you know it",
+            )
+        ) or clarify_wants_numbered_list(clarify or "")
+        if (
+            canned_clarify
+            and not candidates_are_pending
+            and looks_like_concrete_title(user_message)
+            and not (search_title or "").strip()
+        ):
+            seeded = catalog_search_title(user_message) or user_message.strip()
+            if seeded:
+                search_title = seeded[:200]
+                action = "search"
+                clarify = ""
+        # Model echoed the canned clue template while a candidate/guess exists
+        # — promote to search that row, never leave the template.
+        if action == "clarify" and clarify and not candidates_are_pending:
+            lowered_q = clarify.lower()
+            if (
+                "any year, actor, or other clue" in lowered_q
+                or "want another in that vibe" in lowered_q
+            ):
+                if looks_like_concrete_title(user_message):
+                    seeded = (
+                        catalog_search_title(user_message) or user_message.strip()
+                    )
+                    if seeded:
+                        search_title = seeded[:200]
+                        action = "search"
+                        clarify = ""
+                elif (
+                    search_title
+                    and search_title.strip().lower() not in rejected_norm
+                ):
+                    action = "search"
+                    clarify = ""
+                elif candidate_count == 1 and candidates:
+                    phantom_title = str(
+                        (candidates or [{}])[0].get("title") or ""
+                    ).strip()
+                    if (
+                        phantom_title
+                        and phantom_title.lower() not in rejected_norm
+                    ):
+                        search_title = phantom_title[:200]
+                        if year is None:
+                            year = _year_from_candidate((candidates or [{}])[0])
+                        action = "search"
+                        clarify = ""
         listless = (not clarify) or clarify_wants_numbered_list(clarify)
-        if candidate_count < 2 and listless:
+        if action == "clarify" and candidate_count < 2 and listless:
             phantom = None
             rows = list(candidates or [])
             if len(rows) == 1:

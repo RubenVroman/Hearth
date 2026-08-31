@@ -815,6 +815,30 @@ class TelegramInbox:
                             )
                             if reused is not None:
                                 return reused
+                concrete = self._concrete_title_from_message(view.text)
+                if concrete:
+                    reused = await self._reuse_prior_title(
+                        view,
+                        concrete,
+                        media_kind=intent.media_kind
+                        if intent.media_kind in {"movie", "tv"}
+                        else "",
+                        year=intent.year,
+                    )
+                    if reused is not None:
+                        return reused
+                prior, prior_kind, prior_year = self._prior_titled_ask(view.chat_id)
+                if prior and self._followup_should_reuse_prior(
+                    view.chat_id, view.text, prior
+                ):
+                    reused = await self._reuse_prior_title(
+                        view,
+                        prior,
+                        media_kind=prior_kind,
+                        year=prior_year,
+                    )
+                    if reused is not None:
+                        return reused
                 return InboxResult(
                     handled=True,
                     reply=(
@@ -912,6 +936,35 @@ class TelegramInbox:
                         )
                         if reused is not None:
                             return reused
+            # Bare concrete title (or look-alike ask naming one) → search that
+            # title. Never dump the canned clue / send-link templates first.
+            if pending is None and not hits:
+                concrete = self._concrete_title_from_message(view.text)
+                if concrete:
+                    return await self._reuse_prior_title(
+                        view,
+                        concrete,
+                        media_kind=intent.media_kind
+                        if intent.media_kind in {"movie", "tv"}
+                        else "",
+                        year=intent.year,
+                    )
+                prior, prior_kind, prior_year = self._prior_titled_ask(view.chat_id)
+                if (
+                    prior
+                    and self._clarify_is_canned_template(intent.clarify_question)
+                    and self._followup_should_reuse_prior(
+                        view.chat_id, view.text, prior
+                    )
+                ):
+                    reused = await self._reuse_prior_title(
+                        view,
+                        prior,
+                        media_kind=prior_kind,
+                        year=prior_year,
+                    )
+                    if reused is not None:
+                        return reused
             question = intent.clarify_question or (
                 SOFT_CONTEXT_CLARIFY
                 if looks_like_recommend_ask(view.text)
@@ -942,6 +995,26 @@ class TelegramInbox:
                     if looks_like_recommend_ask(view.text)
                     else CONTEXT_CLUE_CLARIFY
                 )
+            # Final guard: canned clue templates are not a valid first reply when
+            # this turn still refers to a prior titled ask (look-alike / anaphora).
+            if self._clarify_is_canned_template(question):
+                concrete = self._concrete_title_from_message(view.text)
+                if concrete:
+                    reused = await self._reuse_prior_title(view, concrete)
+                    if reused is not None:
+                        return reused
+                prior, prior_kind, prior_year = self._prior_titled_ask(view.chat_id)
+                if prior and self._followup_should_reuse_prior(
+                    view.chat_id, view.text, prior
+                ):
+                    reused = await self._reuse_prior_title(
+                        view,
+                        prior,
+                        media_kind=prior_kind,
+                        year=prior_year,
+                    )
+                    if reused is not None:
+                        return reused
             # Never re-stick a rejected 1–N list after a clarify pivot.
             if pending is None:
                 self.pending.pop(view.chat_id, None)
@@ -1098,7 +1171,73 @@ class TelegramInbox:
                 continue
             mk = str(turn.get("media_kind") or "")
             return st, mk if mk in {"movie", "tv"} else "", year
+        # Fall back to the last user turn that looks like a bare catalog title
+        # (e.g. "Land" before a canned clue reply).
+        for turn in reversed(self.memory.history_blob(chat_id)):
+            if turn.get("role") != "user":
+                continue
+            text = str(turn.get("text") or "").strip()
+            if looks_like_concrete_title(text):
+                return catalog_search_title(text) or text, "", None
         return "", "", None
+
+    @staticmethod
+    def _clarify_is_canned_template(question: str | None) -> bool:
+        """True for the default clue / send-link / empty-title templates."""
+        lowered = (question or "").strip().lower()
+        if not lowered:
+            return True
+        if "any year, actor, or other clue" in lowered:
+            return True
+        if "want another in that vibe" in lowered:
+            return True
+        if "send the title if you know it" in lowered:
+            return True
+        if "send an imdb" in lowered or "send an imdb/tmdb" in lowered:
+            return True
+        return False
+
+    @staticmethod
+    def _concrete_title_from_message(text: str) -> str:
+        """Bare catalog title from this turn — empty when the ask is plot/vibe."""
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        if looks_like_concrete_title(raw):
+            return catalog_search_title(raw) or raw
+        return ""
+
+    def _followup_should_reuse_prior(
+        self, chat_id: int, user_text: str, prior: str
+    ) -> bool:
+        """True when a canned clarify should reuse a prior titled ask.
+
+        Look-alike / anaphoric follow-ups that still mention the seed (or come
+        right after a miss/guess) reuse it. A brand-new plot sentence must NOT
+        glue a leftover franchise (Harry Potter) onto a spaceship-horror ask.
+        """
+        from hearth.telegram.intent import _significant_tokens
+
+        raw = (user_text or "").strip()
+        prior_title = (prior or "").strip()
+        if not raw or not prior_title:
+            return False
+        if looks_like_recommend_ask(raw):
+            return False
+        # User still talking about that title (tokens overlap / look like X).
+        if _significant_tokens(prior_title) & _significant_tokens(raw):
+            return True
+        if titles_match(prior_title, raw):
+            return True
+        # New descriptive plot (long, not a concrete title) → do not reuse.
+        if (
+            looks_like_media_ask(raw)
+            and not looks_like_concrete_title(raw)
+            and len(raw) >= 24
+        ):
+            return False
+        # Short anaphoric follow-up after a titled miss / Did-you-mean.
+        return self._last_bot_was_title_miss_or_guess(chat_id)
 
     def _last_bot_was_title_miss_or_guess(self, chat_id: int) -> bool:
         """True when the last bot turn was a catalog miss or guess-confirm."""
@@ -1290,7 +1429,12 @@ class TelegramInbox:
         media_kind_hint: str = "",
         skip_rate: bool = False,
     ) -> InboxResult:
-        """Queue a known Overseerr/TMDB row by id — no fuzzy title re-search."""
+        """Queue THIS pending/catalog row's title+year(+id) — never re-fuzzy.
+
+        Confirm of ``Did you mean Land (2021)?`` must queue Land, never a
+        substring Overseerr hit like La La Land. Prefer the row's tmdbId; when
+        missing, resolve via exact/prefix catalog seed match for title+year.
+        """
         if not skip_rate and not self.rate.allow():
             return InboxResult(handled=True, reply=format_rate_limited())
         kind = str(
@@ -1304,6 +1448,35 @@ class TelegramInbox:
         year = int(row["year"]) if row.get("year") not in (None, "") else None
         tmdb = row.get("tmdbId") or row.get("mediaId")
         tvdb = row.get("tvdbId")
+        # Pending guess-confirm may lack tmdbId — re-resolve with seed match so
+        # Land (2021) cannot become La La Land (2016) via substring search.
+        if tmdb in (None, "") and tvdb in (None, "") and title.strip():
+            try:
+                hits = await resolve_title(
+                    title,
+                    year=year,
+                    media_kind=kind,
+                    strict=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.info("confirm-row catalog resolve failed: %s", redact(str(exc)))
+                hits = []
+            seed_hits = [
+                h
+                for h in hits
+                if catalog_seed_matches_title(title, h.title)
+            ]
+            if year is not None:
+                year_hits = [h for h in seed_hits if h.year == year]
+                if year_hits:
+                    seed_hits = year_hits
+            if seed_hits:
+                pick = seed_hits[0]
+                title = pick.title or title
+                year = pick.year if pick.year is not None else year
+                kind = pick.media_kind if pick.media_kind in {"movie", "tv"} else kind
+                tmdb = pick.tmdb_id
+                tvdb = pick.tvdb_id
         resolved = ParsedRequest(
             kind="request",
             media_kind=kind,  # type: ignore[arg-type]
@@ -1544,37 +1717,29 @@ class TelegramInbox:
             exact = [
                 row
                 for row in hits
-                if normalize_title(str(row.get("title") or "")) == normalize_title(parsed.title)
+                if catalog_seed_matches_title(
+                    parsed.title, str(row.get("title") or "")
+                )
                 and str(row.get("year") or "") == str(parsed.year)
             ]
             if exact:
                 return exact[:1]
 
         if parsed.title:
-            needle = normalize_title(parsed.title)
-            exact_title = [
+            # Exact / franchise-prefix only — never substring (Land ≠ La La Land).
+            seed_hits = [
                 row
                 for row in hits
-                if normalize_title(str(row.get("title") or "")) == needle
+                if catalog_seed_matches_title(
+                    parsed.title, str(row.get("title") or "")
+                )
             ]
-            if len(exact_title) == 1:
-                return exact_title
-            if len(exact_title) > 1 and not parsed.year:
-                return exact_title[:MAX_CANDIDATES]
-            # Substring / franchise hits — keep a bounded set for "all of them".
-            related = [
-                row
-                for row in hits
-                if needle and needle in normalize_title(str(row.get("title") or ""))
-            ]
-            if related:
-                if len(related) == 1:
-                    return related
-                return related[:MAX_CANDIDATES]
-            if not exact_title:
-                if len(hits) == 1:
-                    return hits
-                return hits[:MAX_CANDIDATES]
+            if len(seed_hits) == 1:
+                return seed_hits
+            if len(seed_hits) > 1:
+                return seed_hits[:MAX_CANDIDATES]
+            # No seed match — do not fall through to unrelated Overseerr noise.
+            return []
 
         # Single hit is fine; multiple fuzzy hits need disambiguation.
         if len(hits) == 1:
@@ -1637,6 +1802,19 @@ class TelegramInbox:
             # else: implied kind missed — keep other type (TV-only title under movie ask)
 
         choices = self._dedupe_choices(self._filter_hits(hits, parsed, exact_id=exact_id))
+        # Belt-and-suspenders: never queue a substring neighbor of the named title.
+        if parsed.title and choices:
+            seeded = [
+                row
+                for row in choices
+                if catalog_seed_matches_title(
+                    parsed.title, str(row.get("title") or "")
+                )
+            ]
+            if seeded:
+                choices = seeded
+            elif not exact_id or not (parsed.tmdb_id or parsed.tvdb_id or parsed.imdb_id):
+                choices = []
         if parsed.tmdb_id:
             id_hits = [
                 row

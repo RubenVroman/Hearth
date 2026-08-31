@@ -4034,3 +4034,313 @@ def test_looks_like_concrete_title_rejects_anaphoric_find_match():
     assert not looks_like_concrete_title("zoek die film die ik net noemde")
     assert looks_like_concrete_title("The squid and the whale")
     assert looks_like_concrete_title("Cedar Hollow Signal")
+
+
+# --- Land / La La Land confirm thread (live Telegram 2026-08-31 23:30–23:32) ---
+
+
+@pytest.mark.asyncio
+async def test_inbox_land_thread_yes_duh_queues_land_not_la_la_land(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live Movies & Series bug: Did you mean Land (2021)? → Yes... duh → La La Land.
+
+    Replay the critical confirm. Pending must stay Land (2021). Yes / Yes... duh
+    must queue THAT title+year via catalog_seed_matches — never La La Land even
+    when Overseerr substring-noise returns it for 'Land'.
+    """
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+    from hearth.telegram.intent import CONTEXT_CLUE_CLARIFY
+
+    land = {
+        "title": "Land",
+        "year": 2021,
+        "tmdbId": 688271,
+        "mediaId": 688271,
+        "mediaType": "movie",
+    }
+    la_la = {
+        "title": "La La Land",
+        "year": 2016,
+        "tmdbId": 313369,
+        "mediaId": 313369,
+        "mediaType": "movie",
+    }
+    cop = {
+        "title": "Cop Land",
+        "year": 1997,
+        "tmdbId": 9470,
+        "mediaId": 9470,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower().strip()
+        if q == "land" or "688271" in q:
+            # Overseerr substring noise — exact helper must keep only Land.
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "results": [la_la, land, cop],
+            }
+        if "la la" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [la_la]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # Seed: bot already asked Did you mean Land (2021)? (plot path succeeded).
+    option = {
+        "title": "Land",
+        "year": 2021,
+        "mediaType": "movie",
+        # No tmdbId — forces title+year resolve path that used to pick La La Land.
+    }
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[option],
+        media_kind="movie",
+        query="Land",
+        created_message_id=8600,
+        last_bot_reply="Did you mean Land (2021)?",
+    )
+    inbox.memory.set_subject(
+        -1001, "Land", media_kind="movie", offered=[option]
+    )
+    inbox.memory.record_user(
+        -1001, "Edee, in the aftermath of an unfathomable event"
+    )
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean Land (2021)?",
+        search_title="Land",
+        media_kind="movie",
+        offered=[option],
+    )
+
+    pipeline.overseerr_queue.clear()
+
+    # Model confirms the on-screen guess (full thread + pending — no phrase list).
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {"action": "pick", "indices": [1], "confidence": 0.95},
+    )
+    yes = await inbox.handle_message(_msg("Yes... duh", message_id=8601))
+    assert calls, "gpt-4o must see Yes... duh with full thread"
+    payload = __import__("json").loads(calls[0]["messages"][1]["content"])
+    assert payload["user_message"] == "Yes... duh"
+    assert payload.get("candidates_are_live_pending") is True or payload.get(
+        "candidates"
+    )
+    assert yes.grabbed is True, yes.reply
+    assert "Land" in yes.reply
+    assert "2021" in yes.reply
+    assert "La La Land" not in yes.reply
+    assert CONTEXT_CLUE_CLARIFY not in yes.reply
+    assert "Any year, actor, or other clue" not in yes.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 688271
+
+    # Bare "yes" with the same pending shape (reset) also queues Land.
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[dict(option)],
+        media_kind="movie",
+        query="Land",
+        created_message_id=8602,
+        last_bot_reply="Did you mean Land (2021)?",
+    )
+    inbox.memory.set_subject(
+        -1001, "Land", media_kind="movie", offered=[dict(option)]
+    )
+    pipeline.overseerr_queue.clear()
+    overseerr_requests.clear()
+    bare = await inbox.handle_message(_msg("yes", message_id=8603))
+    assert bare.grabbed is True, bare.reply
+    assert "Land" in bare.reply
+    assert "2021" in bare.reply
+    assert "La La Land" not in bare.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 688271
+
+
+@pytest.mark.asyncio
+async def test_inbox_land_thread_bare_land_and_lookalike_not_clue_template(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Bare 'Land' and 'Name a few that look like Land' must not clue-fish.
+
+    gpt-4o sees the full thread; catalog exact/prefix keeps Land ≠ La La Land.
+    Canned 'Any year, actor, or other clue?' / send-link are never the reply.
+    """
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.intent import CONTEXT_CLUE_CLARIFY
+
+    land = {
+        "title": "Land",
+        "year": 2021,
+        "tmdbId": 688271,
+        "mediaId": 688271,
+        "mediaType": "movie",
+    }
+    la_la = {
+        "title": "La La Land",
+        "year": 2016,
+        "tmdbId": 313369,
+        "mediaId": 313369,
+        "mediaType": "movie",
+    }
+    cop = {
+        "title": "Cop Land",
+        "year": 1997,
+        "tmdbId": 9470,
+        "mediaId": 9470,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower().strip()
+        if q == "land" or "688271" in q:
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "results": [la_la, land, cop],
+            }
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    # Model wrongly clue-fishes on bare Land — inbox/parser must still resolve.
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": CONTEXT_CLUE_CLARIFY,
+            "confidence": 0.4,
+        },
+    )
+    first = await inbox.handle_message(_msg("Land", message_id=8700))
+    assert calls, "gpt-4o must see bare Land"
+    payload = __import__("json").loads(calls[0]["messages"][1]["content"])
+    assert payload["user_message"] == "Land"
+    assert first.reply != CONTEXT_CLUE_CLARIFY
+    assert "Any year, actor, or other clue" not in first.reply
+    assert "Send an IMDb" not in first.reply
+    assert "send the title if you know it" not in first.reply.lower()
+    assert "La La Land" not in first.reply
+    assert "Cop Land" not in first.reply
+    assert "Land" in first.reply
+    assert first.grabbed is True or "Did you mean" in first.reply or "Queued" in first.reply
+
+    # Follow-up look-alike ask — still no clue template; model + history for Land.
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": CONTEXT_CLUE_CLARIFY,
+            "confidence": 0.35,
+        },
+    )
+    # Clear live pending so this matches a canned-template-only bot turn.
+    inbox.pending.clear()
+    look = await inbox.handle_message(
+        _msg("Name a few that look like Land", message_id=8701)
+    )
+    assert look.reply != CONTEXT_CLUE_CLARIFY
+    assert "Any year, actor, or other clue" not in look.reply
+    assert "Send an IMDb" not in look.reply
+    assert "La La Land" not in look.reply or "Land (2021)" in look.reply
+    assert "Land" in look.reply or look.grabbed
+
+
+@pytest.mark.asyncio
+async def test_inbox_yes_duh_model_search_la_la_still_queues_pending_land(
+    inbox: TelegramInbox, monkeypatch
+):
+    """If the model invents La La Land on confirm, pending Land (2021) still wins."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    land = {
+        "title": "Land",
+        "year": 2021,
+        "tmdbId": 688271,
+        "mediaId": 688271,
+        "mediaType": "movie",
+    }
+    la_la = {
+        "title": "La La Land",
+        "year": 2016,
+        "tmdbId": 313369,
+        "mediaId": 313369,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower().strip()
+        if "la la" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [la_la]}
+        if q == "land" or "688271" in q:
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "results": [la_la, land],
+            }
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    option = dict(land)
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[option],
+        media_kind="movie",
+        query="Land",
+        created_message_id=8800,
+        last_bot_reply="Did you mean Land (2021)?",
+    )
+    inbox.memory.set_subject(
+        -1001, "Land", media_kind="movie", offered=[option]
+    )
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean Land (2021)?",
+        search_title="Land",
+        media_kind="movie",
+        offered=[option],
+    )
+
+    pipeline.overseerr_queue.clear()
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "La La Land",
+            "year": 2016,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    result = await inbox.handle_message(_msg("Yes... duh", message_id=8801))
+    assert result.grabbed is True, result.reply
+    assert "Land" in result.reply
+    assert "2021" in result.reply
+    assert "La La Land" not in result.reply
