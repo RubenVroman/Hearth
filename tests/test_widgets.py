@@ -57,6 +57,10 @@ def test_command_center_includes_info_overlay(client):
     assert "emptyMediaMarkup" in js.text
     assert "mediaStatusBanner" in js.text
     assert "contentEmpty" in js.text
+    assert "activeMediaItem" in js.text
+    assert "showLocalMediaOverlay" in js.text
+    assert "data-media-id=" in js.text
+    assert "playActiveInInfuse(playBtn.getAttribute" in js.text
     assert "setRefreshInterval" in js.text
     assert ".info-infuse-btn" in css.text
     assert ".info-media-card.is-selectable" in css.text

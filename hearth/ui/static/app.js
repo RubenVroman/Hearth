@@ -660,14 +660,26 @@ function cycleMedia(delta) {
   return focusMediaById(next.id, { reveal: true });
 }
 
-async function playActiveInInfuse() {
+async function playActiveInInfuse(mediaId) {
   const visual = pickVisualOverlay(state.widgets);
-  if (!visual || visual.kind !== "media") return;
-  const item = (visual.data && visual.data.item) || mediaItemsOf(visual)[0];
-  if (!item || !item.title) {
+  if (!visual || visual.kind !== "media") {
     appendLog("system", "Nothing to open in Infuse.");
     return;
   }
+  const item = activeMediaItem(visual, mediaId);
+  if (!item || !item.title) {
+    appendLog("system", "Nothing to open in Infuse.");
+    showLocalMediaOverlay({
+      title: visual.title || "Play",
+      status: "error",
+      body: "No playable title is selected.",
+      detail: "Pick a card, then try Open in Infuse again.",
+      data: { ...(visual.data || {}), pick: Boolean((visual.data || {}).pick) },
+    });
+    return;
+  }
+  // Keep the focused card in sync before the round-trip remounts the overlay.
+  if (item.id) focusMediaById(item.id, { reveal: true });
   const args = { query: String(item.title) };
   if (item.tmdbId != null && item.tmdbId !== "") args.tmdbId = Number(item.tmdbId);
   if (item.ratingKey) args.ratingKey = String(item.ratingKey);
@@ -689,14 +701,101 @@ async function playActiveInInfuse() {
       appendLog("system", (data && data.error) || "Infuse play failed.");
     }
     applyWidgetPayload(out);
-    refresh();
+    // If the tool returned no visual (miss / misbind), show a clear non-empty error glass.
+    const visualAfter = pickVisualOverlay(state.widgets);
+    if (!visualAfter || visualAfter.kind !== "media") {
+      const localItem = { ...item, pending: true, id: item.id || mediaItemKey(item) };
+      showLocalMediaOverlay({
+        title: item.title,
+        status: "error",
+        body: (data && (data.error || data.speak)) || "Could not open that title in Infuse.",
+        detail: "Try another title, or say play again.",
+        data: {
+          item: localItem,
+          items: [localItem],
+          active_id: localItem.id,
+          presentation: "carousel",
+          tool: "infuse_play",
+        },
+      });
+    } else {
+      refresh();
+    }
   } catch (err) {
     appendLog("system", `Infuse play failed: ${err.message}`);
     if (btn) {
       btn.disabled = false;
       btn.textContent = "Open in Infuse";
     }
+    showLocalMediaOverlay({
+      title: item.title || visual.title || "Play",
+      status: "error",
+      body: `Infuse play failed: ${err.message}`,
+      detail: "Check Apple TV / Infuse, then try again.",
+      data: {
+        ...(visual.data || {}),
+        item: { ...item, id: item.id || mediaItemKey(item) },
+        active_id: item.id || mediaItemKey(item),
+      },
+    });
   }
+}
+
+/**
+ * Client-only media glass when a play round-trip leaves no server widget.
+ * Stays until dismiss / next real media payload — never a blank popup.
+ */
+function showLocalMediaOverlay({ title, status, body, detail, data }) {
+  const items = Array.isArray(data && data.items) ? data.items : [];
+  const item = (data && data.item) || items[0] || { title: title || "Play" };
+  const widget = {
+    id: "media",
+    kind: "media",
+    title: title || item.title || "Play",
+    status: status || "error",
+    body: body || "",
+    detail: detail || "",
+    data: {
+      presentation: "carousel",
+      tool: (data && data.tool) || "infuse_play",
+      item,
+      items: items.length ? items : item.title ? [item] : [],
+      active_id: (data && data.active_id) || item.id || mediaItemKey(item),
+      ...(data || {}),
+    },
+    context: { relevant: true, active_id: (data && data.active_id) || item.id || "" },
+    dismissible: true,
+    sticky: false,
+    updated_at: new Date().toISOString(),
+  };
+  state.widgets = [...state.widgets.filter((w) => w.id !== "media"), widget];
+  openInfoOverlay(widget);
+}
+
+/**
+ * Resolve the focused / requested media card for Infuse play.
+ * Prefer explicit mediaId → active_id → data.item → first stack card.
+ */
+function activeMediaItem(visual, mediaId) {
+  if (!visual || visual.kind !== "media") return null;
+  const items = mediaItemsOf(visual);
+  const wanted = mediaId != null && String(mediaId) !== "" ? String(mediaId) : "";
+  if (wanted) {
+    const hit = items.find((row) => String(row.id || mediaItemKey(row)) === wanted);
+    if (hit) return hit;
+  }
+  const activeId = String(
+    (visual.context && visual.context.active_id) || (visual.data && visual.data.active_id) || ""
+  );
+  if (activeId) {
+    const hit = items.find((row) => String(row.id || mediaItemKey(row)) === activeId);
+    if (hit) return hit;
+  }
+  const dataItem = visual.data && visual.data.item;
+  if (dataItem && dataItem.title) {
+    return { ...dataItem, id: dataItem.id || mediaItemKey(dataItem) };
+  }
+  return items[0] || null;
 }
 
 async function browseGenreCategory(genre, { mediaType = "movie" } = {}) {
@@ -955,9 +1054,10 @@ function mediaCardMarkup(
     }
     const playable = !item.skeleton && (item.title || item.tmdbId || item.ratingKey);
     if (playable) {
+      const playId = escapeHtml(String(item.id || mediaItemKey(item)));
       bits.push(
         `<div class="info-media-actions">
-        <button type="button" class="info-infuse-btn" data-infuse-play="1">
+        <button type="button" class="info-infuse-btn" data-infuse-play="1" data-media-id="${playId}">
           Open in Infuse
         </button>
       </div>`
@@ -1444,7 +1544,7 @@ function bindInfoOverlay() {
       ev.preventDefault();
       ev.stopPropagation();
       pinFromUser();
-      playActiveInInfuse();
+      playActiveInInfuse(playBtn.getAttribute("data-media-id") || "");
       return;
     }
     const nav = target.closest("[data-media-nav]");
