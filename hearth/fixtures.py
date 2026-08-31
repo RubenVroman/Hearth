@@ -600,6 +600,27 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
         "year": 2025,
         "imdbId": "tt32000101",
     },
+    {
+        "id": 688271,
+        "mediaType": "movie",
+        "title": "Land",
+        "year": 2021,
+        "imdbId": "tt10320310",
+    },
+    {
+        "id": 228150,
+        "mediaType": "movie",
+        "title": "Wild",
+        "year": 2014,
+        "imdbId": "tt2305051",
+    },
+    {
+        "id": 38050,
+        "mediaType": "movie",
+        "title": "Eat Pray Love",
+        "year": 2010,
+        "imdbId": "tt0879870",
+    },
 ]
 
 

@@ -12,6 +12,7 @@ from hearth.memory.redact import redact
 from hearth.telegram.intent import (
     MAX_BATCH,
     MAX_CANDIDATES,
+    CONTEXT_CLUE_CLARIFY,
     SOFT_CONTEXT_CLARIFY,
     IntentDecision,
     clarify_wants_numbered_list,
@@ -37,6 +38,7 @@ from hearth.telegram.parse import (
 from hearth.telegram.catalog import (
     CatalogHit,
     catalog_search_title,
+    catalog_seed_matches_title,
     hit_to_parsed,
     resolve_parsed,
     resolve_title,
@@ -241,18 +243,24 @@ class TelegramInbox:
                         confidence=intent.confidence,
                         source=intent.source,
                         media_kind=intent.media_kind,
+                        people=list(intent.people),
+                        year=intent.year,
+                        search_title=intent.search_title,
                     ),
                     pending,
                 )
-            # New ask / reject of the on-screen offer — drop sticky list now.
+            # Drop sticky wrong options. Do NOT reject pending.query when the
+            # model is refining the same title with actor/year clues
+            # ("Land with robin wright" after a bad Land menu).
             rejected_now = self._titles_from_options(pending.options)
-            if pending.query:
+            same_title = titles_match(pending.query, intent.search_title)
+            if pending.query and not same_title:
                 rejected_now.append(pending.query)
             self.memory.remember_rejected(
                 chat_id,
                 rejected_now,
                 clear_offered=True,
-                clear_subject=True,
+                clear_subject=not same_title,
             )
             self.pending.pop(chat_id, None)
             return intent, None
@@ -303,6 +311,9 @@ class TelegramInbox:
         Actor clauses are stripped from the query; the model still sees the
         full user text (actor clues). Plot/reject sentences skip pre-search
         so Dutch plots never become Overseerr queries.
+
+        Only exact / franchise-prefix rows become candidates — never substring
+        hits like La La Land for ``Land`` or The Wild Robot for ``Wild``.
         """
         raw = (view.text or "").strip()
         if not looks_like_concrete_title(raw):
@@ -314,6 +325,10 @@ class TelegramInbox:
             seed = catalog_search_title(raw) or raw
         if not seed:
             return []
+        # Always search the cast-stripped seed (never the raw "with Actor" blob).
+        # Exact/prefix filtering below drops La La Land for Land and Wild Robot
+        # for a bare Wild seed; title+person blobs with no "with" still go to
+        # gpt-4o when Overseerr has no exact seed match.
         try:
             hits = await resolve_title(
                 seed,
@@ -328,21 +343,16 @@ class TelegramInbox:
             log.info("catalog-in-loop search failed: %s", redact(str(exc)))
             return []
         rows = self._dedupe_choices([h.as_dict() for h in hits])
-        seed_norm = normalize_title(seed)
         grounded = [
             row
             for row in rows
-            if titles_match(str(row.get("title") or ""), seed)
-            or seed_norm in normalize_title(str(row.get("title") or ""))
-            or normalize_title(str(row.get("title") or "")) in seed_norm
+            if catalog_seed_matches_title(seed, str(row.get("title") or ""))
         ]
-        rows = (grounded or rows)[:MAX_CANDIDATES]
+        rows = grounded[:MAX_CANDIDATES]
         rejected_norm = {
             normalize_title(t) for t in (rejected_titles or []) if str(t).strip()
         }
         if rejected_norm:
-            # Keep rows the user is naming again (re-queue / same title ask).
-            # Still drop rejects for plot/recommend turns where seed is unrelated.
             kept: list[dict[str, Any]] = []
             for row in rows:
                 title_n = normalize_title(str(row.get("title") or ""))
@@ -351,7 +361,7 @@ class TelegramInbox:
                 )
                 if rejected_hit and not (
                     titles_match(str(row.get("title") or ""), raw)
-                    or (seed_norm and (seed_norm in title_n or title_n in seed_norm))
+                    or catalog_seed_matches_title(seed, str(row.get("title") or ""))
                 ):
                     continue
                 kept.append(row)
@@ -646,6 +656,8 @@ class TelegramInbox:
 
         # Live pending options are the pick targets. Prefer them over a fresh
         # catalog search so confirm/reject of the on-screen guess stays grounded.
+        # Actor/year refinements still see the sticky list; the model returns a
+        # new search_title and reconcile drops non-matching options.
         candidates_are_pending = bool(pending is not None and pending.options)
         if candidates_are_pending:
             candidates_for_model: list[dict[str, Any]] | None = list(pending.options)
@@ -782,14 +794,17 @@ class TelegramInbox:
                     handled=True,
                     reply=(
                         SOFT_CONTEXT_CLARIFY
-                        if (
-                            looks_like_recommend_ask(view.text)
-                            or pending is not None
-                            or self.memory.has_history(view.chat_id)
-                        )
+                        if looks_like_recommend_ask(view.text)
                         else (
-                            "Which movie or series did you mean? "
-                            "Send the title if you know it."
+                            CONTEXT_CLUE_CLARIFY
+                            if (
+                                pending is not None
+                                or self.memory.has_history(view.chat_id)
+                            )
+                            else (
+                                "Which movie or series did you mean? "
+                                "Send the title if you know it."
+                            )
                         )
                     ),
                 )
@@ -852,28 +867,34 @@ class TelegramInbox:
                 return InboxResult(handled=True, reply=reply)
             question = intent.clarify_question or (
                 SOFT_CONTEXT_CLARIFY
-                if (
-                    looks_like_recommend_ask(view.text)
-                    or self.memory.has_history(view.chat_id)
+                if looks_like_recommend_ask(view.text)
+                else (
+                    CONTEXT_CLUE_CLARIFY
+                    if self.memory.has_history(view.chat_id)
+                    else "Which movie or series did you mean? Send the title if you know it."
                 )
-                else "Which movie or series did you mean? Send the title if you know it."
             )
             # Never emit list-less "reply 1–N" / "1–1".
             if clarify_wants_numbered_list(question):
                 question = (
                     SOFT_CONTEXT_CLARIFY
-                    if (
-                        looks_like_recommend_ask(view.text)
-                        or self.memory.has_history(view.chat_id)
+                    if looks_like_recommend_ask(view.text)
+                    else (
+                        CONTEXT_CLUE_CLARIFY
+                        if self.memory.has_history(view.chat_id)
+                        else "Which movie or series did you mean? Send the title if you know it."
                     )
-                    else "Which movie or series did you mean? Send the title if you know it."
                 )
-            # Never demand a title when history already has one.
+            # Never demand a title when history already has one / plot clue given.
             if "send the title if you know it" in question.lower() and (
                 looks_like_recommend_ask(view.text)
                 or self.memory.has_history(view.chat_id)
             ):
-                question = SOFT_CONTEXT_CLARIFY
+                question = (
+                    SOFT_CONTEXT_CLARIFY
+                    if looks_like_recommend_ask(view.text)
+                    else CONTEXT_CLUE_CLARIFY
+                )
             # Never re-stick a rejected 1–N list after a clarify pivot.
             if pending is None:
                 self.pending.pop(view.chat_id, None)
@@ -939,8 +960,60 @@ class TelegramInbox:
                     query=intent.search_title,
                     media_kind_hint=media_kind,
                 )
-            # Actor/cast clauses are clues for the model — strip from Overseerr query.
+            # Actor/year clues → resolve the MODEL's title strictly; never list
+            # substring hits (Wild Robot for Wild + Reese Witherspoon).
             search_title = catalog_search_title(intent.search_title) or intent.search_title
+            strict = bool(intent.people) or intent.year is not None
+            if strict:
+                try:
+                    resolved = await resolve_title(
+                        search_title,
+                        year=intent.year,
+                        media_kind=media_kind if media_kind in {"movie", "tv"} else "",
+                        strict=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.info("strict catalog resolve failed: %s", redact(str(exc)))
+                    resolved = []
+                exact_rows = self._dedupe_choices([h.as_dict() for h in resolved])
+                exact_rows = [
+                    row
+                    for row in exact_rows
+                    if catalog_seed_matches_title(
+                        search_title, str(row.get("title") or "")
+                    )
+                ]
+                if len(exact_rows) == 1 or (
+                    exact_rows and self._choices_are_indistinguishable(exact_rows)
+                ):
+                    return await self._grab_catalog_row(
+                        view,
+                        exact_rows[0],
+                        query=search_title,
+                        media_kind_hint=media_kind,
+                    )
+                if len(exact_rows) > 1:
+                    reply = format_ambiguous(search_title, exact_rows)
+                    kind = str(exact_rows[0].get("mediaType") or media_kind or "movie")
+                    self._remember_pending(
+                        view,
+                        options=exact_rows,
+                        media_kind=kind if kind in {"movie", "tv"} else "movie",
+                        query=search_title,
+                        reply=reply,
+                    )
+                    return InboxResult(handled=True, reply=reply)
+                # Model already named title (+ year/people) — catalog miss is not
+                # "unknown movie". Guess-confirm so we never 404 after resolving.
+                return self._ask_guess_confirm(
+                    view,
+                    {
+                        "title": search_title,
+                        "year": intent.year,
+                        "mediaType": media_kind if media_kind in {"movie", "tv"} else "movie",
+                    },
+                    query=search_title,
+                )
             self.memory.set_subject(
                 view.chat_id,
                 search_title,
@@ -956,11 +1029,14 @@ class TelegramInbox:
                 reason="intent_search",
             )
             self.pending.pop(view.chat_id, None)
-            return await self._resolve_and_grab(
+            result = await self._resolve_and_grab(
                 view,
                 synthetic,
                 select_all=intent.select_all,
             )
+            # Model named title+year/people already handled above. Bare title
+            # catalog miss still uses the classic not-found reply.
+            return result
         return None
 
     def _ask_guess_confirm(

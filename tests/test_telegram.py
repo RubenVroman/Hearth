@@ -3249,3 +3249,446 @@ def test_parse_model_json_never_empty_title_when_candidates_live():
         ).lower()
     else:
         assert parsed.search_title == "Pandorum"
+
+
+# --- gpt-4o whole-message (actor / plot / year) — live Movies & Series bugs ---
+
+
+def test_catalog_seed_matches_rejects_substring_titles():
+    from hearth.telegram.catalog import catalog_seed_matches_title
+
+    assert catalog_seed_matches_title("Land", "Land")
+    assert not catalog_seed_matches_title("Land", "La La Land")
+    assert not catalog_seed_matches_title("Land", "Cop Land")
+    assert not catalog_seed_matches_title("Wild", "The Wild Robot")
+    assert not catalog_seed_matches_title("Wild", "Wild Awakening")
+    assert catalog_seed_matches_title("Wild", "Wild")
+    assert catalog_seed_matches_title(
+        "Harry Potter", "Harry Potter and the Chamber of Secrets"
+    )
+
+
+def test_looks_like_concrete_title_rejects_plot_shell():
+    from hearth.telegram.intent import looks_like_concrete_title, search_title_grounded
+
+    nose = "That movie with the guy with that weird nose"
+    assert not looks_like_concrete_title(nose)
+    assert search_title_grounded("Cyrano", user_message=nose, candidates=None)
+
+
+def test_parse_model_json_plot_clue_not_vibe_template():
+    from hearth.telegram.intent import CONTEXT_CLUE_CLARIFY, SOFT_CONTEXT_CLARIFY, _parse_model_json
+
+    nose = "That movie with the guy with that weird nose"
+    parsed = _parse_model_json(
+        '{"action":"clarify","clarify_question":'
+        '"Want another in that vibe? Any year, actor, or other clue?",'
+        '"confidence":0.5}',
+        candidate_count=0,
+        user_message=nose,
+        has_context=True,
+    )
+    assert parsed is not None
+    assert parsed.action == "clarify"
+    assert "want another in that vibe" not in (parsed.clarify_question or "").lower()
+    assert "send the title if you know it" not in (parsed.clarify_question or "").lower()
+    assert parsed.clarify_question == CONTEXT_CLUE_CLARIFY
+    assert parsed.clarify_question != SOFT_CONTEXT_CLARIFY
+
+
+@pytest.mark.asyncio
+async def test_inbox_land_with_robin_wright_not_la_la_land(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: actor clue ignored; La La Land / Cop Land listed for Land."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    land = {
+        "title": "Land",
+        "year": 2021,
+        "tmdbId": 688271,
+        "mediaId": 688271,
+        "mediaType": "movie",
+    }
+    la_la = {
+        "title": "La La Land",
+        "year": 2016,
+        "tmdbId": 313369,
+        "mediaId": 313369,
+        "mediaType": "movie",
+    }
+    cop = {
+        "title": "Cop Land",
+        "year": 1997,
+        "tmdbId": 9470,
+        "mediaId": 9470,
+        "mediaType": "movie",
+    }
+    soul = {
+        "title": "Soul Land",
+        "year": 2018,
+        "tmdbId": 90001,
+        "mediaId": 90001,
+        "mediaType": "tv",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        # Substring noise Overseerr would return for "Land".
+        if q.strip() == "land":
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "results": [soul, la_la, land, cop],
+            }
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Land",
+            "year": 2021,
+            "media_kind": "movie",
+            "people": ["Robin Wright"],
+            "confidence": 0.95,
+        },
+    )
+
+    # Sticky wrong menu from a prior fuzzy first-token path (live failure shape).
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[soul, la_la],
+        media_kind="movie",
+        query="Land",
+        created_message_id=8000,
+        last_bot_reply=(
+            "Which one for 'Land'? Reply 1-2:\n"
+            "1. Soul Land (2018)\n2. La La Land (2016)"
+        ),
+    )
+    inbox.memory.record_bot(
+        -1001,
+        "Which one for 'Land'? Reply 1-2:\n1. Soul Land (2018)\n2. La La Land (2016)",
+        search_title="Land",
+        media_kind="movie",
+        offered=[soul, la_la],
+    )
+
+    # Exact Land still wins a bare-title resolve (no La La Land / Cop Land).
+    from hearth.telegram.catalog import resolve_title
+
+    hits = await resolve_title("Land")
+    assert [h.title for h in hits] == ["Land"]
+    assert hits[0].year == 2021
+
+    result = await inbox.handle_message(
+        _msg("Land with robin wright", message_id=8002)
+    )
+    assert result.grabbed is True or "Did you mean" in result.reply or "Queued" in result.reply
+    assert "La La Land" not in result.reply
+    assert "Cop Land" not in result.reply
+    assert "Soul Land" not in result.reply
+    assert "Land" in result.reply
+    assert "2021" in result.reply
+    assert calls
+    import json as _json
+
+    payload = _json.loads(calls[-1]["messages"][1]["content"])
+    assert "robin" in payload["user_message"].lower()
+    # Sticky list may be visible to the model; it must still search Land+actor.
+    assert payload.get("user_message")
+
+
+@pytest.mark.asyncio
+async def test_inbox_weird_nose_plot_guess_confirm_not_vibe(
+    inbox: TelegramInbox, monkeypatch
+):
+    """After clarify-ask, plot/appearance clue → named guess, not vibe template."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "cyrano" in q:
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "results": [
+                    {
+                        "title": "Cyrano",
+                        "year": 2021,
+                        "tmdbId": 644479,
+                        "mediaId": 644479,
+                        "mediaType": "movie",
+                    }
+                ],
+            }
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    # Prior bot ask (empty title clarify) so history/context exists.
+    inbox.memory.record_bot(
+        -1001,
+        "Which movie or series did you mean? Send the title if you know it.",
+    )
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Cyrano",
+            "year": 2021,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("That movie with the guy with that weird nose", message_id=8100)
+    )
+    assert result.grabbed is False
+    assert "Did you mean" in result.reply
+    assert "Cyrano" in result.reply
+    assert "send the title if you know it" not in result.reply.lower()
+    assert "want another in that vibe" not in result.reply.lower()
+    assert "1–1" not in result.reply and "1-1" not in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_numbered_menu_always_lists_titles(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Never send a numbered prompt without the actual Title (year) rows."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.progress import format_ambiguous
+
+    heat_a = {"title": "Heat", "year": 1995, "tmdbId": 949, "mediaType": "movie"}
+    heat_b = {"title": "Heat", "year": 1986, "tmdbId": 10784, "mediaType": "movie"}
+
+    async def _search(query: str, *args, **kwargs):
+        if "heat" in (query or "").lower():
+            return {"mode": "mock", "service": "overseerr", "results": [heat_a, heat_b]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Heat",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    result = await inbox.handle_message(_msg("Heat", message_id=8200))
+    assert "1." in result.reply
+    assert "Heat" in result.reply
+    assert "1995" in result.reply or "1986" in result.reply
+    # 1-item pending is guess-confirm, never list-less 1–1.
+    one = format_ambiguous("Alien", [{"title": "Alien", "year": 1979}])
+    assert "Did you mean" in one
+    assert "1–1" not in one and "1-1" not in one
+
+
+@pytest.mark.asyncio
+async def test_inbox_wild_reese_witherspoon_not_wild_robot(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: first-token Wild → Wild Robot; actor ignored."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    wild = {
+        "title": "Wild",
+        "year": 2014,
+        "tmdbId": 228150,
+        "mediaId": 228150,
+        "mediaType": "movie",
+    }
+    awakening = {
+        "title": "Wild Awakening",
+        "year": 2016,
+        "tmdbId": 400001,
+        "mediaId": 400001,
+        "mediaType": "movie",
+    }
+    robot = {
+        "title": "The Wild Robot",
+        "year": 2024,
+        "tmdbId": 1184918,
+        "mediaId": 1184918,
+        "mediaType": "movie",
+    }
+
+    searches: list[str] = []
+
+    async def _search(query: str, *args, **kwargs):
+        searches.append(str(query))
+        q = (query or "").lower().strip()
+        if q == "wild":
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "results": [awakening, robot, wild],
+            }
+        if "reese" in q or "witherspoon" in q:
+            # Full-blob search must not be what pins the menu.
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "results": [awakening, robot],
+            }
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Wild",
+            "year": 2014,
+            "media_kind": "movie",
+            "people": ["Reese Witherspoon"],
+            "confidence": 0.96,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("Wild reese witherspoon", message_id=8300)
+    )
+    assert "Wild Robot" not in result.reply
+    assert "Wild Awakening" not in result.reply
+    assert "Wild" in result.reply
+    assert "2014" in result.reply
+    assert result.grabbed is True or "Did you mean" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_wild_reese_witherspoon_2014(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Year + actor must resolve to Wild (2014), not Wild Robot."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    wild = {
+        "title": "Wild",
+        "year": 2014,
+        "tmdbId": 228150,
+        "mediaId": 228150,
+        "mediaType": "movie",
+    }
+    robot = {
+        "title": "The Wild Robot",
+        "year": 2024,
+        "tmdbId": 1184918,
+        "mediaId": 1184918,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower().strip()
+        if q == "wild":
+            return {"mode": "mock", "service": "overseerr", "results": [robot, wild]}
+        return {"mode": "mock", "service": "overseerr", "results": [robot]}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Wild",
+            "year": 2014,
+            "media_kind": "movie",
+            "people": ["Reese Witherspoon"],
+            "confidence": 0.97,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("Wild reese witherspoon 2014", message_id=8301)
+    )
+    assert "Wild Robot" not in result.reply
+    assert "2014" in result.reply
+    assert "Wild" in result.reply
+    assert result.grabbed is True or "Did you mean" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_eat_pray_love_no_404_after_model_resolve(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: model named Eat Pray Love (2010) then catalog 404'd."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    eat = {
+        "title": "Eat Pray Love",
+        "year": 2010,
+        "tmdbId": 38050,
+        "mediaId": 38050,
+        "mediaType": "movie",
+    }
+
+    async def _search_miss(query: str, *args, **kwargs):
+        # Simulate Overseerr miss even for the canonical title.
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search_miss)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search_miss)
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Eat Pray Love",
+            "year": 2010,
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    result = await inbox.handle_message(_msg("Eat pray love", message_id=8400))
+    assert "Couldn't find" not in result.reply
+    assert "IMDb" not in result.reply and "TMDB" not in result.reply.upper().replace(
+        "TMDBID", ""
+    )
+    assert "Eat Pray Love" in result.reply or "Eat pray love" in result.reply
+    assert "2010" in result.reply
+    assert "Did you mean" in result.reply or result.grabbed is True
+
+    # When catalog does have it, unique grab (or confirm) — still no 404.
+    async def _search_hit(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "eat" in q and "pray" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [eat]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search_hit)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search_hit)
+    inbox.deduper.reset()
+    inbox.pending.clear()
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Eat Pray Love",
+            "year": 2010,
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    hit = await inbox.handle_message(_msg("Eat pray love", message_id=8401))
+    assert "Couldn't find" not in hit.reply
+    assert "Eat Pray Love" in hit.reply or hit.grabbed
