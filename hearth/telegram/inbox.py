@@ -797,6 +797,24 @@ class TelegramInbox:
                     view, pending.options[0], query=pending.query
                 )
             else:
+                if (
+                    not looks_like_recommend_ask(view.text)
+                    and self._last_bot_was_title_miss_or_guess(view.chat_id)
+                ):
+                    prior, prior_kind, prior_year = self._prior_titled_ask(view.chat_id)
+                    if prior:
+                        new_concrete = looks_like_concrete_title(
+                            view.text
+                        ) and not titles_match(prior, view.text)
+                        if not new_concrete:
+                            reused = await self._reuse_prior_title(
+                                view,
+                                prior,
+                                media_kind=prior_kind,
+                                year=prior_year,
+                            )
+                            if reused is not None:
+                                return reused
                 return InboxResult(
                     handled=True,
                     reply=(
@@ -872,6 +890,28 @@ class TelegramInbox:
                     reply=reply,
                 )
                 return InboxResult(handled=True, reply=reply)
+            # After a catalog miss / guess-confirm, follow-ups that do not name a
+            # NEW concrete title must reuse the prior titled ask — never clue-fish.
+            if (
+                pending is None
+                and not hits
+                and not looks_like_recommend_ask(view.text)
+                and self._last_bot_was_title_miss_or_guess(view.chat_id)
+            ):
+                prior, prior_kind, prior_year = self._prior_titled_ask(view.chat_id)
+                if prior:
+                    new_concrete = looks_like_concrete_title(
+                        view.text
+                    ) and not titles_match(prior, view.text)
+                    if not new_concrete:
+                        reused = await self._reuse_prior_title(
+                            view,
+                            prior,
+                            media_kind=prior_kind,
+                            year=prior_year,
+                        )
+                        if reused is not None:
+                            return reused
             question = intent.clarify_question or (
                 SOFT_CONTEXT_CLARIFY
                 if looks_like_recommend_ask(view.text)
@@ -967,60 +1007,10 @@ class TelegramInbox:
                     query=intent.search_title,
                     media_kind_hint=media_kind,
                 )
-            # Actor/year clues → resolve the MODEL's title strictly; never list
-            # substring hits (Wild Robot for Wild + Reese Witherspoon).
+            # Resolve the MODEL's title (exact/prefix only). Never list substring
+            # hits (Wild Robot for Wild + Reese Witherspoon). Catalog miss after
+            # the model named a title → confirm Title (year), never "send a link".
             search_title = catalog_search_title(intent.search_title) or intent.search_title
-            strict = bool(intent.people) or intent.year is not None
-            if strict:
-                try:
-                    resolved = await resolve_title(
-                        search_title,
-                        year=intent.year,
-                        media_kind=media_kind if media_kind in {"movie", "tv"} else "",
-                        strict=True,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.info("strict catalog resolve failed: %s", redact(str(exc)))
-                    resolved = []
-                exact_rows = self._dedupe_choices([h.as_dict() for h in resolved])
-                exact_rows = [
-                    row
-                    for row in exact_rows
-                    if catalog_seed_matches_title(
-                        search_title, str(row.get("title") or "")
-                    )
-                ]
-                if len(exact_rows) == 1 or (
-                    exact_rows and self._choices_are_indistinguishable(exact_rows)
-                ):
-                    return await self._grab_catalog_row(
-                        view,
-                        exact_rows[0],
-                        query=search_title,
-                        media_kind_hint=media_kind,
-                    )
-                if len(exact_rows) > 1:
-                    reply = format_ambiguous(search_title, exact_rows)
-                    kind = str(exact_rows[0].get("mediaType") or media_kind or "movie")
-                    self._remember_pending(
-                        view,
-                        options=exact_rows,
-                        media_kind=kind if kind in {"movie", "tv"} else "movie",
-                        query=search_title,
-                        reply=reply,
-                    )
-                    return InboxResult(handled=True, reply=reply)
-                # Model already named title (+ year/people) — catalog miss is not
-                # "unknown movie". Guess-confirm so we never 404 after resolving.
-                return self._ask_guess_confirm(
-                    view,
-                    {
-                        "title": search_title,
-                        "year": intent.year,
-                        "mediaType": media_kind if media_kind in {"movie", "tv"} else "movie",
-                    },
-                    query=search_title,
-                )
             self.memory.set_subject(
                 view.chat_id,
                 search_title,
@@ -1028,23 +1018,161 @@ class TelegramInbox:
                 clear_rejected=True,
                 clear_offered=True,
             )
-            synthetic = ParsedRequest(
-                kind="request",
-                media_kind=media_kind,  # type: ignore[arg-type]
-                title=search_title,
-                year=intent.year,
-                reason="intent_search",
-            )
-            self.pending.pop(view.chat_id, None)
-            result = await self._resolve_and_grab(
+            if intent.select_all:
+                synthetic = ParsedRequest(
+                    kind="request",
+                    media_kind=media_kind,  # type: ignore[arg-type]
+                    title=search_title,
+                    year=intent.year,
+                    reason="intent_search",
+                )
+                self.pending.pop(view.chat_id, None)
+                return await self._resolve_and_grab(
+                    view,
+                    synthetic,
+                    select_all=True,
+                )
+            try:
+                resolved = await resolve_title(
+                    search_title,
+                    year=intent.year,
+                    media_kind=media_kind if media_kind in {"movie", "tv"} else "",
+                    strict=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.info("model-title catalog resolve failed: %s", redact(str(exc)))
+                resolved = []
+            exact_rows = self._dedupe_choices([h.as_dict() for h in resolved])
+            exact_rows = [
+                row
+                for row in exact_rows
+                if catalog_seed_matches_title(
+                    search_title, str(row.get("title") or "")
+                )
+            ]
+            if len(exact_rows) == 1 or (
+                exact_rows and self._choices_are_indistinguishable(exact_rows)
+            ):
+                return await self._grab_catalog_row(
+                    view,
+                    exact_rows[0],
+                    query=search_title,
+                    media_kind_hint=media_kind,
+                )
+            if len(exact_rows) > 1:
+                reply = format_ambiguous(search_title, exact_rows)
+                kind = str(exact_rows[0].get("mediaType") or media_kind or "movie")
+                self._remember_pending(
+                    view,
+                    options=exact_rows,
+                    media_kind=kind if kind in {"movie", "tv"} else "movie",
+                    query=search_title,
+                    reply=reply,
+                )
+                return InboxResult(handled=True, reply=reply)
+            return self._ask_guess_confirm(
                 view,
-                synthetic,
-                select_all=intent.select_all,
+                {
+                    "title": search_title,
+                    "year": intent.year,
+                    "mediaType": media_kind if media_kind in {"movie", "tv"} else "movie",
+                },
+                query=search_title,
             )
-            # Model named title+year/people already handled above. Bare title
-            # catalog miss still uses the classic not-found reply.
-            return result
         return None
+
+    def _prior_titled_ask(self, chat_id: int) -> tuple[str, str, int | None]:
+        """Last model/user titled ask still in play (subject or history).
+
+        Used when a follow-up says 'find/match that' and the model clarifies
+        instead of reusing the already-stated title.
+        """
+        subject, kind = self.memory.subject(chat_id)
+        year: int | None = None
+        title = (subject or "").strip()
+        if title:
+            return title, kind if kind in {"movie", "tv"} else "", year
+        for turn in reversed(self.memory.history_blob(chat_id)):
+            st = str(turn.get("search_title") or "").strip()
+            if not st:
+                continue
+            mk = str(turn.get("media_kind") or "")
+            return st, mk if mk in {"movie", "tv"} else "", year
+        return "", "", None
+
+    def _last_bot_was_title_miss_or_guess(self, chat_id: int) -> bool:
+        """True when the last bot turn was a catalog miss or guess-confirm."""
+        history = self.memory.history_blob(chat_id)
+        for turn in reversed(history):
+            if turn.get("role") != "bot":
+                continue
+            text = str(turn.get("text") or "").lower()
+            if "couldn't find a match" in text:
+                return True
+            if "did you mean" in text:
+                return True
+            return False
+        return False
+
+    async def _reuse_prior_title(
+        self,
+        view: MessageView,
+        title: str,
+        *,
+        media_kind: str = "",
+        year: int | None = None,
+    ) -> InboxResult | None:
+        """Resolve a previously stated title after an anaphoric follow-up."""
+        search_title = catalog_search_title(title) or title
+        if not search_title:
+            return None
+        if not self.rate.allow():
+            return InboxResult(handled=True, reply=format_rate_limited())
+        kind = media_kind if media_kind in {"movie", "tv"} else ""
+        try:
+            resolved = await resolve_title(
+                search_title,
+                year=year,
+                media_kind=kind,
+                strict=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("prior-title reuse resolve failed: %s", redact(str(exc)))
+            resolved = []
+        rows = self._dedupe_choices([h.as_dict() for h in resolved])
+        rows = [
+            row
+            for row in rows
+            if catalog_seed_matches_title(search_title, str(row.get("title") or ""))
+        ]
+        if len(rows) == 1 or (rows and self._choices_are_indistinguishable(rows)):
+            return await self._grab_catalog_row(
+                view,
+                rows[0],
+                query=search_title,
+                media_kind_hint=kind,
+                skip_rate=True,
+            )
+        if len(rows) > 1:
+            reply = format_ambiguous(search_title, rows)
+            row_kind = str(rows[0].get("mediaType") or kind or "movie")
+            self._remember_pending(
+                view,
+                options=rows,
+                media_kind=row_kind if row_kind in {"movie", "tv"} else "movie",
+                query=search_title,
+                reply=reply,
+            )
+            return InboxResult(handled=True, reply=reply)
+        return self._ask_guess_confirm(
+            view,
+            {
+                "title": search_title,
+                "year": year,
+                "mediaType": kind or "movie",
+            },
+            query=search_title,
+        )
 
     def _ask_guess_confirm(
         self,

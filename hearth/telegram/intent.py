@@ -197,6 +197,12 @@ _SYSTEM = (
     "guess. "
     "When the user names a title (even prefixed with download/queue/get/bring/"
     "add), action=search that catalog title, or pick if it matches a candidate. "
+    "When the user asks you to find/match/confirm a previously stated title "
+    "('find a title that matches that', 'zoek die', 'that one', 'deze') and "
+    "recent_history / subject_title / pending_query already name one, "
+    "action=search THAT prior catalog title (+ year when known) — never "
+    "action=clarify with 'any year, actor, or other clue' when the title was "
+    "already given. "
     "Never clarify with 'send the title if you know it' when candidates, "
     "last_bot_reply, subject_title, pending_query, or recent_history already "
     "name a guessed/queued title, or when the user asked you to find/confirm/"
@@ -328,6 +334,13 @@ def looks_like_concrete_title(text: str) -> bool:
         return False
     # "another one" / "find one" are recommend asks — never treat as a title.
     if looks_like_recommend_ask(raw):
+        return False
+    # Anaphoric find/match follow-ups refer to a prior title — conversation hop.
+    if re.search(
+        r"\b(?:find|match|zoek|resolve|confirm)\b.{0,48}\b(?:that|it|this|die|dat|deze)\b",
+        raw,
+        re.I,
+    ):
         return False
     if _CATALOG_ID.search(raw) or _URLISH.search(raw):
         return False

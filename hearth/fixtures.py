@@ -721,6 +721,21 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
         "year": 2010,
         "imdbId": "tt0879870",
     },
+    {
+        "id": 116,
+        "mediaType": "movie",
+        "title": "The Squid and the Whale",
+        "year": 2005,
+        "imdbId": "tt0367089",
+    },
+    {
+        # Made-up but real-sounding catalog row for Telegram exact-title tests.
+        "id": 900116,
+        "mediaType": "movie",
+        "title": "Cedar Hollow Signal",
+        "year": 2019,
+        "imdbId": "tt90011601",
+    },
 ]
 
 
