@@ -463,6 +463,7 @@ MOCK_SONARR_LOOKUP: list[dict[str, Any]] = [
 MOCK_RADARR_DOWNLOADS: list[dict[str, Any]] = [
     {
         "id": 1,
+        "movieId": 101,
         "title": "Annihilation",
         "status": "downloading",
         "trackedDownloadState": "downloading",
@@ -471,12 +472,14 @@ MOCK_RADARR_DOWNLOADS: list[dict[str, Any]] = [
         "sizeleft": 2_000_000_000,
         "timeleft": "00:25:00",
         "indexer": "MockIndexer",
+        "downloadId": "mock-anni-1",
         "quality": {"quality": {"name": "Bluray-1080p"}},
         "downloadClient": "qBittorrent",
-        "movie": {"title": "Annihilation", "year": 2018, "tmdbId": 300668},
+        "movie": {"id": 101, "title": "Annihilation", "year": 2018, "tmdbId": 300668},
     },
     {
         "id": 2,
+        "movieId": 102,
         "title": "Dune: Part Two",
         "status": "queued",
         "trackedDownloadState": "downloading",
@@ -485,15 +488,18 @@ MOCK_RADARR_DOWNLOADS: list[dict[str, Any]] = [
         "sizeleft": 12_000_000_000,
         "timeleft": "00:00:00",
         "indexer": "MockIndexer",
+        "downloadId": "mock-dune-2",
         "quality": {"quality": {"name": "Bluray-2160p"}},
         "downloadClient": "qBittorrent",
-        "movie": {"title": "Dune: Part Two", "year": 2024, "tmdbId": 693134},
+        "movie": {"id": 102, "title": "Dune: Part Two", "year": 2024, "tmdbId": 693134},
     },
 ]
 
 MOCK_SONARR_DOWNLOADS: list[dict[str, Any]] = [
     {
         "id": 11,
+        "seriesId": 201,
+        "episodeId": 301,
         "title": "Severance - S02E03",
         "status": "downloading",
         "trackedDownloadState": "downloading",
@@ -502,11 +508,97 @@ MOCK_SONARR_DOWNLOADS: list[dict[str, Any]] = [
         "sizeleft": 1_000_000_000,
         "timeleft": "00:12:00",
         "indexer": "MockIndexer",
+        "downloadId": "mock-sev-11",
         "quality": {"quality": {"name": "WEBDL-1080p"}},
         "downloadClient": "qBittorrent",
-        "series": {"title": "Severance", "year": 2022, "tvdbId": 371980},
+        "series": {"id": 201, "title": "Severance", "year": 2022, "tvdbId": 371980},
+        "episode": {"id": 301, "title": "Who Is Alive?", "seasonNumber": 2, "episodeNumber": 3},
     },
 ]
+
+# Alternate indexer releases for retry-from-another-source (mock).
+MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
+    101: [
+        {
+            "guid": "anni-mock-indexer-dead",
+            "indexerId": 1,
+            "indexer": "MockIndexer",
+            "title": "Annihilation.2018.1080p.BluRay.MOCK",
+            "approved": True,
+            "score": 10,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 101,
+        },
+        {
+            "guid": "anni-alt-indexer-good",
+            "indexerId": 2,
+            "indexer": "AltIndexer",
+            "title": "Annihilation.2018.1080p.BluRay.ALT",
+            "approved": True,
+            "score": 40,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 101,
+        },
+        {
+            "guid": "anni-third-indexer",
+            "indexerId": 3,
+            "indexer": "ThirdIndexer",
+            "title": "Annihilation.2018.720p.WEB.THIRD",
+            "approved": True,
+            "score": 20,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 101,
+        },
+    ],
+    102: [
+        {
+            "guid": "dune-mock-indexer",
+            "indexerId": 1,
+            "indexer": "MockIndexer",
+            "title": "Dune.Part.Two.2024.2160p.MOCK",
+            "approved": True,
+            "score": 10,
+            "movieId": 102,
+        },
+        {
+            "guid": "dune-alt-indexer",
+            "indexerId": 2,
+            "indexer": "AltIndexer",
+            "title": "Dune.Part.Two.2024.2160p.ALT",
+            "approved": True,
+            "score": 50,
+            "movieId": 102,
+        },
+    ],
+}
+
+MOCK_SONARR_RELEASES: dict[int, list[dict[str, Any]]] = {
+    301: [
+        {
+            "guid": "sev-mock-indexer-dead",
+            "indexerId": 1,
+            "indexer": "MockIndexer",
+            "title": "Severance.S02E03.1080p.WEB.MOCK",
+            "approved": True,
+            "score": 10,
+            "episodeId": 301,
+            "seriesId": 201,
+        },
+        {
+            "guid": "sev-alt-indexer-good",
+            "indexerId": 2,
+            "indexer": "AltIndexer",
+            "title": "Severance.S02E03.1080p.WEB.ALT",
+            "approved": True,
+            "score": 40,
+            "episodeId": 301,
+            "seriesId": 201,
+        },
+    ],
+}
 
 MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
     {
@@ -648,6 +740,9 @@ class MockPipeline:
         self.overseerr_queue: list[dict[str, Any]] = []
         self.radarr_downloads: list[dict[str, Any]] | None = None
         self.sonarr_downloads: list[dict[str, Any]] | None = None
+        self.radarr_blocklist: list[dict[str, Any]] = []
+        self.sonarr_blocklist: list[dict[str, Any]] = []
+        self._download_seq = 1000
 
     def search_radarr(self, query: str) -> list[dict[str, Any]]:
         return _filter_title(MOCK_RADARR_LOOKUP, query)
@@ -703,6 +798,172 @@ class MockPipeline:
     def list_sonarr_downloads(self, title: str = "") -> list[dict[str, Any]]:
         source = self.sonarr_downloads if self.sonarr_downloads is not None else MOCK_SONARR_DOWNLOADS
         return _filter_download_title(source, title)
+
+    def _downloads_bucket(self, kind: str) -> list[dict[str, Any]]:
+        if kind == "radarr":
+            if self.radarr_downloads is None:
+                self.radarr_downloads = deepcopy(MOCK_RADARR_DOWNLOADS)
+            return self.radarr_downloads
+        if self.sonarr_downloads is None:
+            self.sonarr_downloads = deepcopy(MOCK_SONARR_DOWNLOADS)
+        return self.sonarr_downloads
+
+    def blocklist_queue_item(self, kind: str, queue_id: int) -> dict[str, Any] | None:
+        """Remove a queue row and remember it as blocklisted (mock *arr)."""
+        bucket = self._downloads_bucket(kind)
+        removed: dict[str, Any] | None = None
+        keep: list[dict[str, Any]] = []
+        for row in bucket:
+            try:
+                rid = int(row.get("id"))
+            except (TypeError, ValueError):
+                keep.append(row)
+                continue
+            if rid == int(queue_id):
+                removed = deepcopy(row)
+            else:
+                keep.append(row)
+        bucket[:] = keep
+        if removed is not None:
+            bl = self.radarr_blocklist if kind == "radarr" else self.sonarr_blocklist
+            bl.append(removed)
+        return removed
+
+    def list_releases(self, kind: str, item: dict[str, Any]) -> list[dict[str, Any]]:
+        if kind == "radarr":
+            movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+            movie_id = item.get("movieId") or movie.get("id")
+            try:
+                mid = int(movie_id) if movie_id is not None else None
+            except (TypeError, ValueError):
+                mid = None
+            rows = MOCK_RADARR_RELEASES.get(mid or -1, [])
+            blocked_indexers = {
+                str(b.get("indexer") or "").lower()
+                for b in self.radarr_blocklist
+                if (b.get("movieId") or (b.get("movie") or {}).get("id")) == mid
+            }
+            out = []
+            for row in deepcopy(rows):
+                indexer = str(row.get("indexer") or "").lower()
+                # Once MockIndexer was blocklisted for this movie, skip its releases.
+                if indexer and indexer in blocked_indexers:
+                    continue
+                out.append(row)
+            return out
+
+        episode = item.get("episode") if isinstance(item.get("episode"), dict) else {}
+        episode_id = item.get("episodeId") or episode.get("id")
+        try:
+            eid = int(episode_id) if episode_id is not None else None
+        except (TypeError, ValueError):
+            eid = None
+        rows = MOCK_SONARR_RELEASES.get(eid or -1, [])
+        blocked_indexers = {
+            str(b.get("indexer") or "").lower()
+            for b in self.sonarr_blocklist
+            if (b.get("episodeId") or (b.get("episode") or {}).get("id")) == eid
+        }
+        out = []
+        for row in deepcopy(rows):
+            indexer = str(row.get("indexer") or "").lower()
+            if indexer and indexer in blocked_indexers:
+                continue
+            out.append(row)
+        return out
+
+    def grab_release(self, kind: str, release: dict[str, Any]) -> dict[str, Any]:
+        """Enqueue a new mock download from an alternate release."""
+        bucket = self._downloads_bucket(kind)
+        self._download_seq += 1
+        new_id = self._download_seq
+        if kind == "radarr":
+            movie_id = release.get("movieId")
+            title = "Annihilation"
+            movie: dict[str, Any] = {
+                "id": movie_id,
+                "title": title,
+                "year": 2018,
+                "tmdbId": 300668,
+            }
+            for seed in MOCK_RADARR_DOWNLOADS:
+                if seed.get("movieId") == movie_id:
+                    movie = deepcopy(seed.get("movie") or movie)
+                    title = str(
+                        (seed.get("movie") or {}).get("title") or seed.get("title") or title
+                    )
+                    break
+            for blocked in reversed(self.radarr_blocklist):
+                if blocked.get("movieId") == movie_id or (blocked.get("movie") or {}).get(
+                    "id"
+                ) == movie_id:
+                    movie = deepcopy(blocked.get("movie") or movie)
+                    title = str(
+                        (blocked.get("movie") or {}).get("title")
+                        or blocked.get("title")
+                        or title
+                    )
+                    break
+            row = {
+                "id": new_id,
+                "movieId": movie_id,
+                "title": title,
+                "status": "downloading",
+                "trackedDownloadState": "downloading",
+                "trackedDownloadStatus": "ok",
+                "size": 8_000_000_000,
+                "sizeleft": 7_500_000_000,
+                "timeleft": "00:40:00",
+                "indexer": release.get("indexer") or "AltIndexer",
+                "downloadId": str(release.get("guid") or f"grab-{new_id}"),
+                "quality": {"quality": {"name": "Bluray-1080p"}},
+                "downloadClient": "qBittorrent",
+                "movie": movie,
+            }
+            bucket.append(row)
+            return {"ok": True, "queued": row}
+
+        episode_id = release.get("episodeId")
+        series_id = release.get("seriesId")
+        title = "Severance - S02E03"
+        series: dict[str, Any] = {
+            "id": series_id,
+            "title": "Severance",
+            "year": 2022,
+            "tvdbId": 371980,
+        }
+        episode: dict[str, Any] = {
+            "id": episode_id,
+            "title": "Who Is Alive?",
+            "seasonNumber": 2,
+            "episodeNumber": 3,
+        }
+        for blocked in reversed(self.sonarr_blocklist):
+            if blocked.get("episodeId") == episode_id:
+                series = deepcopy(blocked.get("series") or series)
+                episode = deepcopy(blocked.get("episode") or episode)
+                title = str(blocked.get("title") or title)
+                break
+        row = {
+            "id": new_id,
+            "seriesId": series_id,
+            "episodeId": episode_id,
+            "title": title,
+            "status": "downloading",
+            "trackedDownloadState": "downloading",
+            "trackedDownloadStatus": "ok",
+            "size": 2_500_000_000,
+            "sizeleft": 2_400_000_000,
+            "timeleft": "00:30:00",
+            "indexer": release.get("indexer") or "AltIndexer",
+            "downloadId": str(release.get("guid") or f"grab-{new_id}"),
+            "quality": {"quality": {"name": "WEBDL-1080p"}},
+            "downloadClient": "qBittorrent",
+            "series": series,
+            "episode": episode,
+        }
+        bucket.append(row)
+        return {"ok": True, "queued": row}
 
 
 def _filter_title(items: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:

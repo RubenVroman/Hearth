@@ -33,6 +33,7 @@ IntentAction = Literal[
     "pick",
     "pick_many",
     "search",
+    "retry",
 ]
 
 MAX_CANDIDATES = 12
@@ -209,7 +210,15 @@ _SYSTEM = (
     "(e.g. 'coolest sci-fi you can fins', 'old horror movie on a spaceship') — "
     "always action=search or pick so the bot can queue or ask yes/no. Ignore is "
     "only for pure chatter/emoji/meta with no media ask. "
-    "Actions: passthrough, ignore, clarify, pick, pick_many, search. "
+    "When the user says the current/recent download did not work, stalled, failed, "
+    "or asks to try another source / get a new one / retry that title "
+    "(NL+EN: 'this download didn't work', 'try another source', 'get a new one', "
+    "'probeer een andere bron', 'download werkt niet'), action=retry. "
+    "Set search_title to that SAME title when known (subject_title / recent_history / "
+    "queued title); leave search_title empty to retry the active tracked download. "
+    "Retry is NOT a new movie search and NOT Overseerr re-request — it blocklists the "
+    "bad release and grabs an alternate indexer for the same title. "
+    "Actions: passthrough, ignore, clarify, pick, pick_many, search, retry. "
     "search sets search_title (and year when known; select_all=true for whole "
     "series/trilogy). Catalog year wins later — still include your best year. "
     "When the user names people/actors, also set people to a JSON array of "
@@ -888,7 +897,15 @@ def _parse_model_json(
     if not isinstance(data, dict):
         return None
     action = str(data.get("action") or "passthrough").strip().lower()
-    if action not in {"passthrough", "ignore", "clarify", "pick", "pick_many", "search"}:
+    if action not in {
+        "passthrough",
+        "ignore",
+        "clarify",
+        "pick",
+        "pick_many",
+        "search",
+        "retry",
+    }:
         return None
     indices_raw = data.get("indices") or data.get("picks") or []
     indices: list[int] = []

@@ -83,6 +83,19 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from hearth.tools.websearch import reset_rate_limit
 
     reset_rate_limit()
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import radarr, sonarr
+
+    pipeline.radarr_queue.clear()
+    pipeline.sonarr_queue.clear()
+    pipeline.overseerr_queue.clear()
+    pipeline.radarr_downloads = None
+    pipeline.sonarr_downloads = None
+    pipeline.radarr_blocklist.clear()
+    pipeline.sonarr_blocklist.clear()
+    pipeline._download_seq = 1000
+    radarr.reset_retry_counts()
+    sonarr.reset_retry_counts()
     from hearth.telegram import telegram_inbox
 
     telegram_inbox.inbox.reset()

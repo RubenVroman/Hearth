@@ -375,6 +375,14 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
             return str(spoken)
         label = "Radarr" if name == "radarr_queue" else "Sonarr"
         return f"No {label} queue update{mock}."
+    if name in {"radarr_retry", "sonarr_retry"}:
+        spoken = data.get("speak")
+        if spoken:
+            return str(spoken)
+        title = data.get("title") or "that download"
+        if data.get("ok"):
+            return f"Retrying {title} from another source{mock}."
+        return f"Couldn't retry {title}{mock}."
     if name == "sonarr_search":
         titles = ", ".join(
             f"{r.get('title')} ({r.get('year')})" for r in (data.get("results") or [])[:4] if r.get("title")
@@ -670,6 +678,31 @@ _DOWNLOAD_PROGRESS_TITLE = re.compile(
     r")(.+?)(?:\s+downloading)?[.?!]*$",
     re.I,
 )
+_DOWNLOAD_RETRY = re.compile(
+    r"\b("
+    r"try\s+(?:it\s+)?(?:again|another\s+source)|"
+    r"another\s+source|"
+    r"(?:get|grab|download)\s+a\s+new\s+one|"
+    r"(?:this\s+)?download\s+(?:didn'?t|doesn'?t|won'?t|isn'?t)\s+work|"
+    r"download\s+(?:failed|stalled|stuck)|"
+    r"(?:is\s+)?stalled|"
+    r"retry|"
+    r"blocklist|"
+    r"andere\s+bron|"
+    r"download\s+werkt\s+niet|"
+    r"probeer\s+(?:opnieuw|een\s+andere)"
+    r")\b",
+    re.I,
+)
+_DOWNLOAD_RETRY_TITLE = re.compile(
+    r"(?:"
+    r"retry(?:\s+the)?(?:\s+download)?(?:\s+of|\s+for)?|"
+    r"try\s+another\s+source\s+(?:for|on)|"
+    r"(?:get|grab)\s+a\s+new\s+(?:one\s+)?(?:for|of)|"
+    r"download\s+(?:of|for)"
+    r")\s+(.+?)(?:\s+didn'?t\s+work)?[.?!]*$",
+    re.I,
+)
 _GRAB = re.compile(
     r"\b(download|grab|snatch|request|get me)\b"
     r"|\badd .{0,80}\b(to|in) (radarr|sonarr|overseerr|the library|the queue)\b",
@@ -748,6 +781,9 @@ def route_intent(text: str) -> dict[str, Any] | None:
     if remember:
         rest = remember.group(1).strip(" .?!")
         return {"tool": "memory_remember", "args": {"text": rest, "value": rest, "key": rest}}
+    retry = _download_retry_plan(raw)
+    if retry:
+        return retry
     progress = _download_progress_plan(raw)
     if progress:
         return progress
@@ -1030,6 +1066,70 @@ def _about_media_plan(raw: str) -> dict[str, Any] | None:
     if _MOVIE.search(raw) or _SERIES.search(raw) or _PLEX_ONLY.search(raw) or len(title.split()) <= 6:
         return {"tool": "plex_search", "args": {"query": title}}
     return None
+
+
+def _download_retry_plan(raw: str) -> dict[str, Any] | None:
+    """Route stalled/failed / try-another-source asks to radarr_retry / sonarr_retry."""
+    if not _DOWNLOAD_RETRY.search(raw):
+        return None
+    # Don't steal a fresh grab (“download the movie Dune”) unless it also
+    # clearly asks for another source / says the download failed.
+    if re.search(
+        r"\b(download|grab|snatch|get me)\b.+\b(movie|film|show|series|season)\b",
+        raw,
+        re.I,
+    ) and not re.search(
+        r"\b(another\s+source|new\s+one|didn'?t\s+work|failed|stalled|retry|stuck)\b",
+        raw,
+        re.I,
+    ):
+        return None
+
+    title = ""
+    match = _DOWNLOAD_RETRY_TITLE.search(raw)
+    if match:
+        title = _play_title_clean(match.group(1))
+    if not title:
+        # Prefer an explicit "for/on Title" clause over "this download didn't…".
+        named = re.search(
+            r"\b(?:for|on)\s+([A-Za-zÀ-ÿ0-9][\w'’.:\- ]{1,60})[.?!]*$",
+            raw,
+            re.I,
+        ) or re.search(
+            r"\bretry(?:\s+the)?(?:\s+download)?(?:\s+(?:of|for))?\s+(.+?)[.?!]*$",
+            raw,
+            re.I,
+        ) or re.search(
+            r"^(.+?)\s+(?:didn'?t|doesn'?t)\s+work\b",
+            raw,
+            re.I,
+        )
+        if named:
+            title = _play_title_clean(named.group(1))
+    title = re.sub(
+        r"\b(the )?(movie|film|show|series|episode|download|source|one|it|that|this)\b",
+        " ",
+        title,
+        flags=re.I,
+    )
+    title = re.sub(r"\s+", " ", title).strip(" .?!'\"")
+    if title.lower() in {
+        "",
+        "it",
+        "that",
+        "this",
+        "something",
+        "everything",
+        "anything",
+        "download",
+        "one",
+    }:
+        title = ""
+    if not title:
+        return None
+
+    tool = "sonarr_retry" if _SERIES.search(raw) and not _MOVIE.search(raw) else "radarr_retry"
+    return {"tool": tool, "args": {"query": title}}
 
 
 def _download_progress_plan(raw: str) -> dict[str, Any] | None:

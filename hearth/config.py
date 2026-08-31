@@ -113,6 +113,13 @@ class Settings(BaseSettings):
     sonarr_api_key: str = Field(default="", alias="SONARR_API_KEY")
     overseerr_url: str = Field(default="http://host.docker.internal:5055", alias="OVERSEERR_URL")
     overseerr_api_key: str = Field(default="", alias="OVERSEERR_API_KEY")
+    # Failed/stalled grab: blocklist + alternate *arr release (not Overseerr re-POST).
+    download_max_retries: int = Field(default=3, alias="HEARTH_DOWNLOAD_MAX_RETRIES")
+    # Zero-progress "downloading" for this long → treat as stalled (seconds).
+    download_stall_idle_seconds: float = Field(
+        default=20 * 60,
+        alias="HEARTH_DOWNLOAD_STALL_IDLE_SECONDS",
+    )
 
     docker_socket: str = Field(default="/var/run/docker.sock", alias="DOCKER_SOCKET")
 

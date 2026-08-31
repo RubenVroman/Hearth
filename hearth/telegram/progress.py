@@ -3,6 +3,9 @@
 Quiet policy: one early "started and healthy" ping once a download reaches
 a trustworthy mid-start percent, then silence until done / failed (or a manual
 status ask via radarr_queue / sonarr_queue elsewhere).
+
+When a watched grab stalls or fails, automatically blocklist the bad release
+and grab an alternate *arr source (capped) — with clear user feedback.
 """
 
 from __future__ import annotations
@@ -12,7 +15,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
-from hearth.tools.arr import radarr, sonarr
+from hearth.config import settings
+from hearth.tools.arr import download_is_unhealthy, radarr, sonarr
 
 log = logging.getLogger("hearth.telegram")
 
@@ -31,7 +35,11 @@ class TrackedGrab:
     year: int | None = None
     started_at: float = field(default_factory=time.monotonic)
     last_status: str = ""
+    last_percent: float | None = None
+    last_progress_at: float = field(default_factory=time.monotonic)
     announce_started: bool = False
+    announce_retrying: bool = False
+    retry_attempts: int = 0
     done: bool = False
 
 
@@ -57,6 +65,27 @@ def format_done(title: str) -> str:
 def format_failed(title: str, detail: str = "") -> str:
     bit = f" ({detail})" if detail else ""
     return f"{title} failed{bit}."
+
+
+def format_retrying(
+    title: str,
+    *,
+    indexer: str = "",
+    attempt: int = 0,
+    max_attempts: int = 0,
+) -> str:
+    source = f" via {indexer}" if indexer else ""
+    cap = f" (attempt {attempt}/{max_attempts})" if attempt and max_attempts else ""
+    return f"{title} stalled — trying another source{source}{cap}."
+
+
+def format_retry_exhausted(title: str, *, max_attempts: int = 0) -> str:
+    if max_attempts:
+        return (
+            f"{title} failed — ran out of alternate sources "
+            f"after {max_attempts} tries."
+        )
+    return f"{title} failed — ran out of alternate sources."
 
 
 def format_not_found(query: str) -> str:
@@ -152,6 +181,13 @@ def _trustworthy_start_percent(percent: float | None, *, threshold: float) -> bo
     return threshold <= percent < START_PERCENT_MAX
 
 
+def _stall_idle_seconds() -> float:
+    try:
+        return max(30.0, float(settings.download_stall_idle_seconds))
+    except (TypeError, ValueError):
+        return 20 * 60
+
+
 class ProgressTracker:
     def __init__(self) -> None:
         self._items: list[TrackedGrab] = []
@@ -170,9 +206,111 @@ class ProgressTracker:
             TrackedGrab(chat_id=chat_id, title=title, service=service, year=year)
         )
 
+    def active_title_for(self, chat_id: int) -> str:
+        """Most recent unfinished tracked title for this chat (retry subject)."""
+        for item in reversed(self._items):
+            if item.chat_id == chat_id and not item.done:
+                return item.title
+        return ""
+
+    def active_service_for(self, chat_id: int, title: str = "") -> str:
+        needle = (title or "").strip().lower()
+        for item in reversed(self._items):
+            if item.chat_id != chat_id or item.done:
+                continue
+            if not needle or item.title.lower() == needle or needle in item.title.lower():
+                return item.service
+        return ""
+
     @property
     def active(self) -> list[TrackedGrab]:
         return [item for item in self._items if not item.done]
+
+    def _note_progress(self, item: TrackedGrab, percent: float | None, now: float) -> None:
+        prev = item.last_percent
+        if percent is None:
+            return
+        if prev is None or abs(percent - prev) >= 0.5:
+            item.last_percent = percent
+            item.last_progress_at = now
+        else:
+            item.last_percent = percent
+
+    def _idle_stalled(self, item: TrackedGrab, *, now: float, stall_idle_s: float) -> bool:
+        """Zero/flat progress for long enough while still 'downloading'."""
+        if item.last_status not in {"downloading", "queued", "paused", "warning", "unknown"}:
+            return False
+        # Need at least one observation before declaring idle stall.
+        if not item.last_status:
+            return False
+        return (now - item.last_progress_at) >= stall_idle_s
+
+    async def _auto_retry(
+        self,
+        item: TrackedGrab,
+        send: Callable[[int, str], Awaitable[Any]],
+        *,
+        why: str,
+    ) -> bool:
+        """Try alternate source. Returns True when the grab is finished (exhausted/failed)."""
+        client = radarr if item.service == "radarr" else sonarr
+        try:
+            result = await client.retry_download(
+                item.title, force=False, reason=f"auto:{why}"
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("telegram auto-retry failed for %s", item.title)
+            await send(item.chat_id, format_failed(item.title, why))
+            item.done = True
+            return True
+
+        reason = str(result.get("reason") or "")
+        if result.get("ok") and reason == "retried":
+            item.retry_attempts = int(result.get("attempt") or item.retry_attempts + 1)
+            item.announce_retrying = True
+            item.announce_started = False
+            item.last_status = "downloading"
+            item.last_percent = None
+            item.last_progress_at = time.monotonic()
+            spoken = str(result.get("speak") or "").strip()
+            if spoken:
+                await send(item.chat_id, spoken)
+            else:
+                await send(
+                    item.chat_id,
+                    format_retrying(
+                        item.title,
+                        indexer=str(result.get("indexer") or ""),
+                        attempt=int(result.get("attempt") or 0),
+                        max_attempts=int(result.get("max_attempts") or 0),
+                    ),
+                )
+            return False
+
+        if reason == "exhausted":
+            await send(
+                item.chat_id,
+                str(result.get("speak") or "").strip()
+                or format_retry_exhausted(
+                    item.title, max_attempts=int(result.get("max_attempts") or 0)
+                ),
+            )
+            item.done = True
+            return True
+
+        if reason in {"no_alternate", "not_found", "error"}:
+            await send(
+                item.chat_id,
+                str(result.get("speak") or "").strip()
+                or format_failed(item.title, reason.replace("_", " ")),
+            )
+            item.done = True
+            return True
+
+        # Healthy / unexpected — fall back to a plain failure notice for failed/stalled.
+        await send(item.chat_id, format_failed(item.title, why))
+        item.done = True
+        return True
 
     async def poll_once(
         self,
@@ -180,8 +318,10 @@ class ProgressTracker:
         *,
         max_age_s: float = 6 * 3600,
         start_threshold: float = START_THRESHOLD,
+        stall_idle_s: float | None = None,
     ) -> None:
         now = time.monotonic()
+        idle_limit = float(stall_idle_s) if stall_idle_s is not None else _stall_idle_seconds()
         for item in list(self.active):
             if now - item.started_at > max_age_s:
                 item.done = True
@@ -195,18 +335,26 @@ class ProgressTracker:
             downloads = payload.get("downloads") or []
             if not downloads:
                 # Not in queue anymore — treat as imported / done after we had progress.
-                if item.announce_started or item.last_status:
+                if item.announce_started or item.last_status or item.announce_retrying:
                     await send(item.chat_id, format_done(item.title))
                     item.done = True
                 continue
             row = downloads[0]
             status = str(row.get("status") or "unknown").strip().lower()
             percent = _as_percent(row.get("percent"))
+            prev_status = item.last_status
             item.last_status = status
-            if status == "failed":
-                await send(item.chat_id, format_failed(item.title))
-                item.done = True
+            self._note_progress(item, percent, now)
+
+            unhealthy = download_is_unhealthy(row) or status in {"failed", "stalled"}
+            idle_stalled = (not unhealthy) and self._idle_stalled(
+                item, now=now, stall_idle_s=idle_limit
+            )
+            if unhealthy or idle_stalled:
+                why = status if unhealthy else "stalled"
+                await self._auto_retry(item, send, why=why)
                 continue
+
             if status == "completed":
                 # Imported (or *arr says completed) — announce done, never
                 # "downloading ~100%" even on first sighting.
@@ -218,8 +366,17 @@ class ProgressTracker:
                 continue
             # One early healthy-start ping at a trustworthy mid-start percent;
             # no later percent spam. Skip bogus near-100 / missing-byte first polls.
+            # After an auto-retry, allow one fresh start ping for the new source.
             if not item.announce_started and _trustworthy_start_percent(
                 percent, threshold=start_threshold
             ):
                 await send(item.chat_id, format_downloading(item.title, percent))
                 item.announce_started = True
+            elif (
+                item.announce_retrying
+                and prev_status in {"failed", "stalled", ""}
+                and status == "downloading"
+                and not item.announce_started
+            ):
+                # Retry just landed; stay quiet until real mid-start percent.
+                pass
