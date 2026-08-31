@@ -81,7 +81,7 @@ class TelegramBotClient:
         body: dict[str, Any] = {
             "timeout": max(0, min(int(timeout), 50)),
             "limit": max(1, min(int(limit), 100)),
-            "allowed_updates": ["message", "edited_message"],
+            "allowed_updates": ["message", "edited_message", "callback_query"],
         }
         if offset is not None:
             body["offset"] = int(offset)
@@ -93,6 +93,7 @@ class TelegramBotClient:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        reply_markup: dict[str, Any] | None = None,
         disable_notification: bool = True,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -103,10 +104,27 @@ class TelegramBotClient:
         }
         if reply_to_message_id is not None:
             body["reply_to_message_id"] = int(reply_to_message_id)
+        if reply_markup:
+            body["reply_markup"] = reply_markup
         data = await self._call("sendMessage", body)
         if not data.get("ok"):
             log.info("telegram send failed chat=%s err=%s", chat_id, data.get("error"))
         return data
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        *,
+        text: str = "",
+        show_alert: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "callback_query_id": str(callback_query_id),
+            "show_alert": show_alert,
+        }
+        if text:
+            body["text"] = text[:200]
+        return await self._call("answerCallbackQuery", body)
 
     async def delete_webhook(self) -> dict[str, Any]:
         """Ensure long-polling works (webhook would block getUpdates)."""

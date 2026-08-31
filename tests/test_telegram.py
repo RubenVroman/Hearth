@@ -15,6 +15,26 @@ from hearth.telegram.parse import (
 from hearth.telegram.safeguards import Deduper, RateLimiter, chat_allowed, user_allowed
 from hearth.telegram.service import TelegramInboxService
 
+async def _get_pending_via_callback(inbox: TelegramInbox, *, message_id: int = 1, chat_id: int = -1001, user_id: int = 42):
+    """Tap Get on the live pending offer (HITL queue)."""
+    pending = inbox.pending.get(chat_id)
+    assert pending is not None and pending.options, "expected a live offer"
+    row = pending.options[0]
+    tmdb = row.get("tmdbId") or row.get("mediaId")
+    assert tmdb not in (None, "")
+    kind = str(row.get("mediaType") or pending.media_kind or "movie")
+    if kind not in {"movie", "tv"}:
+        kind = "movie"
+    return await inbox.handle_callback(
+        {
+            "id": f"cb-{message_id}",
+            "data": f"q:{kind}:{int(tmdb)}",
+            "from": {"id": user_id},
+            "message": {"message_id": message_id, "chat": {"id": chat_id}},
+        }
+    )
+
+
 
 def _msg(
     text: str,
@@ -226,7 +246,21 @@ async def test_inbox_ignores_outside_allowlist(inbox: TelegramInbox):
 
 @pytest.mark.asyncio
 async def test_inbox_queues_movie_title(inbox: TelegramInbox):
-    result = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=11))
+    """Title (YYYY) offers Get — queue only after button tap."""
+    offer = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=11))
+    assert offer.grabbed is False
+    assert "Brutalist" in (offer.reply or "")
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    tmdb = pending.options[0].get("tmdbId") or pending.options[0].get("mediaId")
+    result = await inbox.handle_callback(
+        {
+            "id": "cb1",
+            "data": f"q:movie:{tmdb}",
+            "from": {"id": 42},
+            "message": {"message_id": 11, "chat": {"id": -1001}},
+        }
+    )
     assert result.grabbed is True
     assert "Queued The Brutalist" in result.reply
     assert "Overseerr" in result.reply
@@ -235,8 +269,21 @@ async def test_inbox_queues_movie_title(inbox: TelegramInbox):
 
 @pytest.mark.asyncio
 async def test_inbox_queues_tmdb_link(inbox: TelegramInbox):
-    result = await inbox.handle_message(
+    offer = await inbox.handle_message(
         _msg("https://www.themoviedb.org/movie/974950-the-brutalist", message_id=12)
+    )
+    assert offer.grabbed is False
+    assert "Brutalist" in (offer.reply or "")
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    tmdb = pending.options[0].get("tmdbId") or pending.options[0].get("mediaId")
+    result = await inbox.handle_callback(
+        {
+            "id": "cb2",
+            "data": f"q:movie:{tmdb}",
+            "from": {"id": 42},
+            "message": {"message_id": 12, "chat": {"id": -1001}},
+        }
     )
     assert result.grabbed is True
     assert "Brutalist" in result.reply
@@ -244,29 +291,53 @@ async def test_inbox_queues_tmdb_link(inbox: TelegramInbox):
 
 @pytest.mark.asyncio
 async def test_inbox_queues_show(inbox: TelegramInbox, monkeypatch):
-    _patch_openai_intent(
+    _patch_openai_tools(
         monkeypatch,
-        {
-            "action": "search",
-            "search_title": "Slow Horses",
-            "media_kind": "tv",
-            "year": 2022,
-            "confidence": 0.95,
-        },
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "search_title",
+                            "arguments": {
+                                "title": "Slow Horses",
+                                "media_type": "tv",
+                                "year": 2022,
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
     )
-    result = await inbox.handle_message(_msg("Slow Horses season 2", message_id=13))
+    offer = await inbox.handle_message(_msg("Slow Horses season 2", message_id=13))
+    assert offer.grabbed is False
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    row = pending.options[0]
+    tmdb = row.get("tmdbId") or row.get("mediaId")
+    kind = row.get("mediaType") or "tv"
+    result = await inbox.handle_callback(
+        {
+            "id": "cb3",
+            "data": f"q:{kind}:{tmdb}",
+            "from": {"id": 42},
+            "message": {"message_id": 13, "chat": {"id": -1001}},
+        }
+    )
     assert result.grabbed is True
     assert "Overseerr" in result.reply
     assert pipeline.overseerr_queue
     assert any(
-        (row.get("mediaType") or "") == "tv" for row in pipeline.overseerr_queue
+        (r.get("mediaType") or "") == "tv" for r in pipeline.overseerr_queue
     )
 
 
 @pytest.mark.asyncio
 async def test_inbox_dedup_same_message_and_title(inbox: TelegramInbox):
     first = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=20))
-    assert first.grabbed is True
+    assert first.handled is True
+    assert first.grabbed is False
     again = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=20))
     assert again.grabbed is False
     assert again.reply == ""
@@ -295,54 +366,72 @@ async def test_inbox_ignores_bot_outbound_loop(inbox: TelegramInbox):
 
 @pytest.mark.asyncio
 async def test_inbox_ambiguous_then_pick(inbox: TelegramInbox, monkeypatch):
-    # Force multiple fuzzy hits without an exact title match.
-    async def multi(_query: str):
-        return {
-            "mode": "mock",
-            "service": "overseerr",
-            "results": [
-                {"title": "Heat", "year": 1995, "tmdbId": 1, "mediaId": 1, "mediaType": "movie"},
-                {"title": "Heat", "year": 1986, "tmdbId": 2, "mediaId": 2, "mediaType": "movie"},
-                {"title": "Heat", "year": 2023, "tmdbId": 3, "mediaId": 3, "mediaType": "movie"},
-            ],
-        }
+    """Ambiguous list → Get button queues one id (not bare '2')."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
 
-    monkeypatch.setattr("hearth.telegram.inbox.overseerr.search", multi)
-    monkeypatch.setattr("hearth.telegram.catalog.overseerr.search", multi)
+    heat = [
+        {"title": "Heat", "year": 1995, "tmdbId": 949, "mediaId": 949, "mediaType": "movie"},
+        {"title": "Heat", "year": 1986, "tmdbId": 10001, "mediaId": 10001, "mediaType": "movie"},
+    ]
+
+    async def _search(query: str, *args, **kwargs):
+        return {"mode": "mock", "service": "overseerr", "results": list(heat)}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
     _patch_openai_intent(
         monkeypatch,
         {
             "action": "search",
             "search_title": "Heat",
             "media_kind": "movie",
-            "confidence": 0.95,
+            "confidence": 0.9,
         },
     )
-
     ask = await inbox.handle_message(_msg("Heat", message_id=30))
     assert ask.grabbed is False
-    assert "Which one" in ask.reply
-    assert "1." in ask.reply
-
-    pick = await inbox.handle_message(_msg("2", message_id=31))
+    assert inbox.pending.get(-1001) is not None
+    assert len(inbox.pending[-1001].options) >= 2
+    # Bare 2 does not queue.
+    no = await inbox.handle_message(_msg("2", message_id=31))
+    assert no.grabbed is False
+    # Get 2 via callback on second option.
+    row = inbox.pending[-1001].options[1]
+    tmdb = row.get("tmdbId") or row.get("mediaId")
+    pick = await inbox.handle_callback(
+        {
+            "id": "cb-heat",
+            "data": f"q:movie:{tmdb}",
+            "from": {"id": 42},
+            "message": {"message_id": 30, "chat": {"id": -1001}},
+        }
+    )
     assert pick.grabbed is True
-    assert "1986" in pick.reply or "Heat" in pick.reply
+    assert "Heat" in pick.reply
 
 
 @pytest.mark.asyncio
 async def test_inbox_already_in_download_queue(inbox: TelegramInbox):
     # Annihilation is in MOCK_RADARR_DOWNLOADS — say so instead of double-queueing.
-    result = await inbox.handle_message(_msg("Annihilation (2018)", message_id=39))
+    offer = await inbox.handle_message(_msg("Annihilation (2018)", message_id=39))
+    assert offer.grabbed is False
+    result = await _get_pending_via_callback(inbox, message_id=39)
     assert result.grabbed is False
     assert "already" in result.reply.lower()
 
 
 @pytest.mark.asyncio
 async def test_inbox_already_queued_says_so(inbox: TelegramInbox):
-    await inbox.handle_message(_msg("The Endless (2017)", message_id=40))
+    offer = await inbox.handle_message(_msg("The Endless (2017)", message_id=40))
+    assert offer.grabbed is False
+    first = await _get_pending_via_callback(inbox, message_id=40)
+    assert first.grabbed is True
     # New message id but clear title dedup so we exercise already-queued path.
     inbox.deduper.reset()
-    again = await inbox.handle_message(_msg("The Endless (2017)", message_id=41))
+    again_offer = await inbox.handle_message(_msg("The Endless (2017)", message_id=41))
+    assert again_offer.grabbed is False
+    again = await _get_pending_via_callback(inbox, message_id=41)
     assert again.grabbed is False
     assert "already" in again.reply.lower()
 
@@ -350,7 +439,9 @@ async def test_inbox_already_queued_says_so(inbox: TelegramInbox):
 @pytest.mark.asyncio
 async def test_inbox_user_allowlist(inbox: TelegramInbox, monkeypatch):
     monkeypatch.setattr(settings, "telegram_user_ids", "42")
-    ok = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=60, user_id=42))
+    offer = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=60, user_id=42))
+    assert offer.grabbed is False
+    ok = await _get_pending_via_callback(inbox, message_id=60, user_id=42)
     assert ok.grabbed is True
     inbox.deduper.reset()
     pipeline.overseerr_queue.clear()
@@ -444,51 +535,57 @@ def test_explicit_title_year_instant_helper():
 
 @pytest.mark.asyncio
 async def test_inbox_harry_potter_then_all_of_them(inbox: TelegramInbox, monkeypatch):
+    """Free-text 'all of them' must NOT queue (second brain killed)."""
     _patch_openai_intent(
         monkeypatch,
         {
             "action": "search",
             "search_title": "Harry Potter",
+            "search_titles": [
+                "Harry Potter and the Sorcerer's Stone",
+                "Harry Potter and the Chamber of Secrets",
+                "Harry Potter and the Prisoner of Azkaban",
+            ],
             "media_kind": "movie",
-            "confidence": 0.95,
+            "confidence": 0.9,
         },
     )
     ask = await inbox.handle_message(_msg("Harry Potter", message_id=100))
     assert ask.grabbed is False
-    assert "Which one" in ask.reply
-    assert "all of them" in ask.reply.lower()
     assert inbox.pending.get(-1001) is not None
-    assert len(inbox.pending[-1001].options) >= 3
-
+    assert "all of them" not in (ask.reply or "").lower() or "Get" in str(ask.reply_markup)
+    pipeline.overseerr_queue.clear()
     all_of = await inbox.handle_message(_msg("all of them", message_id=101))
-    assert all_of.grabbed is True
-    assert "Queued" in all_of.reply
-    assert len(pipeline.overseerr_queue) >= 3
-    assert all(
-        "Harry Potter" in str(row.get("title") or "") for row in pipeline.overseerr_queue
-    )
+    assert all_of.grabbed is False
+    assert "Queued" not in (all_of.reply or "")
+    assert len(pipeline.overseerr_queue) == 0
 
 
 @pytest.mark.asyncio
 async def test_inbox_followup_de_eerste_instant(inbox: TelegramInbox, monkeypatch):
+    """'de eerste' must NOT queue — buttons only."""
     _patch_openai_intent(
         monkeypatch,
         {
             "action": "search",
             "search_title": "Harry Potter",
+            "search_titles": [
+                "Harry Potter and the Sorcerer's Stone",
+                "Harry Potter and the Chamber of Secrets",
+            ],
             "media_kind": "movie",
-            "confidence": 0.95,
+            "confidence": 0.9,
         },
     )
     await inbox.handle_message(_msg("Harry Potter", message_id=110))
     pick = await inbox.handle_message(_msg("de eerste", message_id=111))
-    assert pick.grabbed is True
-    assert "2001" in pick.reply or "Sorcerer" in pick.reply or "Harry Potter" in pick.reply
-    assert len(pipeline.overseerr_queue) == 1
+    assert pick.grabbed is False
+    assert "Queued" not in (pick.reply or "")
 
 
 @pytest.mark.asyncio
 async def test_inbox_whole_series_via_model(inbox: TelegramInbox, monkeypatch):
+    """Whole-series select_all no longer bulk-queues — offers Get buttons."""
     _patch_openai_intent(
         monkeypatch,
         {
@@ -502,8 +599,9 @@ async def test_inbox_whole_series_via_model(inbox: TelegramInbox, monkeypatch):
     result = await inbox.handle_message(
         _msg("the whole Harry Potter series", message_id=120)
     )
-    assert result.grabbed is True
-    assert len(pipeline.overseerr_queue) >= 3
+    assert result.grabbed is False
+    assert "Queued 3" not in (result.reply or "")
+    assert "Queued 4" not in (result.reply or "")
 
 
 @pytest.mark.asyncio
@@ -534,25 +632,28 @@ async def test_inbox_ambiguous_yes_clarifies(inbox: TelegramInbox, monkeypatch):
 async def test_inbox_numeric_pick_still_works_with_franchise(
     inbox: TelegramInbox, monkeypatch
 ):
+    """Bare '2' must NOT queue — remind user to tap Get."""
     calls = _patch_openai_intent(
         monkeypatch,
         {
             "action": "search",
             "search_title": "Harry Potter",
+            "search_titles": [
+                "Harry Potter and the Sorcerer's Stone",
+                "Harry Potter and the Chamber of Secrets",
+                "Harry Potter and the Prisoner of Azkaban",
+            ],
             "media_kind": "movie",
-            "confidence": 0.95,
+            "confidence": 0.9,
         },
     )
     ask = await inbox.handle_message(_msg("Harry Potter", message_id=140))
-    assert "1." in ask.reply
-    before = len(calls)
+    assert ask.grabbed is False
+    assert inbox.pending.get(-1001) is not None
     pick = await inbox.handle_message(_msg("2", message_id=141))
-    assert pick.grabbed is True
-    assert "Chamber" in pick.reply or "2002" in pick.reply or "Harry Potter" in pick.reply
-    assert len(calls) == before  # bare "2" is instant — no second OpenAI hop
-
-
-# --- conversation / plot-to-title (always AI) ---------------------------------
+    assert pick.grabbed is False
+    assert "Queued" not in (pick.reply or "")
+    assert "Get" in (pick.reply or "") or pick.reply_markup
 
 
 def test_looks_like_descriptive_ask_compat_shim():
@@ -674,14 +775,19 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
             bind = False
             if looks_like_confirm_yes(user) or action in {"pick", "pick_many"}:
                 bind = True
-            elif action == "search" and pending_title:
-                if search_title and (
-                    _norm(search_title) == _norm(pending_title)
-                    or _norm(pending_title) in _norm(search_title)
-                ):
-                    bind = True
-                elif _norm(pending_title) and _norm(pending_title) in _norm(user):
-                    bind = True
+            elif action == "search" and pending_title and looks_like_confirm_yes(user):
+                bind = True
+            elif (
+                action == "search"
+                and pending_title
+                and _norm(pending_title)
+                and _norm(pending_title) in _norm(user)
+                and any(
+                    v in user.lower()
+                    for v in ("download", "queue", "get", "bring", "add", "grab")
+                )
+            ):
+                bind = True
             if bind and pending_title:
                 args = {
                     "title": pending_title,
@@ -761,16 +867,35 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
                 or bool(_re.search(r"\ba few\b", user, _re.I))
             )
             if listish and not body.get("select_all"):
+                from hearth.telegram.buttons import genre_hint_from_text
+
                 if primary and primary not in titles:
                     titles.insert(0, primary)
-                if len(titles) < 2:
-                    titles = titles + [
-                        "The Matrix",
-                        "Arrival",
-                        "Interstellar",
-                        "Dune",
+                hint_inc, hint_exc = genre_hint_from_text(primary or user)
+                if hint_inc and len(titles) < 2:
+                    args = {
+                        "genre_ids": hint_inc,
+                        "exclude_genre_ids": hint_exc,
+                        "limit": 4,
+                        "query": primary or user,
+                    }
+                    if body.get("media_kind"):
+                        args["media_type"] = body["media_kind"]
+                    return [
+                        {
+                            "id": _next_id(),
+                            "type": "function",
+                            "function": {
+                                "name": "discover_by_genre",
+                                "arguments": _json.dumps(args),
+                            },
+                        }
                     ]
-                args = {"titles": titles[:4], "limit": min(4, max(2, len(titles[:4])))}
+                if len(titles) < 2:
+                    # Non-genre list ask without names — still suggest_titles
+                    # with empty pack so the tool can error or discover.
+                    titles = list(titles)
+                args = {"titles": titles[:4], "limit": min(4, max(2, len(titles[:4]) or 2))}
                 if body.get("media_kind"):
                     args["media_type"] = body["media_kind"]
                 if primary or user:
@@ -796,7 +921,7 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
                         "id": _next_id(),
                         "type": "function",
                         "function": {
-                            "name": "search_catalog",
+                            "name": "search_title",
                             "arguments": _json.dumps(args),
                         },
                     }
@@ -805,13 +930,10 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
         return []
 
     def _followup_tool_calls(messages: list) -> list[dict] | None:
-        """After search_catalog of a concrete title with 1 hit → queue_request."""
-        from hearth.telegram.intent import looks_like_concrete_title
-
+        """After search/discover, do NOT auto-queue (HITL: Get button or yes)."""
         results = _tool_results(messages)
         if not results:
             return None
-        # Already queued this turn.
         for msg in messages or []:
             if msg.get("role") != "assistant":
                 continue
@@ -820,61 +942,11 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
                 if fn.get("name") == "queue_request":
                     return None
         last = results[-1]
-        user = _user_text(messages)
-        if last.get("refused"):
+        if last.get("refused") or last.get("grabbed"):
             return None
-        if last.get("grabbed"):
-            return None
-        # select_all (whole series) → queue every catalog hit.
-        if _select_all["flag"] and last.get("results"):
+        # Whole-series select_all used to bulk-queue — now just leave the offer.
+        if _select_all["flag"]:
             _select_all["flag"] = False
-            out = []
-            for row in last["results"][:10]:
-                args = {
-                    "title": row.get("title"),
-                    "media_type": row.get("mediaType") or "movie",
-                }
-                if row.get("year") not in (None, ""):
-                    args["year"] = row["year"]
-                if row.get("tmdbId") not in (None, ""):
-                    args["tmdb_id"] = row["tmdbId"]
-                out.append(
-                    {
-                        "id": _next_id(),
-                        "type": "function",
-                        "function": {
-                            "name": "queue_request",
-                            "arguments": _json.dumps(args),
-                        },
-                    }
-                )
-            return out or None
-        # Concrete single catalog hit → queue immediately (Friends, Daniel Sloss).
-        if (
-            last.get("count") == 1
-            and last.get("results")
-            and looks_like_concrete_title(user)
-            and not looks_like_list_ask(user)
-        ):
-            row = last["results"][0]
-            args = {
-                "title": row.get("title"),
-                "media_type": row.get("mediaType") or "movie",
-            }
-            if row.get("year") not in (None, ""):
-                args["year"] = row["year"]
-            if row.get("tmdbId") not in (None, ""):
-                args["tmdb_id"] = row["tmdbId"]
-            return [
-                {
-                    "id": _next_id(),
-                    "type": "function",
-                    "function": {
-                        "name": "queue_request",
-                        "arguments": _json.dumps(args),
-                    },
-                }
-            ]
         return None
 
     def _final_from_tools(messages: list) -> str:
@@ -892,13 +964,15 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
                 return f"Queued {label} via Overseerr."
         for payload in reversed(results):
             if payload.get("refused"):
-                return (
-                    "Got it — not that one. Want a few other options, "
-                    "or name a title?"
-                )
+                continue
             reply = str(payload.get("reply") or "").strip()
             if reply:
                 return reply
+        if any(p.get("refused") for p in results):
+            return (
+                "Got it — not that one. Want a few other options, "
+                "or name a title?"
+            )
         return "Which movie or series did you mean?"
 
     def _as_tool_call_objs(raw_calls: list[dict]) -> list:
@@ -1296,7 +1370,7 @@ async def test_inbox_reject_imitation_game_leonardo_clue_searches_davinci(
     )
     first = await inbox.handle_message(_msg(dutch, message_id=301))
     assert "Imitation Game" in first.reply
-    assert "1–2" in first.reply or "1-2" in first.reply or "Reply 1" in first.reply
+    assert ('1.' in (first.reply or '') and '2.' in (first.reply or '')) or bool(first.reply_markup)
     assert inbox.pending.get(-1001) is not None
 
     second = await inbox.handle_message(_msg(reject, message_id=302))
@@ -1514,9 +1588,9 @@ async def test_inbox_chat_memory_dutch_followup_de_eerste(
     before = list(queries)
     before_calls = len(calls)
     pick = await inbox.handle_message(_msg("de eerste", message_id=251))
-    assert pick.grabbed is True
+    assert pick.grabbed is False
     assert "2001" in pick.reply or "Sorcerer" in pick.reply or "Harry Potter" in pick.reply
-    assert len(calls) == before_calls  # instant — no second model hop
+    assert len(calls) >= before_calls  # free-text de eerste is agent turn, not instant queue
     new_queries = queries[len(before) :]
     for q in new_queries:
         assert q.strip().lower() != "de eerste"
@@ -1617,7 +1691,7 @@ async def test_inbox_chat_memory_lotr_all_of_them_not_potter(
     assert all("Lord" in str(row.get("title") or "") for row in pending.options[:3])
 
     all_of = await inbox.handle_message(_msg("all of them", message_id=262))
-    assert all_of.grabbed is True
+    assert all_of.grabbed is False
     assert "Lord of the Rings" in all_of.reply
     assert "Harry Potter" not in all_of.reply
     joined = " ".join(all_of.titles) if all_of.titles else all_of.reply
@@ -1648,6 +1722,8 @@ async def test_inbox_literal_title_still_passthrough(inbox: TelegramInbox, monke
         {"action": "search", "search_title": "WRONG", "confidence": 0.99},
     )
     result = await inbox.handle_message(_msg("The Brutalist (2024)", message_id=210))
+    assert result.grabbed is False  # HITL offer first
+    result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True
     assert "Brutalist" in result.reply
     assert calls == []  # year + concrete title → instant, no intent hop
@@ -1662,6 +1738,8 @@ async def test_inbox_catalog_link_still_passthrough(inbox: TelegramInbox, monkey
     result = await inbox.handle_message(
         _msg("https://www.themoviedb.org/movie/974950-the-brutalist", message_id=211)
     )
+    assert result.grabbed is False  # HITL offer first
+    result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True
     assert "Brutalist" in result.reply
     assert calls == []
@@ -1727,8 +1805,8 @@ async def test_inbox_followups_still_work_with_descriptive_layer(
     ask = await inbox.handle_message(_msg("Harry Potter", message_id=230))
     assert "Which one" in ask.reply
     all_of = await inbox.handle_message(_msg("all of them", message_id=231))
-    assert all_of.grabbed is True
-    assert len(pipeline.overseerr_queue) >= 3
+    assert all_of.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0  # free-text all of them never bulk-queues
 
 
 def test_status_endpoint_includes_telegram(client, monkeypatch):
@@ -2213,6 +2291,8 @@ async def test_inbox_imdb_cape_fear_resolves_tv_not_tt_string(
     result = await inbox.handle_message(
         _msg("https://www.imdb.com/title/tt34675596/", message_id=400)
     )
+    if not result.grabbed:
+        result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True
     assert "Cape Fear" in result.reply
     assert "2026" in result.reply
@@ -2286,6 +2366,8 @@ async def test_inbox_daniel_sloss_near_exact_queues_without_dup_12(
         },
     )
     result = await inbox.handle_message(_msg("Daniel sloss can't", message_id=420))
+    if not result.grabbed:
+        result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True
     assert "Daniel Sloss" in result.reply
     assert "2025" in result.reply
@@ -2300,6 +2382,8 @@ async def test_inbox_daniel_sloss_near_exact_queues_without_dup_12(
     inbox.deduper.reset()
     pipeline.overseerr_queue.clear()
     again = await inbox.handle_message(_msg("Daniel sloss: Can't", message_id=421))
+    if not again.grabbed:
+        again = await _get_pending_via_callback(inbox)
     assert again.grabbed is True or "already" in again.reply.lower()
     assert "1. Daniel Sloss: Can't (2025)" not in again.reply
     assert again.reply.count("2025") <= 2  # queued line only, not a 1–2 list
@@ -2411,6 +2495,8 @@ async def test_inbox_reggie_dinkins_with_actor_queues_overseerr_tv(
             message_id=500,
         )
     )
+    if not result.grabbed:
+        result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True, result.reply
     assert "Couldn't find" not in result.reply
     assert "Reggie Dinkins" in result.reply
@@ -2467,6 +2553,8 @@ async def test_inbox_reggie_dinkins_without_actor_still_tv(
     result = await inbox.handle_message(
         _msg("The Fall and Rise of Reggie Dinkins", message_id=501)
     )
+    if not result.grabbed:
+        result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True, result.reply
     assert "Couldn't find" not in result.reply
     assert "Overseerr" in result.reply
@@ -2504,6 +2592,8 @@ async def test_inbox_friends_s1_still_queues_overseerr_tv(
         },
     )
     result = await inbox.handle_message(_msg("Friends s1", message_id=502))
+    if not result.grabbed:
+        result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True, result.reply
     assert "Friends" in result.reply
     assert "Overseerr" in result.reply
@@ -2615,6 +2705,8 @@ async def test_inbox_christophers_with_mckellen_queues_never_guest(
     assert calls
     assert any("mckellan" in t.lower() for t in _openai_user_texts(calls))
     assert any("christophers" in t.lower() for t in _openai_user_texts(calls))
+    if not result.grabbed:
+        result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True, result.reply
     assert "Christophers" in result.reply
     assert "2025" in result.reply
@@ -2659,6 +2751,8 @@ async def test_inbox_christophers_clears_davinci_subject_leak(
     ctx = _openai_session_context(calls)
     assert any("christophers" in t.lower() for t in users)
     assert "Da Vinci" not in ctx or "Christophers" in " ".join(users)
+    if not result.grabbed:
+        result = await _get_pending_via_callback(inbox)
     assert result.grabbed is True, result.reply
     assert "Christophers" in result.reply
     assert "Da Vinci" not in result.reply
@@ -2875,6 +2969,8 @@ async def test_inbox_after_harry_potter_spaceship_horror_asks_alien_not_1_1(
     )
 
     hp = await inbox.handle_message(_msg("Harry potter 2", message_id=700))
+    if not hp.grabbed:
+        hp = await _get_pending_via_callback(inbox)
     assert hp.grabbed is True, hp.reply
     assert "Chamber" in hp.reply or "2002" in hp.reply
     assert inbox.memory.offered(-1001) == []
@@ -2928,6 +3024,8 @@ async def test_inbox_after_harry_potter_spaceship_horror_asks_alien_not_1_1(
     assert "Alien" in str(pending.options[0].get("title") or "")
 
     yes = await inbox.handle_message(_msg("yes", message_id=703))
+    if not yes.grabbed:
+        yes = await _get_pending_via_callback(inbox)
     assert yes.grabbed is True, yes.reply
     assert "Alien" in yes.reply
     assert overseerr_requests
@@ -5155,12 +5253,13 @@ async def test_inbox_no_on_matrix_confirm_does_not_queue(
 
 def test_telegram_tool_schemas_include_required_tools():
     from hearth.telegram.agent import TELEGRAM_CHAT_TOOLS, should_refuse_queue
+    from hearth.telegram.buttons import GENRE_FANTASY, GENRE_SCI_FI, genre_hint_from_text
 
     names = {t["function"]["name"] for t in TELEGRAM_CHAT_TOOLS}
-    assert "search_catalog" in names
-    assert "suggest_titles" in names
+    assert "search_title" in names
+    assert "discover_by_genre" in names
     assert "queue_request" in names
-    assert "already_queued" in names
+    assert "library_status" in names
     assert "download_progress" in names
     assert "retry_download" in names
     assert should_refuse_queue("No")
@@ -5168,8 +5267,16 @@ def test_telegram_tool_schemas_include_required_tools():
     assert should_refuse_queue("Name a few more")
     assert should_refuse_queue("a few cool space sci-fi movies")
     assert should_refuse_queue("I was asking for a few")
+    assert should_refuse_queue("all of them")
+    assert should_refuse_queue("3")
+    assert should_refuse_queue("those are all scifi")
+    assert should_refuse_queue("Fantasy.. those are all scifi")
+    assert should_refuse_queue("Why did you do that")
     assert not should_refuse_queue("Yep")
     assert not should_refuse_queue("Blade Runner")
+    inc, exc = genre_hint_from_text("cool fantasy movies")
+    assert GENRE_FANTASY in inc
+    assert GENRE_SCI_FI in exc
 
 
 @pytest.mark.asyncio
@@ -5562,3 +5669,294 @@ async def test_inbox_0100_yep_queues_blade_runner_via_queue_request(
     assert overseerr_requests[-1]["media_id"] == 78
     # Prove the model path used tools (not Python instant-pending bind).
     assert any(c.get("tools") for c in calls)
+
+
+# --- Fantasy HITL modes (live Telegram ~01:32 2026-09-01) --------------------
+
+
+@pytest.mark.asyncio
+async def test_inbox_0132_fantasy_discover_excludes_scifi(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Fantasy ask → TMDB genre 14 list; not Matrix/Arrival/Interstellar alone."""
+    from hearth.telegram.buttons import GENRE_FANTASY, GENRE_SCI_FI
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "discover_by_genre",
+                            "arguments": {
+                                "genre_ids": [GENRE_FANTASY],
+                                "exclude_genre_ids": [GENRE_SCI_FI],
+                                "query": "cool fantasy movies",
+                                "limit": 4,
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    result = await inbox.handle_message(
+        _msg("Give me a few cool fantasy movies", message_id=10101)
+    )
+    assert result.grabbed is False
+    assert "Queued" not in (result.reply or "")
+    titles = " ".join(
+        str(r.get("title") or "") for r in (inbox.pending.get(-1001).options if inbox.pending.get(-1001) else [])
+    ).lower()
+    assert "green knight" in titles or "labyrinth" in titles or "spirited" in titles or "lord of the rings" in titles
+    scifi_only = {"the matrix", "arrival", "interstellar"}
+    offered = {
+        str(r.get("title") or "").strip().lower()
+        for r in (inbox.pending[-1001].options if inbox.pending.get(-1001) else [])
+    }
+    assert not offered or not offered.issubset(scifi_only)
+    assert result.reply_markup or inbox.pending.get(-1001)
+
+
+@pytest.mark.asyncio
+async def test_inbox_0132_fantasy_correction_does_not_queue(
+    inbox: TelegramInbox, monkeypatch
+):
+    """'Fantasy.. those are all scifi' does NOT queue; rediscovers fantasy."""
+    from hearth.telegram.buttons import GENRE_FANTASY, GENRE_SCI_FI
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    scifi = [
+        {"title": "The Matrix", "year": 1999, "tmdbId": 603, "mediaType": "movie"},
+        {"title": "Arrival", "year": 2016, "tmdbId": 329865, "mediaType": "movie"},
+        {"title": "Interstellar", "year": 2014, "tmdbId": 157336, "mediaType": "movie"},
+    ]
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=scifi,
+        media_kind="movie",
+        query="cool fantasy",
+        created_message_id=10200,
+        last_bot_reply="1. The Matrix\n2. Arrival\n3. Interstellar",
+        mode="offer",
+    )
+    pipeline.overseerr_queue.clear()
+    overseerr_requests: list[dict] = []
+    from hearth.telegram import inbox as inbox_mod
+
+    original = inbox_mod.overseerr.request
+
+    async def _cap(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append({"query": query, "media_id": media_id})
+        return await original(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _cap)
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "discover_by_genre",
+                            "arguments": {
+                                "genre_ids": [GENRE_FANTASY],
+                                "exclude_genre_ids": [GENRE_SCI_FI],
+                                "query": "fantasy",
+                            },
+                        }
+                    }
+                ]
+            },
+        ],
+    )
+    result = await inbox.handle_message(
+        _msg("Fantasy.. those are all scifi", message_id=10201)
+    )
+    assert result.grabbed is False
+    assert "Queued" not in (result.reply or "")
+    assert overseerr_requests == []
+    assert "Queued 3" not in (result.reply or "")
+    # Correction stays browse / offer fantasy — never Matrix-only.
+    assert inbox.pending.get(-1001) is not None or "fantasy" in (result.reply or "").lower() or "sci-fi" in (result.reply or "").lower()
+    if inbox.pending.get(-1001):
+        offered = {
+            str(r.get("title") or "").strip().lower()
+            for r in inbox.pending[-1001].options
+        }
+        assert offered
+        assert not offered.issubset({"the matrix", "arrival", "interstellar"})
+
+
+@pytest.mark.asyncio
+async def test_inbox_0132_why_did_you_do_that_explains_no_reoffer(
+    inbox: TelegramInbox, monkeypatch
+):
+    """'Why did you do that' does not queue and does not re-offer sci-fi as fantasy."""
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[
+            {"title": "The Matrix", "year": 1999, "tmdbId": 603, "mediaType": "movie"},
+            {"title": "Arrival", "year": 2016, "tmdbId": 329865, "mediaType": "movie"},
+            {"title": "Interstellar", "year": 2014, "tmdbId": 157336, "mediaType": "movie"},
+        ],
+        media_kind="movie",
+        query="fantasy",
+        created_message_id=10300,
+        last_bot_reply="1. The Matrix\n2. Arrival\n3. Interstellar",
+    )
+    pipeline.overseerr_queue.clear()
+    # Explain mode is Python short-circuit — no OpenAI needed.
+    result = await inbox.handle_message(_msg("Why did you do that", message_id=10301))
+    assert result.grabbed is False
+    assert "Queued" not in (result.reply or "")
+    assert "sorry" in (result.reply or "").lower() or "bug" in (result.reply or "").lower()
+    # Must not re-list the sci-fi set as fantasy.
+    assert "the matrix" not in (result.reply or "").lower()
+    assert result.mode == "explain"
+
+
+@pytest.mark.asyncio
+async def test_inbox_0132_callback_queues_only_that_tmdb_id(inbox: TelegramInbox):
+    """Button callback q:movie:<id> queues that id only."""
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[
+            {
+                "title": "The Green Knight",
+                "year": 2021,
+                "tmdbId": 497698,
+                "mediaId": 497698,
+                "mediaType": "movie",
+            },
+            {
+                "title": "Pan's Labyrinth",
+                "year": 2006,
+                "tmdbId": 1417,
+                "mediaId": 1417,
+                "mediaType": "movie",
+            },
+        ],
+        media_kind="movie",
+        query="fantasy",
+        created_message_id=10400,
+    )
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_callback(
+        {
+            "id": "cb-green",
+            "data": "q:movie:497698",
+            "from": {"id": 42},
+            "message": {"message_id": 10400, "chat": {"id": -1001}},
+        }
+    )
+    assert result.grabbed is True
+    assert "Green Knight" in result.reply
+    assert "Queued" in result.reply
+    assert "Queued 2" not in result.reply
+    assert "Labyrinth" not in result.reply
+    assert len(pipeline.overseerr_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbox_0132_bare_3_and_all_scifi_do_not_queue(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Bare '3' or 'all scifi' on an offer does not queue."""
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    options = [
+        {"title": "The Matrix", "year": 1999, "tmdbId": 603, "mediaType": "movie"},
+        {"title": "Arrival", "year": 2016, "tmdbId": 329865, "mediaType": "movie"},
+        {"title": "Interstellar", "year": 2014, "tmdbId": 157336, "mediaType": "movie"},
+    ]
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=options,
+        media_kind="movie",
+        query="space",
+        created_message_id=10500,
+        last_bot_reply="1. The Matrix\n2. Arrival\n3. Interstellar",
+    )
+    pipeline.overseerr_queue.clear()
+
+    # Bare 3 — parser disambiguation_pick path, must not queue.
+    three = await inbox.handle_message(_msg("3", message_id=10501))
+    assert three.grabbed is False
+    assert "Queued" not in (three.reply or "")
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=options,
+        media_kind="movie",
+        query="space",
+        created_message_id=10500,
+        last_bot_reply="1. The Matrix\n2. Arrival\n3. Interstellar",
+    )
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "queue_request",
+                            "arguments": {
+                                "tmdb_id": 603,
+                                "media_type": "movie",
+                                "title": "The Matrix",
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    all_scifi = await inbox.handle_message(_msg("all scifi", message_id=10502))
+    assert all_scifi.grabbed is False
+    assert "Queued" not in (all_scifi.reply or "")
+    assert len(pipeline.overseerr_queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_inbox_0132_all_of_them_does_not_queue(
+    inbox: TelegramInbox, monkeypatch
+):
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[
+            {"title": "A", "year": 2001, "tmdbId": 1, "mediaType": "movie"},
+            {"title": "B", "year": 2002, "tmdbId": 2, "mediaType": "movie"},
+        ],
+        media_kind="movie",
+        query="franchise",
+        created_message_id=10600,
+    )
+    pipeline.overseerr_queue.clear()
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "queue_request",
+                            "arguments": {"tmdb_id": 1, "media_type": "movie", "title": "A"},
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    result = await inbox.handle_message(_msg("all of them", message_id=10601))
+    assert result.grabbed is False
+    assert "Queued" not in (result.reply or "")
+    assert len(pipeline.overseerr_queue) == 0

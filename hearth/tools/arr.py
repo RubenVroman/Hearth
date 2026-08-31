@@ -1224,6 +1224,7 @@ class Overseerr:
                 body["seasons"] = seasons or [1]
             except Exception:  # noqa: BLE001
                 body["seasons"] = [1]
+        body["is4k"] = False
         try:
             response = await client.post("/api/v1/request", json=body)
             response.raise_for_status()
@@ -1241,6 +1242,92 @@ class Overseerr:
                     "service": "overseerr",
                     "error": str(exc),
                     "requested": _summarize_overseerr(item),
+                }
+            raise
+
+    async def discover(
+        self,
+        *,
+        genre_ids: list[int] | None = None,
+        exclude_genre_ids: list[int] | None = None,
+        media_type: str = "movie",
+        limit: int = 4,
+    ) -> dict[str, Any]:
+        """TMDB discover via Overseerr (genre include / exclude).
+
+        Fantasy=14, Sci-Fi=878, Horror=27. Results with an excluded genre id
+        are filtered out client-side when the API cannot exclude them.
+        """
+        kind = media_type if media_type in {"movie", "tv"} else "movie"
+        include = [int(g) for g in (genre_ids or []) if str(g).isdigit() or isinstance(g, int)]
+        exclude = [
+            int(g) for g in (exclude_genre_ids or []) if str(g).isdigit() or isinstance(g, int)
+        ]
+        cap = max(1, min(int(limit or 4), 8))
+
+        if not self.live:
+            rows = pipeline.discover_overseerr(
+                genre_ids=include,
+                exclude_genre_ids=exclude,
+                media_type=kind,
+                limit=cap,
+            )
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "media_type": kind,
+                "genre_ids": include,
+                "exclude_genre_ids": exclude,
+                "results": [_summarize_overseerr(h) for h in rows],
+            }
+
+        client = await self._http()
+        path = "/api/v1/discover/movies" if kind == "movie" else "/api/v1/discover/tv"
+        params: dict[str, Any] = {}
+        if include:
+            # Overseerr accepts comma-separated genre ids.
+            params["genre"] = ",".join(str(g) for g in include)
+        try:
+            response = await client.get(path, params=params)
+            response.raise_for_status()
+            payload = response.json() or {}
+            raw_rows = list(payload.get("results") or [])
+            filtered: list[dict[str, Any]] = []
+            for row in raw_rows:
+                genres = row.get("genreIds") or row.get("genre_ids") or []
+                try:
+                    gset = {int(g) for g in genres}
+                except (TypeError, ValueError):
+                    gset = set()
+                if exclude and gset and gset.intersection(exclude):
+                    continue
+                filtered.append(row)
+                if len(filtered) >= cap:
+                    break
+            return {
+                "mode": "live",
+                "service": "overseerr",
+                "media_type": kind,
+                "genre_ids": include,
+                "exclude_genre_ids": exclude,
+                "results": [_summarize_overseerr(h) for h in filtered[:cap]],
+            }
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                rows = pipeline.discover_overseerr(
+                    genre_ids=include,
+                    exclude_genre_ids=exclude,
+                    media_type=kind,
+                    limit=cap,
+                )
+                return {
+                    "mode": "mock",
+                    "service": "overseerr",
+                    "media_type": kind,
+                    "genre_ids": include,
+                    "exclude_genre_ids": exclude,
+                    "error": str(exc),
+                    "results": [_summarize_overseerr(h) for h in rows],
                 }
             raise
 
