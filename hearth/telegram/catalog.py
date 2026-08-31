@@ -275,7 +275,15 @@ def _filter_title_year(
     *,
     title: str,
     year: int | None,
+    strict: bool = False,
 ) -> list[CatalogHit]:
+    """Prefer exact / franchise-prefix matches. Never keep bare substring hits.
+
+    ``Land`` must not become ``La La Land``; ``Wild`` must not become
+    ``The Wild Robot``. ``strict`` is retained for callers that already know
+    the model named a specific title (+ people/year).
+    """
+    del strict  # exact-or-prefix is always required now
     needle = normalize_title(title)
     needle_loose = re.sub(r"[^a-z0-9à-ÿ]+", " ", needle).strip()
 
@@ -287,13 +295,17 @@ def _filter_title_year(
         exact = [h for h in hits if _loose(h.title) == needle_loose]
     if exact:
         hits = exact
+    else:
+        prefix = [h for h in hits if catalog_seed_matches_title(title, h.title)]
+        if not prefix:
+            return []
+        hits = prefix
 
     if year is not None:
         year_hits = [h for h in hits if h.year == year]
         if year_hits:
             return year_hits
-        # Catalog disagrees with the requested year — return other years for
-        # disambiguation rather than grabbing the wrong edition.
+        # Exact title, wrong year editions → keep for disambiguation.
         if hits:
             return hits
         return []
@@ -301,11 +313,48 @@ def _filter_title_year(
     return hits
 
 
+def catalog_seed_matches_title(seed: str, title: str) -> bool:
+    """True when a catalog row is a real match for the search seed.
+
+    Exact title, or multi-word franchise prefix (Harry Potter → Chamber…).
+    Single-token seeds must be exact — ``Land`` must not match ``La La Land``,
+    ``Wild`` must not match ``The Wild Robot``.
+    """
+    def _tokens(value: str) -> list[str]:
+        text = re.sub(r"[^a-z0-9à-ÿ]+", " ", normalize_title(value)).strip()
+        return [t for t in text.split() if t]
+
+    seed_tokens = _tokens(seed)
+    title_tokens = _tokens(title)
+    if not seed_tokens or not title_tokens:
+        return False
+    if seed_tokens == title_tokens:
+        return True
+
+    # Drop leading articles for equality / prefix checks.
+    def _strip_articles(tokens: list[str]) -> list[str]:
+        while tokens and tokens[0] in {"the", "a", "an", "de", "het", "een"}:
+            tokens = tokens[1:]
+        return tokens
+
+    seed_tokens = _strip_articles(seed_tokens)
+    title_tokens = _strip_articles(title_tokens)
+    if not seed_tokens or not title_tokens:
+        return False
+    if seed_tokens == title_tokens:
+        return True
+    # Multi-word seed as leading phrase (franchise / longer official title).
+    if len(seed_tokens) >= 2 and title_tokens[: len(seed_tokens)] == seed_tokens:
+        return True
+    return False
+
+
 async def resolve_title(
     title: str,
     *,
     year: int | None = None,
     media_kind: str = "",
+    strict: bool = False,
 ) -> list[CatalogHit]:
     """Search Overseerr by title (movie + TV). Prefer catalog year."""
     title = catalog_search_title(title)
@@ -326,7 +375,7 @@ async def resolve_title(
         log.info("overseerr title search failed: %s", redact(str(exc)))
 
     hits = _dedupe_hits(hits)
-    hits = _filter_title_year(hits, title=title, year=year)
+    hits = _filter_title_year(hits, title=title, year=year, strict=strict)
     return prefer_hits(hits, implied_kind=media_kind if media_kind in {"movie", "tv"} else "")
 
 
@@ -448,6 +497,7 @@ async def resolve_parsed(parsed: ParsedRequest) -> tuple[list[CatalogHit], str]:
 __all__ = [
     "CatalogHit",
     "catalog_search_title",
+    "catalog_seed_matches_title",
     "find_by_imdb",
     "find_by_tmdb",
     "find_by_tvdb",
