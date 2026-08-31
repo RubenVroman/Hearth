@@ -2,8 +2,11 @@
 
 The inbox owns Telegram I/O, safety checks, short-lived pending choices, and
 tool execution. Conversation is an OpenAI Chat Completions loop with native
-function tools (``hearth.telegram.agent``). Queueing happens only when the
-model calls ``queue_request`` — never via short-reply Python binds.
+function tools (``hearth.telegram.agent``).
+
+Queueing is HITL only: inline-keyboard ``q:movie:<tmdbId>`` / ``q:tv:<tmdbId>``
+or an explicit yes bound to that pending tmdb_id. Free-text "all" / "3" /
+"those" / "de eerste" never queues. ``intent.py`` is not the router.
 """
 
 from __future__ import annotations
@@ -16,7 +19,22 @@ from typing import Any
 
 from hearth.config import settings
 from hearth.memory.redact import redact
-from hearth.telegram.agent import run_telegram_agent, should_refuse_queue
+from hearth.telegram.agent import (
+    SessionMode,
+    looks_like_correction,
+    looks_like_explain,
+    run_telegram_agent,
+    should_refuse_queue,
+)
+from hearth.telegram.buttons import (
+    GENRE_FANTASY,
+    GENRE_SCI_FI,
+    genre_hint_from_text,
+    is_none_of_these_callback,
+    offer_inline_keyboard,
+    parse_queue_callback,
+    single_get_keyboard,
+)
 from hearth.telegram.catalog import (
     catalog_search_title,
     catalog_seed_matches_title,
@@ -28,7 +46,6 @@ from hearth.telegram.intent import (
     SOFT_CONTEXT_CLARIFY,
     IntentDecision,
     clarify_wants_numbered_list,
-    instant_pick_decision,
     is_explicit_title_year,
     looks_like_chatter,
     looks_like_concrete_title,
@@ -74,31 +91,6 @@ log = logging.getLogger("hearth.telegram")
 PENDING_TTL_S = 15 * 60
 SAFE_CLARIFY = "Which movie or series did you mean?"
 
-# Mood → default title packs when suggest_titles gets a vibe query only.
-_VIBE_PACKS: list[tuple[tuple[str, ...], list[str]]] = [
-    (
-        ("space", "sci-fi", "scifi", "science fiction", "cool space"),
-        ["Blade Runner", "Arrival", "Interstellar", "Dune"],
-    ),
-    (
-        ("horror", "scary", "spaceship"),
-        ["Event Horizon", "Alien", "The Thing", "Pandorum"],
-    ),
-    (
-        ("mind", "twist", "cerebral"),
-        ["Arrival", "Primer", "Coherence", "Ex Machina"],
-    ),
-]
-_DEFAULT_VIBE = ["The Matrix", "Arrival", "Interstellar", "Dune"]
-
-
-def _vibe_title_pack(query: str) -> list[str]:
-    q = (query or "").lower()
-    for keys, titles in _VIBE_PACKS:
-        if any(k in q for k in keys):
-            return list(titles)
-    return list(_DEFAULT_VIBE)
-
 
 # --- Public state -----------------------------------------------------------
 
@@ -112,6 +104,8 @@ class PendingDisambiguation:
     created_message_id: int
     created_at: float = field(default_factory=time.monotonic)
     last_bot_reply: str = ""
+    mode: SessionMode = "offer"
+    reply_markup: dict[str, Any] | None = None
 
 
 @dataclass
@@ -123,6 +117,8 @@ class InboxResult:
     service: str = ""
     year: int | None = None
     titles: list[str] = field(default_factory=list)
+    reply_markup: dict[str, Any] | None = None
+    mode: SessionMode = "idle"
 
 
 @dataclass
@@ -134,6 +130,7 @@ class TelegramInbox:
     outbound_message_ids: set[tuple[int, int]] = field(default_factory=set)
     bot_user_id: int | None = None
     memory: ChatMemory = field(default_factory=ChatMemory)
+    modes: dict[int, SessionMode] = field(default_factory=dict)
 
     def reset(self) -> None:
         self.deduper.reset()
@@ -142,11 +139,115 @@ class TelegramInbox:
         self.pending.clear()
         self.outbound_message_ids.clear()
         self.memory.reset()
+        self.modes.clear()
 
     def remember_outbound(self, chat_id: int, message_id: int) -> None:
         self.outbound_message_ids.add((int(chat_id), int(message_id)))
 
+    def _set_mode(self, chat_id: int, mode: SessionMode) -> None:
+        self.modes[int(chat_id)] = mode
+
+    def _mode(self, chat_id: int) -> SessionMode:
+        return self.modes.get(int(chat_id), "idle")
+
     # --- Message lifecycle --------------------------------------------------
+
+    async def handle_callback(self, callback: dict[str, Any]) -> InboxResult:
+        """HITL Get / None-of-these — the only free path that queues by tmdb id."""
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        from_user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+        try:
+            chat_id = int(chat.get("id"))
+        except (TypeError, ValueError):
+            return InboxResult(handled=False)
+        try:
+            user_id = int(from_user.get("id") or 0)
+        except (TypeError, ValueError):
+            user_id = 0
+        if not chat_allowed(chat_id, settings.telegram_chat_id_list):
+            return InboxResult(handled=False)
+        if not user_allowed(
+            user_id,
+            settings.telegram_user_id_list,
+            bot_user_id=self.bot_user_id,
+        ):
+            return InboxResult(handled=True)
+
+        data = str(callback.get("data") or "")
+        if is_none_of_these_callback(data):
+            pending = self._pending_for(chat_id)
+            if pending is not None:
+                rejected = self._titles_from_options(pending.options)
+                self.memory.remember_rejected(
+                    chat_id, rejected, clear_offered=True, clear_subject=False
+                )
+                self.pending.pop(chat_id, None)
+            self._set_mode(chat_id, "browse")
+            return InboxResult(
+                handled=True,
+                reply="Ok — none of those. What should I look for?",
+                mode="browse",
+            )
+
+        parsed = parse_queue_callback(data)
+        if parsed is None:
+            return InboxResult(handled=True)
+        media_type, tmdb_id = parsed
+
+        # Prefer the live offer row so title/year stay accurate.
+        pending = self._pending_for(chat_id)
+        row: dict[str, Any] | None = None
+        if pending is not None:
+            for option in pending.options:
+                oid = option.get("tmdbId") or option.get("mediaId")
+                try:
+                    if oid is not None and int(oid) == tmdb_id:
+                        row = dict(option)
+                        break
+                except (TypeError, ValueError):
+                    continue
+        if row is None:
+            row = {
+                "title": f"tmdb:{tmdb_id}",
+                "tmdbId": tmdb_id,
+                "mediaId": tmdb_id,
+                "mediaType": media_type,
+            }
+
+        # Synthetic view for grab helpers.
+        view = MessageView(
+            chat_id=chat_id,
+            message_id=int(message.get("message_id") or 0),
+            user_id=user_id,
+            text=f"[Get {media_type}:{tmdb_id}]",
+            is_bot=False,
+        )
+        if not self.rate.allow():
+            return InboxResult(handled=True, reply=format_rate_limited(), mode="offer")
+
+        result = await self._grab_catalog_row(
+            view,
+            row,
+            query=str(row.get("title") or ""),
+            media_kind_hint=media_type,
+            skip_rate=True,
+        )
+        result.mode = "queued" if result.grabbed else self._mode(chat_id)
+        if result.grabbed:
+            self._set_mode(chat_id, "queued")
+            self.pending.pop(chat_id, None)
+        if result.reply:
+            self.memory.record_user(chat_id, f"[button Get {tmdb_id}]")
+            self.memory.record_bot(
+                chat_id,
+                result.reply,
+                search_title=result.title,
+                media_kind=media_type,
+            )
+            if result.grabbed and result.title:
+                self.memory.remember_rejected(chat_id, [result.title])
+        return result
 
     async def handle_message(self, message: dict[str, Any]) -> InboxResult:
         """Parse one Telegram message and run the tool-calling conversation."""
@@ -170,34 +271,31 @@ class TelegramInbox:
         if self.deduper.seen_message(view.chat_id, view.message_id):
             return InboxResult(handled=True)
 
-        # 1) A bare numeric choice is always local while a live menu exists.
-        if parsed.kind == "disambiguation_pick":
-            result = await self._handle_pick(view, parsed)
-            return await self._finish(view, result, user_text=view.text)
-
         pending = self._pending_for(view.chat_id)
 
-        # 2) Multi-row list shortcuts only: "all of them" / "de eerste".
-        # Never auto-queue on yes/yep/short replies — that is a model turn.
-        if pending is not None and len(pending.options) >= 2:
-            instant = instant_pick_decision(view.text, pending.options)
-            if (
-                instant is not None
-                and instant.action in {"pick", "pick_many"}
-                and not looks_like_confirm_yes(view.text)
-            ):
-                result = await self._apply_intent(
-                    view, parsed, instant, pending=pending
-                )
+        # Bare 1/2/3 / all-of-them / de eerste MUST NOT queue (second brain killed).
+        # Buttons carry the tmdb id; free-text ordinals are ignored or re-prompted.
+        if parsed.kind == "disambiguation_pick":
+            if pending is not None and pending.options:
                 return await self._finish(
                     view,
-                    result or InboxResult(handled=True),
-                    search_title=pending.query,
-                    media_kind=pending.media_kind,
+                    InboxResult(
+                        handled=True,
+                        reply=(
+                            "Tap a Get button for the title you want — "
+                            "numbers in chat don't queue."
+                        ),
+                        reply_markup=pending.reply_markup
+                        or offer_inline_keyboard(pending.options),
+                        mode="offer",
+                    ),
                     user_text=view.text,
                 )
+            return await self._finish(
+                view, InboxResult(handled=True), user_text=view.text
+            )
 
-        # 3) IDs, catalog URLs, and explicit Title (YYYY) are unambiguous tools.
+        # Exact Title (YYYY) / catalog URL → search then offer Get (never silent grab).
         if self._is_instant_catalog(parsed, view):
             if not self.rate.allow():
                 return await self._finish(
@@ -210,7 +308,7 @@ class TelegramInbox:
                     view, InboxResult(handled=True), user_text=view.text
                 )
             self.pending.pop(view.chat_id, None)
-            result = await self._resolve_and_grab(view, parsed)
+            result = await self._resolve_and_offer(view, parsed)
             return await self._finish(
                 view,
                 result,
@@ -218,14 +316,11 @@ class TelegramInbox:
                 media_kind=(
                     parsed.media_kind
                     if parsed.media_kind in {"movie", "tv"}
-                    else ("tv" if result.service == "sonarr" else "movie")
-                    if result.grabbed
                     else ""
                 ),
                 user_text=view.text,
             )
 
-        # 4) Unsupported download payloads receive the existing house reply.
         if parsed.kind == "reject_download":
             return await self._finish(
                 view,
@@ -233,20 +328,31 @@ class TelegramInbox:
                 user_text=view.text,
             )
 
-        # 5) Chatter is silent unless a pending offer makes it conversational.
         if (
             looks_like_chatter(view.text)
             and pending is None
             and not looks_like_media_ask(view.text)
+            and not looks_like_explain(view.text)
+            and not looks_like_correction(view.text)
         ):
             return await self._finish(
                 view, InboxResult(handled=True), user_text=view.text
             )
 
-        # 5b) Bare reject: remember rejected titles for the model context.
-        # Do NOT auto-queue — safety rail refuses queue_request on rejects.
-        # Pending stays visible so a mistaken model queue_request is refused
-        # against the live offer, then cleared after the turn.
+        # Explain mode: apologize, do not re-search unless asked.
+        if looks_like_explain(view.text):
+            self._set_mode(view.chat_id, "explain")
+            apology = (
+                "Sorry — that was a bug. A leftover shortcut treated a free-text "
+                "reply like a confirm and queued titles without a Get tap. "
+                "I won't re-offer that wrong set; say what you want next."
+            )
+            return await self._finish(
+                view,
+                InboxResult(handled=True, reply=apology, mode="explain"),
+                user_text=view.text,
+            )
+
         rejected_this_turn = False
         if pending is not None and looks_like_confirm_no(view.text):
             rejected_rows = self._titles_from_options(pending.options)
@@ -259,6 +365,21 @@ class TelegramInbox:
                 clear_subject=False,
             )
             rejected_this_turn = True
+            self._set_mode(view.chat_id, "browse")
+
+        # Genre correction stays in browse — never queue.
+        if looks_like_correction(view.text):
+            self._set_mode(view.chat_id, "browse")
+            if pending is not None:
+                rejected_rows = self._titles_from_options(pending.options)
+                self.memory.remember_rejected(
+                    view.chat_id,
+                    rejected_rows,
+                    clear_offered=True,
+                    clear_subject=False,
+                )
+                self.pending.pop(view.chat_id, None)
+                pending = None
 
         history = self.memory.history_blob(view.chat_id)
         subject_title, subject_kind = self.memory.subject(view.chat_id)
@@ -279,10 +400,6 @@ class TelegramInbox:
                 clear_subject=True,
             )
             subject_title, subject_kind = "", ""
-        elif pending is None and self.memory.offered(view.chat_id):
-            # Keep offered rows visible to the model as context; do not wipe
-            # on every new ask — the agent context block needs them for Yep.
-            pass
 
         pending_blob = None
         offered_rows: list[dict[str, Any]] = []
@@ -312,6 +429,36 @@ class TelegramInbox:
                 user_text=view.text,
             )
 
+        # Explicit yes / download-of-pending bound to a single pending tmdb_id.
+        queue_approved = False
+        if pending is not None and len(pending.options) == 1:
+            pending_title = str(pending.options[0].get("title") or "")
+            has_id = bool(
+                pending.options[0].get("tmdbId") or pending.options[0].get("mediaId")
+            )
+            names_pending = bool(
+                pending_title
+                and normalize_title(pending_title)
+                and normalize_title(pending_title) in normalize_title(view.text)
+            )
+            download_verb = bool(
+                re.search(
+                    r"\b(?:download|queue|get|bring|add|grab|doe)\b",
+                    view.text,
+                    re.I,
+                )
+            )
+            queue_approved = has_id and (
+                looks_like_confirm_yes(view.text)
+                or (names_pending and download_verb)
+            )
+
+        session_mode = self._mode(view.chat_id)
+        if pending is not None:
+            session_mode = "confirm" if len(pending.options) == 1 else "offer"
+        elif looks_like_correction(view.text):
+            session_mode = "browse"
+
         handlers = self._tool_handlers(view)
         agent = await run_telegram_agent(
             view.text,
@@ -322,6 +469,8 @@ class TelegramInbox:
             subject_media_kind=subject_kind,
             rejected_titles=rejected,
             offered=offered_rows,
+            mode=session_mode,
+            queue_approved=queue_approved,
         )
 
         result = InboxResult(
@@ -332,18 +481,26 @@ class TelegramInbox:
             year=agent.year,
             titles=list(agent.titles),
             service="overseerr" if agent.grabbed else "",
+            reply_markup=agent.reply_markup,
+            mode=agent.mode,
         )
 
-        # Reject turn: drop the refused offer so it cannot stick for a later bind.
         if rejected_this_turn and not result.grabbed:
             self.pending.pop(view.chat_id, None)
             self.memory.clear_offered(view.chat_id)
 
-        # If tools set pending/reply but the model returned empty prose, keep
-        # the tool-formatted reply (Did you mean / numbered list / Queued).
-        if not result.reply and self.pending.get(view.chat_id):
-            live = self.pending[view.chat_id]
-            result.reply = live.last_bot_reply
+        live = self.pending.get(view.chat_id)
+        if live is not None:
+            if not result.reply_markup:
+                result.reply_markup = live.reply_markup
+            if not result.reply and live.last_bot_reply:
+                result.reply = live.last_bot_reply
+            self._set_mode(
+                view.chat_id,
+                "confirm" if len(live.options) == 1 else "offer",
+            )
+        elif result.mode:
+            self._set_mode(view.chat_id, result.mode)
 
         return await self._finish(
             view,
@@ -368,8 +525,11 @@ class TelegramInbox:
     def _tool_handlers(self, view: MessageView) -> dict[str, Any]:
         """Bind per-message tool handlers for the Chat Completions loop."""
 
-        async def search_catalog(args: dict[str, Any]) -> dict[str, Any]:
+        async def search_title(args: dict[str, Any]) -> dict[str, Any]:
             return await self._tool_search_catalog(view, args)
+
+        async def discover_by_genre(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_discover_by_genre(view, args)
 
         async def suggest_titles(args: dict[str, Any]) -> dict[str, Any]:
             return await self._tool_suggest_titles(view, args)
@@ -377,7 +537,7 @@ class TelegramInbox:
         async def queue_request(args: dict[str, Any]) -> dict[str, Any]:
             return await self._tool_queue_request(view, args)
 
-        async def already_queued(args: dict[str, Any]) -> dict[str, Any]:
+        async def library_status(args: dict[str, Any]) -> dict[str, Any]:
             return await self._tool_already_queued(view, args)
 
         async def download_progress(args: dict[str, Any]) -> dict[str, Any]:
@@ -387,10 +547,13 @@ class TelegramInbox:
             return await self._tool_retry_download(view, args)
 
         return {
-            "search_catalog": search_catalog,
+            "search_title": search_title,
+            "search_catalog": search_title,  # back-compat alias
+            "discover_by_genre": discover_by_genre,
             "suggest_titles": suggest_titles,
             "queue_request": queue_request,
-            "already_queued": already_queued,
+            "library_status": library_status,
+            "already_queued": library_status,
             "download_progress": download_progress,
             "retry_download": retry_download,
         }
@@ -495,7 +658,8 @@ class TelegramInbox:
                 "results": compact,
                 "count": 1,
                 "reply": offered.reply,
-                "hint": "Ask the user to confirm before calling queue_request.",
+                "reply_markup": offered.reply_markup,
+                "hint": "Ask the user to confirm or tap Get before queue_request.",
             }
 
         if len(compact) > 1:
@@ -509,7 +673,8 @@ class TelegramInbox:
                 "results": compact,
                 "count": len(compact),
                 "reply": offered.reply,
-                "hint": "Present the numbered list; wait for a pick or confirm.",
+                "reply_markup": offered.reply_markup,
+                "hint": "Present the numbered list with Get buttons; wait for a tap or yes.",
             }
 
         # No catalog hit — still offer a confirm on the model-named title so
@@ -530,12 +695,135 @@ class TelegramInbox:
             "results": [],
             "count": 0,
             "reply": offered.reply,
+            "reply_markup": offered.reply_markup,
             "hint": "No exact catalog hit; confirm the guessed title with the user.",
+        }
+
+    async def _tool_discover_by_genre(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        raw_ids = args.get("genre_ids") or args.get("genreIds") or []
+        raw_excl = args.get("exclude_genre_ids") or args.get("excludeGenreIds") or []
+        if not isinstance(raw_ids, list):
+            raw_ids = [raw_ids]
+        if not isinstance(raw_excl, list):
+            raw_excl = [raw_excl]
+        genre_ids: list[int] = []
+        for item in raw_ids:
+            try:
+                genre_ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        exclude_ids: list[int] = []
+        for item in raw_excl:
+            try:
+                exclude_ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+
+        # Fantasy asks must exclude Sci-Fi even if the model forgets.
+        if GENRE_FANTASY in genre_ids and GENRE_SCI_FI not in exclude_ids:
+            exclude_ids.append(GENRE_SCI_FI)
+
+        # Also honor genre hints from the user/correction text.
+        hint_inc, hint_exc = genre_hint_from_text(view.text)
+        for gid in hint_inc:
+            if gid not in genre_ids:
+                genre_ids.append(gid)
+        for gid in hint_exc:
+            if gid not in exclude_ids:
+                exclude_ids.append(gid)
+
+        if not genre_ids:
+            return {"ok": False, "error": "genre_ids required"}
+
+        media_type = str(args.get("media_type") or args.get("mediaType") or "movie").strip()
+        kind = media_type if media_type in {"movie", "tv"} else "movie"
+        try:
+            limit = int(args.get("limit") or 4)
+        except (TypeError, ValueError):
+            limit = 4
+        limit = max(2, min(4, limit))
+        query = str(args.get("query") or view.text or "discover").strip()[:120]
+
+        discovered = await overseerr.discover(
+            genre_ids=genre_ids,
+            exclude_genre_ids=exclude_ids,
+            media_type=kind,
+            limit=limit + 2,
+        )
+        rows = list(discovered.get("results") or [])
+        rows = [
+            r
+            for r in rows
+            if not self._title_is_rejected(view.chat_id, str(r.get("title") or ""))
+        ][:limit]
+
+        if len(rows) < 2:
+            return {
+                "ok": False,
+                "error": "discover_by_genre returned fewer than 2 titles",
+                "genre_ids": genre_ids,
+                "exclude_genre_ids": exclude_ids,
+                "partial": [
+                    {"title": str(r.get("title") or ""), "year": self._row_year(r)}
+                    for r in rows
+                ],
+            }
+
+        # Correction copy when rediscovering after a wrong genre set.
+        prefix = ""
+        if looks_like_correction(view.text):
+            prefix = "You're right — those were sci-fi. Fantasy instead:\n"
+
+        offered = self._offer_rows(
+            view,
+            query or "discover",
+            rows,
+            media_kind=kind,
+            reply_prefix=prefix,
+        )
+        compact = [
+            {
+                "title": str(r.get("title") or ""),
+                "year": self._row_year(r),
+                "tmdbId": r.get("tmdbId") or r.get("mediaId"),
+                "mediaType": self._row_kind(r, kind),
+            }
+            for r in rows
+        ]
+        self._set_mode(view.chat_id, "offer")
+        return {
+            "ok": True,
+            "query": query,
+            "media_type": kind,
+            "genre_ids": genre_ids,
+            "exclude_genre_ids": exclude_ids,
+            "results": compact,
+            "count": len(compact),
+            "reply": offered.reply,
+            "reply_markup": offered.reply_markup,
+            "hint": "Present this list with Get buttons. Do not call queue_request.",
         }
 
     async def _tool_suggest_titles(
         self, view: MessageView, args: dict[str, Any]
     ) -> dict[str, Any]:
+        query = str(args.get("query") or "").strip()
+        # Genre/vibe asks must go through TMDB discover — never chat-memory sci-fi packs.
+        hint_inc, hint_exc = genre_hint_from_text(query or view.text)
+        if hint_inc and not (isinstance(args.get("titles"), list) and len(args.get("titles") or []) >= 2):
+            return await self._tool_discover_by_genre(
+                view,
+                {
+                    "genre_ids": hint_inc,
+                    "exclude_genre_ids": hint_exc,
+                    "media_type": args.get("media_type") or "movie",
+                    "limit": args.get("limit") or 4,
+                    "query": query or view.text,
+                },
+            )
+
         raw_titles = args.get("titles")
         titles: list[str] = []
         if isinstance(raw_titles, list):
@@ -553,7 +841,6 @@ class TelegramInbox:
                 if len(titles) >= 4:
                     break
 
-        query = str(args.get("query") or "").strip()
         media_type = str(args.get("media_type") or args.get("type") or "").strip()
         kind = media_type if media_type in {"movie", "tv"} else ""
         try:
@@ -562,25 +849,18 @@ class TelegramInbox:
             limit = 4
         limit = max(2, min(4, limit))
 
-        # Curated vibe packs when the model only passes a mood query.
-        if len(titles) < 2 and query:
-            pack = _vibe_title_pack(query)
-            for name in pack:
-                if name not in titles:
-                    titles.append(name)
-                if len(titles) >= limit:
-                    break
-
         if len(titles) < 2:
             return {
                 "ok": False,
-                "error": "suggest_titles needs 2–4 titles or a vibe query",
+                "error": (
+                    "suggest_titles needs 2–4 explicit titles; "
+                    "for genre/vibe asks use discover_by_genre"
+                ),
             }
 
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for name in titles[:limit]:
-            # Strip year for lookup seed.
             seed = re.sub(r"\s*\(\d{4}\)\s*$", "", name).strip() or name
             year_m = re.search(r"\((\d{4})\)\s*$", name)
             year_i = int(year_m.group(1)) if year_m else None
@@ -636,21 +916,22 @@ class TelegramInbox:
             "results": compact,
             "count": len(compact),
             "reply": offered.reply,
-            "hint": "Reply with this numbered list. Do not call queue_request.",
+            "reply_markup": offered.reply_markup,
+            "hint": "Present this numbered list with Get buttons. Do not call queue_request.",
         }
 
     async def _tool_queue_request(
         self, view: MessageView, args: dict[str, Any]
     ) -> dict[str, Any]:
-        title = str(args.get("title") or "").strip()
-        if not title:
-            return {"ok": False, "error": "title required"}
-        # Belt-and-suspenders: refuse even if the agent loop missed it.
+        # Belt-and-suspenders: refuse free-text all/3/correction/reject/list.
         if should_refuse_queue(view.text):
             return {
                 "ok": False,
                 "refused": True,
-                "error": "User rejected or asked for a list; queue_request refused.",
+                "error": (
+                    "User rejected, corrected, listed, or used a free-text pick; "
+                    "queue_request refused. Use Get buttons or yes for one pending id."
+                ),
             }
 
         year = args.get("year")
@@ -665,51 +946,74 @@ class TelegramInbox:
             tmdb_id = None
         media_type = str(args.get("media_type") or args.get("mediaType") or "").strip()
         kind = media_type if media_type in {"movie", "tv"} else "movie"
+        title = str(args.get("title") or "").strip()
 
-        # Prefer a matching pending/offered row (confirm of Did-you-mean).
         pending = self._pending_for(view.chat_id)
+        # HITL: queue only when the live pending tmdb_id is targeted and the
+        # user is not a refuse/list/correction/bare-pick. Buttons use
+        # handle_callback instead. Multi-row free-text never approves.
+        approved = False
         row: dict[str, Any] | None = None
-        if pending is not None:
-            for option in pending.options:
-                if titles_match(str(option.get("title") or ""), title):
-                    row = dict(option)
-                    break
-            if row is None and len(pending.options) == 1 and (
-                looks_like_confirm_yes(view.text)
-                or titles_match(title, str(pending.options[0].get("title") or ""))
-            ):
-                # Confirm of the single on-screen guess — bind to that row so
-                # the model cannot redirect Land → La La Land.
-                row = dict(pending.options[0])
-            # Download/queue phrasing naming the pending title.
-            if row is None and len(pending.options) == 1:
-                pending_title = str(pending.options[0].get("title") or "")
-                if pending_title and normalize_title(pending_title) in normalize_title(
-                    view.text
+        if pending is not None and not should_refuse_queue(view.text):
+            if len(pending.options) == 1:
+                option = pending.options[0]
+                oid = option.get("tmdbId") or option.get("mediaId")
+                try:
+                    oid_i = int(oid) if oid not in (None, "") else None
+                except (TypeError, ValueError):
+                    oid_i = None
+                pending_title = str(option.get("title") or "")
+                names_pending = bool(
+                    pending_title
+                    and normalize_title(pending_title)
+                    and normalize_title(pending_title) in normalize_title(view.text)
+                )
+                download_verb = bool(
+                    re.search(
+                        r"\b(?:download|queue|get|bring|add|grab|doe)\b",
+                        view.text,
+                        re.I,
+                    )
+                )
+                if looks_like_confirm_yes(view.text) or (
+                    names_pending and download_verb
                 ):
-                    row = dict(pending.options[0])
-                elif looks_like_confirm_yes(view.text):
-                    row = dict(pending.options[0])
-        if row is None:
-            for option in self.memory.offered(view.chat_id):
-                if titles_match(str(option.get("title") or ""), title):
                     row = dict(option)
-                    break
+                    approved = True
+                elif tmdb_id is not None and oid_i == tmdb_id and (
+                    looks_like_confirm_yes(view.text)
+                    or names_pending
+                    or download_verb
+                ):
+                    # Model proposed the on-screen pending id after yes / bring-it.
+                    row = dict(option)
+                    approved = True
+            elif tmdb_id is not None and looks_like_confirm_yes(view.text):
+                for option in pending.options:
+                    oid = option.get("tmdbId") or option.get("mediaId")
+                    try:
+                        if oid is not None and int(oid) == tmdb_id:
+                            row = dict(option)
+                            approved = True
+                            break
+                    except (TypeError, ValueError):
+                        continue
 
-        if row is None:
-            row = {
-                "title": title,
-                "year": year_i,
-                "tmdbId": tmdb_id,
-                "mediaId": tmdb_id,
-                "mediaType": kind,
+        if not approved or row is None:
+            return {
+                "ok": False,
+                "refused": True,
+                "error": (
+                    "queue_request requires a Get button callback or an explicit "
+                    "yes bound to a pending tmdb_id. Do not queue from free text."
+                ),
             }
-        else:
-            if year_i is not None and row.get("year") in (None, ""):
-                row["year"] = year_i
-            if tmdb_id is not None and not (row.get("tmdbId") or row.get("mediaId")):
-                row["tmdbId"] = tmdb_id
-                row["mediaId"] = tmdb_id
+
+        if year_i is not None and row.get("year") in (None, ""):
+            row["year"] = year_i
+        if tmdb_id is not None and not (row.get("tmdbId") or row.get("mediaId")):
+            row["tmdbId"] = tmdb_id
+            row["mediaId"] = tmdb_id
 
         result = await self._grab_catalog_row(
             view,
@@ -718,6 +1022,8 @@ class TelegramInbox:
             media_kind_hint=str(row.get("mediaType") or kind),
             skip_rate=True,
         )
+        if result.grabbed:
+            self._set_mode(view.chat_id, "queued")
         return {
             "ok": bool(result.grabbed) or "Queued" in (result.reply or ""),
             "grabbed": bool(result.grabbed),
@@ -915,9 +1221,16 @@ class TelegramInbox:
         media_kind: str,
         query: str,
         reply: str,
+        reply_markup: dict[str, Any] | None = None,
+        mode: SessionMode = "offer",
     ) -> None:
         rows = dedupe_choice_rows(options)[:MAX_CANDIDATES]
         kind = media_kind if media_kind in {"movie", "tv"} else "movie"
+        if reply_markup is None:
+            if len(rows) == 1:
+                reply_markup = single_get_keyboard(rows[0])
+            elif rows:
+                reply_markup = offer_inline_keyboard(rows)
         self.pending[view.chat_id] = PendingDisambiguation(
             chat_id=view.chat_id,
             options=rows,
@@ -925,7 +1238,10 @@ class TelegramInbox:
             query=query[:200],
             created_message_id=view.message_id,
             last_bot_reply=reply[:400],
+            mode=mode if len(rows) != 1 else "confirm",
+            reply_markup=reply_markup,
         )
+        self._set_mode(view.chat_id, "confirm" if len(rows) == 1 else "offer")
         self.memory.set_subject(
             view.chat_id,
             query,
@@ -1044,13 +1360,12 @@ class TelegramInbox:
             rejected_titles=rejected_titles,
         )[:MAX_CANDIDATES]
 
-    async def _resolve_and_grab(
+    async def _resolve_and_offer(
         self,
         view: MessageView,
         parsed: ParsedRequest,
-        *,
-        select_all: bool = False,
     ) -> InboxResult:
+        """Exact Title (YYYY) / URL → offer Get, never silently grab."""
         hits, label = await tool_lookup_parsed(parsed)
         if not hits:
             return InboxResult(
@@ -1058,14 +1373,6 @@ class TelegramInbox:
                 reply=format_not_found(label or parsed.display_label()),
             )
         rows = dedupe_choice_rows([hit.as_dict() for hit in hits])
-        if select_all and len(rows) > 1:
-            return await self._queue_many(
-                view,
-                parsed.title or label,
-                parsed.media_kind,
-                rows,
-                skip_rate=True,
-            )
         if len(rows) > 1 and not choices_are_indistinguishable(rows):
             return self._offer_rows(
                 view,
@@ -1073,13 +1380,22 @@ class TelegramInbox:
                 rows,
                 media_kind=parsed.media_kind,
             )
-        return await self._grab_catalog_row(
+        return self._ask_guess_confirm(
             view,
             rows[0],
             query=parsed.title or label,
-            media_kind_hint=parsed.media_kind,
-            skip_rate=True,
         )
+
+    async def _resolve_and_grab(
+        self,
+        view: MessageView,
+        parsed: ParsedRequest,
+        *,
+        select_all: bool = False,
+    ) -> InboxResult:
+        # Legacy name retained for older callers/tests — HITL: offer, don't grab.
+        del select_all
+        return await self._resolve_and_offer(view, parsed)
 
     async def _grab_catalog_row(
         self,
@@ -1621,14 +1937,60 @@ class TelegramInbox:
             "inLibrary": bool(row.get("inLibrary")),
         }
         reply = format_guess_confirm(title, year)
+        markup = single_get_keyboard(option)
         self._remember_pending(
             view,
             options=[option],
             media_kind=kind,
             query=title,
             reply=reply,
+            reply_markup=markup,
+            mode="confirm",
         )
-        return InboxResult(handled=True, reply=reply)
+        return InboxResult(
+            handled=True,
+            reply=reply,
+            reply_markup=markup,
+            mode="confirm",
+            title=title,
+            year=year,
+        )
+
+    def _offer_rows(
+        self,
+        view: MessageView,
+        query: str,
+        rows: list[dict[str, Any]],
+        *,
+        media_kind: str = "",
+        reply_prefix: str = "",
+    ) -> InboxResult:
+        choices = dedupe_choice_rows(rows)[:MAX_CANDIDATES]
+        if len(choices) == 1:
+            return self._ask_guess_confirm(view, choices[0], query=query)
+        reply = format_ambiguous(query or "that", choices)
+        if reply_prefix:
+            reply = f"{reply_prefix}{reply}"
+        kind = self._row_kind(
+            choices[0],
+            media_kind if media_kind in {"movie", "tv"} else "",
+        )
+        markup = offer_inline_keyboard(choices)
+        self._remember_pending(
+            view,
+            options=choices,
+            media_kind=kind,
+            query=query or "that",
+            reply=reply,
+            reply_markup=markup,
+            mode="offer",
+        )
+        return InboxResult(
+            handled=True,
+            reply=reply,
+            reply_markup=markup,
+            mode="offer",
+        )
 
     async def _offer_list_guesses(
         self,
@@ -1637,7 +1999,7 @@ class TelegramInbox:
         *,
         media_kind_hint: str = "",
     ) -> InboxResult | None:
-        """Build a 2–4 option numbered list for 'name a few more' / options asks."""
+        """Legacy helper — prefer discover_by_genre / suggest_titles tools."""
         titles: list[str] = []
         for title in list(intent.search_titles or []):
             cleaned = catalog_search_title(title) or str(title).strip()
@@ -1651,33 +2013,24 @@ class TelegramInbox:
         titles = titles[:4]
         if len(titles) < 2:
             return None
-
         kind = media_kind_hint if media_kind_hint in {"movie", "tv"} else ""
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for title in titles:
             found = await tool_lookup_title(title, media_kind=kind)
-            row: dict[str, Any]
-            if found:
-                row = dict(found[0])
-            else:
-                row = {
-                    "title": title,
-                    "year": intent.year if title == primary else None,
-                    "mediaType": kind or "movie",
-                }
+            row = dict(found[0]) if found else {
+                "title": title,
+                "year": intent.year if title == primary else None,
+                "mediaType": kind or "movie",
+            }
             label = str(row.get("title") or title).strip()
             key = normalize_title(label)
-            if not key or key in seen:
-                continue
-            # Skip titles the user already rejected / queued this chat.
-            if self._title_is_rejected(view.chat_id, label):
+            if not key or key in seen or self._title_is_rejected(view.chat_id, label):
                 continue
             seen.add(key)
             rows.append(row)
             if len(rows) >= 4:
                 break
-
         if len(rows) < 2:
             return None
         return self._offer_rows(
@@ -1687,40 +2040,26 @@ class TelegramInbox:
             media_kind=kind or self._row_kind(rows[0]),
         )
 
-    def _offer_rows(
-        self,
-        view: MessageView,
-        query: str,
-        rows: list[dict[str, Any]],
-        *,
-        media_kind: str = "",
-    ) -> InboxResult:
-        choices = dedupe_choice_rows(rows)[:MAX_CANDIDATES]
-        if len(choices) == 1:
-            return self._ask_guess_confirm(view, choices[0], query=query)
-        reply = format_ambiguous(query or "that", choices)
-        kind = self._row_kind(
-            choices[0],
-            media_kind if media_kind in {"movie", "tv"} else "",
-        )
-        self._remember_pending(
-            view,
-            options=choices,
-            media_kind=kind,
-            query=query or "that",
-            reply=reply,
-        )
-        return InboxResult(handled=True, reply=reply)
-
     # --- Picks and batch execution -----------------------------------------
 
     async def _handle_pick(
         self, view: MessageView, parsed: ParsedRequest
     ) -> InboxResult:
+        """Bare numeric picks no longer queue — buttons carry tmdb ids."""
+        del parsed
         pending = self._pending_for(view.chat_id)
-        if pending is None or parsed.pick_index is None:
+        if pending is None:
             return InboxResult(handled=True)
-        return await self._handle_indices(view, pending, [parsed.pick_index])
+        return InboxResult(
+            handled=True,
+            reply=(
+                "Tap a Get button for the title you want — "
+                "numbers in chat don't queue."
+            ),
+            reply_markup=pending.reply_markup
+            or offer_inline_keyboard(pending.options),
+            mode="offer",
+        )
 
     async def _handle_indices(
         self,
@@ -1728,59 +2067,17 @@ class TelegramInbox:
         pending: PendingDisambiguation,
         indices: list[int],
     ) -> InboxResult:
-        picks: list[dict[str, Any]] = []
-        for number in indices[:MAX_BATCH]:
-            index = number - 1
-            if index < 0 or index >= len(pending.options):
-                return InboxResult(
-                    handled=True,
-                    reply=(
-                        f"Pick 1–{min(3, len(pending.options))} from the list "
-                        "(or say 'all of them')."
-                    ),
-                )
-            picks.append(pending.options[index])
-        if not picks:
-            return InboxResult(handled=True)
-        if not self.rate.allow():
-            return InboxResult(handled=True, reply=format_rate_limited())
-
-        self.pending.pop(view.chat_id, None)
-        if len(picks) == 1:
-            return await self._grab_catalog_row(
-                view,
-                picks[0],
-                query=str(picks[0].get("title") or pending.query),
-                media_kind_hint=pending.media_kind,
-                skip_rate=True,
-            )
-
-        queued: list[str] = []
-        for row in picks:
-            result = await self._grab_catalog_row(
-                view,
-                row,
-                query=str(row.get("title") or pending.query),
-                media_kind_hint=pending.media_kind,
-                skip_rate=True,
-            )
-            if result.grabbed and result.title:
-                queued.append(
-                    f"{result.title} ({result.year})"
-                    if result.year
-                    else result.title
-                )
-        if queued:
-            return InboxResult(
-                handled=True,
-                reply=format_queued_many(queued, "Overseerr"),
-                grabbed=True,
-                titles=queued,
-                service="overseerr",
-            )
+        """Deprecated free-text index grab — never queue from list indices."""
+        del indices
         return InboxResult(
             handled=True,
-            reply=f"Nothing new to queue for '{pending.query}'.",
+            reply=(
+                "Tap a Get button for the title you want — "
+                "numbers in chat don't queue."
+            ),
+            reply_markup=pending.reply_markup
+            or offer_inline_keyboard(pending.options),
+            mode="offer",
         )
 
     async def _queue_many(
@@ -1792,49 +2089,13 @@ class TelegramInbox:
         *,
         skip_rate: bool = False,
     ) -> InboxResult:
-        pending = PendingDisambiguation(
-            chat_id=view.chat_id,
-            options=dedupe_choice_rows(rows)[:MAX_BATCH],
-            media_kind=media_kind if media_kind in {"movie", "tv"} else "movie",
-            query=query,
-            created_message_id=view.message_id,
-        )
-        self.pending[view.chat_id] = pending
-        if skip_rate:
-            # Instant caller already consumed the rate token.
-            picks = pending.options
-            self.pending.pop(view.chat_id, None)
-            queued: list[str] = []
-            for row in picks:
-                result = await self._grab_catalog_row(
-                    view,
-                    row,
-                    query=str(row.get("title") or query),
-                    media_kind_hint=pending.media_kind,
-                    skip_rate=True,
-                )
-                if result.grabbed and result.title:
-                    queued.append(
-                        f"{result.title} ({result.year})"
-                        if result.year
-                        else result.title
-                    )
-            if queued:
-                return InboxResult(
-                    handled=True,
-                    reply=format_queued_many(queued, "Overseerr"),
-                    grabbed=True,
-                    titles=queued,
-                    service="overseerr",
-                )
-            return InboxResult(
-                handled=True,
-                reply=f"Nothing new to queue for '{query}'.",
-            )
-        return await self._handle_indices(
+        """Never bulk-queue — offer Get buttons instead."""
+        del skip_rate
+        return self._offer_rows(
             view,
-            pending,
-            list(range(1, len(pending.options) + 1)),
+            query,
+            rows,
+            media_kind=media_kind,
         )
 
     # --- Retry and conversation memory -------------------------------------

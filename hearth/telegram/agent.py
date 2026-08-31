@@ -1,7 +1,12 @@
 """Telegram Movies conversational agent — OpenAI Chat Completions + tools.
 
-Every media ask is a model turn. The only way to queue is ``queue_request``.
-Python never auto-queues on short replies (Yep/No/Nah/a few…).
+Modes (session state, not vibes): idle → browse → offer → confirm → queued.
+Correction stays in browse (never queues). Explain apologizes without re-search.
+
+READ tools auto-run. WRITE ``queue_request`` is HITL: Python executes it only
+after an inline-keyboard callback ``q:movie:<tmdbId>`` / ``q:tv:<tmdbId>`` or
+an explicit yes bound to that pending tmdb_id — never from free-text
+"all" / "3" / "those" / "all of them" / "de eerste".
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from hearth.config import settings
 from hearth.memory.redact import redact
@@ -26,6 +31,8 @@ log = logging.getLogger("hearth.telegram")
 MAX_TOOL_TURNS = 6
 HISTORY_TURNS = 8
 
+SessionMode = Literal["idle", "browse", "offer", "confirm", "queued", "explain"]
+
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
@@ -34,8 +41,45 @@ _ASKING_FOR_LIST = re.compile(
     r"\bi was asking for a few\b|"
     r"\basking for a (?:few|list|options)\b|"
     r"\bwant(?:ed)? a (?:few|list|options)\b|"
-    r"\ba few\b.+\b(?:movies?|films?|shows?|series|titles?|options|sci-?fi)\b|"
+    r"\ba few\b.+\b(?:movies?|films?|shows?|series|titles?|options|sci-?fi|fantas)\b|"
     r"\b(?:give|name|show|list)\s+(?:me\s+)?(?:a\s+)?few\b"
+    r")",
+    re.I,
+)
+
+# Free-text that must NEVER trigger queue_request (second-brain leftovers).
+_FREE_TEXT_QUEUE_BAN = re.compile(
+    r"^\s*(?:"
+    r"all(?:\s+of\s+(?:them|em|'em|it))?"
+    r"|all\s+(?:the\s+)?(?:movies?|films?|ones?|sci-?fi|fantas\w*)?"
+    r"|every(?:one|thing)?"
+    r"|allemaal|alles"
+    r"|#?\s*[1-9]"
+    r"|(?:de\s+|het\s+)?eerste(?:\s+(?:een|één|one|film|movie))?"
+    r"|(?:just\s+)?(?:the\s+)?first(?:\s+one)?"
+    r"|those"
+    r")\s*[.!?]*\s*$",
+    re.I,
+)
+
+_CORRECTION = re.compile(
+    r"(?:"
+    r"those are all\s+sci-?fi|"
+    r"all\s+(?:sci-?fi|scifi)|"
+    r"fantas(?:y|ie).{0,40}sci-?fi|"
+    r"sci-?fi.{0,40}fantas(?:y|ie)|"
+    r"not\s+sci-?fi|"
+    r"geen\s+sci-?fi|"
+    r"dat\s+(?:zijn|is)\s+(?:allemaal\s+)?sci-?fi"
+    r")",
+    re.I,
+)
+
+_EXPLAIN_WHY = re.compile(
+    r"(?:"
+    r"why did you (?:do|queue|grab|add)|"
+    r"waarom\s+(?:deed|doe)|"
+    r"why\s+would\s+you"
     r")",
     re.I,
 )
@@ -44,33 +88,58 @@ _ASKING_FOR_LIST = re.compile(
 SYSTEM_PROMPT = """You are Hearth, a Telegram bot for movies and TV series (Dutch + English).
 Users ask in a group chat; you help request titles via Overseerr.
 
-You have tools. Use them — do not invent catalog ids or queue without tools.
+Session modes: idle → browse → offer → confirm → queued.
+- browse: searching / discovering (genre or title). Never queue here.
+- offer: numbered list with Get buttons on screen. Wait for a button or yes to ONE id.
+- confirm: single Did-you-mean / Get pending. Yes → queue that tmdb_id only.
+- explain: user asked why something happened — apologize + say what happened. Do NOT
+  re-search or re-offer the same wrong set unless they ask again.
+Correction ("those are all sci-fi", "fantasy not sci-fi") stays in browse: acknowledge,
+call discover_by_genre again with the right genre_ids, NEVER queue.
 
-Tools:
-- search_catalog: exact/prefix title lookup on Overseerr/TMDB. Single-token seeds are exact
-  (Land ≠ La La Land, Wild ≠ The Wild Robot). Use for named titles and plot guesses.
-- suggest_titles: return 2–4 titled+year options. MUST use for list/vibe asks
-  ("a few", "name a few more", "cool space sci-fi", "give me options", "I was asking for a few").
-  Never reply with a single "Did you mean …?" for a list ask. Never queue on a list ask.
-- queue_request: Overseerr grab. The ONLY way anything gets queued. Call only when the user
-  clearly confirms a pending title (yes/yep/duh/ja) or names an exact Title (year)/id to grab.
-- already_queued / download_progress: optional status checks.
+You have tools. Use them — do not invent catalog ids.
+
+READ tools (auto-run):
+- search_title: exact/prefix title lookup. Single-token seeds are exact
+  (Land ≠ La La Land, Wild ≠ The Wild Robot). Use for named titles.
+- discover_by_genre: TMDB discover via Overseerr. Pass genre_ids and optional
+  exclude_genre_ids. Fantasy = 14 (ALWAYS exclude 878 Sci-Fi). Sci-Fi = 878.
+  Horror = 27. "cool fantasy" MUST call discover_by_genre([14], exclude=[878]).
+  Never invent Matrix/Arrival/Interstellar as a fantasy set.
+- library_status / download_progress: status checks.
+
+WRITE (HITL — Python only executes after Get button or explicit yes for that id):
+- queue_request(tmdb_id, media_type): ONLY way to queue. Never call for free-text
+  "all", "3", "those", "all of them", "de eerste", rejects, list asks, or corrections.
 
 Conversation rules:
-- Every user media message is a turn. Use recent history (~8 turns / 30 min) and pending/offered.
-- Rejects (no/nah/nope/nee/not that): never queue that title. Call suggest_titles for alternatives
-  or ask what they want. rejected_titles must not be re-offered.
-- Confirms (yes/yep/yeah/ja/duh) of a single pending Did-you-mean → queue_request with that
-  title + year + tmdb_id from pending/offered context only.
-- Plot/vibe single guesses → search_catalog then ask "Did you mean Title (year)?" — do not queue yet.
-- Concrete exact titles with one catalog hit may queue_request after search_catalog.
-- Ignore pure group chatter/emoji with no media ask (empty reply).
+- Rejects (no/nah/nope/nee): never queue. Discover alternatives or ask what they want.
+- Confirms (yes/yep/ja) of a single pending offer → queue_request with THAT pending tmdb_id.
+- Genre / vibe list asks → discover_by_genre (not a single Did-you-mean).
+- Exact Title (YYYY) / IMDb-TMDB URL: search_title then offer Get — do not assume queued.
+- Ignore pure group chatter/emoji (empty reply).
 - Prefer short Telegram replies. Numbered lists as "1. Title (year)\\n2. …".
+- After a wrong genre: "You're right — those were sci-fi. Fantasy instead: …"
+- Never say "Queued 3" / "Queued N via".
 """
 
 
+def looks_like_correction(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw or len(raw) > 200:
+        return False
+    return bool(_CORRECTION.search(raw))
+
+
+def looks_like_explain(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw or len(raw) > 160:
+        return False
+    return bool(_EXPLAIN_WHY.search(raw))
+
+
 def should_refuse_queue(user_text: str) -> bool:
-    """Safety rail: never execute queue_request on clear reject / list asks."""
+    """Safety rail: never execute queue_request on reject / list / correction / bare picks."""
     raw = (user_text or "").strip()
     if not raw:
         return False
@@ -80,6 +149,17 @@ def should_refuse_queue(user_text: str) -> bool:
         return True
     if _ASKING_FOR_LIST.search(raw):
         return True
+    if looks_like_correction(raw):
+        return True
+    if looks_like_explain(raw):
+        return True
+    if _FREE_TEXT_QUEUE_BAN.match(raw):
+        return True
+    # "Fantasy.. those are all scifi" and similar multi-clause corrections.
+    if re.search(r"\bthose are all\b", raw, re.I):
+        return True
+    if re.search(r"\ball (?:of )?(?:them|sci-?fi|scifi|fantas)", raw, re.I):
+        return True
     return False
 
 
@@ -87,7 +167,7 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "search_catalog",
+            "name": "search_title",
             "description": (
                 "Search Overseerr/TMDB for an exact or prefix movie/TV title. "
                 "Single-token seeds match exactly (Land ≠ La La Land)."
@@ -99,10 +179,7 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
                         "type": "string",
                         "description": "Catalog title to look up (not a plot sentence).",
                     },
-                    "year": {
-                        "type": "integer",
-                        "description": "Optional release year",
-                    },
+                    "year": {"type": "integer", "description": "Optional release year"},
                     "media_type": {
                         "type": "string",
                         "description": "movie, tv, or any",
@@ -115,11 +192,49 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "discover_by_genre",
+            "description": (
+                "TMDB discover by genre ids. Fantasy=14 (exclude 878), Sci-Fi=878, "
+                "Horror=27. Use for 'cool fantasy', genre corrections, vibe lists. "
+                "Never queues."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "genre_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "TMDB genre ids to include (e.g. [14] for Fantasy)",
+                    },
+                    "exclude_genre_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "TMDB genre ids to exclude (e.g. [878] for Sci-Fi)",
+                    },
+                    "media_type": {
+                        "type": "string",
+                        "description": "movie or tv (default movie)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many options (2–4, default 4)",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional label for the offer, e.g. 'cool fantasy'",
+                    },
+                },
+                "required": ["genre_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "suggest_titles",
             "description": (
-                "Return 2–4 titled+year options for vibe/list asks "
-                "('a few', 'name a few more', 'cool space sci-fi'). "
-                "Never queues. Prefer over a single Did-you-mean."
+                "Return 2–4 titled options when you already know specific names "
+                "(not a genre browse). For genre/vibe asks prefer discover_by_genre."
             ),
             "parameters": {
                 "type": "object",
@@ -127,20 +242,14 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
                     "titles": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Explicit title list when you already know 2–4 names",
+                        "description": "Explicit title list (2–4 names)",
                     },
                     "query": {
                         "type": "string",
-                        "description": "Mood/vibe when titles are unknown, e.g. 'cool space sci-fi'",
+                        "description": "Label for the offer",
                     },
-                    "media_type": {
-                        "type": "string",
-                        "description": "movie, tv, or any",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "How many options (2–4, default 4)",
-                    },
+                    "media_type": {"type": "string"},
+                    "limit": {"type": "integer"},
                 },
             },
         },
@@ -150,30 +259,29 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "queue_request",
             "description": (
-                "Queue one movie/TV title via Overseerr. Only call on clear user confirm "
-                "of a pending offer, or an unambiguous Title (year)/id grab. "
-                "Requires title; include year and tmdb_id when known."
+                "Queue one title via Overseerr. Only after Get button or explicit yes "
+                "for that pending tmdb_id. Requires tmdb_id + media_type."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string"},
-                    "year": {"type": "integer"},
                     "tmdb_id": {"type": "integer"},
                     "media_type": {
                         "type": "string",
                         "description": "movie or tv",
                     },
+                    "title": {"type": "string"},
+                    "year": {"type": "integer"},
                 },
-                "required": ["title"],
+                "required": ["tmdb_id", "media_type"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "already_queued",
-            "description": "Check whether a title is already downloading or in the library queue.",
+            "name": "library_status",
+            "description": "Check whether a title is already in the library or download queue.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -203,8 +311,7 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "retry_download",
             "description": (
-                "Retry a stalled or failed download from another *arr source. "
-                "Use when the user says the download didn't work / try another source."
+                "Retry a stalled or failed download from another *arr source."
             ),
             "parameters": {
                 "type": "object",
@@ -217,6 +324,12 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+# Back-compat alias used by older patches / docs.
+TELEGRAM_CHAT_TOOLS_ALIASES = {
+    "search_catalog": "search_title",
+    "already_queued": "library_status",
+}
+
 
 @dataclass
 class AgentTurnResult:
@@ -228,6 +341,8 @@ class AgentTurnResult:
     tools_used: list[dict[str, Any]] = field(default_factory=list)
     search_title: str = ""
     media_kind: str = ""
+    mode: SessionMode = "idle"
+    reply_markup: dict[str, Any] | None = None
 
 
 def _parse_args(raw: str | None) -> dict[str, Any]:
@@ -241,7 +356,6 @@ def _parse_args(raw: str | None) -> dict[str, Any]:
 
 
 def _history_messages(history: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Map ChatMemory history_blob turns into OpenAI chat messages."""
     out: list[dict[str, Any]] = []
     for turn in (history or [])[-HISTORY_TURNS:]:
         role = "assistant" if turn.get("role") == "bot" else "user"
@@ -259,8 +373,10 @@ def _context_block(
     subject_media_kind: str,
     rejected_titles: list[str],
     offered: list[dict[str, Any]],
+    mode: str = "idle",
 ) -> str:
     payload = {
+        "mode": mode,
         "pending": pending,
         "subject_title": redact(subject_title)[:120] if subject_title else "",
         "subject_media_kind": subject_media_kind or "",
@@ -268,8 +384,9 @@ def _context_block(
         "offered": offered[:8],
     }
     return (
-        "Session context (JSON). pending/offered are the live on-screen titles; "
-        "never re-offer rejected_titles.\n"
+        "Session context (JSON). mode is the explicit session state. "
+        "pending/offered are live on-screen titles with tmdb ids; "
+        "never re-offer rejected_titles. queue_request only for a confirmed pending id.\n"
         + json.dumps(payload, ensure_ascii=False, default=str)
     )
 
@@ -284,19 +401,42 @@ async def run_telegram_agent(
     subject_media_kind: str = "",
     rejected_titles: list[str] | None = None,
     offered: list[dict[str, Any]] | None = None,
+    mode: SessionMode | str = "idle",
     model: str | None = None,
+    queue_approved: bool = False,
 ) -> AgentTurnResult:
     """One user turn: Chat Completions with native function tools."""
     from openai import AsyncOpenAI
 
     if not settings.openai_api_key:
-        return AgentTurnResult(reply="")
+        return AgentTurnResult(reply="", mode=mode if mode in {
+            "idle", "browse", "offer", "confirm", "queued", "explain"
+        } else "idle")
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     use_model = model or telegram_intent_model()
-    # Prefer gpt-4o for Telegram conversation unless a non-mini override is set.
     if use_model.endswith("-mini") and not model:
         use_model = TELEGRAM_INTENT_MODEL
+
+    session_mode: SessionMode = (
+        mode if mode in {"idle", "browse", "offer", "confirm", "queued", "explain"} else "idle"
+    )
+
+    extra_system = ""
+    if looks_like_explain(user_text):
+        session_mode = "explain"
+        extra_system = (
+            "EXPLAIN MODE: Apologize briefly and explain what happened. "
+            "Do NOT call discover_by_genre or search_title unless the user asks "
+            "for a new search. Do NOT call queue_request."
+        )
+    elif looks_like_correction(user_text):
+        session_mode = "browse"
+        extra_system = (
+            "CORRECTION MODE: Stay in browse. Acknowledge the wrong genre. "
+            "Call discover_by_genre with the corrected genre_ids "
+            "(Fantasy=14 exclude 878). Never queue_request."
+        )
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -308,14 +448,25 @@ async def run_telegram_agent(
                 subject_media_kind=subject_media_kind,
                 rejected_titles=list(rejected_titles or []),
                 offered=list(offered or []),
+                mode=session_mode,
             ),
         },
-        *_history_messages(history),
-        {"role": "user", "content": user_text},
     ]
+    if extra_system:
+        messages.append({"role": "system", "content": extra_system})
+    messages.extend(_history_messages(history))
+    messages.append({"role": "user", "content": user_text})
 
-    result = AgentTurnResult()
-    refuse = should_refuse_queue(user_text)
+    result = AgentTurnResult(mode=session_mode)
+    refuse = should_refuse_queue(user_text) and not queue_approved
+
+    # Alias map so handlers can be registered under either name.
+    resolved_handlers = dict(handlers)
+    for alias, canonical in TELEGRAM_CHAT_TOOLS_ALIASES.items():
+        if alias in resolved_handlers and canonical not in resolved_handlers:
+            resolved_handlers[canonical] = resolved_handlers[alias]
+        if canonical in resolved_handlers and alias not in resolved_handlers:
+            resolved_handlers[alias] = resolved_handlers[canonical]
 
     for _ in range(MAX_TOOL_TURNS):
         response = await client.chat.completions.create(
@@ -374,14 +525,15 @@ async def run_telegram_agent(
                 }
             )
             for tc in normalized:
-                name = tc["name"]
+                name = TELEGRAM_CHAT_TOOLS_ALIASES.get(tc["name"], tc["name"])
                 args = _parse_args(tc["arguments"])
                 payload = await _dispatch_tool(
                     name,
                     args,
-                    handlers=handlers,
+                    handlers=resolved_handlers,
                     refuse_queue=refuse,
                     user_text=user_text,
+                    queue_approved=queue_approved,
                 )
                 result.tools_used.append(
                     {"name": name, "args": args, "result": payload}
@@ -415,22 +567,30 @@ async def _dispatch_tool(
     handlers: dict[str, ToolHandler],
     refuse_queue: bool,
     user_text: str,
+    queue_approved: bool = False,
 ) -> dict[str, Any]:
-    if name == "queue_request" and refuse_queue:
+    if name == "queue_request" and refuse_queue and not queue_approved:
         log.info(
-            "refused queue_request for reject/list ask: %s",
+            "refused queue_request for reject/list/correction: %s",
             redact(user_text)[:80],
         )
         return {
             "ok": False,
             "refused": True,
             "error": (
-                "Tool refused: the latest user message is a reject or list ask. "
-                "Do not queue. Call suggest_titles for 2–4 alternatives or ask "
-                "what they want instead."
+                "Tool refused: free-text cannot queue. Wait for a Get button "
+                "callback or an explicit yes bound to a pending tmdb_id. "
+                "For genre mistakes call discover_by_genre."
             ),
         }
     handler = handlers.get(name)
+    if handler is None:
+        # Try alias.
+        alias = next(
+            (a for a, c in TELEGRAM_CHAT_TOOLS_ALIASES.items() if c == name),
+            None,
+        )
+        handler = handlers.get(alias) if alias else None
     if handler is None:
         return {"ok": False, "error": f"unknown tool {name}"}
     try:
@@ -448,6 +608,7 @@ def _absorb_tool_side_effects(
         return
     if name == "queue_request" and payload.get("ok") and payload.get("grabbed"):
         result.grabbed = True
+        result.mode = "queued"
         result.title = str(payload.get("title") or result.title or "")
         year = payload.get("year")
         try:
@@ -459,7 +620,15 @@ def _absorb_tool_side_effects(
         titles = payload.get("titles")
         if isinstance(titles, list):
             result.titles.extend(str(t) for t in titles if t)
-    if name in {"search_catalog", "suggest_titles", "retry_download", "download_progress"}:
+    if name in {
+        "search_title",
+        "search_catalog",
+        "discover_by_genre",
+        "suggest_titles",
+        "retry_download",
+        "download_progress",
+        "library_status",
+    }:
         st = payload.get("query") or payload.get("title") or ""
         if st:
             result.search_title = str(st)[:200]
@@ -467,6 +636,17 @@ def _absorb_tool_side_effects(
         if kind in {"movie", "tv"}:
             result.media_kind = kind
         if payload.get("reply"):
-            # Prefer model prose, but keep tool-formatted list / retry copy.
-            if not result.reply or name in {"retry_download", "suggest_titles"}:
+            if not result.reply or name in {
+                "retry_download",
+                "suggest_titles",
+                "discover_by_genre",
+            }:
                 result.reply = str(payload["reply"])
+        if payload.get("reply_markup") and isinstance(payload["reply_markup"], dict):
+            result.reply_markup = payload["reply_markup"]
+        if name in {"discover_by_genre", "suggest_titles"} and payload.get("ok"):
+            result.mode = "offer"
+        elif name in {"search_title", "search_catalog"} and payload.get("count") == 1:
+            result.mode = "confirm"
+        elif name in {"search_title", "search_catalog"} and (payload.get("count") or 0) > 1:
+            result.mode = "offer"

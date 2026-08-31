@@ -608,6 +608,84 @@ MOCK_SONARR_RELEASES: dict[int, list[dict[str, Any]]] = {
     ],
 }
 
+# TMDB discover fixtures (Telegram genre browse). Fantasy=14, Sci-Fi=878.
+# Fantasy pack must NOT be Matrix / Arrival / Interstellar.
+MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
+    {
+        "id": 497698,
+        "mediaType": "movie",
+        "title": "The Green Knight",
+        "year": 2021,
+        "genreIds": [14, 12, 18],
+        "overview": "A fantasy retelling of Sir Gawain and the Green Knight.",
+    },
+    {
+        "id": 1417,
+        "mediaType": "movie",
+        "title": "Pan's Labyrinth",
+        "year": 2006,
+        "genreIds": [14, 18, 27],
+        "overview": "A young girl enters a mythical labyrinth in Francoist Spain.",
+    },
+    {
+        "id": 120,
+        "mediaType": "movie",
+        "title": "The Lord of the Rings: The Fellowship of the Ring",
+        "year": 2001,
+        "genreIds": [14, 12, 28],
+        "overview": "A hobbit begins a quest to destroy the One Ring.",
+    },
+    {
+        "id": 129,
+        "mediaType": "movie",
+        "title": "Spirited Away",
+        "year": 2001,
+        "genreIds": [14, 16, 12],
+        "overview": "A girl enters a spirit world to save her parents.",
+    },
+    {
+        "id": 603,
+        "mediaType": "movie",
+        "title": "The Matrix",
+        "year": 1999,
+        "genreIds": [28, 878],
+        "overview": "A hacker learns the nature of his reality.",
+    },
+    {
+        "id": 329865,
+        "mediaType": "movie",
+        "title": "Arrival",
+        "year": 2016,
+        "genreIds": [18, 878],
+        "overview": "A linguist makes contact with alien visitors.",
+    },
+    {
+        "id": 157336,
+        "mediaType": "movie",
+        "title": "Interstellar",
+        "year": 2014,
+        "genreIds": [12, 18, 878],
+        "overview": "Explorers travel through a wormhole in space.",
+    },
+    {
+        "id": 78,
+        "mediaType": "movie",
+        "title": "Blade Runner",
+        "year": 1982,
+        "genreIds": [878, 18, 53],
+        "overview": "A blade runner hunts replicants in a dystopian future.",
+    },
+    {
+        "id": 438631,
+        "mediaType": "movie",
+        "title": "Dune",
+        "year": 2021,
+        "genreIds": [878, 12],
+        "overview": "Paul Atreides arrives on Arrakis.",
+    },
+]
+
+
 MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
     {
         "id": 693134,
@@ -794,10 +872,38 @@ class MockPipeline:
             for s in _filter_title(MOCK_SONARR_LOOKUP, query)
             if s.get("matched") != "fallback"
         ]
-        merged = movies + shows
+        # Also match discover catalog rows (fantasy / sci-fi packs).
+        discover_hits = _filter_title(MOCK_TMDB_DISCOVER, query)
+        merged = movies + shows + discover_hits
         if merged:
             return merged
         return primary
+
+    def discover_overseerr(
+        self,
+        *,
+        genre_ids: list[int] | None = None,
+        exclude_genre_ids: list[int] | None = None,
+        media_type: str = "movie",
+        limit: int = 4,
+    ) -> list[dict[str, Any]]:
+        """Mock TMDB discover — Fantasy (14) never returns Matrix/Arrival/Interstellar."""
+        include = set(int(g) for g in (genre_ids or []))
+        exclude = set(int(g) for g in (exclude_genre_ids or []))
+        kind = media_type if media_type in {"movie", "tv"} else "movie"
+        out: list[dict[str, Any]] = []
+        for row in MOCK_TMDB_DISCOVER:
+            if str(row.get("mediaType") or "movie") != kind:
+                continue
+            genres = {int(g) for g in (row.get("genreIds") or [])}
+            if include and not genres.intersection(include):
+                continue
+            if exclude and genres.intersection(exclude):
+                continue
+            out.append(dict(row))
+            if len(out) >= max(1, min(int(limit or 4), 8)):
+                break
+        return out
 
     def add_radarr(self, item: dict[str, Any]) -> dict[str, Any]:
         queued = {**item, "queued": True}

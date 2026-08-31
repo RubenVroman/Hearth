@@ -114,8 +114,8 @@ def format_ambiguous(query: str, options: list[dict[str, Any]]) -> str:
         except (TypeError, ValueError):
             year_i = None
         return format_guess_confirm(title, year_i)
-    show = min(3, len(options))
-    lines = [f"Which one for '{query}'? Reply 1–{show}:"]
+    show = min(4, len(options))
+    lines = [f"Which one for '{query}'? Tap Get, or None of these:"]
     for idx, row in enumerate(options[:show], start=1):
         title = row.get("title") or "Untitled"
         year = row.get("year")
@@ -123,7 +123,6 @@ def format_ambiguous(query: str, options: list[dict[str, Any]]) -> str:
         label = f"{title} ({year})" if year else str(title)
         if kind in {"movie", "tv"}:
             type_bit = "TV" if kind == "tv" else "movie"
-            # Only annotate type when it helps tell options apart.
             kinds = {
                 str(o.get("mediaType") or "").strip().lower()
                 for o in options[:show]
@@ -131,22 +130,16 @@ def format_ambiguous(query: str, options: list[dict[str, Any]]) -> str:
             if len(kinds) > 1:
                 label = f"{label} [{type_bit}]"
         lines.append(f"{idx}. {label}")
-    if len(options) > 1:
-        extra = f" ({len(options)} matches)" if len(options) > show else ""
-        lines.append(
-            f"Or say 'all of them'{extra}, 'the first one', or 'the new one'."
-        )
     return "\n".join(lines)
 
 
 def format_queued_many(titles: list[str], via: str) -> str:
+    """Deprecated multi-queue copy — never emit 'Queued N'. One title at a time."""
     if not titles:
         return f"Nothing new to queue via {via}."
-    if len(titles) == 1:
-        return format_queued(titles[0], None, via)
-    preview = ", ".join(titles[:5])
-    more = f" (+{len(titles) - 5} more)" if len(titles) > 5 else ""
-    return f"Queued {len(titles)} via {via}: {preview}{more}."
+    # HITL queues one id per tap; if called with many, report the first only.
+    first = titles[0]
+    return format_queued(first, None, via)
 
 
 def format_already(title: str, *, queued: bool = False, library: bool = False) -> str:

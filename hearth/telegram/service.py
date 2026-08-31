@@ -141,6 +141,11 @@ class TelegramInboxService:
                 log.exception("telegram progress loop error")
 
     async def _dispatch_update(self, update: dict[str, Any]) -> None:
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            await self._dispatch_callback(callback)
+            return
+
         message = update.get("message") or update.get("edited_message")
         if not isinstance(message, dict):
             return
@@ -156,12 +161,40 @@ class TelegramInboxService:
                 chat_id = int(chat.get("id"))
             except (TypeError, ValueError):
                 return
-            reply_to = message.get("message_id")
-            try:
-                reply_to_id = int(reply_to) if reply_to is not None else None
-            except (TypeError, ValueError):
-                reply_to_id = None
-            await self._send_status(chat_id, result.reply, reply_to_message_id=reply_to_id)
+            # Buttons bind the offer — stop reply-quoting every user line.
+            await self._send_status(
+                chat_id,
+                result.reply,
+                reply_markup=getattr(result, "reply_markup", None),
+            )
+
+    async def _dispatch_callback(self, callback: dict[str, Any]) -> None:
+        try:
+            result = await self.inbox.handle_callback(callback)
+        except Exception:  # noqa: BLE001
+            log.exception("telegram handle_callback failed")
+            result = None
+        cb_id = str(callback.get("id") or "")
+        if cb_id:
+            ack = ""
+            if result is not None and result.grabbed:
+                ack = "Queued"
+            elif result is not None and result.reply:
+                ack = "Got it"
+            await self.client.answer_callback_query(cb_id, text=ack)
+        if result is None or not result.reply:
+            return
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        try:
+            chat_id = int(chat.get("id"))
+        except (TypeError, ValueError):
+            return
+        await self._send_status(
+            chat_id,
+            result.reply,
+            reply_markup=getattr(result, "reply_markup", None),
+        )
 
     async def _send_status(
         self,
@@ -169,11 +202,13 @@ class TelegramInboxService:
         text: str,
         *,
         reply_to_message_id: int | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> None:
         data = await self.client.send_message(
             chat_id,
             text,
             reply_to_message_id=reply_to_message_id,
+            reply_markup=reply_markup,
         )
         if data.get("ok"):
             result = data.get("result") or {}
