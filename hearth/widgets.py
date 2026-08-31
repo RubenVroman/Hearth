@@ -344,6 +344,21 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
     return item
 
 
+def _candidate_media_items(data: dict[str, Any], *, source: str) -> list[dict[str, Any]]:
+    """Turn ambiguous play candidates into selectable overlay cards."""
+    candidates = data.get("candidates") or data.get("results") or []
+    if not isinstance(candidates, list) or not candidates:
+        return []
+    out: list[dict[str, Any]] = []
+    for hit in candidates[:_SEARCH_HIT_CAP]:
+        if not isinstance(hit, dict):
+            continue
+        item = _normalize_media_item({**hit, "pending": True}, source=source)
+        if item:
+            out.append(item)
+    return out
+
+
 def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, Any]]:
     """Normalize one or many hits from a media tool into stack cards."""
     if name == "plex_now_playing":
@@ -366,27 +381,36 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
         return out
     if name == "plex_play":
         item_raw = data.get("item") or {}
-        if not isinstance(item_raw, dict) or not item_raw.get("title"):
-            return []
-        client = data.get("client") or {}
-        item = _normalize_media_item(
-            {
-                **item_raw,
-                "player": client.get("name") if isinstance(client, dict) else None,
-                "pending": bool(data.get("needs_confirm") or data.get("would_call_with")),
-            },
-            source="plex",
-        )
-        return [item] if item else []
+        if isinstance(item_raw, dict) and item_raw.get("title"):
+            client = data.get("client") or {}
+            item = _normalize_media_item(
+                {
+                    **item_raw,
+                    "player": client.get("name") if isinstance(client, dict) else None,
+                    "pending": bool(data.get("needs_confirm") or data.get("would_call_with")),
+                },
+                source="plex",
+            )
+            return [item] if item else []
+        # Ambiguous title / client miss: surface candidates as pickable play cards
+        # instead of publishing nothing (which left the glass empty or stale).
+        return _candidate_media_items(data, source="plex")
     if name == "infuse_play":
+        # Ambiguous library matches must become pickable cards — never a lone
+        # query-only shell that looks like an empty/broken play popup.
+        if data.get("ambiguous") or data.get("ambiguous_titles"):
+            picked = _candidate_media_items(data, source="infuse")
+            if picked:
+                return picked
         item_raw = data.get("item") or {}
         if not isinstance(item_raw, dict):
             item_raw = {}
-        title = item_raw.get("title") or data.get("query") or data.get("speak")
+        # Prefer a real title/query — never use `speak` (e.g. "Which title?") as the card.
+        title = item_raw.get("title") or data.get("query")
         if not title and data.get("tmdbId") is not None:
             title = f"TMDB {data.get('tmdbId')}"
         if not title:
-            return []
+            return _candidate_media_items(data, source="infuse")
         row = {
             **item_raw,
             "title": title,
@@ -675,11 +699,26 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
         payload["total"] = data.get("total")
     if data.get("count") is not None:
         payload["count"] = data.get("count")
+    if data.get("ambiguous") or data.get("ambiguous_titles"):
+        payload["pick"] = True
     # Keep the full genre directory so the UI can switch categories without re-asking.
     genre_catalog = _genre_catalog(data)
     if genre_catalog and name == "plex_browse_genre":
         payload["genres"] = genre_catalog
 
+    if data.get("ambiguous") or data.get("ambiguous_titles"):
+        return runtime.upsert_widget(
+            Widget(
+                id="media",
+                kind="media",
+                title=title,
+                status="info",
+                body=str(data.get("speak") or data.get("error") or "Which title should I play?"),
+                detail="Tap a card, then Open in Infuse.",
+                data=payload,
+                sticky=False,
+            )
+        )
     if not ok:
         return runtime.upsert_widget(
             Widget(
@@ -687,8 +726,8 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
                 kind="media",
                 title=title,
                 status="error",
-                body=str(data.get("error") or "Could not load media."),
-                detail="",
+                body=str(data.get("error") or data.get("speak") or "Could not load media."),
+                detail=str(data.get("speak") or ""),
                 data=payload,
             )
         )

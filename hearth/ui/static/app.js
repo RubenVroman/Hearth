@@ -563,16 +563,12 @@ function softHideInfoOverlay() {
 }
 
 function revealInfoOverlay() {
-  const root = $("info-overlay");
-  if (!root) return;
-  clearInfoCloseTimer();
-  state.infoSoftHidden = false;
-  root.hidden = false;
-  root.classList.remove("is-soft-hidden", "is-closing");
-  root.setAttribute("aria-hidden", "false");
-  void root.offsetWidth;
-  root.classList.add("is-open");
-  scheduleOverlayIdleHide();
+  const visual = pickVisualOverlay(state.widgets);
+  if (!visual) {
+    closeInfoOverlay({ animate: false });
+    return;
+  }
+  openInfoOverlay(visual);
 }
 
 function looksUnrelatedToOverlay(text, widget) {
@@ -991,15 +987,20 @@ function mediaCardMarkup(
       ? "Ready to play"
       : item.source === "suggest"
         ? "Suggested"
-        : genre
-          ? escapeHtml(genre)
-          : "Library";
+        : item.player && item.state === "opening"
+          ? "Opening"
+          : item.player
+            ? "Now playing"
+            : genre
+              ? escapeHtml(genre)
+              : "Library";
   const slotAbs = Math.abs(Number(slot) || 0);
   const classes = [
     "info-media-card",
     active ? "is-active is-front" : "is-recessed is-selectable",
     item.skeleton ? "is-skeleton" : "",
     item.source === "suggest" ? "is-suggest" : "",
+    item.pending ? "is-pending" : "",
     slotAbs > 2 ? "is-far" : "",
     Number(slot) < 0 ? "is-peek-prev" : "",
     Number(slot) > 0 ? "is-peek-next" : "",
@@ -1102,15 +1103,20 @@ function mediaMarkup(widget) {
   const genreChips = mediaGenreChips(data.genres || [], genre, { mediaType });
   const activeId =
     (widget.context && widget.context.active_id) || data.active_id || (items[0] && items[0].id) || "";
+  const statusBanner = mediaStatusBanner(widget);
   if (!items.length) {
     const item = data.item || {};
-    return `${genreChips}${mediaCardMarkup(
-      { ...item, id: mediaItemKey(item), title: widget.title || item.title || "Untitled" },
+    const title = widget.title || item.title || "";
+    if (!title && !genreChips) {
+      return `${statusBanner}${emptyMediaMarkup(widget)}`;
+    }
+    return `${statusBanner}${genreChips}${mediaCardMarkup(
+      { ...item, id: mediaItemKey(item), title: title || "Untitled" },
       { active: true, slot: 0, labelled: true, genre }
     )}`;
   }
   if (items.length === 1) {
-    return `${genreChips}<div class="info-media-stack is-single" data-count="1">${mediaCardMarkup(items[0], {
+    return `${statusBanner}${genreChips}<div class="info-media-stack is-single" data-count="1">${mediaCardMarkup(items[0], {
       active: true,
       slot: 0,
       labelled: true,
@@ -1129,7 +1135,7 @@ function mediaMarkup(widget) {
       })
     )
     .join("");
-  return `${genreChips}<div class="info-media-stack is-stacked is-carousel" data-count="${items.length}" data-flick="1" data-active-idx="${activeIdx}">
+  return `${statusBanner}${genreChips}<div class="info-media-stack is-stacked is-carousel" data-count="${items.length}" data-flick="1" data-active-idx="${activeIdx}">
     ${mediaStackCounter(items, activeId, total)}
     <div class="info-media-carousel">
       <button type="button" class="info-media-nav info-media-prev" data-media-nav="-1" aria-label="Previous title">‹</button>
@@ -1137,6 +1143,52 @@ function mediaMarkup(widget) {
       <button type="button" class="info-media-nav info-media-next" data-media-nav="1" aria-label="Next title">›</button>
     </div>
   </div>`;
+}
+
+function mediaStatusBanner(widget) {
+  if (!widget) return "";
+  const data = widget.data || {};
+  const status = String(widget.status || "");
+  const body = String(widget.body || "").trim();
+  const detail = String(widget.detail || "").trim();
+  if (data.pick || status === "info") {
+    const msg = body || "Which title should I play?";
+    return `<div class="info-media-banner is-pick" role="status">
+      <p class="info-media-banner-title">${escapeHtml(msg)}</p>
+      ${detail ? `<p class="info-media-banner-detail">${escapeHtml(detail)}</p>` : ""}
+    </div>`;
+  }
+  if (status === "error") {
+    const msg = body || "Could not start playback.";
+    return `<div class="info-media-banner is-error" role="alert">
+      <p class="info-media-banner-title">${escapeHtml(msg)}</p>
+      ${detail && detail !== msg ? `<p class="info-media-banner-detail">${escapeHtml(detail)}</p>` : ""}
+    </div>`;
+  }
+  return "";
+}
+
+function emptyMediaMarkup(widget) {
+  const title = (widget && widget.title) || "Nothing to play";
+  const body =
+    (widget && (widget.body || widget.detail)) ||
+    "No playable title loaded. Dismiss and ask again, or name the movie.";
+  return `<div class="info-media-empty" role="status">
+    <p class="info-kicker">Play</p>
+    <h2 class="info-title" id="info-title">${escapeHtml(title)}</h2>
+    <p class="info-detail">${escapeHtml(body)}</p>
+  </div>`;
+}
+
+function emptyOverlayMarkup(widget) {
+  if (widget && widget.kind === "media") return emptyMediaMarkup(widget);
+  const title = (widget && widget.title) || "Nothing to show";
+  const body = (widget && (widget.body || widget.detail)) || "This panel had no content.";
+  return `
+    <p class="info-kicker">Info</p>
+    <h2 class="info-title" id="info-title">${escapeHtml(title)}</h2>
+    <p class="info-body">${escapeHtml(body)}</p>
+  `;
 }
 
 function downloadStatusClass(status) {
@@ -1230,15 +1282,20 @@ function downloadsMarkup(widget) {
 }
 
 function overlayInnerHtml(widget) {
+  if (!widget) return emptyOverlayMarkup(null);
   if (widget.kind === "weather") return weatherMarkup(widget);
   if (widget.kind === "media") return mediaMarkup(widget);
   if (widget.kind === "downloads") return downloadsMarkup(widget);
-  return `
+  const html = `
     <p class="info-kicker">Info</p>
     <h2 class="info-title" id="info-title">${escapeHtml(widget.title || "")}</h2>
     <p class="info-body">${escapeHtml(widget.body || "")}</p>
     ${widget.detail ? `<p class="info-detail">${escapeHtml(widget.detail)}</p>` : ""}
   `;
+  if (!String(widget.title || "").trim() && !String(widget.body || "").trim()) {
+    return emptyOverlayMarkup(widget);
+  }
+  return html;
 }
 
 function openInfoOverlay(widget) {
@@ -1252,11 +1309,27 @@ function openInfoOverlay(widget) {
     !root.classList.contains("is-closing") &&
     !root.classList.contains("is-soft-hidden") &&
     !state.infoSoftHidden;
-  if (alreadyOpen && state.infoSignature === signature) {
+  const contentEmpty = !String(content.innerHTML || "").trim();
+  // Never keep a blank glass open — remount when the DOM was cleared or markup is empty.
+  if (alreadyOpen && state.infoSignature === signature && !contentEmpty) {
     scheduleOverlayIdleHide();
     return;
   }
-  content.innerHTML = overlayInnerHtml(widget);
+  let html = "";
+  try {
+    html = overlayInnerHtml(widget);
+  } catch (err) {
+    html = emptyOverlayMarkup(widget);
+  }
+  if (!String(html || "").trim()) {
+    html = emptyOverlayMarkup(widget);
+  }
+  // Still nothing meaningful → dismiss cleanly instead of a hollow popup.
+  if (!String(html || "").trim()) {
+    closeInfoOverlay({ animate: false });
+    return;
+  }
+  content.innerHTML = html;
   state.infoSignature = signature;
   state.infoSoftHidden = false;
   root.hidden = false;
@@ -1264,7 +1337,7 @@ function openInfoOverlay(widget) {
   root.classList.remove("is-closing", "is-soft-hidden");
   // Content swaps while the glass stays up should not replay enter/pop animations
   // (that was the main movie-card flicker when cycling or transcript-focusing).
-  if (alreadyOpen) {
+  if (alreadyOpen && !contentEmpty) {
     content.dataset.settled = "1";
   } else {
     delete content.dataset.settled;
