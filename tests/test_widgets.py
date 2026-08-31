@@ -49,7 +49,7 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v16" in sw.text
+    assert "hearth-shell-v17" in sw.text
     assert "info-infuse-btn" in js.text
     assert "playActiveInInfuse" in js.text
     assert "focusMediaById" in js.text
@@ -278,14 +278,36 @@ def test_drama_genre_browse_replaces_stack_automatically(client):
         assert row.get("year") is not None
 
 
-def test_empty_genre_list_does_not_publish_media_overlay(client):
+def test_genre_list_publishes_category_picker(client):
     chat = client.post("/api/chat", json={"message": "list plex genres"})
     assert chat.status_code == 200
     body = chat.json()
     assert body["tools"][0]["name"] == "plex_browse_genre"
     assert body["tools"][0]["data"].get("listed_genres") is True
     assert body["tools"][0]["data"].get("results") == []
-    assert not any(w["kind"] == "media" for w in body["widgets"])
+    media = next(w for w in body["widgets"] if w["kind"] == "media")
+    assert media["data"].get("presentation") == "genres"
+    titles = {g["title"] for g in media["data"].get("genres") or []}
+    assert "Science Fiction" in titles
+    assert "Animation" in titles
+    js = client.get("/static/app.js")
+    assert "browseGenreCategory" in js.text
+    assert "data-genre-browse" in js.text
+    css = client.get("/static/styles.css")
+    assert "info-genre-chip" in css.text
+
+
+def test_sci_fi_genre_browse_includes_item_genres_and_directory(client):
+    chat = client.post("/api/chat", json={"message": "what sci-fi movies do we have"})
+    assert chat.status_code == 200
+    media = next(w for w in chat.json()["widgets"] if w["kind"] == "media")
+    assert media["data"].get("genre") == "Science Fiction"
+    catalog = {g["title"] for g in media["data"].get("genres") or []}
+    assert "Science Fiction" in catalog
+    items = media["data"].get("items") or []
+    assert items
+    tagged = [row for row in items if "Science Fiction" in (row.get("genres") or [])]
+    assert tagged, "Science Fiction titles should carry Plex genre tags on the cards"
 
 
 def test_ui_can_invoke_infuse_play_for_listed_title(client):

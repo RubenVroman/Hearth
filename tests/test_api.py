@@ -90,6 +90,7 @@ def test_plex_genre_library_endpoints(client):
     assert body["ok"] is True
     names = {g["title"] for g in body["genres"]}
     assert "Animation" in names
+    assert "Science Fiction" in names
     assert "animation" in body["speak"].lower()
 
     library = client.get("/api/plex/library", params={"genre": "Animation"})
@@ -101,6 +102,16 @@ def test_plex_genre_library_endpoints(client):
     titles = {r["title"] for r in lib["results"]}
     assert "Spirited Away" in titles
     assert "3" in lib["speak"] and "Animation" in lib["speak"]
+    for row in lib["results"]:
+        assert "Animation" in (row.get("genres") or [])
+
+    sci_fi = client.get("/api/plex/library", params={"genre": "Science Fiction"})
+    assert sci_fi.status_code == 200
+    sci = sci_fi.json()
+    assert sci["ok"] is True
+    assert sci["genre"] == "Science Fiction"
+    sci_titles = {r["title"] for r in sci["results"]}
+    assert "Dune: Part Two" in sci_titles or "The Endless" in sci_titles
 
     chat = client.post("/api/chat", json={"message": "what animation movies do we have"})
     assert chat.status_code == 200

@@ -456,6 +456,11 @@ function overlayEntityTopics(widget) {
     for (const item of mediaItemsOf(widget)) {
       addChunk(item.title);
       addChunk(item.show);
+      for (const tag of item.genres || []) addChunk(tag);
+    }
+    addChunk(widget.data && widget.data.genre);
+    for (const row of (widget.data && widget.data.genres) || []) {
+      addChunk(row && row.title ? row.title : row);
     }
   } else {
     addChunk(widget.title);
@@ -705,6 +710,29 @@ async function playActiveInInfuse() {
   }
 }
 
+async function browseGenreCategory(genre, { mediaType = "movie" } = {}) {
+  const title = String(genre || "").trim();
+  if (!title) return;
+  flashLocalActivity("thinking", `${title}…`, 20000);
+  try {
+    const out = await invoke("plex_browse_genre", {
+      genre: title,
+      type: mediaType === "show" ? "show" : "movie",
+    });
+    const data = out.data || out.output || out;
+    const speak = (data && data.speak) || out.speak || "";
+    if (speak) appendLog("hearth", speak);
+    applyWidgetPayload(out);
+    noteOverlayConversation(title);
+  } catch (err) {
+    appendLog("system", `Genre browse failed: ${err.message}`);
+    flashLocalActivity("error", "Genre browse failed", 4000);
+  } finally {
+    clearLocalActivity();
+    renderActivity(state.serverActivity);
+  }
+}
+
 /**
  * Focus a stacked media card when live talk names its title.
  * Returns true when the active card changed.
@@ -905,8 +933,19 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
         active ? "eager" : "lazy"
       }" />`
     : mediaPosterFallback(title);
+  const itemGenres = Array.isArray(item.genres)
+    ? item.genres.map((g) => String(g || "").trim()).filter(Boolean)
+    : [];
   const bits = [];
   if (active) {
+    if (itemGenres.length) {
+      bits.push(
+        `<p class="info-media-genres">${itemGenres
+          .slice(0, 4)
+          .map((g) => `<span class="info-media-genre-tag">${escapeHtml(g)}</span>`)
+          .join("")}</p>`
+      );
+    }
     if (item.skeleton && !summary) {
       bits.push(`<p class="info-detail info-media-skeleton-line">Looking this up…</p>`);
     } else if (summary) {
@@ -992,22 +1031,68 @@ function mediaStackCounter(items, activeId, total) {
   </div>`;
 }
 
-function mediaMarkup(widget) {
-  const items = mediaItemsOf(widget);
+function mediaGenreChips(genres, activeGenre = "", { mediaType = "movie" } = {}) {
+  if (!Array.isArray(genres) || !genres.length) return "";
+  const active = String(activeGenre || "").toLowerCase();
+  const chips = genres
+    .slice(0, 18)
+    .map((row) => {
+      const title = String((row && row.title) || "").trim();
+      if (!title) return "";
+      const size = row && row.size != null ? Number(row.size) : null;
+      const label =
+        size != null && Number.isFinite(size) ? `${title} · ${size}` : title;
+      const on = active && title.toLowerCase() === active;
+      return `<button type="button" class="info-genre-chip${on ? " is-on" : ""}" data-genre-browse="${escapeHtml(
+        title
+      )}" data-media-type="${escapeHtml(mediaType)}" aria-pressed="${on ? "true" : "false"}">${escapeHtml(
+        label
+      )}</button>`;
+    })
+    .filter(Boolean)
+    .join("");
+  if (!chips) return "";
+  return `<div class="info-genre-chips" role="list" aria-label="Browse by genre">${chips}</div>`;
+}
+
+function mediaGenresMarkup(widget) {
   const data = widget.data || {};
+  const genres = Array.isArray(data.genres) ? data.genres : [];
+  const mediaType = data.media_type || "movie";
+  const kindLabel = mediaType === "show" ? "shows" : "movies";
+  const chips = mediaGenreChips(genres, "", { mediaType });
+  return `
+    <div class="info-genre-browser">
+      <p class="info-kicker">Library</p>
+      <h2 class="info-title" id="info-title">${escapeHtml(widget.title || `${kindLabel} by genre`)}</h2>
+      <p class="info-meta">${escapeHtml(widget.detail || `Tap a genre to see ${kindLabel} in that category.`)}</p>
+      ${chips || `<p class="info-detail">No genres found in the Plex library.</p>`}
+      <p class="info-detail info-genre-hint">Categories come from Plex metadata (e.g. Science Fiction).</p>
+    </div>
+  `;
+}
+
+function mediaMarkup(widget) {
+  const data = widget.data || {};
+  if (data.presentation === "genres" || data.listed_genres) {
+    return mediaGenresMarkup(widget);
+  }
+  const items = mediaItemsOf(widget);
   const genre = data.genre || "";
   const total = data.total;
+  const mediaType = data.media_type || "movie";
+  const genreChips = mediaGenreChips(data.genres || [], genre, { mediaType });
   const activeId =
     (widget.context && widget.context.active_id) || data.active_id || (items[0] && items[0].id) || "";
   if (!items.length) {
     const item = data.item || {};
-    return mediaCardMarkup(
+    return `${genreChips}${mediaCardMarkup(
       { ...item, id: mediaItemKey(item), title: widget.title || item.title || "Untitled" },
       { active: true, stackIndex: 0, labelled: true, genre }
-    );
+    )}`;
   }
   if (items.length === 1) {
-    return `<div class="info-media-stack is-single" data-count="1">${mediaCardMarkup(items[0], {
+    return `${genreChips}<div class="info-media-stack is-single" data-count="1">${mediaCardMarkup(items[0], {
       active: true,
       stackIndex: 0,
       labelled: true,
@@ -1025,7 +1110,7 @@ function mediaMarkup(widget) {
       })
     )
     .join("");
-  return `<div class="info-media-stack is-stacked" data-count="${items.length}" data-flick="1">
+  return `${genreChips}<div class="info-media-stack is-stacked" data-count="${items.length}" data-flick="1">
     ${mediaStackCounter(items, activeId, total)}
     <div class="info-media-deck">${cards}</div>
   </div>`;
@@ -1243,6 +1328,16 @@ function bindInfoOverlay() {
   $("info-content")?.addEventListener("click", (ev) => {
     const target = ev.target;
     if (!(target instanceof Element)) return;
+    const genreBtn = target.closest("[data-genre-browse]");
+    if (genreBtn) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      pinFromUser();
+      browseGenreCategory(genreBtn.getAttribute("data-genre-browse") || "", {
+        mediaType: genreBtn.getAttribute("data-media-type") || "movie",
+      });
+      return;
+    }
     const playBtn = target.closest("[data-infuse-play]");
     if (playBtn) {
       ev.preventDefault();
@@ -1277,7 +1372,7 @@ function bindInfoOverlay() {
     "pointerdown",
     (ev) => {
       if (!(ev.target instanceof Element)) return;
-      if (ev.target.closest("[data-infuse-play], .info-dismiss, button, a")) return;
+      if (ev.target.closest("[data-infuse-play], [data-genre-browse], .info-dismiss, button, a")) return;
       const stack = ev.target.closest(".info-media-stack.is-stacked");
       if (!stack) return;
       flick = { x: ev.clientX, y: ev.clientY, id: ev.pointerId, moved: false };
