@@ -80,7 +80,7 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `OPENAI_REALTIME_MODEL` | Conversational Realtime model. Default `gpt-realtime-2.1` (ChatGPT-app equivalent). |
 | `HA_URL` | Default `http://host.docker.internal:8123`; HA uses host networking for LAN mDNS/SSDP discovery. |
 | `HA_TOKEN` | **Live** HA REST. Empty → mocked lights/scenes/Denon/LG. |
-| `HA_TV_ENTITY` | LG webOS `media_player` entity_id. Default `media_player.lg_webos_tv`. Set after HA pairing if different. |
+| `HA_TV_ENTITY` | LG webOS `media_player` entity_id. Default `media_player.lg_webos_tv`. Set after HA pairing if different (e.g. `media_player.lg_webos_tv_oled65g1rla`). |
 | `HA_AVR_ENTITY` | Denon AVR entity_id. Default `media_player.denon_avr_x3700h`. |
 | `HA_APPLE_TV_ENTITY` | Apple TV `media_player` (HA apple_tv / pyatv). Default `media_player.apple_tv`. Required for Infuse. |
 | `HA_REQUEST_RETRIES` / `HA_RETRY_BASE_SECONDS` | Transient HA retry policy. Defaults `3` / `0.25`. Transport failures force a fresh connection. |
@@ -89,6 +89,8 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HA_AVR_APPLE_TV_SOURCE` / `HA_AVR_TV_SOURCE` | Denon source names for the Apple TV and TV Audio activities. Defaults `Media Player` / `TV Audio`. |
 | `HEARTH_APPLE_TV_PLAYER` | `infuse` (default) or `plex`. Prefer Infuse over the Plex tvOS app for Apple TV. |
 | `INFUSE_APP_ID` | Optional Infuse bundle id. Default `com.firecore.infuse`. |
+| `VIDEOLAND_SOURCE` | Friendly LG source name for Videoland (`select_source`). Default `Videoland`. |
+| `VIDEOLAND_APP_ID` | Optional raw webOS app id for experimental `contentId` launch only. Leave empty unless verified — does **not** enable real title playback. |
 | `PLEX_URL` | Existing Plex on the host. Default `http://host.docker.internal:32400`. |
 | `PLEX_TOKEN` | **Live** Plex sessions/search/clients/play. Empty → mocked now-playing + library/play fixtures. |
 | `PLEX_DEFAULT_PLAYER` | Optional default client name substring (e.g. `Apple TV`) when using the Plex-client path. |
@@ -184,6 +186,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Any routine HA entity by friendly name → `ha_device_control` (lights, switches, fans, covers, climate, scenes, scripts, buttons, vacuums); ambiguous matches are returned instead of guessed
 - LG TV / Denon AVR / Apple TV power, volume, source, transport → `ha_media_control` (prefer over raw `ha_call_service`)
 - Receiver-centric “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; orders Denon → LG → Denon source → Apple TV and reports every failed step
+- **Videoland on the LG** → `videoland_play` (Dutch/English: “zet B&B Vol Liefde aan op Videoland”, “open Videoland”, “open het profiel Parel”). HA can **launch** the Videoland app via `media_player.select_source`; it **cannot** start a named title or select an in-app profile. See [Videoland on LG webOS](#videoland-on-lg-webos).
 - House media snapshot (TV + AVR + Apple TV + Plex) → `house_media` or `GET /api/media`
 - What's playing on Plex → `plex_now_playing` (Infuse has **no** now-playing API)
 - Browse Plex library **by genre** (Animation, Science Fiction, …) → `plex_browse_genre` / `GET /api/plex/library?genre=Science%20Fiction`. Speakable count + short title list; glass overlay shows tappable genre category chips from real Plex metadata. `GET /api/plex/genres` / “list plex genres” opens the category picker.
@@ -275,6 +278,35 @@ Gated APIs: `GET /api/memory`, `GET /api/memory/search`, `POST /api/memory/remem
 
 Empty `./data` → boot runs `init_memory_db()` and creates schema v1. Re-running is idempotent. Later bumps are numbered SQL in `hearth/memory/store.py` (`SCHEMA_VERSION` / `_MIGRATIONS`). No manual migration step on first deploy.
 
+## Videoland on LG webOS
+
+Videoland is the Dutch RTL streaming app on the living-room **LG webOS TV** (HA entity from `HA_TV_ENTITY`, e.g. OLED65G1RLA after pairing). Hearth talks to the TV only through Home Assistant REST — not webOS/SSAP directly.
+
+### What is possible
+
+| Capability | Via HA? | Hearth tool |
+| --- | --- | --- |
+| Launch / focus Videoland | Yes — `media_player.select_source` with source `Videoland` (from the TV `source_list`) | `videoland_play` |
+| Start a named title (e.g. “B&B Vol Liefde”) | **No** — no documented Videoland `contentId` / deep-link on webOS | Honest `played=false` + workaround |
+| Select an in-app profile (e.g. “Parel”) | **No** — Netflix-style profile pickers are not a HA/webOS API | Honest `profile_selected=false` + workaround |
+| D-pad remote automation | Possible via `webostv.button`, but layout is unstable | **Not used** (would fake success) |
+
+Optional `VIDEOLAND_APP_ID` only enables an experimental `webostv.command` `system.launcher/launch` with `contentId=<title>`. That is **not** treated as playback — Videoland has no verified contentId schema.
+
+### Workaround
+
+1. Ask Hearth to open Videoland (or play/open a title) → TV shows the Videoland app.
+2. On the TV remote, pick the profile (if asked) and start the title yourself.
+3. Hearth will say this in Dutch and English — it will not claim the show is playing.
+
+### Spoken workflow
+
+| You say | Hearth does |
+| --- | --- |
+| “Zet B&B Vol Liefde aan op Videoland” / “play B&B Vol Liefde on Videoland” | `videoland_play` → opens Videoland if needed; **does not** start the show; speaks the limit |
+| “Open Videoland” | Launches Videoland on the LG |
+| “Open het profiel Parel” / “switch Videoland to Parel” | Opens Videoland if needed; **does not** select the profile; speaks the limit |
+
 ## Infuse on Apple TV
 
 Before every Infuse launch, Hearth prepares the receiver-centric media path. It retries transient
@@ -330,6 +362,7 @@ Routine house actions **run immediately** — no second “confirm” step:
 
 - `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG, Apple TV)
 - `ha_media_control` — LG TV / Denon AVR / Apple TV turn_on/off, volume, source, play_media, transport
+- `videoland_play` — open Videoland on the LG (honest: cannot start titles or select profiles)
 - `infuse_play` — open a library title in Infuse on the Apple TV (HA deep link)
 - `infuse_transport` — pause / play / stop / skip via HA Apple TV remote
 - `plex_play` — start a Plex library title on a Plex client (LG / Shield / …)

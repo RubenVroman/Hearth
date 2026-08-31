@@ -654,6 +654,31 @@ _SOURCE = re.compile(
     r"\b(?:set|switch)\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\s+(?:to\s+|source\s+|input\s+)(.+)$",
     re.I,
 )
+# Videoland on LG — before generic play/plex so Dutch "zet … aan op Videoland" stays house-local.
+_VIDEOLAND_PLAY = re.compile(
+    r"(?:"
+    r"(?:play|start|put on|watch)\s+(.+?)\s+on\s+(?:the\s+)?videoland\b"
+    r"|(?:zet|speel|start|doe)\s+(.+?)\s+(?:aan\s+)?(?:op|in)\s+videoland\b"
+    r"|(?:op|in)\s+videoland\s+(?:zet|speel|start)\s+(.+?)$"
+    r")",
+    re.I,
+)
+_VIDEOLAND_OPEN = re.compile(
+    r"\b(?:open|launch|start|start\s+op)\s+(?:de\s+|the\s+)?videoland\b"
+    r"|\bvideoland\s+(?:openen|starten)\b"
+    r"|\bopen\s+videoland\b",
+    re.I,
+)
+_VIDEOLAND_PROFILE = re.compile(
+    r"(?:"
+    r"(?:open|switch(?:\s+to)?|select|kies|open\s+het)\s+"
+    r"(?:the\s+|het\s+)?(?:videoland\s+)?profiel(?:e)?\s+[\"“”']?(.+?)[\"“”']?"
+    r"(?:\s+(?:in|on|op)\s+(?:the\s+)?videoland)?\b"
+    r"|(?:switch|zet)\s+videoland\s+(?:to|naar)\s+[\"“”']?(.+?)[\"“”']?\b"
+    r"|(?:videoland\s+)?profile\s+[\"“”']?(.+?)[\"“”']?"
+    r")",
+    re.I,
+)
 _INSPECT = re.compile(r"\binspect\s+(\S+)", re.I)
 _MOVIE = re.compile(r"\b(movie|film|radarr)\b", re.I)
 _SERIES = re.compile(r"\b(show|series|season|episode|sonarr)\b", re.I)
@@ -798,6 +823,9 @@ def route_intent(text: str) -> dict[str, Any] | None:
         return {"tool": "overseerr_request", "args": {"query": query or raw}}
     if _NETWORK_STATUS.search(raw):
         return {"tool": "house_network", "args": {}}
+    videoland_plan = _videoland_plan(raw)
+    if videoland_plan is not None:
+        return videoland_plan
     activity = _MEDIA_ACTIVITY.search(raw)
     if activity:
         lower_activity = raw.lower()
@@ -895,6 +923,39 @@ def route_intent(text: str) -> dict[str, Any] | None:
         return {"tool": "workspace_list", "args": {}}
     if _LIGHTS.search(raw):
         return {"tool": "ha_list_entities", "args": {}}
+    return None
+
+
+def _videoland_plan(raw: str) -> dict[str, Any] | None:
+    """Route Videoland title / open / profile asks to videoland_play (honest HA path)."""
+    play = _VIDEOLAND_PLAY.search(raw)
+    if play:
+        title = next((g for g in play.groups() if g), "") or ""
+        title = _play_title_clean(title)
+        if title and title.lower() not in {"it", "that", "this", "iets", "het"}:
+            return {"tool": "videoland_play", "args": {"query": title}}
+
+    profile = _VIDEOLAND_PROFILE.search(raw)
+    if profile and (
+        "videoland" in raw.lower()
+        or "profiel" in raw.lower()
+        or "profile" in raw.lower()
+    ):
+        name = next((g for g in profile.groups() if g), "") or ""
+        name = _play_title_clean(name)
+        name = re.sub(
+            r"\s+(?:in|on|op)\s+(?:the\s+|de\s+)?videoland\b",
+            "",
+            name,
+            flags=re.I,
+        )
+        name = name.strip(" .?!'\"")
+        if name and name.lower() not in {"videoland", "the", "het", "de"}:
+            return {"tool": "videoland_play", "args": {"profile": name}}
+
+    if _VIDEOLAND_OPEN.search(raw):
+        return {"tool": "videoland_play", "args": {}}
+
     return None
 
 

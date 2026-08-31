@@ -14,6 +14,7 @@ from hearth.tools.media import house_media_inventory, media_activity, media_cont
 from hearth.tools.plex import plex
 from hearth.tools.skills import load_workspace_skills
 from hearth.tools.thuisbezorgd import thuisbezorgd
+from hearth.tools.videoland import videoland
 from hearth.tools.weather import fetch_weather
 from hearth.tools.suggest import suggest_titles
 from hearth.tools.websearch import web_search
@@ -88,6 +89,17 @@ async def _ha_media(args: dict[str, Any]) -> dict[str, Any]:
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
+
+
+async def _videoland_play(args: dict[str, Any]) -> dict[str, Any]:
+    title = str(args.get("query") or args.get("title") or "").strip()
+    profile = str(args.get("profile") or "").strip()
+    prepare = args.get("prepare_path")
+    return await videoland.play(
+        title,
+        profile=profile,
+        prepare_path=True if prepare is None else bool(prepare),
+    )
 
 
 async def _plex_now(_args: dict[str, Any]) -> dict[str, Any]:
@@ -619,6 +631,54 @@ def register_builtin_tools() -> None:
                 "required": ["device", "action"],
             },
             handler=_ha_media,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="videoland_play",
+            description=(
+                "Open Videoland on the living-room LG webOS TV via Home Assistant "
+                "(media_player.select_source). Use for Dutch/English asks like "
+                "“zet B&B Vol Liefde aan op Videoland”, “play X on Videoland”, "
+                "“open Videoland”, or “open the Parel profile”. "
+                "HA can launch the Videoland app but CANNOT start a specific title or "
+                "select an in-app profile — there is no webOS/Videoland contentId or "
+                "profile API through HA. Always speak the tool's limitation + workaround "
+                "(pick the title/profile on the TV). Never claim playback or profile "
+                "selection succeeded. Runs immediately — no confirm step. "
+                "Do not escalate to Chief of Staff for Videoland title/profile asks."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Title to request in Videoland, e.g. B&B Vol Liefde. "
+                            "Optional when only opening the app."
+                        ),
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Alias for query.",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": (
+                            "Optional profile name (e.g. Parel). Accepted for the ask, "
+                            "but HA cannot select Videoland profiles — speak that limit."
+                        ),
+                    },
+                    "prepare_path": {
+                        "type": "boolean",
+                        "description": (
+                            "Wake the receiver-centric TV path before launching "
+                            "(default true)."
+                        ),
+                    },
+                },
+            },
+            handler=_videoland_play,
         )
     )
     registry.register(

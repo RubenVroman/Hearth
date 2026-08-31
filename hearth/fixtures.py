@@ -54,6 +54,14 @@ MOCK_HA_STATES: list[dict[str, Any]] = [
             "friendly_name": "LG webOS TV",
             "source": "HDMI 1",
             "volume_level": 0.0,
+            "source_list": [
+                "HDMI 1",
+                "Live TV",
+                "Netflix",
+                "Plex",
+                "Videoland",
+                "YouTube",
+            ],
         },
     },
     {
@@ -1415,6 +1423,19 @@ class MockHouse:
                 if content.startswith("infuse://"):
                     state["attributes"]["app_name"] = "Infuse"
                     state["attributes"]["media_title"] = content.split("?")[0]
+        elif domain == "webostv":
+            # HA webostv.command / webostv.button target the media_player entity.
+            # Mock accepts them so Videoland deep-link attempts stay fixture-safe.
+            if service == "command":
+                payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+                app_id = str(payload.get("id") or "")
+                if "videoland" in app_id.lower() or str(data.get("command") or "").endswith(
+                    "/launch"
+                ):
+                    state["attributes"]["source"] = "Videoland"
+                    state["state"] = "on"
+            elif service == "button":
+                state["state"] = state.get("state") or "on"
         return {"ok": True, "entity": deepcopy(state)}
 
     def _set_light(self, entity_id: str, on_off: str, brightness: int) -> None:

@@ -98,6 +98,12 @@ class Settings(BaseSettings):
     apple_tv_player: str = Field(default="infuse", alias="HEARTH_APPLE_TV_PLAYER")
     # Bundle id / app id for launch_app fallback (HA media_content_type=app).
     infuse_app_id: str = Field(default="com.firecore.infuse", alias="INFUSE_APP_ID")
+    # Videoland on LG webOS — launch via media_player.select_source (friendly name).
+    # Title playback / profile select are NOT supported by HA webostv; see videoland tool.
+    videoland_source: str = Field(default="Videoland", alias="VIDEOLAND_SOURCE")
+    # Optional raw webOS app id for an experimental contentId launch attempt only.
+    # Leave empty unless you have verified the id on this TV (listApps / HA source).
+    videoland_app_id: str = Field(default="", alias="VIDEOLAND_APP_ID")
 
     plex_url: str = Field(default="http://host.docker.internal:32400", alias="PLEX_URL")
     plex_token: str = Field(default="", alias="PLEX_TOKEN")
