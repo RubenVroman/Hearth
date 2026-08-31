@@ -186,7 +186,8 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Receiver-centric “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; orders Denon → LG → Denon source → Apple TV and reports every failed step
 - House media snapshot (TV + AVR + Apple TV + Plex) → `house_media` or `GET /api/media`
 - What's playing on Plex → `plex_now_playing` (Infuse has **no** now-playing API)
-- Browse Plex library **by genre** (Animation, Comedy, …) → `plex_browse_genre` / `GET /api/plex/library?genre=Animation`. Speakable count + short title list. `GET /api/plex/genres` lists genres.
+- Browse Plex library **by genre** (Animation, Science Fiction, …) → `plex_browse_genre` / `GET /api/plex/library?genre=Science%20Fiction`. Speakable count + short title list; glass overlay shows tappable genre category chips from real Plex metadata. `GET /api/plex/genres` / “list plex genres” opens the category picker.
+- Recommend / suggest movies or shows (or “show them on the UI”) → `suggest_titles` / `POST /api/media/suggest` (same glass media overlay; metadata resolved server-side)
 - Play on **Apple TV / Infuse** → `infuse_play` (default). Title → TMDB (Plex Guids / Radarr / Overseerr) → `infuse://movie/{tmdb}?play` via HA Apple TV `play_media` type `url`. See [Infuse on Apple TV](#infuse-on-apple-tv) below. Runs immediately (lenient).
 - Pause / stop / skip while Infuse is up → `infuse_transport` (HA Apple TV remote — not Infuse REST)
 - Play on **LG / Shield / an explicit Plex client** → `plex_play` (optional `plex_search` / `plex_clients`). PMS-proxied `playMedia`. Starts immediately; if no clients are online, Hearth keeps the play ready and **Try again** / confirm re-polls until the client appears.
@@ -196,7 +197,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - **Telegram drop-group** → same *arr/Overseerr grab path; status posts back into the group (see below)
 - Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
 - Weather outside → `get_weather` (Open-Meteo; no API key)
-- Live web (news, current events, where-to-watch / streaming) → `web_search` (OpenAI hosted web search by default; optional Brave; DuckDuckGo HTML lite last resort). Search results only — Hearth does not fetch arbitrary pages.
+- Live web (news, current events, where-to-watch / streaming) → `web_search` (OpenAI hosted web search by default; optional Brave; DuckDuckGo HTML lite last resort). Search results only — Hearth does not fetch arbitrary pages. Follow with `suggest_titles` when movie/TV ideas should appear as overlay cards.
 - “Tell me about / what’s the movie …” → `plex_search` (glass overlay with title, year, summary, poster)
 
 **Call Chief of Staff** (`chief_of_staff`)
@@ -231,7 +232,7 @@ In its place, a **centered glass panel** opens when there is rich visual content
 | Kind | Source tools | Shows |
 | --- | --- | --- |
 | `weather` | `get_weather` | Place, temperature, condition, humidity / wind (single panel) |
-| `media` | `plex_search`, `plex_browse_genre`, `plex_now_playing`, `plex_play`, `radarr_search`, `sonarr_search`, `overseerr_search` | Stacked title cards (poster, year, summary); front card = what is being talked about now |
+| `media` | `plex_search`, `plex_browse_genre`, `plex_now_playing`, `plex_play`, `radarr_search`, `sonarr_search`, `overseerr_search`, `suggest_titles` | Stacked title cards (poster, year, summary); front card = what is being talked about now |
 | `downloads` | `radarr_queue`, `sonarr_queue` | Queue progress list |
 
 ### Behavior
@@ -351,6 +352,7 @@ Read-only / inspect:
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`, `plex_clients`, `plex_browse_genre`
 - `radarr_search`, `sonarr_search`, `overseerr_search`
+- `suggest_titles` — resolve recommended movie/TV titles into overlay cards (Overseerr/*arr metadata, public TMDB links)
 - `web_search` — live public web (title, short snippet, source). Caps query length; refuses local/internal URLs and secret-fishing; does not fetch result pages.
 - `thuisbezorgd_restaurants`, `thuisbezorgd_menu`, `thuisbezorgd_cart`, `thuisbezorgd_auth_status`
 - `workspace_list`, `workspace_read`
@@ -393,7 +395,7 @@ cp .env.example .env
 python -m hearth
 ```
 
-Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire and a `media` glass overlay. `{"message":"what animation movies do we have"}` → `plex_browse_genre` (speakable Animation list). `GET /api/plex/library?genre=Animation` does the same without chat. `{"message":"what's the weather"}` → `weather` overlay. `{"message":"search the web for where to watch The Bear"}` → `web_search`. `{"message":"tell me about the movie Dune"}` → `plex_search` + media overlay. `{"message":"play The Endless on the Apple TV"}` should start `infuse_play` immediately. `{"message":"play The Endless on the LG"}` should start `plex_play` immediately. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should queue `radarr_add` immediately (no action/update guard cards). `{"message":"forget that I like dim lights"}` / food checkout still dry-run until confirm.
+Then `POST /api/chat` with `{"message":"what's playing"}` — you should see the Plex tool fire and a `media` glass overlay. `{"message":"what animation movies do we have"}` → `plex_browse_genre` (speakable Animation list). `GET /api/plex/library?genre=Animation` does the same without chat. `{"message":"suggest some sci-fi movies"}` / `{"message":"Can you show them on the UI?"}` → `suggest_titles` + suggestion cards on the same overlay (`POST /api/media/suggest` also works). `{"message":"what's the weather"}` → `weather` overlay. `{"message":"search the web for where to watch The Bear"}` → `web_search`. `{"message":"tell me about the movie Dune"}` → `plex_search` + media overlay. `{"message":"play The Endless on the Apple TV"}` should start `infuse_play` immediately. `{"message":"play The Endless on the LG"}` should start `plex_play` immediately. `{"message":"add a weather skill to the repo"}` should call `chief_of_staff`, not GitHub. `{"message":"download the movie Dune"}` should queue `radarr_add` immediately (no action/update guard cards). `{"message":"forget that I like dim lights"}` / food checkout still dry-run until confirm.
 
 ## Home Assistant devices
 

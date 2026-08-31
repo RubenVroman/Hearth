@@ -20,6 +20,7 @@ _MEDIA_TOOLS = {
     "radarr_search",
     "sonarr_search",
     "overseerr_search",
+    "suggest_titles",
 }
 
 _DOWNLOAD_TOOLS = {
@@ -304,15 +305,27 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
     if row.get("tmdbId") is None and row.get("mediaId") is not None:
         row = {**row, "tmdbId": row.get("mediaId")}
     art = _art_fields(row)
+    genres = row.get("genres")
+    if not isinstance(genres, list):
+        genres = []
+    genres = [str(g).strip() for g in genres if str(g or "").strip()]
+    raw_type = str(row.get("type") or row.get("mediaType") or "movie").lower()
+    if raw_type in {"tv", "show", "series"}:
+        media_type = "show"
+    elif raw_type in {"movie", "film"}:
+        media_type = "movie"
+    else:
+        media_type = raw_type or "movie"
     item = {
-        "id": _media_item_id({**row, **art, "title": title}),
+        "id": _media_item_id({**row, **art, "title": title, "type": media_type}),
         "title": title,
-        "type": row.get("type") or row.get("mediaType") or "movie",
+        "type": media_type,
         "year": row.get("year"),
         "show": row.get("show") or row.get("grandparentTitle"),
         "summary": row.get("summary") or row.get("overview") or "",
         "contentRating": row.get("contentRating"),
         "rating": row.get("rating") or row.get("audienceRating"),
+        "genres": genres,
         **art,
         "source": source,
         "skeleton": bool(row.get("skeleton")),
@@ -323,6 +336,11 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
         item["state"] = row.get("state")
     if row.get("pending"):
         item["pending"] = True
+    links = row.get("links") if isinstance(row.get("links"), dict) else None
+    if links:
+        item["links"] = {
+            k: str(v) for k, v in links.items() if k in {"tmdb", "imdb"} and v
+        }
     return item
 
 
@@ -379,7 +397,14 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
         }
         item = _normalize_media_item(row, source="infuse")
         return [item] if item else []
-    if name in {"plex_search", "plex_browse_genre", "radarr_search", "sonarr_search", "overseerr_search"}:
+    if name in {
+        "plex_search",
+        "plex_browse_genre",
+        "radarr_search",
+        "sonarr_search",
+        "overseerr_search",
+        "suggest_titles",
+    }:
         results = data.get("results") or []
         if not results:
             return []
@@ -389,10 +414,17 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
             "radarr_search": "radarr",
             "sonarr_search": "sonarr",
             "overseerr_search": "overseerr",
+            "suggest_titles": "suggest",
         }.get(name, "media")
         default_type = "movie" if "radarr" in name or name == "plex_browse_genre" else "show"
         if name == "plex_browse_genre" and str(data.get("media_type") or "").lower() == "show":
             default_type = "show"
+        if name == "suggest_titles":
+            asked_type = str(data.get("media_type") or "").lower()
+            if asked_type in {"tv", "show"}:
+                default_type = "show"
+            else:
+                default_type = "movie"
         cap = _BROWSE_HIT_CAP if name == "plex_browse_genre" else _SEARCH_HIT_CAP
         out = []
         for hit in results[:cap]:
@@ -526,10 +558,75 @@ def _media_panel_copy(
     return title, body, " · ".join(detail_parts)
 
 
+def _genre_catalog(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compact genre directory for the glass category chips (no secrets)."""
+    raw = data.get("genres") or []
+    out: list[dict[str, Any]] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "").strip()
+        if not title:
+            continue
+        entry: dict[str, Any] = {"title": title}
+        if row.get("key") is not None:
+            entry["key"] = str(row["key"])
+        if row.get("size") is not None:
+            try:
+                entry["size"] = int(row["size"])
+            except (TypeError, ValueError):
+                pass
+        out.append(entry)
+    return out
+
+
+def _genres_widget(result: dict[str, Any]) -> Widget | None:
+    """Glass panel of library genre buckets — tap one to browse that category."""
+    data = result.get("data") or {}
+    genres = _genre_catalog(data)
+    if not genres:
+        return None
+    media_type = str(data.get("media_type") or "movie")
+    kind_label = "shows" if media_type == "show" else "movies"
+    names = [g["title"] for g in genres[:8]]
+    body = ", ".join(names)
+    if len(genres) > 8:
+        body = f"{body}, +{len(genres) - 8} more"
+    detail = f"{len(genres)} {kind_label} categories from Plex"
+    if data.get("mode") == "mock":
+        detail = f"{detail} · mock"
+    return runtime.upsert_widget(
+        Widget(
+            id="media",
+            kind="media",
+            title=f"{kind_label.capitalize()} by genre",
+            status="done",
+            body=body,
+            detail=detail,
+            data={
+                "tool": "plex_browse_genre",
+                "presentation": "genres",
+                "listed_genres": True,
+                "media_type": media_type,
+                "genres": genres,
+                "items": [],
+                "item": {"title": f"{kind_label.capitalize()} by genre", "type": media_type},
+                "active_id": "",
+            },
+            sticky=False,
+        )
+    )
+
+
 def _media_widget(result: dict[str, Any]) -> Widget | None:
     name = str(result.get("name") or "media")
     data = result.get("data") or {}
     ok = bool(result.get("ok")) and data.get("ok") is not False
+
+    # List-genres asks → category picker (not an empty media stack).
+    if name == "plex_browse_genre" and data.get("listed_genres"):
+        return _genres_widget(result)
+
     incoming = _media_items_from_tool(name, data)
     if not incoming:
         # Empty search / nothing playing — no overlay (voice/transcript still answers).
@@ -578,6 +675,10 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
         payload["total"] = data.get("total")
     if data.get("count") is not None:
         payload["count"] = data.get("count")
+    # Keep the full genre directory so the UI can switch categories without re-asking.
+    genre_catalog = _genre_catalog(data)
+    if genre_catalog and name == "plex_browse_genre":
+        payload["genres"] = genre_catalog
 
     if not ok:
         return runtime.upsert_widget(
