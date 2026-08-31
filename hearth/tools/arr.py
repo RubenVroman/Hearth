@@ -144,6 +144,7 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
         "tmdbId": media_id,
         "imdbId": item.get("imdbId"),
         "inLibrary": _in_library(item),
+        "overview": (item.get("overview") or item.get("summary") or "")[:180],
         "posterPath": _poster_path(item),
         "popularity": item.get("popularity"),
     }

@@ -425,6 +425,112 @@ input,
   }
 }
 
+/*
+ * Spoken-answer read-along — glass caption under the orb.
+ * Parent keeps zero flow height so the orb/composer never jump when text appears.
+ */
+.spoken-answer {
+  position: relative;
+  width: min(440px, 92vw);
+  height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 6;
+  opacity: 0;
+  transition: opacity 280ms ease;
+}
+
+.spoken-answer.is-open {
+  opacity: 1;
+}
+
+.spoken-answer.is-closing {
+  opacity: 0;
+}
+
+.spoken-answer-glass {
+  position: absolute;
+  left: 50%;
+  top: 10px;
+  width: 100%;
+  max-height: min(28vh, 200px);
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  transform: translateX(-50%) translateY(10px) scale(0.98);
+  opacity: 0;
+  border-radius: 18px;
+  border: 1px solid rgba(244, 234, 216, 0.14);
+  background: linear-gradient(
+    165deg,
+    rgba(36, 28, 20, 0.58) 0%,
+    rgba(14, 11, 8, 0.78) 100%
+  );
+  backdrop-filter: blur(18px) saturate(1.15);
+  -webkit-backdrop-filter: blur(18px) saturate(1.15);
+  box-shadow:
+    0 16px 48px rgba(0, 0, 0, 0.38),
+    inset 0 1px 0 rgba(255, 206, 138, 0.1);
+  padding: 14px 18px 16px;
+  text-align: left;
+  transition:
+    transform 320ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 280ms ease;
+}
+
+.spoken-answer.is-open .spoken-answer-glass {
+  transform: translateX(-50%) translateY(0) scale(1);
+  opacity: 1;
+}
+
+.spoken-answer.is-closing .spoken-answer-glass {
+  transform: translateX(-50%) translateY(6px) scale(0.985);
+  opacity: 0;
+}
+
+.spoken-answer-kicker {
+  margin: 0 0 6px;
+  font-size: 10px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--ember-2) 75%, var(--muted));
+}
+
+.spoken-answer-text {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.spoken-answer-settled {
+  color: color-mix(in srgb, var(--ink) 82%, var(--muted));
+}
+
+.spoken-answer-live {
+  color: var(--ink);
+  text-shadow: 0 0 18px color-mix(in srgb, var(--ember) 28%, transparent);
+  animation: spoken-live-glow 1.2s ease-in-out infinite;
+}
+
+@keyframes spoken-live-glow {
+  0%,
+  100% {
+    opacity: 0.88;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .hint {
   color: var(--muted);
   font-size: 13px;
@@ -897,6 +1003,85 @@ input,
   gap: 10px;
 }
 
+.info-media-genres {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 2px;
+}
+
+.info-media-genre-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 206, 138, 0.18);
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(244, 234, 216, 0.72);
+}
+
+.info-genre-chips {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  margin: 0 0 12px;
+  padding: 2px 1px 6px;
+}
+
+.info-genre-chips::-webkit-scrollbar {
+  display: none;
+}
+
+.info-genre-chip {
+  flex: 0 0 auto;
+  appearance: none;
+  border: 1px solid rgba(255, 206, 138, 0.22);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ink, #f4ead8);
+  font: inherit;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  padding: 8px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.info-genre-chip:hover,
+.info-genre-chip:focus-visible {
+  border-color: rgba(255, 206, 138, 0.5);
+  outline: none;
+}
+
+.info-genre-chip.is-on {
+  background: linear-gradient(
+    165deg,
+    rgba(224, 138, 58, 0.28) 0%,
+    rgba(120, 72, 28, 0.4) 100%
+  );
+  border-color: rgba(255, 206, 138, 0.45);
+}
+
+.info-genre-browser {
+  display: grid;
+  gap: 8px;
+}
+
+.info-genre-browser .info-genre-chips {
+  flex-wrap: wrap;
+  overflow: visible;
+  margin-top: 4px;
+}
+
+.info-genre-hint {
+  margin-top: 2px;
+  opacity: 0.72;
+}
+
 .info-infuse-btn {
   appearance: none;
   border: 1px solid rgba(255, 206, 138, 0.28);
@@ -932,6 +1117,29 @@ input,
 .info-infuse-btn:disabled {
   opacity: 0.65;
   cursor: wait;
+}
+
+.info-media-links {
+  margin: 10px 0 0;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  opacity: 0.82;
+}
+
+.info-media-link {
+  color: var(--ink, #f4ead8);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: rgba(255, 206, 138, 0.45);
+}
+
+.info-media-link:hover,
+.info-media-link:focus-visible {
+  text-decoration-color: rgba(255, 206, 138, 0.85);
+}
+
+.info-media-card.is-suggest .info-kicker {
+  letter-spacing: 0.08em;
 }
 
 .info-media-card.is-skeleton .info-poster-fallback,
@@ -1185,6 +1393,15 @@ input,
   .info-media-stack.is-stacked .info-media-card.is-active.is-front,
   .info-media-nav {
     transition: none;
+    animation: none;
+  }
+
+  .spoken-answer,
+  .spoken-answer-glass {
+    transition: none;
+  }
+
+  .spoken-answer-live {
     animation: none;
   }
 }
@@ -1714,6 +1931,22 @@ input,
     max-width: min(280px, 86vw);
     font-size: 11px;
     padding: 5px 11px;
+  }
+
+  .spoken-answer {
+    width: min(360px, 88vw);
+  }
+
+  .spoken-answer-glass {
+    top: 8px;
+    max-height: min(22vh, 160px);
+    border-radius: 16px;
+    padding: 12px 14px 14px;
+  }
+
+  .spoken-answer-text {
+    font-size: 14px;
+    line-height: 1.4;
   }
 
   /* Orb label already says Tap to talk — keep hint with the scrolled chrome. */
@@ -2524,6 +2757,39 @@ html[data-look="jarvis"] .activity {
 html[data-look="forge"] .activity {
   border-color: color-mix(in srgb, var(--ember) 35%, transparent);
   background: color-mix(in srgb, rgba(22, 12, 6, 0.82) 90%, transparent);
+}
+
+html[data-look="jarvis"] .spoken-answer-glass {
+  border-radius: 8px;
+  border-color: color-mix(in srgb, var(--ember) 35%, transparent);
+  background: linear-gradient(
+    165deg,
+    rgba(8, 24, 36, 0.7) 0%,
+    rgba(4, 12, 20, 0.82) 100%
+  );
+  box-shadow:
+    0 16px 48px rgba(0, 0, 0, 0.45),
+    inset 0 0 0 1px rgba(62, 199, 255, 0.08);
+}
+
+html[data-look="jarvis"] .spoken-answer-kicker {
+  letter-spacing: 0.32em;
+  font-family: var(--font-ui);
+}
+
+html[data-look="forge"] .spoken-answer-glass {
+  border-radius: 6px;
+  border-color: color-mix(in srgb, var(--ember) 32%, var(--line));
+  background: linear-gradient(
+    165deg,
+    rgba(36, 20, 12, 0.72) 0%,
+    rgba(16, 10, 6, 0.84) 100%
+  );
+}
+
+html[data-look="forge"] .spoken-answer-kicker {
+  letter-spacing: 0.22em;
+  font-family: var(--font-ui);
 }
 
 html[data-look="jarvis"] .pill,

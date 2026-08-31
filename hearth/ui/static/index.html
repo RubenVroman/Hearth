@@ -83,6 +83,21 @@
             <span class="activity-dot" aria-hidden="true"></span>
             <span class="activity-label" id="activity-label"></span>
           </p>
+          <!-- Live spoken-answer read-along (Realtime output transcript). Zero flow height — no orb/composer jump. -->
+          <div
+            id="spoken-answer"
+            class="spoken-answer"
+            hidden
+            aria-hidden="true"
+            role="status"
+            aria-live="polite"
+            aria-atomic="false"
+          >
+            <div class="spoken-answer-glass">
+              <p class="spoken-answer-kicker">Hearth</p>
+              <p class="spoken-answer-text" id="spoken-answer-text"></p>
+            </div>
+          </div>
         </div>
         <div class="phone-rest-anchor" aria-hidden="true"></div>
         <p class="hint" id="hint">Tap to talk.</p>
@@ -193,6 +208,7 @@
 
     <script src="/static/pwa.js"></script>
     <script src="/static/vad.js"></script>
+    <script src="/static/spoken-answer.js"></script>
     <script src="/static/settings.js"></script>
     <script src="/static/app.js"></script>
   </body>

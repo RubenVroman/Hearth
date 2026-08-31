@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -274,6 +275,7 @@ class Plex:
 
         genre_title = str(matched.get("title") or needle)
         genre_key = matched.get("key") or matched.get("id")
+        genre_path = matched.get("path")
 
         if not self.live:
             hits = _mock_browse_genre(genre_title, kind)
@@ -308,15 +310,9 @@ class Plex:
             }
 
         client = await self._http()
-        params: dict[str, Any] = {"genre": genre_key}
-        plex_type = _plex_type_id(kind)
-        if plex_type is not None:
-            params["type"] = plex_type
+        path, params = _genre_browse_request(section, matched, kind)
         try:
-            response = await client.get(
-                f"/library/sections/{section['key']}/all",
-                params=params,
-            )
+            response = await client.get(path, params=params)
             response.raise_for_status()
             payload = response.json()
             container = payload.get("MediaContainer") or {}
@@ -329,6 +325,7 @@ class Plex:
                 "media_type": kind,
                 "genre": genre_title,
                 "genre_key": genre_key,
+                "genre_path": genre_path,
                 "section": section,
                 "genres": available,
                 "results": results,
@@ -1302,18 +1299,68 @@ def _pick_section(sections: list[dict[str, Any]], media_type: str) -> dict[str, 
     return None
 
 
+def _genre_id_from_raw(raw: Any) -> str | None:
+    """Extract a Plex genre tag id from Directory key / fastKey / filter strings.
+
+    Live PMS often returns keys like ``/library/sections/1/all?genre=42`` (or a
+    ``fastKey`` with the same shape). Passing that whole path as ``?genre=``
+    returns the wrong bucket — or nothing. Prefer the numeric tag id.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return text
+    # filter="genre=1328" or path "?genre=1328&…"
+    match = re.search(r"(?:^|[?&]|:)genre=(\d+)", text, flags=re.I)
+    if match:
+        return match.group(1)
+    # Trailing path segment that is only digits: …/genre/42
+    tail = text.rstrip("/").rsplit("/", 1)[-1]
+    if tail.isdigit():
+        return tail
+    return None
+
+
+def _genre_browse_path(raw: Any) -> str | None:
+    """Return a usable library path when Plex hands us a full genre fastKey/key."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text.startswith("/"):
+        return None
+    if "genre=" in text.lower() or "/genre/" in text.lower() or text.rstrip("/").endswith("/all"):
+        return text
+    return None
+
+
 def _genres(payload: dict[str, Any]) -> list[dict[str, Any]]:
     rows = (payload.get("MediaContainer") or {}).get("Directory") or []
     out: list[dict[str, Any]] = []
     for row in rows:
         title = row.get("title") or row.get("tag") or row.get("name")
-        key = row.get("key") or row.get("id")
         if not title:
             continue
+        # Prefer fastKey (absolute filter URL), then key/id/filter tag id.
+        path = (
+            _genre_browse_path(row.get("fastKey"))
+            or _genre_browse_path(row.get("key"))
+        )
+        genre_id = (
+            _genre_id_from_raw(row.get("id"))
+            or _genre_id_from_raw(row.get("fastKey"))
+            or _genre_id_from_raw(row.get("key"))
+            or _genre_id_from_raw(row.get("filter"))
+        )
+        key = genre_id or (str(row.get("key")) if row.get("key") is not None else str(title))
         entry: dict[str, Any] = {
             "title": str(title),
-            "key": str(key) if key is not None else str(title),
+            "key": str(key),
         }
+        if path:
+            entry["path"] = path
         if row.get("size") is not None:
             try:
                 entry["size"] = int(row["size"])
@@ -1322,6 +1369,40 @@ def _genres(payload: dict[str, Any]) -> list[dict[str, Any]]:
         out.append(entry)
     out.sort(key=lambda g: str(g.get("title") or "").lower())
     return out
+
+
+def _genre_browse_request(
+    section: dict[str, Any],
+    matched: dict[str, Any],
+    media_type: str,
+) -> tuple[str, dict[str, Any]]:
+    """Build the live PMS path + params for a genre bucket.
+
+    Uses Plex's own fastKey/path when present; otherwise filters ``/all`` with
+    the extracted genre tag id (never a raw path string as the genre value).
+    """
+    plex_type = _plex_type_id(media_type)
+    path_raw = matched.get("path")
+    if isinstance(path_raw, str) and path_raw.startswith("/"):
+        parsed = urlparse(path_raw)
+        path = parsed.path or path_raw.split("?", 1)[0]
+        params: dict[str, Any] = {}
+        for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
+            if not values:
+                continue
+            params[key] = values[0] if len(values) == 1 else values
+        if plex_type is not None and "type" not in params:
+            params["type"] = plex_type
+        return path, params
+
+    genre_key = matched.get("key") or matched.get("id")
+    # Last-resort: if key still looks like a path, peel the id out.
+    genre_id = _genre_id_from_raw(genre_key) or str(genre_key or "")
+    params = {"genre": genre_id}
+    if plex_type is not None:
+        params["type"] = plex_type
+    section_key = section.get("key")
+    return f"/library/sections/{section_key}/all", params
 
 
 def _genre_tags(m: dict[str, Any]) -> list[str]:
