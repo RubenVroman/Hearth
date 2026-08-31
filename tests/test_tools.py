@@ -683,6 +683,57 @@ async def test_plex_browse_genre_sci_fi_alias():
         assert result.data["genre"] == "Science Fiction", needle
         titles = {r["title"] for r in result.data["results"]}
         assert "Dune: Part Two" in titles or "The Endless" in titles, needle
+        for row in result.data["results"]:
+            assert "Science Fiction" in (row.get("genres") or []), row.get("title")
+
+
+def test_plex_genre_directory_parses_fastkey_paths():
+    """Live PMS genre Directory keys are often full /all?genre=N paths — peel the id."""
+    from hearth.tools.plex import _genre_browse_request, _genres
+
+    payload = {
+        "MediaContainer": {
+            "Directory": [
+                {
+                    "title": "Science Fiction",
+                    "key": "/library/sections/1/all?genre=42",
+                    "fastKey": "/library/sections/1/all?genre=42",
+                    "size": 12,
+                },
+                {
+                    "title": "Action",
+                    "key": "7",
+                    "id": 7,
+                    "size": 3,
+                },
+                {
+                    "title": "Animation",
+                    "filter": "genre=1328",
+                    "key": "1328",
+                    "size": 5,
+                },
+            ]
+        }
+    }
+    genres = _genres(payload)
+    by_title = {g["title"]: g for g in genres}
+    assert by_title["Science Fiction"]["key"] == "42"
+    assert by_title["Science Fiction"]["path"] == "/library/sections/1/all?genre=42"
+    assert by_title["Action"]["key"] == "7"
+    assert by_title["Animation"]["key"] == "1328"
+
+    path, params = _genre_browse_request(
+        {"key": "1"},
+        by_title["Science Fiction"],
+        "movie",
+    )
+    assert path == "/library/sections/1/all"
+    assert params.get("genre") == "42"
+    assert params.get("type") == 1
+
+    path2, params2 = _genre_browse_request({"key": "1"}, by_title["Action"], "movie")
+    assert path2 == "/library/sections/1/all"
+    assert params2.get("genre") == "7"
 
 
 def test_intent_sci_fi_movies_uses_plex_browse_genre():
@@ -1019,7 +1070,7 @@ async def test_ui_try_again_label_for_awaiting_client():
     assert 'reason === "awaiting_client"' in app_js
     assert "Try again — Plex is open" in app_js
     sw = Path("hearth/ui/static/sw.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v16" in sw
+    assert "hearth-shell-v17" in sw
 
 
 async def test_plex_play_live_proxies_play_media(monkeypatch):

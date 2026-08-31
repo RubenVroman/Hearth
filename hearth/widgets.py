@@ -304,6 +304,10 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
     if row.get("tmdbId") is None and row.get("mediaId") is not None:
         row = {**row, "tmdbId": row.get("mediaId")}
     art = _art_fields(row)
+    genres = row.get("genres")
+    if not isinstance(genres, list):
+        genres = []
+    genres = [str(g).strip() for g in genres if str(g or "").strip()]
     item = {
         "id": _media_item_id({**row, **art, "title": title}),
         "title": title,
@@ -313,6 +317,7 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
         "summary": row.get("summary") or row.get("overview") or "",
         "contentRating": row.get("contentRating"),
         "rating": row.get("rating") or row.get("audienceRating"),
+        "genres": genres,
         **art,
         "source": source,
         "skeleton": bool(row.get("skeleton")),
@@ -526,10 +531,75 @@ def _media_panel_copy(
     return title, body, " · ".join(detail_parts)
 
 
+def _genre_catalog(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compact genre directory for the glass category chips (no secrets)."""
+    raw = data.get("genres") or []
+    out: list[dict[str, Any]] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "").strip()
+        if not title:
+            continue
+        entry: dict[str, Any] = {"title": title}
+        if row.get("key") is not None:
+            entry["key"] = str(row["key"])
+        if row.get("size") is not None:
+            try:
+                entry["size"] = int(row["size"])
+            except (TypeError, ValueError):
+                pass
+        out.append(entry)
+    return out
+
+
+def _genres_widget(result: dict[str, Any]) -> Widget | None:
+    """Glass panel of library genre buckets — tap one to browse that category."""
+    data = result.get("data") or {}
+    genres = _genre_catalog(data)
+    if not genres:
+        return None
+    media_type = str(data.get("media_type") or "movie")
+    kind_label = "shows" if media_type == "show" else "movies"
+    names = [g["title"] for g in genres[:8]]
+    body = ", ".join(names)
+    if len(genres) > 8:
+        body = f"{body}, +{len(genres) - 8} more"
+    detail = f"{len(genres)} {kind_label} categories from Plex"
+    if data.get("mode") == "mock":
+        detail = f"{detail} · mock"
+    return runtime.upsert_widget(
+        Widget(
+            id="media",
+            kind="media",
+            title=f"{kind_label.capitalize()} by genre",
+            status="done",
+            body=body,
+            detail=detail,
+            data={
+                "tool": "plex_browse_genre",
+                "presentation": "genres",
+                "listed_genres": True,
+                "media_type": media_type,
+                "genres": genres,
+                "items": [],
+                "item": {"title": f"{kind_label.capitalize()} by genre", "type": media_type},
+                "active_id": "",
+            },
+            sticky=False,
+        )
+    )
+
+
 def _media_widget(result: dict[str, Any]) -> Widget | None:
     name = str(result.get("name") or "media")
     data = result.get("data") or {}
     ok = bool(result.get("ok")) and data.get("ok") is not False
+
+    # List-genres asks → category picker (not an empty media stack).
+    if name == "plex_browse_genre" and data.get("listed_genres"):
+        return _genres_widget(result)
+
     incoming = _media_items_from_tool(name, data)
     if not incoming:
         # Empty search / nothing playing — no overlay (voice/transcript still answers).
@@ -578,6 +648,10 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
         payload["total"] = data.get("total")
     if data.get("count") is not None:
         payload["count"] = data.get("count")
+    # Keep the full genre directory so the UI can switch categories without re-asking.
+    genre_catalog = _genre_catalog(data)
+    if genre_catalog and name == "plex_browse_genre":
+        payload["genres"] = genre_catalog
 
     if not ok:
         return runtime.upsert_widget(

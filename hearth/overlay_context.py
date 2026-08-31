@@ -303,7 +303,15 @@ def entity_topics_for_widget(widget: Widget) -> list[str]:
             item.get("title"),
             item.get("show"),
             widget.title,
+            data.get("genre"),
         )
+        for tag in list(item.get("genres") or [])[:6]:
+            topics |= _entity_tokens_from_chunks(tag)
+        for row in list(data.get("genres") or [])[:12]:
+            if isinstance(row, dict):
+                topics |= _entity_tokens_from_chunks(row.get("title"))
+            else:
+                topics |= _entity_tokens_from_chunks(row)
     elif kind == "downloads":
         topics |= _entity_tokens_from_chunks(widget.title, data.get("query"))
         for row in list(data.get("downloads") or [])[:8]:

@@ -186,7 +186,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Receiver-centric “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; orders Denon → LG → Denon source → Apple TV and reports every failed step
 - House media snapshot (TV + AVR + Apple TV + Plex) → `house_media` or `GET /api/media`
 - What's playing on Plex → `plex_now_playing` (Infuse has **no** now-playing API)
-- Browse Plex library **by genre** (Animation, Comedy, …) → `plex_browse_genre` / `GET /api/plex/library?genre=Animation`. Speakable count + short title list. `GET /api/plex/genres` lists genres.
+- Browse Plex library **by genre** (Animation, Science Fiction, …) → `plex_browse_genre` / `GET /api/plex/library?genre=Science%20Fiction`. Speakable count + short title list; glass overlay shows tappable genre category chips from real Plex metadata. `GET /api/plex/genres` / “list plex genres” opens the category picker.
 - Play on **Apple TV / Infuse** → `infuse_play` (default). Title → TMDB (Plex Guids / Radarr / Overseerr) → `infuse://movie/{tmdb}?play` via HA Apple TV `play_media` type `url`. See [Infuse on Apple TV](#infuse-on-apple-tv) below. Runs immediately (lenient).
 - Pause / stop / skip while Infuse is up → `infuse_transport` (HA Apple TV remote — not Infuse REST)
 - Play on **LG / Shield / an explicit Plex client** → `plex_play` (optional `plex_search` / `plex_clients`). PMS-proxied `playMedia`. Starts immediately; if no clients are online, Hearth keeps the play ready and **Try again** / confirm re-polls until the client appears.
