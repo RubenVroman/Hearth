@@ -1,19 +1,22 @@
 """Conversation-first Telegram inbox for movies and series.
 
 The inbox owns Telegram I/O, safety checks, short-lived pending choices, and
-tool execution.  ``interpret_intent`` owns the conversation and names titles;
-the catalog and Overseerr tools ground and execute those decisions.
+tool execution. Conversation is an OpenAI Chat Completions loop with native
+function tools (``hearth.telegram.agent``). Queueing happens only when the
+model calls ``queue_request`` — never via short-reply Python binds.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from hearth.config import settings
 from hearth.memory.redact import redact
+from hearth.telegram.agent import run_telegram_agent, should_refuse_queue
 from hearth.telegram.catalog import (
     catalog_search_title,
     catalog_seed_matches_title,
@@ -26,7 +29,6 @@ from hearth.telegram.intent import (
     IntentDecision,
     clarify_wants_numbered_list,
     instant_pick_decision,
-    interpret_intent,
     is_explicit_title_year,
     looks_like_chatter,
     looks_like_concrete_title,
@@ -71,6 +73,31 @@ log = logging.getLogger("hearth.telegram")
 
 PENDING_TTL_S = 15 * 60
 SAFE_CLARIFY = "Which movie or series did you mean?"
+
+# Mood → default title packs when suggest_titles gets a vibe query only.
+_VIBE_PACKS: list[tuple[tuple[str, ...], list[str]]] = [
+    (
+        ("space", "sci-fi", "scifi", "science fiction", "cool space"),
+        ["Blade Runner", "Arrival", "Interstellar", "Dune"],
+    ),
+    (
+        ("horror", "scary", "spaceship"),
+        ["Event Horizon", "Alien", "The Thing", "Pandorum"],
+    ),
+    (
+        ("mind", "twist", "cerebral"),
+        ["Arrival", "Primer", "Coherence", "Ex Machina"],
+    ),
+]
+_DEFAULT_VIBE = ["The Matrix", "Arrival", "Interstellar", "Dune"]
+
+
+def _vibe_title_pack(query: str) -> list[str]:
+    q = (query or "").lower()
+    for keys, titles in _VIBE_PACKS:
+        if any(k in q for k in keys):
+            return list(titles)
+    return list(_DEFAULT_VIBE)
 
 
 # --- Public state -----------------------------------------------------------
@@ -122,7 +149,7 @@ class TelegramInbox:
     # --- Message lifecycle --------------------------------------------------
 
     async def handle_message(self, message: dict[str, Any]) -> InboxResult:
-        """Parse one Telegram message, interpret it, and run grounded tools."""
+        """Parse one Telegram message and run the tool-calling conversation."""
         view, parsed = parse_message(
             message,
             max_length=settings.telegram_max_title_length,
@@ -150,20 +177,25 @@ class TelegramInbox:
 
         pending = self._pending_for(view.chat_id)
 
-        # 2) Tiny, deterministic pending shortcuts: yes, all, de eerste.
-        instant = instant_pick_decision(
-            view.text,
-            pending.options if pending is not None else None,
-        )
-        if instant is not None and instant.action in {"pick", "pick_many"}:
-            result = await self._apply_intent(view, parsed, instant, pending=pending)
-            return await self._finish(
-                view,
-                result or InboxResult(handled=True),
-                search_title=pending.query if pending else "",
-                media_kind=pending.media_kind if pending else "",
-                user_text=view.text,
-            )
+        # 2) Multi-row list shortcuts only: "all of them" / "de eerste".
+        # Never auto-queue on yes/yep/short replies — that is a model turn.
+        if pending is not None and len(pending.options) >= 2:
+            instant = instant_pick_decision(view.text, pending.options)
+            if (
+                instant is not None
+                and instant.action in {"pick", "pick_many"}
+                and not looks_like_confirm_yes(view.text)
+            ):
+                result = await self._apply_intent(
+                    view, parsed, instant, pending=pending
+                )
+                return await self._finish(
+                    view,
+                    result or InboxResult(handled=True),
+                    search_title=pending.query,
+                    media_kind=pending.media_kind,
+                    user_text=view.text,
+                )
 
         # 3) IDs, catalog URLs, and explicit Title (YYYY) are unambiguous tools.
         if self._is_instant_catalog(parsed, view):
@@ -202,14 +234,20 @@ class TelegramInbox:
             )
 
         # 5) Chatter is silent unless a pending offer makes it conversational.
-        if looks_like_chatter(view.text) and pending is None:
+        if (
+            looks_like_chatter(view.text)
+            and pending is None
+            and not looks_like_media_ask(view.text)
+        ):
             return await self._finish(
                 view, InboxResult(handled=True), user_text=view.text
             )
 
-        # 5b) Bare reject of a live Did-you-mean / list: clear pending, never
-        # queue that row. Model still sees the thread (+ rejected_titles) and
-        # should suggest something else or ask what they want.
+        # 5b) Bare reject: remember rejected titles for the model context.
+        # Do NOT auto-queue — safety rail refuses queue_request on rejects.
+        # Pending stays visible so a mistaken model queue_request is refused
+        # against the live offer, then cleared after the turn.
+        rejected_this_turn = False
         if pending is not None and looks_like_confirm_no(view.text):
             rejected_rows = self._titles_from_options(pending.options)
             if pending.query:
@@ -217,23 +255,22 @@ class TelegramInbox:
             self.memory.remember_rejected(
                 view.chat_id,
                 rejected_rows,
-                clear_offered=True,
+                clear_offered=False,
                 clear_subject=False,
             )
-            self.pending.pop(view.chat_id, None)
-            pending = None
+            rejected_this_turn = True
 
         history = self.memory.history_blob(view.chat_id)
         subject_title, subject_kind = self.memory.subject(view.chat_id)
         rejected = list(self.memory.rejected(view.chat_id))
 
-        # A new ask must not inherit stale candidates from a prior subject.
         if (
             pending is None
             and subject_title
             and not subject_matches_user_title(subject_title, view.text)
             and not looks_like_confirm_yes(view.text)
             and not looks_like_confirm_no(view.text)
+            and not should_refuse_queue(view.text)
         ):
             self.memory.remember_rejected(
                 view.chat_id,
@@ -243,133 +280,514 @@ class TelegramInbox:
             )
             subject_title, subject_kind = "", ""
         elif pending is None and self.memory.offered(view.chat_id):
-            self.memory.clear_offered(view.chat_id)
+            # Keep offered rows visible to the model as context; do not wipe
+            # on every new ask — the agent context block needs them for Yep.
+            pass
 
-        # Concrete title text gets exact/prefix catalog candidates before the
-        # model. Descriptions, Dutch plots, and vibe asks never become queries.
-        catalog_rows = await self._catalog_candidates_for_message(
-            view,
-            parsed,
-            rejected_titles=rejected,
-        )
-        candidates_are_pending = bool(pending and pending.options)
-        candidates = (
-            list(pending.options)
-            if candidates_are_pending and pending is not None
-            else list(catalog_rows)
-        )
-        last_bot = (
-            pending.last_bot_reply
-            if pending is not None
-            else str(history[-1].get("text") or "")
-            if history
-            else ""
-        )
+        pending_blob = None
+        offered_rows: list[dict[str, Any]] = []
+        if pending is not None:
+            offered_rows = list(pending.options)
+            pending_blob = {
+                "query": pending.query,
+                "media_kind": pending.media_kind,
+                "last_bot_reply": pending.last_bot_reply[:400],
+                "options": [
+                    {
+                        "title": str(r.get("title") or ""),
+                        "year": r.get("year"),
+                        "tmdbId": r.get("tmdbId") or r.get("mediaId"),
+                        "mediaType": r.get("mediaType") or pending.media_kind,
+                    }
+                    for r in pending.options[:8]
+                ],
+            }
+        elif self.memory.offered(view.chat_id):
+            offered_rows = list(self.memory.offered(view.chat_id))
 
-        intent = await interpret_intent(
+        if not self.rate.allow():
+            return await self._finish(
+                view,
+                InboxResult(handled=True, reply=format_rate_limited()),
+                user_text=view.text,
+            )
+
+        handlers = self._tool_handlers(view)
+        agent = await run_telegram_agent(
             view.text,
-            candidates=candidates or None,
-            pending_query=(pending.query if pending else subject_title) or "",
-            last_bot_reply=last_bot,
-            force=True,
+            handlers=handlers,
             history=history,
+            pending=pending_blob,
             subject_title=subject_title,
             subject_media_kind=subject_kind,
             rejected_titles=rejected,
-            candidates_are_pending=candidates_are_pending,
+            offered=offered_rows,
         )
 
-        # A one-row offer is a hard binding. A confirm cannot be redirected to
-        # an invented model title (Land -> La La Land). Rejects never bind.
-        if pending is not None and len(pending.options) == 1:
-            if looks_like_confirm_no(view.text):
-                # Should already be cleared above; belt-and-suspenders.
-                pass
-            else:
-                model_pick = intent.action in {"pick", "pick_many"}
-                ungrounded_search = (
-                    intent.action == "search"
-                    and bool(intent.search_title.strip())
-                    and not search_title_grounded(
-                        intent.search_title,
-                        user_message=view.text,
-                        candidates=pending.options,
-                    )
-                )
-                if (
-                    looks_like_confirm_yes(view.text)
-                    or model_pick
-                    or ungrounded_search
-                ):
-                    result = await self._grab_catalog_row(
-                        view,
-                        pending.options[0],
-                        query=pending.query,
-                        media_kind_hint=pending.media_kind,
-                    )
-                    return await self._finish(
-                        view,
-                        result,
-                        search_title=pending.query,
-                        media_kind=pending.media_kind,
-                        user_text=view.text,
-                    )
-
-        # Reconcile the model's decision with the still-live on-screen rows.
-        if pending is not None:
-            intent, pending = self._reconcile_pending_after_intent(
-                view.chat_id, pending, intent
-            )
-            rejected = list(self.memory.rejected(view.chat_id))
-            subject_title, subject_kind = self.memory.subject(view.chat_id)
-
-        # A model pick of this turn's catalog candidates gets a temporary,
-        # concrete pending object so the shared row-grab path can execute it.
-        active_pending = pending
-        if (
-            active_pending is None
-            and intent.action in {"pick", "pick_many"}
-            and intent.indices
-            and candidates
-            and not candidates_are_pending
-        ):
-            active_pending = PendingDisambiguation(
-                chat_id=view.chat_id,
-                options=candidates[:MAX_CANDIDATES],
-                media_kind=subject_kind
-                or str(candidates[0].get("mediaType") or "movie"),
-                query=subject_title
-                or (catalog_search_title(view.text) or view.text)[:200],
-                created_message_id=view.message_id,
-                last_bot_reply=last_bot,
-            )
-            self.pending[view.chat_id] = active_pending
-
-        result = await self._apply_intent(
-            view,
-            parsed,
-            intent,
-            pending=active_pending,
-            catalog_hits=catalog_rows,
+        result = InboxResult(
+            handled=True,
+            reply=agent.reply or "",
+            grabbed=agent.grabbed,
+            title=agent.title,
+            year=agent.year,
+            titles=list(agent.titles),
+            service="overseerr" if agent.grabbed else "",
         )
-        if result is None:
-            result = await self._passthrough_fallback(view, parsed, intent)
 
-        finish_title = intent.search_title if intent.action == "search" else ""
-        if intent.action in {"pick", "pick_many"} and active_pending is not None:
-            finish_title = active_pending.query
+        # Reject turn: drop the refused offer so it cannot stick for a later bind.
+        if rejected_this_turn and not result.grabbed:
+            self.pending.pop(view.chat_id, None)
+            self.memory.clear_offered(view.chat_id)
+
+        # If tools set pending/reply but the model returned empty prose, keep
+        # the tool-formatted reply (Did you mean / numbered list / Queued).
+        if not result.reply and self.pending.get(view.chat_id):
+            live = self.pending[view.chat_id]
+            result.reply = live.last_bot_reply
+
         return await self._finish(
             view,
             result,
-            search_title=finish_title,
-            media_kind=intent.media_kind or subject_kind,
+            search_title=agent.search_title
+            or (self.pending[view.chat_id].query if self.pending.get(view.chat_id) else "")
+            or agent.title,
+            media_kind=agent.media_kind
+            or (
+                self.pending[view.chat_id].media_kind
+                if self.pending.get(view.chat_id)
+                else subject_kind
+            ),
             offered=(
                 self.pending[view.chat_id].options
                 if self.pending.get(view.chat_id)
-                else []
+                else offered_rows
             ),
             user_text=view.text,
         )
+
+    def _tool_handlers(self, view: MessageView) -> dict[str, Any]:
+        """Bind per-message tool handlers for the Chat Completions loop."""
+
+        async def search_catalog(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_search_catalog(view, args)
+
+        async def suggest_titles(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_suggest_titles(view, args)
+
+        async def queue_request(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_queue_request(view, args)
+
+        async def already_queued(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_already_queued(view, args)
+
+        async def download_progress(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_download_progress(view, args)
+
+        async def retry_download(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_retry_download(view, args)
+
+        return {
+            "search_catalog": search_catalog,
+            "suggest_titles": suggest_titles,
+            "queue_request": queue_request,
+            "already_queued": already_queued,
+            "download_progress": download_progress,
+            "retry_download": retry_download,
+        }
+
+    async def _tool_search_catalog(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        title = catalog_search_title(str(args.get("title") or "")) or str(
+            args.get("title") or ""
+        ).strip()
+        if not title:
+            return {"ok": False, "error": "title required"}
+        year = args.get("year")
+        try:
+            year_i = int(year) if year not in (None, "") else None
+        except (TypeError, ValueError):
+            year_i = None
+        media_type = str(args.get("media_type") or args.get("mediaType") or "").strip()
+        kind = media_type if media_type in {"movie", "tv"} else ""
+
+        # Prefer the user's concrete seed when the model invents a different
+        # title (Christophers + McKellen ≠ Christopher Guest; Land ≠ La La Land).
+        user_seed = ""
+        if looks_like_concrete_title(view.text):
+            user_seed = (
+                catalog_search_title(view.text)
+                or self._concrete_title_from_message(view.text)
+            )
+        if (
+            user_seed
+            and not titles_match(user_seed, title)
+            and not catalog_seed_matches_title(user_seed, title)
+        ):
+            user_rows = await tool_lookup_title(
+                user_seed, year=year_i, media_kind=kind
+            )
+            user_rows = filter_seed_rows(user_rows, user_seed) if user_rows else []
+            if user_rows:
+                title = user_seed
+                rows = user_rows
+            else:
+                rows = await tool_lookup_title(title, year=year_i, media_kind=kind)
+                rows = filter_seed_rows(rows, title) if rows else []
+        else:
+            rows = await tool_lookup_title(title, year=year_i, media_kind=kind)
+            rows = [
+                r
+                for r in rows
+                if catalog_seed_matches_title(title, str(r.get("title") or ""))
+                or titles_match(title, str(r.get("title") or ""))
+            ]
+            rows = filter_seed_rows(rows, title) if rows else []
+
+        # Drop rejected titles.
+        rows = [
+            r
+            for r in rows
+            if not self._title_is_rejected(view.chat_id, str(r.get("title") or ""))
+        ]
+
+        # Pivoting to a new search clears the prior on-screen offer.
+        live = self._pending_for(view.chat_id)
+        if live is not None and not titles_match(live.query, title):
+            rejected_rows = self._titles_from_options(live.options)
+            if live.query:
+                rejected_rows.append(live.query)
+            self.memory.remember_rejected(
+                view.chat_id,
+                rejected_rows,
+                clear_offered=True,
+                clear_subject=False,
+            )
+            self.pending.pop(view.chat_id, None)
+
+        compact = [
+            {
+                "title": str(r.get("title") or ""),
+                "year": self._row_year(r),
+                "tmdbId": r.get("tmdbId") or r.get("mediaId"),
+                "mediaType": self._row_kind(r, kind),
+                "inLibrary": bool(r.get("inLibrary")),
+            }
+            for r in rows[:MAX_CANDIDATES]
+        ]
+
+        if len(compact) == 1:
+            offered = self._ask_guess_confirm(
+                view,
+                {
+                    "title": compact[0]["title"],
+                    "year": compact[0]["year"],
+                    "tmdbId": compact[0]["tmdbId"],
+                    "mediaId": compact[0]["tmdbId"],
+                    "mediaType": compact[0]["mediaType"],
+                },
+                query=title,
+            )
+            return {
+                "ok": True,
+                "query": title,
+                "media_type": compact[0]["mediaType"],
+                "results": compact,
+                "count": 1,
+                "reply": offered.reply,
+                "hint": "Ask the user to confirm before calling queue_request.",
+            }
+
+        if len(compact) > 1:
+            offered = self._offer_rows(
+                view, title, rows[:MAX_CANDIDATES], media_kind=kind
+            )
+            return {
+                "ok": True,
+                "query": title,
+                "media_type": kind or self._row_kind(rows[0]),
+                "results": compact,
+                "count": len(compact),
+                "reply": offered.reply,
+                "hint": "Present the numbered list; wait for a pick or confirm.",
+            }
+
+        # No catalog hit — still offer a confirm on the model-named title so
+        # Eat Pray Love / plot guesses can proceed without a 404/link nag.
+        offered = self._ask_guess_confirm(
+            view,
+            {
+                "title": title,
+                "year": year_i,
+                "mediaType": kind or "movie",
+            },
+            query=title,
+        )
+        return {
+            "ok": True,
+            "query": title,
+            "media_type": kind or "movie",
+            "results": [],
+            "count": 0,
+            "reply": offered.reply,
+            "hint": "No exact catalog hit; confirm the guessed title with the user.",
+        }
+
+    async def _tool_suggest_titles(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        raw_titles = args.get("titles")
+        titles: list[str] = []
+        if isinstance(raw_titles, list):
+            for item in raw_titles:
+                if isinstance(item, dict):
+                    label = str(item.get("title") or item.get("name") or "").strip()
+                    year = item.get("year")
+                    if label and year not in (None, "") and "(" not in label:
+                        label = f"{label} ({year})"
+                else:
+                    label = str(item or "").strip()
+                cleaned = catalog_search_title(label) or label
+                if cleaned and cleaned not in titles:
+                    titles.append(cleaned)
+                if len(titles) >= 4:
+                    break
+
+        query = str(args.get("query") or "").strip()
+        media_type = str(args.get("media_type") or args.get("type") or "").strip()
+        kind = media_type if media_type in {"movie", "tv"} else ""
+        try:
+            limit = int(args.get("limit") or 4)
+        except (TypeError, ValueError):
+            limit = 4
+        limit = max(2, min(4, limit))
+
+        # Curated vibe packs when the model only passes a mood query.
+        if len(titles) < 2 and query:
+            pack = _vibe_title_pack(query)
+            for name in pack:
+                if name not in titles:
+                    titles.append(name)
+                if len(titles) >= limit:
+                    break
+
+        if len(titles) < 2:
+            return {
+                "ok": False,
+                "error": "suggest_titles needs 2–4 titles or a vibe query",
+            }
+
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for name in titles[:limit]:
+            # Strip year for lookup seed.
+            seed = re.sub(r"\s*\(\d{4}\)\s*$", "", name).strip() or name
+            year_m = re.search(r"\((\d{4})\)\s*$", name)
+            year_i = int(year_m.group(1)) if year_m else None
+            found = await tool_lookup_title(seed, year=year_i, media_kind=kind)
+            if found:
+                row = dict(found[0])
+            else:
+                row = {
+                    "title": seed,
+                    "year": year_i,
+                    "mediaType": kind or "movie",
+                }
+            label = str(row.get("title") or seed).strip()
+            key = normalize_title(label)
+            if not key or key in seen:
+                continue
+            if self._title_is_rejected(view.chat_id, label):
+                continue
+            seen.add(key)
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+
+        if len(rows) < 2:
+            return {
+                "ok": False,
+                "error": "Could not resolve 2+ distinct titles for suggest_titles",
+                "partial": [
+                    {"title": str(r.get("title") or ""), "year": self._row_year(r)}
+                    for r in rows
+                ],
+            }
+
+        offered = self._offer_rows(
+            view,
+            query or "a few more",
+            rows,
+            media_kind=kind or self._row_kind(rows[0]),
+        )
+        compact = [
+            {
+                "title": str(r.get("title") or ""),
+                "year": self._row_year(r),
+                "tmdbId": r.get("tmdbId") or r.get("mediaId"),
+                "mediaType": self._row_kind(r, kind),
+            }
+            for r in rows
+        ]
+        return {
+            "ok": True,
+            "query": query or "a few more",
+            "media_type": kind or self._row_kind(rows[0]),
+            "results": compact,
+            "count": len(compact),
+            "reply": offered.reply,
+            "hint": "Reply with this numbered list. Do not call queue_request.",
+        }
+
+    async def _tool_queue_request(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        title = str(args.get("title") or "").strip()
+        if not title:
+            return {"ok": False, "error": "title required"}
+        # Belt-and-suspenders: refuse even if the agent loop missed it.
+        if should_refuse_queue(view.text):
+            return {
+                "ok": False,
+                "refused": True,
+                "error": "User rejected or asked for a list; queue_request refused.",
+            }
+
+        year = args.get("year")
+        try:
+            year_i = int(year) if year not in (None, "") else None
+        except (TypeError, ValueError):
+            year_i = None
+        tmdb_raw = args.get("tmdb_id") or args.get("tmdbId") or args.get("mediaId")
+        try:
+            tmdb_id = int(tmdb_raw) if tmdb_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+        media_type = str(args.get("media_type") or args.get("mediaType") or "").strip()
+        kind = media_type if media_type in {"movie", "tv"} else "movie"
+
+        # Prefer a matching pending/offered row (confirm of Did-you-mean).
+        pending = self._pending_for(view.chat_id)
+        row: dict[str, Any] | None = None
+        if pending is not None:
+            for option in pending.options:
+                if titles_match(str(option.get("title") or ""), title):
+                    row = dict(option)
+                    break
+            if row is None and len(pending.options) == 1 and (
+                looks_like_confirm_yes(view.text)
+                or titles_match(title, str(pending.options[0].get("title") or ""))
+            ):
+                # Confirm of the single on-screen guess — bind to that row so
+                # the model cannot redirect Land → La La Land.
+                row = dict(pending.options[0])
+            # Download/queue phrasing naming the pending title.
+            if row is None and len(pending.options) == 1:
+                pending_title = str(pending.options[0].get("title") or "")
+                if pending_title and normalize_title(pending_title) in normalize_title(
+                    view.text
+                ):
+                    row = dict(pending.options[0])
+                elif looks_like_confirm_yes(view.text):
+                    row = dict(pending.options[0])
+        if row is None:
+            for option in self.memory.offered(view.chat_id):
+                if titles_match(str(option.get("title") or ""), title):
+                    row = dict(option)
+                    break
+
+        if row is None:
+            row = {
+                "title": title,
+                "year": year_i,
+                "tmdbId": tmdb_id,
+                "mediaId": tmdb_id,
+                "mediaType": kind,
+            }
+        else:
+            if year_i is not None and row.get("year") in (None, ""):
+                row["year"] = year_i
+            if tmdb_id is not None and not (row.get("tmdbId") or row.get("mediaId")):
+                row["tmdbId"] = tmdb_id
+                row["mediaId"] = tmdb_id
+
+        result = await self._grab_catalog_row(
+            view,
+            row,
+            query=str(row.get("title") or title),
+            media_kind_hint=str(row.get("mediaType") or kind),
+            skip_rate=True,
+        )
+        return {
+            "ok": bool(result.grabbed) or "Queued" in (result.reply or ""),
+            "grabbed": bool(result.grabbed),
+            "title": result.title or str(row.get("title") or title),
+            "year": result.year if result.year is not None else self._row_year(row),
+            "reply": result.reply,
+            "media_type": str(row.get("mediaType") or kind),
+        }
+
+    async def _tool_already_queued(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        title = str(args.get("title") or "").strip()
+        if not title:
+            return {"ok": False, "error": "title required"}
+        media_type = str(args.get("media_type") or "").strip()
+        service = "sonarr" if media_type == "tv" else "radarr"
+        queued = await self._already_queued(title, service)
+        return {
+            "ok": True,
+            "title": title,
+            "queued": queued,
+            "service": service,
+        }
+
+    async def _tool_download_progress(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        title = str(args.get("title") or "").strip()
+        if not title:
+            title = self.progress.active_title_for(view.chat_id) or ""
+        if not title:
+            return {"ok": False, "error": "no active download title"}
+        media_type = str(args.get("media_type") or "").strip()
+        service = self.progress.active_service_for(view.chat_id, title)
+        if not service:
+            service = "sonarr" if media_type == "tv" else "radarr"
+        client = radarr if service == "radarr" else sonarr
+        try:
+            payload = await client.queue(title)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "title": title,
+            "service": service,
+            "downloads": payload.get("downloads") or [],
+            "speak": payload.get("speak") or "",
+            "reply": str(payload.get("speak") or ""),
+        }
+
+    async def _tool_retry_download(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        title = str(args.get("title") or "").strip()
+        media_kind = str(args.get("media_type") or args.get("media_kind") or "").strip()
+        intent = IntentDecision(
+            action="retry",
+            search_title=title,
+            media_kind=media_kind if media_kind in {"movie", "tv"} else "",
+            confidence=0.9,
+            source="tool",
+        )
+        result = await self._handle_retry(view, intent)
+        return {
+            "ok": True,
+            "title": title or result.title,
+            "reply": result.reply,
+            "grabbed": False,
+        }
 
     async def _finish(
         self,
@@ -421,7 +839,21 @@ class TelegramInbox:
         self, view: MessageView, result: InboxResult
     ) -> InboxResult:
         """Never let a banned canned reply leave the inbox."""
-        if not reply_is_banned(result.reply):
+        # Intentional silence (dedup / chatter) stays empty.
+        if not (result.reply or "").strip():
+            return result
+
+        weak = (
+            reply_is_banned(result.reply)
+            or result.reply.strip() in {SAFE_CLARIFY, CONTEXT_CLUE_CLARIFY, SOFT_CONTEXT_CLARIFY}
+            or "any year, actor" in (result.reply or "").lower()
+            or (
+                # List-less "reply 1–N" with no actual numbered Title rows.
+                bool(re.search(r"reply\s*1\s*[-–—]\s*\d+", result.reply or "", re.I))
+                and not re.search(r"^\s*1\.\s+\S", result.reply or "", re.M)
+            )
+        )
+        if not weak:
             return result
 
         pending = self._pending_for(view.chat_id)

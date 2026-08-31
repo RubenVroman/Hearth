@@ -102,6 +102,10 @@ _LIST_ASK = re.compile(
     r"(?:"
     r"\bname a few more\b|"
     r"\ba few more\b|"
+    r"\bi was asking for a few\b|"
+    r"\basking for a (?:few|list|options)\b|"
+    r"\ba few\b.+\b(?:movies?|films?|shows?|series|titles?|options|sci-?fi)\b|"
+    r"\bgive me (?:a few |some )?(?:cool |good )?.{0,40}\b(?:movies?|films?|shows?|options)\b|"
     r"\bgive me (?:a few |some )?options\b|"
     r"\b(?:show|give|list)\s+(?:me\s+)?(?:some\s+)?options\b|"
     r"\bmore options\b|"
@@ -509,8 +513,9 @@ def is_explicit_title_year(text: str) -> bool:
 def looks_like_confirm_yes(text: str) -> bool:
     """True for short yes / that's it confirmations of a single guess.
 
-    Accepts elongated enthusiasm (yesss, yeahhh, jaaa) and 👍 when a 1-item
-    guess-confirm is pending.
+    Accepts elongated enthusiasm (yesss, yeahhh, jaaa), ``Yes... duh``,
+    and 👍 when a 1-item guess-confirm is pending. Multi-word accepts like
+    ``Sure. Bring it`` stay False so they go through the model tool loop.
     """
     raw = (text or "").strip()
     if not raw or len(raw) > 40:
@@ -519,8 +524,18 @@ def looks_like_confirm_yes(text: str) -> bool:
         return False
     if _CONFIRM_THUMBS.match(raw):
         return True
-    return bool(_CONFIRM_YES.match(raw))
-
+    if _CONFIRM_YES.match(raw):
+        return True
+    # "Yes... duh" / "yes please" — yes + light commentary, still a confirm.
+    if re.match(
+        r"^\s*y+e+s+\s*[.…!?,:]*\s*(?:duh|please|pls|thanks|thx)?\s*[.!?]*\s*$",
+        raw,
+        re.I,
+    ):
+        return True
+    if re.match(r"^\s*duh\s*[.!?]*\s*$", raw, re.I):
+        return True
+    return False
 
 def looks_like_confirm_no(text: str) -> bool:
     """True for short reject of a single on-screen Did-you-mean / list offer.
