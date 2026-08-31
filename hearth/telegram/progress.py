@@ -89,7 +89,12 @@ def format_retry_exhausted(title: str, *, max_attempts: int = 0) -> str:
 
 
 def format_not_found(query: str) -> str:
-    return f"Couldn't find a match for '{query}'. Send an IMDb/TMDB link?"
+    """Catalog miss for an instant Title (YYYY) / id path.
+
+    Never ask for an IMDb/TMDB link — the conversation hop confirms
+    model-named titles instead of calling this.
+    """
+    return f"Couldn't find a match for '{query}'."
 
 
 def format_guess_confirm(title: str, year: int | None = None) -> str:
