@@ -361,6 +361,7 @@ async def test_inbox_user_allowlist(inbox: TelegramInbox, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_inbox_not_found(inbox: TelegramInbox, monkeypatch):
+    """Model-named title with empty catalog → confirm, not 'send a link'."""
     _patch_openai_intent(
         monkeypatch,
         {
@@ -371,6 +372,19 @@ async def test_inbox_not_found(inbox: TelegramInbox, monkeypatch):
         },
     )
     result = await inbox.handle_message(_msg("ZzzNotARealFilm999", message_id=70))
+    assert result.grabbed is False
+    assert "Couldn't find" not in result.reply
+    assert "IMDb" not in result.reply
+    assert "Did you mean" in result.reply
+    assert "ZzzNotARealFilm999" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_instant_title_year_still_not_found(inbox: TelegramInbox):
+    """Explicit Title (YYYY) instant path may still 404 when catalog misses."""
+    result = await inbox.handle_message(
+        _msg("ZzzNotARealFilm999 (2099)", message_id=71)
+    )
     assert result.grabbed is False
     assert "Couldn't find" in result.reply
 
@@ -3826,3 +3840,197 @@ async def test_inbox_eat_pray_love_no_404_after_model_resolve(
     hit = await inbox.handle_message(_msg("Eat pray love", message_id=8401))
     assert "Couldn't find" not in hit.reply
     assert "Eat Pray Love" in hit.reply or hit.grabbed
+
+
+# --- Squid / anaphoric follow-up (live Telegram 2026-08-31) -------------------
+
+
+@pytest.mark.asyncio
+async def test_inbox_squid_and_the_whale_thread_no_send_link(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live Movies & Series bug: Squid miss → send-link; find-that → any year?
+
+    Replay the exact thread. Catalog empty on first ask (model already named the
+    title) must confirm, not 'send a link'. Anaphoric 'Find a title that matches
+    that' must reuse the prior title — never 'Any year, actor, or other clue?'.
+    """
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.intent import CONTEXT_CLUE_CLARIFY
+
+    squid = {
+        "title": "The Squid and the Whale",
+        "year": 2005,
+        "tmdbId": 116,
+        "mediaId": 116,
+        "mediaType": "movie",
+    }
+
+    async def _search_empty(query: str, *args, **kwargs):
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search_empty)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search_empty)
+
+    # 1) Bare title — model names it, catalog empty → confirm (not send-link).
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Squid and the Whale",
+            "year": 2005,
+            "media_kind": "movie",
+            "confidence": 0.92,
+        },
+    )
+    first = await inbox.handle_message(
+        _msg("The squid and the whale", message_id=8500)
+    )
+    assert "Couldn't find" not in first.reply
+    assert "IMDb" not in first.reply
+    assert "send" not in first.reply.lower() or "Did you mean" in first.reply
+    assert "Squid" in first.reply
+    assert "2005" in first.reply
+    assert "Did you mean" in first.reply or first.grabbed
+
+    # 2) Anaphoric follow-up — even if the model wrongly clarifies, reuse prior.
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": CONTEXT_CLUE_CLARIFY,
+            "confidence": 0.4,
+        },
+    )
+    # Clear live pending so this matches the live 404 shape (no on-screen guess).
+    inbox.pending.clear()
+    inbox.memory.clear_offered(-1001)
+
+    follow = await inbox.handle_message(
+        _msg("Find a title that matches that", message_id=8501)
+    )
+    assert follow.reply != CONTEXT_CLUE_CLARIFY
+    assert "Any year, actor, or other clue" not in follow.reply
+    assert "send the title if you know it" not in follow.reply.lower()
+    assert "Squid" in follow.reply or follow.grabbed
+
+    # 3) User repeats the title — still no send-link template.
+    async def _search_hit(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "squid" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [squid]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search_hit)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search_hit)
+    inbox.pending.clear()
+    inbox.deduper.reset()
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Squid and the Whale",
+            "year": 2005,
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    again = await inbox.handle_message(
+        _msg("The squid and the whale", message_id=8502)
+    )
+    assert "Couldn't find" not in again.reply
+    assert "IMDb" not in again.reply
+    assert "Squid" in again.reply or again.grabbed
+    assert again.grabbed is True or "Did you mean" in again.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_find_title_that_matches_that_reuses_prior(
+    inbox: TelegramInbox, monkeypatch
+):
+    """After a titled miss, 'find a title that matches that' searches the prior."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.intent import CONTEXT_CLUE_CLARIFY
+
+    squid = {
+        "title": "The Squid and the Whale",
+        "year": 2005,
+        "tmdbId": 116,
+        "mediaId": 116,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "squid" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [squid]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    # Seed history as if the prior ask already named Squid (bot missed).
+    inbox.memory.record_user(-1001, "The squid and the whale")
+    inbox.memory.record_bot(
+        -1001,
+        "Couldn't find a match for 'The Squid and the Whale'. Send an IMDb/TMDB link?",
+        search_title="The Squid and the Whale",
+        media_kind="movie",
+    )
+    inbox.memory.set_subject(-1001, "The Squid and the Whale", media_kind="movie")
+
+    # Model wrongly asks for clues — inbox must still reuse Squid.
+    calls = _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "clarify",
+            "clarify_question": CONTEXT_CLUE_CLARIFY,
+            "confidence": 0.35,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("Find a title that matches that", message_id=8510)
+    )
+    assert calls, "gpt-4o must still see the follow-up"
+    payload = __import__("json").loads(calls[0]["messages"][1]["content"])
+    assert payload["user_message"]
+    assert payload.get("recent_history") or payload.get("subject_title")
+    assert "Any year, actor, or other clue" not in result.reply
+    assert result.reply != CONTEXT_CLUE_CLARIFY
+    assert "Squid" in result.reply or result.grabbed is True
+    assert result.grabbed is True or "Did you mean" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_made_up_exact_title_catalog_hit(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Real-sounding exact title present in catalog → queue or confirm, no 404."""
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Cedar Hollow Signal",
+            "year": 2019,
+            "media_kind": "movie",
+            "confidence": 0.96,
+        },
+    )
+    result = await inbox.handle_message(
+        _msg("Cedar Hollow Signal", message_id=8520)
+    )
+    assert "Couldn't find" not in result.reply
+    assert "IMDb" not in result.reply
+    assert "Cedar Hollow Signal" in result.reply or result.grabbed
+    assert result.grabbed is True or "Did you mean" in result.reply
+
+
+def test_looks_like_concrete_title_rejects_anaphoric_find_match():
+    from hearth.telegram.intent import looks_like_concrete_title
+
+    assert not looks_like_concrete_title("Find a title that matches that")
+    assert not looks_like_concrete_title("zoek die film die ik net noemde")
+    assert looks_like_concrete_title("The squid and the whale")
+    assert looks_like_concrete_title("Cedar Hollow Signal")
