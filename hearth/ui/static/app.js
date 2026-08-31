@@ -351,18 +351,9 @@ function mediaItemsOf(widget) {
     const id = String(row.id || mediaItemKey(row));
     if (!byId.has(id)) byId.set(id, { ...row, id, skeleton: true });
   }
-  const activeId = String(
-    (widget.context && widget.context.active_id) || data.active_id || ""
-  );
-  const items = [...byId.values()].slice(0, MEDIA_STACK_CAP);
-  if (activeId) {
-    items.sort((a, b) => {
-      const aActive = String(a.id) === activeId ? 0 : 1;
-      const bActive = String(b.id) === activeId ? 0 : 1;
-      return aActive - bActive;
-    });
-  }
-  return items;
+  // Keep server order. Active title is indicated via active_id + carousel slots —
+  // reordering remounts the deck and causes pop-in/out flicker.
+  return [...byId.values()].slice(0, MEDIA_STACK_CAP);
 }
 
 function mediaItemKey(item) {
@@ -625,6 +616,7 @@ function focusMediaById(mediaId, { reveal = true } = {}) {
   }
   data.active_id = hit.id;
   data.item = hit;
+  // Preserve list order so the carousel can slide without remount thrash.
   data.items = items;
   visual.data = data;
   visual.title = hit.title || visual.title;
@@ -634,15 +626,11 @@ function focusMediaById(mediaId, { reveal = true } = {}) {
   if (!visual.context) visual.context = {};
   visual.context.active_id = hit.id;
   visual.context.relevant = true;
-  // Re-order so the focused card is front in the stack markup.
-  const rest = items.filter((row) => String(row.id) !== String(hit.id));
-  data.items = [hit, ...rest];
   if (reveal) {
     if (state.infoHideTimer) {
       clearTimeout(state.infoHideTimer);
       state.infoHideTimer = null;
     }
-    state.infoSignature = "";
     openInfoOverlay(visual);
   }
   return true;
@@ -889,7 +877,10 @@ function mediaPosterFallback(title) {
   )}</div>`;
 }
 
-function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = false, genre = "" } = {}) {
+function mediaCardMarkup(
+  item,
+  { active = false, slot = 0, labelled = false, genre = "" } = {}
+) {
   const title = item.title || "Untitled";
   const year = item.year;
   const type = item.type || "movie";
@@ -940,12 +931,14 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
       : genre
         ? escapeHtml(genre)
         : "Library";
+  const slotAbs = Math.abs(Number(slot) || 0);
   const classes = [
     "info-media-card",
-    active ? "is-active" : "is-recessed",
+    active ? "is-active is-front" : "is-recessed is-selectable",
     item.skeleton ? "is-skeleton" : "",
-    stackIndex === 0 && active ? "is-front" : "",
-    !active ? "is-selectable" : "",
+    slotAbs > 2 ? "is-far" : "",
+    Number(slot) < 0 ? "is-peek-prev" : "",
+    Number(slot) > 0 ? "is-peek-next" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -953,7 +946,7 @@ function mediaCardMarkup(item, { active = false, stackIndex = 0, labelled = fals
     <article
       class="${classes}"
       data-media-id="${escapeHtml(String(item.id || mediaItemKey(item)))}"
-      style="--stack-i:${stackIndex}"
+      style="--slot:${Number(slot) || 0};--slot-abs:${slotAbs}"
       aria-hidden="${active ? "false" : "true"}"
       ${!active ? 'tabindex="0" role="button" aria-label="Show this title"' : ""}
     >
@@ -982,13 +975,13 @@ function mediaStackCounter(items, activeId, total) {
     .slice(0, Math.min(shown, 12))
     .map(
       (_, i) =>
-        `<span class="info-media-dot${i === idx ? " is-on" : ""}" aria-hidden="true"></span>`
+        `<button type="button" class="info-media-dot${i === idx ? " is-on" : ""}" data-media-dot="${i}" aria-label="Show title ${i + 1}" ${i === idx ? 'aria-current="true"' : ""}></button>`
     )
     .join("");
   return `<div class="info-media-rail" aria-label="${escapeHtml(label)}">
     <p class="info-media-count">${escapeHtml(label)}</p>
     <div class="info-media-dots">${dots}</div>
-    <p class="info-media-hint">Swipe or tap to flick through</p>
+    <p class="info-media-hint">Swipe or tap cards to browse</p>
   </div>`;
 }
 
@@ -1003,31 +996,36 @@ function mediaMarkup(widget) {
     const item = data.item || {};
     return mediaCardMarkup(
       { ...item, id: mediaItemKey(item), title: widget.title || item.title || "Untitled" },
-      { active: true, stackIndex: 0, labelled: true, genre }
+      { active: true, slot: 0, labelled: true, genre }
     );
   }
   if (items.length === 1) {
     return `<div class="info-media-stack is-single" data-count="1">${mediaCardMarkup(items[0], {
       active: true,
-      stackIndex: 0,
+      slot: 0,
       labelled: true,
       genre,
     })}</div>`;
   }
-  const visible = items.slice(0, 5);
-  const cards = visible
+  let activeIdx = items.findIndex((row) => String(row.id) === String(activeId));
+  if (activeIdx < 0) activeIdx = 0;
+  const cards = items
     .map((item, index) =>
       mediaCardMarkup(item, {
-        active: index === 0,
-        stackIndex: index,
-        labelled: index === 0,
+        active: index === activeIdx,
+        slot: index - activeIdx,
+        labelled: index === activeIdx,
         genre,
       })
     )
     .join("");
-  return `<div class="info-media-stack is-stacked" data-count="${items.length}" data-flick="1">
+  return `<div class="info-media-stack is-stacked is-carousel" data-count="${items.length}" data-flick="1" data-active-idx="${activeIdx}">
     ${mediaStackCounter(items, activeId, total)}
-    <div class="info-media-deck">${cards}</div>
+    <div class="info-media-carousel">
+      <button type="button" class="info-media-nav info-media-prev" data-media-nav="-1" aria-label="Previous title">‹</button>
+      <div class="info-media-deck">${cards}</div>
+      <button type="button" class="info-media-nav info-media-next" data-media-nav="1" aria-label="Next title">›</button>
+    </div>
   </div>`;
 }
 
@@ -1154,8 +1152,13 @@ function openInfoOverlay(widget) {
   root.hidden = false;
   root.setAttribute("aria-hidden", "false");
   root.classList.remove("is-closing", "is-soft-hidden");
-  // Force style flush so enter transition runs when opening from hidden / soft-hidden.
-  if (!alreadyOpen) {
+  // Content swaps while the glass stays up should not replay enter/pop animations
+  // (that was the main movie-card flicker when cycling or transcript-focusing).
+  if (alreadyOpen) {
+    content.dataset.settled = "1";
+  } else {
+    delete content.dataset.settled;
+    // Force style flush so enter transition runs when opening from hidden / soft-hidden.
     void root.offsetWidth;
   }
   root.classList.add("is-open");
@@ -1174,11 +1177,12 @@ function closeInfoOverlay({ animate = true } = {}) {
   clearInfoCloseTimer();
   state.infoSignature = "";
   root.classList.remove("is-soft-hidden");
+  const content = $("info-content");
+  if (content) delete content.dataset.settled;
   if (!animate || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
     root.classList.remove("is-open", "is-closing");
     root.hidden = true;
     root.setAttribute("aria-hidden", "true");
-    const content = $("info-content");
     if (content) content.innerHTML = "";
     return;
   }
@@ -1188,7 +1192,6 @@ function closeInfoOverlay({ animate = true } = {}) {
     root.classList.remove("is-closing");
     root.hidden = true;
     root.setAttribute("aria-hidden", "true");
-    const content = $("info-content");
     if (content) content.innerHTML = "";
     state.infoCloseTimer = null;
   }, 300);
@@ -1251,6 +1254,27 @@ function bindInfoOverlay() {
       playActiveInInfuse();
       return;
     }
+    const nav = target.closest("[data-media-nav]");
+    if (nav) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      pinFromUser();
+      cycleMedia(Number(nav.getAttribute("data-media-nav")) || 1);
+      return;
+    }
+    const dot = target.closest("[data-media-dot]");
+    if (dot) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const visual = pickVisualOverlay(state.widgets);
+      const items = visual ? mediaItemsOf(visual) : [];
+      const idx = Number(dot.getAttribute("data-media-dot"));
+      if (items[idx]) {
+        pinFromUser();
+        focusMediaById(items[idx].id, { reveal: true });
+      }
+      return;
+    }
     const card = target.closest(".info-media-card.is-selectable, .info-media-card.is-recessed");
     if (card && card.dataset.mediaId) {
       ev.preventDefault();
@@ -1277,7 +1301,7 @@ function bindInfoOverlay() {
     "pointerdown",
     (ev) => {
       if (!(ev.target instanceof Element)) return;
-      if (ev.target.closest("[data-infuse-play], .info-dismiss, button, a")) return;
+      if (ev.target.closest("[data-infuse-play], .info-dismiss, button, a, [data-media-nav], [data-media-dot]")) return;
       const stack = ev.target.closest(".info-media-stack.is-stacked");
       if (!stack) return;
       flick = { x: ev.clientX, y: ev.clientY, id: ev.pointerId, moved: false };

@@ -568,7 +568,7 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
         "item": active,
         "items": items,
         "active_id": active_id,
-        "presentation": "stack",
+        "presentation": "carousel",
     }
     if genre:
         payload["genre"] = genre
