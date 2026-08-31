@@ -1348,7 +1348,7 @@ async def test_progress_no_duplicate_start_for_same_item(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_progress_failure_still_notifies(monkeypatch):
+async def test_progress_failure_auto_retries_alternate_source(monkeypatch):
     from hearth.telegram.progress import ProgressTracker
 
     tracker = ProgressTracker()
@@ -1365,7 +1365,22 @@ async def test_progress_failure_still_notifies(monkeypatch):
             "Annihilation", percent=state["percent"], status=state["status"]
         )
 
+    async def fake_retry(title: str = "", *, force: bool = False, reason: str = ""):
+        assert title == "Annihilation"
+        assert force is False
+        assert reason.startswith("auto:")
+        return {
+            "ok": True,
+            "reason": "retried",
+            "title": "Annihilation",
+            "indexer": "AltIndexer",
+            "attempt": 1,
+            "max_attempts": 3,
+            "speak": "Annihilation stalled — trying another source via AltIndexer (attempt 1/3).",
+        }
+
     monkeypatch.setattr("hearth.telegram.progress.radarr.queue", fake_queue)
+    monkeypatch.setattr("hearth.telegram.progress.radarr.retry_download", fake_retry)
 
     await tracker.poll_once(capture)
     assert len(sent) == 1
@@ -1374,7 +1389,41 @@ async def test_progress_failure_still_notifies(monkeypatch):
     state["status"] = "failed"
     await tracker.poll_once(capture)
     assert len(sent) == 2
-    assert "failed" in sent[1].lower()
+    assert "another source" in sent[1].lower()
+    assert tracker.active  # still watching the new grab
+    assert tracker.active[0].announce_retrying is True
+
+
+@pytest.mark.asyncio
+async def test_progress_failure_exhausted_notifies(monkeypatch):
+    from hearth.telegram.progress import ProgressTracker
+
+    tracker = ProgressTracker()
+    tracker.track(-1001, "Annihilation", "radarr", 2018)
+    sent: list[str] = []
+
+    async def capture(_chat_id: int, text: str) -> None:
+        sent.append(text)
+
+    async def fake_queue(_title: str):
+        return _queue_payload("Annihilation", percent=8.0, status="failed")
+
+    async def fake_retry(title: str = "", *, force: bool = False, reason: str = ""):
+        return {
+            "ok": False,
+            "reason": "exhausted",
+            "title": "Annihilation",
+            "attempt": 3,
+            "max_attempts": 3,
+            "speak": "Annihilation failed — ran out of alternate sources after 3 tries.",
+        }
+
+    monkeypatch.setattr("hearth.telegram.progress.radarr.queue", fake_queue)
+    monkeypatch.setattr("hearth.telegram.progress.radarr.retry_download", fake_retry)
+
+    await tracker.poll_once(capture)
+    assert len(sent) == 1
+    assert "ran out of alternate sources" in sent[0].lower()
     assert tracker.active == []
 
 
@@ -1503,7 +1552,92 @@ async def test_progress_first_sighting_completed_says_done_not_downloading(
     assert len(sent) == 1
     assert "done" in sent[0].lower()
     assert "downloading" not in sent[0].lower()
-    assert tracker.active == []
+
+
+@pytest.mark.asyncio
+async def test_progress_idle_zero_progress_triggers_auto_retry(monkeypatch):
+    from hearth.telegram.progress import ProgressTracker
+
+    tracker = ProgressTracker()
+    tracker.track(-1001, "Annihilation", "radarr", 2018)
+    sent: list[str] = []
+
+    async def capture(_chat_id: int, text: str) -> None:
+        sent.append(text)
+
+    async def fake_queue(_title: str):
+        return _queue_payload("Annihilation", percent=0.0, status="downloading")
+
+    calls = {"n": 0}
+
+    async def fake_retry(title: str = "", *, force: bool = False, reason: str = ""):
+        calls["n"] += 1
+        assert force is False
+        assert "stalled" in reason
+        return {
+            "ok": True,
+            "reason": "retried",
+            "title": "Annihilation",
+            "indexer": "AltIndexer",
+            "attempt": 1,
+            "max_attempts": 3,
+            "speak": "Annihilation stalled — trying another source via AltIndexer (attempt 1/3).",
+        }
+
+    monkeypatch.setattr("hearth.telegram.progress.radarr.queue", fake_queue)
+    monkeypatch.setattr("hearth.telegram.progress.radarr.retry_download", fake_retry)
+
+    # First poll records progress baseline — not idle yet.
+    await tracker.poll_once(capture, stall_idle_s=30)
+    assert calls["n"] == 0
+
+    # Force the idle clock past the threshold without percent moving.
+    item = tracker.active[0]
+    item.last_progress_at -= 60
+    await tracker.poll_once(capture, stall_idle_s=30)
+    assert calls["n"] == 1
+    assert any("another source" in msg.lower() for msg in sent)
+
+
+@pytest.mark.asyncio
+async def test_inbox_retry_intent_retries_tracked_title(inbox: TelegramInbox, monkeypatch):
+    from hearth.telegram.intent import IntentDecision
+
+    inbox.progress.track(-1001, "Annihilation", "radarr", 2018)
+    inbox.memory.set_subject(-1001, "Annihilation", media_kind="movie")
+
+    async def fake_intent(*_args, **_kwargs):
+        return IntentDecision(
+            action="retry",
+            search_title="Annihilation",
+            media_kind="movie",
+            confidence=0.9,
+            source="test",
+        )
+
+    monkeypatch.setattr("hearth.telegram.inbox.interpret_intent", fake_intent)
+
+    # Seed a failed queue row so force retry has something to blocklist.
+    pipeline.radarr_downloads = [
+        {
+            "id": 1,
+            "movieId": 101,
+            "title": "Annihilation",
+            "status": "failed",
+            "trackedDownloadState": "failed",
+            "indexer": "MockIndexer",
+            "downloadId": "mock-anni-1",
+            "movie": {"id": 101, "title": "Annihilation", "year": 2018, "tmdbId": 300668},
+        }
+    ]
+
+    result = await inbox.handle_message(
+        _msg("this download didn't work, try another source", message_id=9001)
+    )
+    assert result.handled is True
+    assert "another source" in result.reply.lower()
+    assert pipeline.radarr_blocklist
+    assert any(row.get("indexer") == "AltIndexer" for row in pipeline.radarr_downloads or [])
 
 
 @pytest.mark.asyncio

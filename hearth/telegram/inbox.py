@@ -233,6 +233,11 @@ class TelegramInbox:
         if intent.action in {"pick", "pick_many"} and intent.indices:
             return intent, pending
 
+        if intent.action == "retry":
+            # Retry the download already in play — drop sticky pick menus.
+            self.pending.pop(chat_id, None)
+            return intent, None
+
         if intent.action == "search" and intent.search_title.strip():
             match_idx = self._index_in_pending(pending, intent.search_title)
             if match_idx is not None:
@@ -771,6 +776,8 @@ class TelegramInbox:
         catalog_hits: list[dict[str, Any]] | None = None,
     ) -> InboxResult | None:
         hits = list(catalog_hits or [])
+        if intent.action == "retry":
+            return await self._handle_retry(view, intent)
         if intent.action == "ignore":
             # Belt-and-suspenders: media asks must never go silent.
             if looks_like_chatter(view.text) or not looks_like_media_ask(view.text):
@@ -1187,6 +1194,78 @@ class TelegramInbox:
             clear_offered=True,
         )
         return await self._grab(view, resolved, exact=True)
+
+    async def _handle_retry(
+        self, view: MessageView, intent: IntentDecision
+    ) -> InboxResult:
+        """User asked to retry a stalled/failed grab from another *arr source."""
+        title = (intent.search_title or "").strip()
+        subject, subject_kind = self.memory.subject(view.chat_id)
+        if not title:
+            title = self.progress.active_title_for(view.chat_id) or subject
+        if not title:
+            return InboxResult(
+                handled=True,
+                reply=(
+                    "Which download should I retry? Name the title "
+                    "(or wait until one is queued)."
+                ),
+            )
+        media_kind = intent.media_kind or subject_kind
+        service = self.progress.active_service_for(view.chat_id, title)
+        if not service:
+            if media_kind == "tv":
+                service = "sonarr"
+            elif media_kind == "movie":
+                service = "radarr"
+            else:
+                # Prefer radarr; fall through to sonarr if that queue misses.
+                service = "radarr"
+        client = radarr if service == "radarr" else sonarr
+        try:
+            result = await client.retry_download(
+                title, force=True, reason="user:telegram"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("telegram retry failed: %s", redact(str(exc)))
+            return InboxResult(
+                handled=True,
+                reply=f"Couldn't retry {title}.",
+            )
+        # If movie miss and we guessed radarr, try sonarr once.
+        if (
+            not result.get("ok")
+            and result.get("reason") == "not_found"
+            and service == "radarr"
+            and media_kind != "movie"
+        ):
+            try:
+                result = await sonarr.retry_download(
+                    title, force=True, reason="user:telegram"
+                )
+                service = "sonarr"
+            except Exception as exc:  # noqa: BLE001
+                log.info("telegram sonarr retry failed: %s", redact(str(exc)))
+        spoken = str(result.get("speak") or "").strip()
+        if not spoken:
+            spoken = f"Couldn't retry {title}."
+        if result.get("ok"):
+            year = intent.year
+            self.progress.track(view.chat_id, title, service, year)
+            self.memory.set_subject(
+                view.chat_id,
+                title,
+                media_kind="tv" if service == "sonarr" else "movie",
+            )
+        return InboxResult(
+            handled=True,
+            reply=spoken,
+            grabbed=bool(result.get("ok")),
+            title=str(result.get("title") or title),
+            service=service,
+            year=intent.year,
+        )
+
     async def _handle_pick(self, view: MessageView, parsed: ParsedRequest) -> InboxResult:
         pending = self._pending_for(view.chat_id)
         if not pending or parsed.pick_index is None:

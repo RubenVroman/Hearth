@@ -266,6 +266,14 @@ async def _radarr_queue(args: dict[str, Any]) -> dict[str, Any]:
     return await radarr.queue(str(args.get("query") or args.get("title") or ""))
 
 
+async def _radarr_retry(args: dict[str, Any]) -> dict[str, Any]:
+    return await radarr.retry_download(
+        str(args.get("query") or args.get("title") or ""),
+        force=True,
+        reason="user:house",
+    )
+
+
 async def _sonarr_search(args: dict[str, Any]) -> dict[str, Any]:
     return await sonarr.search(str(args.get("query") or ""))
 
@@ -277,6 +285,14 @@ async def _sonarr_add(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _sonarr_queue(args: dict[str, Any]) -> dict[str, Any]:
     return await sonarr.queue(str(args.get("query") or args.get("title") or ""))
+
+
+async def _sonarr_retry(args: dict[str, Any]) -> dict[str, Any]:
+    return await sonarr.retry_download(
+        str(args.get("query") or args.get("title") or ""),
+        force=True,
+        reason="user:house",
+    )
 
 
 async def _overseerr_search(args: dict[str, Any]) -> dict[str, Any]:
@@ -989,6 +1005,30 @@ def register_builtin_tools() -> None:
     )
     registry.register(
         ToolSpec(
+            name="radarr_retry",
+            description=(
+                "Retry a stalled/failed Radarr movie download from a different indexer/source. "
+                "Blocklists the bad release and grabs an alternate *arr release for the SAME "
+                "movie (does not delete the library entry; does not re-POST Overseerr). "
+                "Use when the user says the download didn’t work, stalled, or wants another "
+                "source / a new one for a title already downloading. Pass query/title."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Movie title already in the Radarr queue to retry.",
+                    },
+                    "title": {"type": "string", "description": "Alias for query."},
+                },
+                "required": ["query"],
+            },
+            handler=_radarr_retry,
+        )
+    )
+    registry.register(
+        ToolSpec(
             name="sonarr_search",
             description="Search Sonarr for a TV series. Use this (not Plex) when grabbing a show.",
             parameters={
@@ -1037,6 +1077,29 @@ def register_builtin_tools() -> None:
                 },
             },
             handler=_sonarr_queue,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="sonarr_retry",
+            description=(
+                "Retry a stalled/failed Sonarr episode download from a different indexer/source. "
+                "Blocklists the bad release and grabs an alternate *arr release for the SAME "
+                "episode. Use for TV when the user says the download didn’t work or wants "
+                "another source. Pass query/title."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Series/episode title already in the Sonarr queue.",
+                    },
+                    "title": {"type": "string", "description": "Alias for query."},
+                },
+                "required": ["query"],
+            },
+            handler=_sonarr_retry,
         )
     )
     registry.register(

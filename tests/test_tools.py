@@ -1,5 +1,6 @@
 from hearth.agent.loop import route_intent
 from hearth.agent.registry import registry
+from hearth.config import settings
 from hearth.tools import files as workspace_files
 
 
@@ -547,6 +548,168 @@ async def test_intent_download_progress_routes_to_radarr_queue():
     assert hows["args"]["query"].lower() == "annihilation"
 
     # Grab intents must still add, not report progress.
+    grab = route_intent("download the movie Dune")
+    assert grab["tool"] == "radarr_add"
+
+
+def test_download_unhealthy_detection():
+    from hearth.tools.arr import (
+        download_is_unhealthy,
+        normalize_download_status,
+        summarize_queue_item,
+    )
+
+    stalled = {
+        "title": "Annihilation",
+        "status": "downloading",
+        "trackedDownloadState": "downloading",
+        "trackedDownloadStatus": "warning",
+        "statusMessages": [{"title": "Download stalled", "messages": ["The download is stalled"]}],
+        "size": 8_000_000_000,
+        "sizeleft": 8_000_000_000,
+    }
+    assert normalize_download_status(stalled) == "stalled"
+    assert download_is_unhealthy(stalled) is True
+
+    failed = {
+        "title": "Annihilation",
+        "status": "failed",
+        "trackedDownloadState": "failed",
+        "trackedDownloadStatus": "warning",
+    }
+    assert normalize_download_status(failed) == "failed"
+    assert download_is_unhealthy(failed) is True
+
+    healthy = summarize_queue_item(
+        {
+            "title": "Annihilation",
+            "status": "downloading",
+            "trackedDownloadState": "downloading",
+            "size": 100,
+            "sizeleft": 50,
+        },
+        service="radarr",
+    )
+    assert healthy["unhealthy"] is False
+    assert download_is_unhealthy(healthy) is False
+
+
+async def test_radarr_retry_blocklists_and_grabs_alternate(monkeypatch):
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import radarr
+
+    # Start from a failed Annihilation grab on MockIndexer.
+    pipeline.radarr_downloads = [
+        {
+            "id": 1,
+            "movieId": 101,
+            "title": "Annihilation",
+            "status": "failed",
+            "trackedDownloadState": "failed",
+            "trackedDownloadStatus": "warning",
+            "size": 8_000_000_000,
+            "sizeleft": 8_000_000_000,
+            "indexer": "MockIndexer",
+            "downloadId": "mock-anni-1",
+            "movie": {"id": 101, "title": "Annihilation", "year": 2018, "tmdbId": 300668},
+        }
+    ]
+    radarr.reset_retry_counts()
+
+    result = await registry.call("radarr_retry", {"query": "Annihilation"})
+    assert result.ok
+    assert result.data["reason"] == "retried"
+    assert result.data["blocklisted"] is True
+    assert result.data["attempt"] == 1
+    assert result.data["max_attempts"] == 3
+    assert "AltIndexer" in str(result.data.get("indexer") or "")
+    assert "another source" in result.data["speak"].lower()
+    # Library movie is still there — only the queue release changed.
+    assert pipeline.radarr_blocklist
+    assert any(row.get("indexer") == "AltIndexer" for row in pipeline.radarr_downloads or [])
+    assert not any(
+        row.get("indexer") == "MockIndexer" and row.get("title") == "Annihilation"
+        for row in pipeline.radarr_downloads or []
+    )
+
+
+async def test_radarr_retry_caps_attempts(monkeypatch):
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import radarr
+
+    monkeypatch.setattr(settings, "download_max_retries", 2)
+    radarr.reset_retry_counts()
+
+    def _failed_row(qid: int) -> dict:
+        return {
+            "id": qid,
+            "movieId": 101,
+            "title": "Annihilation",
+            "status": "failed",
+            "trackedDownloadState": "failed",
+            "indexer": "MockIndexer",
+            "downloadId": f"dead-{qid}",
+            "movie": {"id": 101, "title": "Annihilation", "year": 2018, "tmdbId": 300668},
+        }
+
+    pipeline.radarr_downloads = [_failed_row(1)]
+    first = await radarr.retry_download("Annihilation", force=True)
+    assert first["ok"] is True
+    assert first["attempt"] == 1
+
+    # Simulate the alternate also failing.
+    pipeline.radarr_downloads = [
+        {
+            **_failed_row(2),
+            "indexer": "AltIndexer",
+            "downloadId": "dead-alt",
+        }
+    ]
+    second = await radarr.retry_download("Annihilation", force=True)
+    assert second["ok"] is True
+    assert second["attempt"] == 2
+
+    pipeline.radarr_downloads = [_failed_row(3)]
+    third = await radarr.retry_download("Annihilation", force=True)
+    assert third["ok"] is False
+    assert third["reason"] == "exhausted"
+    assert "ran out of alternate sources" in third["speak"].lower()
+
+
+async def test_radarr_retry_force_on_healthy_user_request():
+    from hearth.tools.arr import radarr
+
+    radarr.reset_retry_counts()
+    # Default mock Annihilation is healthy/downloading — user force still retries.
+    result = await radarr.retry_download("Annihilation", force=True, reason="user:house")
+    assert result["ok"] is True
+    assert result["reason"] == "retried"
+    assert result["trigger"] == "user:house"
+
+    # Without force, healthy title must not auto-rotate.
+    radarr.reset_retry_counts()
+    from hearth.fixtures import pipeline
+
+    pipeline.radarr_downloads = None  # restore defaults
+    pipeline.radarr_blocklist.clear()
+    denied = await radarr.retry_download("Annihilation", force=False)
+    assert denied["ok"] is False
+    assert denied["reason"] == "healthy"
+
+
+async def test_intent_retry_routes_to_radarr_retry():
+    plan = route_intent("this download didn't work for Annihilation")
+    assert plan is not None
+    assert plan["tool"] == "radarr_retry"
+    assert "annihilation" in plan["args"]["query"].lower()
+
+    alt = route_intent("try another source for Annihilation")
+    assert alt["tool"] == "radarr_retry"
+
+    show = route_intent("retry the Severance episode download")
+    assert show["tool"] == "sonarr_retry"
+
+    # Fresh grab must not become a retry.
     grab = route_intent("download the movie Dune")
     assert grab["tool"] == "radarr_add"
 

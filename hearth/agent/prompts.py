@@ -53,7 +53,13 @@ Do it yourself (house):
 - Download / grab a show or season → sonarr_search then sonarr_add (runs immediately).
 - Download progress / “how far along is X” / “what's downloading” → radarr_queue
   (optional query=title). For a show, sonarr_queue. Report status + percent; if the
-  title is not in the queue, say it is not downloading.
+  title is not in the queue, say it is not downloading. Never invent ~100% while
+  still downloading.
+- Download stalled / failed / “didn’t work” / “try another source” / “get a new one”
+  for a title already downloading → radarr_retry (movie) or sonarr_retry (show).
+  That blocklists the bad release and grabs an alternate indexer for the SAME title
+  (not a new Overseerr request, not a library delete). Say clearly when retrying
+  or when alternate sources ran out.
 - “Request X” / Overseerr as the request front door → overseerr_search / overseerr_request.
 - Food / Thuisbezorgd / “order pizza” → thuisbezorgd_restaurants → thuisbezorgd_menu →
   thuisbezorgd_cart → thuisbezorgd_order (confirm=true to place; spends money).

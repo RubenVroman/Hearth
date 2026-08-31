@@ -26,6 +26,8 @@ _MEDIA_TOOLS = {
 _DOWNLOAD_TOOLS = {
     "radarr_queue",
     "sonarr_queue",
+    "radarr_retry",
+    "sonarr_retry",
 }
 
 _VISUAL_KINDS = frozenset({"weather", "media", "downloads"})
@@ -198,11 +200,12 @@ def _downloads_widget(result: dict[str, Any]) -> Widget:
     ok = bool(result.get("ok")) and data.get("ok") is not False
     service = str(data.get("service") or ("sonarr" if "sonarr" in name else "radarr"))
     label = "Sonarr" if service == "sonarr" else "Radarr"
-    query = str(data.get("query") or "").strip()
+    query = str(data.get("query") or data.get("title") or "").strip()
     downloads = _downloads_rows(list(data.get("downloads") or []))
     found = data.get("found")
+    is_retry = "retry" in name
 
-    if not ok:
+    if not ok and not is_retry:
         return runtime.upsert_widget(
             Widget(
                 id="downloads",
@@ -219,6 +222,53 @@ def _downloads_widget(result: dict[str, Any]) -> Widget:
                     "empty": True,
                     "mode": data.get("mode"),
                 },
+                sticky=True,
+            )
+        )
+
+    if is_retry:
+        title = str(data.get("title") or query or label)
+        speak = str(data.get("speak") or "").strip()
+        reason = str(data.get("reason") or "")
+        if data.get("ok") and reason == "retried":
+            body = "Retrying another source"
+        elif reason == "exhausted":
+            body = "No more sources"
+        elif reason == "no_alternate":
+            body = "No other release"
+        elif reason == "not_found":
+            body = "Not in queue"
+        elif not data.get("ok"):
+            body = "Retry failed"
+        else:
+            body = "Retry"
+        detail_parts = [label]
+        if data.get("indexer"):
+            detail_parts.append(str(data.get("indexer")))
+        if data.get("mode") == "mock":
+            detail_parts.append("mock")
+        return runtime.upsert_widget(
+            Widget(
+                id="downloads",
+                kind="downloads",
+                title=title,
+                status="done" if data.get("ok") else "error",
+                body=body,
+                detail=" · ".join(detail_parts),
+                data={
+                    "tool": name,
+                    "service": service,
+                    "query": query or None,
+                    "downloads": downloads,
+                    "found": found,
+                    "empty": None if downloads else "missing",
+                    "mode": data.get("mode"),
+                    "speak": speak or data.get("speak"),
+                    "reason": reason or None,
+                    "attempt": data.get("attempt"),
+                    "max_attempts": data.get("max_attempts"),
+                },
+                sticky=True,
             )
         )
 
