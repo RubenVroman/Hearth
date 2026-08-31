@@ -58,7 +58,7 @@ def test_command_center_includes_info_overlay(client):
     assert ".info-infuse-btn" in css.text
     assert ".info-media-card.is-selectable" in css.text
     assert "is-carousel" in js.text
-    assert "data-settled" in js.text
+    assert "dataset.settled" in js.text
     assert ".info-media-carousel" in css.text
     assert "#info-content[data-settled" in css.text
     assert "Swipe or tap cards to browse" in js.text

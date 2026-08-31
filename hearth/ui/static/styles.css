@@ -556,7 +556,7 @@ input,
 }
 
 .info-glass:has(.info-media-stack.is-carousel) {
-  width: min(560px, 100%);
+  width: min(560px, calc(100vw - 32px));
   overflow-x: hidden;
   overflow-y: auto;
 }
@@ -812,7 +812,10 @@ input,
 }
 
 .info-media-stack.is-stacked .info-media-deck {
-  /* Room for slightly overlapping peek cards beside the active title. */
+  /* Explicit width — absolute cards do not stretch the parent, so % widths
+     would collapse the deck and squash readable copy into a tall sliver. */
+  width: min(320px, 72vw);
+  justify-self: center;
   min-height: min(48vh, 400px);
   padding: 10px 0 28px;
   overflow: visible;
@@ -820,10 +823,9 @@ input,
 
 .info-media-stack.is-stacked .info-media-card {
   position: absolute;
-  left: 50%;
+  left: 0;
   top: 0;
-  width: min(100%, 320px);
-  margin-left: calc(min(100%, 320px) / -2);
+  width: 100%;
   transform-origin: 50% 50%;
   transform:
     translateX(calc(var(--slot, 0) * 52%))
@@ -1043,9 +1045,11 @@ input,
     display: none;
   }
 
+  .info-media-stack.is-stacked .info-media-deck {
+    width: min(300px, 78vw);
+  }
+
   .info-media-stack.is-stacked .info-media-card {
-    width: min(100%, 300px);
-    margin-left: calc(min(100%, 300px) / -2);
     transform:
       translateX(calc(var(--slot, 0) * 44%))
       scale(calc(1 - min(var(--slot-abs, 0), 3) * 0.07));
