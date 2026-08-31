@@ -52,7 +52,7 @@ def test_spoken_answer_shell_is_wired(client):
     assert "height: 0" in css.text
 
     sw = client.get("/sw.js")
-    assert "hearth-shell-v18" in sw.text
+    assert "hearth-shell-v19" in sw.text
     assert "/static/spoken-answer.js" in sw.text
 
 

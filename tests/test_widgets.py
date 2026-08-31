@@ -49,7 +49,7 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v18" in sw.text
+    assert "hearth-shell-v19" in sw.text
     assert "info-infuse-btn" in js.text
     assert "playActiveInInfuse" in js.text
     assert "focusMediaById" in js.text
@@ -57,6 +57,11 @@ def test_command_center_includes_info_overlay(client):
     assert "setRefreshInterval" in js.text
     assert ".info-infuse-btn" in css.text
     assert ".info-media-card.is-selectable" in css.text
+    assert "is-carousel" in js.text
+    assert "dataset.settled" in js.text
+    assert ".info-media-carousel" in css.text
+    assert "#info-content[data-settled" in css.text
+    assert "Swipe or tap cards to browse" in js.text
     assert ".info-media-link" in css.text
     assert "Suggested" in js.text
     assert "info-media-link" in js.text
@@ -218,7 +223,7 @@ def test_animation_genre_browse_surfaces_media_stack(client):
     assert "Spirited Away" in titles or "Spirited Away" in media["title"]
     assert "animation" in body["reply"].lower() or "Spirited" in body["reply"]
     # Ask once → stacked cards with title + year, no confirm gate.
-    assert media["data"].get("presentation") == "stack"
+    assert media["data"].get("presentation") == "carousel"
     assert media["data"].get("genre") == "Animation"
     assert len(items) >= 2
     for row in items:
@@ -227,7 +232,7 @@ def test_animation_genre_browse_surfaces_media_stack(client):
     js = client.get("/static/app.js")
     assert "cycleMedia" in js.text
     assert "MEDIA_STACK_CAP = 12" in js.text
-    assert "Swipe or tap to flick through" in js.text
+    assert "Swipe or tap cards to browse" in js.text
 
 
 def test_sci_fi_genre_browse_surfaces_media_stack(client):
@@ -243,7 +248,7 @@ def test_sci_fi_genre_browse_surfaces_media_stack(client):
     assert "Dune: Part Two" in titles or "The Endless" in titles
     assert media["data"]["active_id"]
     assert media["data"]["item"]["id"] == media["data"]["active_id"]
-    assert media["data"].get("presentation") == "stack"
+    assert media["data"].get("presentation") == "carousel"
     assert media["data"].get("genre") == "Science Fiction"
     assert len(items) >= 2
     # Active card carries Infuse-resolvable identifiers for the UI button.
