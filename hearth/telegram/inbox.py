@@ -30,7 +30,9 @@ from hearth.telegram.intent import (
     is_explicit_title_year,
     looks_like_chatter,
     looks_like_concrete_title,
+    looks_like_confirm_no,
     looks_like_confirm_yes,
+    looks_like_list_ask,
     looks_like_media_ask,
     looks_like_recommend_ask,
     search_title_grounded,
@@ -205,6 +207,22 @@ class TelegramInbox:
                 view, InboxResult(handled=True), user_text=view.text
             )
 
+        # 5b) Bare reject of a live Did-you-mean / list: clear pending, never
+        # queue that row. Model still sees the thread (+ rejected_titles) and
+        # should suggest something else or ask what they want.
+        if pending is not None and looks_like_confirm_no(view.text):
+            rejected_rows = self._titles_from_options(pending.options)
+            if pending.query:
+                rejected_rows.append(pending.query)
+            self.memory.remember_rejected(
+                view.chat_id,
+                rejected_rows,
+                clear_offered=True,
+                clear_subject=False,
+            )
+            self.pending.pop(view.chat_id, None)
+            pending = None
+
         history = self.memory.history_blob(view.chat_id)
         subject_title, subject_kind = self.memory.subject(view.chat_id)
         rejected = list(self.memory.rejected(view.chat_id))
@@ -215,6 +233,7 @@ class TelegramInbox:
             and subject_title
             and not subject_matches_user_title(subject_title, view.text)
             and not looks_like_confirm_yes(view.text)
+            and not looks_like_confirm_no(view.text)
         ):
             self.memory.remember_rejected(
                 view.chat_id,
@@ -261,32 +280,40 @@ class TelegramInbox:
         )
 
         # A one-row offer is a hard binding. A confirm cannot be redirected to
-        # an invented model title (Land -> La La Land).
+        # an invented model title (Land -> La La Land). Rejects never bind.
         if pending is not None and len(pending.options) == 1:
-            model_pick = intent.action in {"pick", "pick_many"}
-            ungrounded_search = (
-                intent.action == "search"
-                and bool(intent.search_title.strip())
-                and not search_title_grounded(
-                    intent.search_title,
-                    user_message=view.text,
-                    candidates=pending.options,
+            if looks_like_confirm_no(view.text):
+                # Should already be cleared above; belt-and-suspenders.
+                pass
+            else:
+                model_pick = intent.action in {"pick", "pick_many"}
+                ungrounded_search = (
+                    intent.action == "search"
+                    and bool(intent.search_title.strip())
+                    and not search_title_grounded(
+                        intent.search_title,
+                        user_message=view.text,
+                        candidates=pending.options,
+                    )
                 )
-            )
-            if looks_like_confirm_yes(view.text) or model_pick or ungrounded_search:
-                result = await self._grab_catalog_row(
-                    view,
-                    pending.options[0],
-                    query=pending.query,
-                    media_kind_hint=pending.media_kind,
-                )
-                return await self._finish(
-                    view,
-                    result,
-                    search_title=pending.query,
-                    media_kind=pending.media_kind,
-                    user_text=view.text,
-                )
+                if (
+                    looks_like_confirm_yes(view.text)
+                    or model_pick
+                    or ungrounded_search
+                ):
+                    result = await self._grab_catalog_row(
+                        view,
+                        pending.options[0],
+                        query=pending.query,
+                        media_kind_hint=pending.media_kind,
+                    )
+                    return await self._finish(
+                        view,
+                        result,
+                        search_title=pending.query,
+                        media_kind=pending.media_kind,
+                        user_text=view.text,
+                    )
 
         # Reconcile the model's decision with the still-live on-screen rows.
         if pending is not None:
@@ -963,6 +990,20 @@ class TelegramInbox:
             return InboxResult(handled=True, reply=question)
 
         if intent.action == "search" and intent.search_title.strip():
+            # List asks want 2–4 titled options, never a single Did-you-mean.
+            if looks_like_list_ask(view.text):
+                list_result = await self._offer_list_guesses(
+                    view,
+                    intent,
+                    media_kind_hint=(
+                        intent.media_kind
+                        if intent.media_kind in {"movie", "tv"}
+                        else parsed.media_kind
+                    ),
+                )
+                if list_result is not None:
+                    return list_result
+
             # If the model invents a title while exact user-title rows exist,
             # those grounded rows win.
             if hits and not search_title_grounded(
@@ -1156,6 +1197,63 @@ class TelegramInbox:
             reply=reply,
         )
         return InboxResult(handled=True, reply=reply)
+
+    async def _offer_list_guesses(
+        self,
+        view: MessageView,
+        intent: IntentDecision,
+        *,
+        media_kind_hint: str = "",
+    ) -> InboxResult | None:
+        """Build a 2–4 option numbered list for 'name a few more' / options asks."""
+        titles: list[str] = []
+        for title in list(intent.search_titles or []):
+            cleaned = catalog_search_title(title) or str(title).strip()
+            if cleaned and cleaned not in titles:
+                titles.append(cleaned)
+            if len(titles) >= 4:
+                break
+        primary = catalog_search_title(intent.search_title) or intent.search_title.strip()
+        if primary and primary not in titles:
+            titles.insert(0, primary)
+        titles = titles[:4]
+        if len(titles) < 2:
+            return None
+
+        kind = media_kind_hint if media_kind_hint in {"movie", "tv"} else ""
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for title in titles:
+            found = await tool_lookup_title(title, media_kind=kind)
+            row: dict[str, Any]
+            if found:
+                row = dict(found[0])
+            else:
+                row = {
+                    "title": title,
+                    "year": intent.year if title == primary else None,
+                    "mediaType": kind or "movie",
+                }
+            label = str(row.get("title") or title).strip()
+            key = normalize_title(label)
+            if not key or key in seen:
+                continue
+            # Skip titles the user already rejected / queued this chat.
+            if self._title_is_rejected(view.chat_id, label):
+                continue
+            seen.add(key)
+            rows.append(row)
+            if len(rows) >= 4:
+                break
+
+        if len(rows) < 2:
+            return None
+        return self._offer_rows(
+            view,
+            primary or "a few more",
+            rows,
+            media_kind=kind or self._row_kind(rows[0]),
+        )
 
     def _offer_rows(
         self,
@@ -1445,7 +1543,9 @@ class TelegramInbox:
 
         if not user_text.strip() or not prior.strip():
             return False
-        if looks_like_recommend_ask(user_text):
+        if looks_like_recommend_ask(user_text) or looks_like_list_ask(user_text):
+            return False
+        if looks_like_confirm_no(user_text) or looks_like_confirm_yes(user_text):
             return False
         if _significant_tokens(prior) & _significant_tokens(user_text):
             return True

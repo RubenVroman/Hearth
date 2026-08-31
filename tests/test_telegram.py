@@ -2731,6 +2731,61 @@ def test_looks_like_confirm_yes_accepts_elongated_and_thumbs():
         assert decision.indices == [1]
 
 
+def test_looks_like_confirm_no_and_list_ask():
+    from hearth.telegram.intent import (
+        looks_like_confirm_no,
+        looks_like_confirm_yes,
+        looks_like_list_ask,
+        looks_like_media_ask,
+        looks_like_recommend_ask,
+        instant_pick_decision,
+    )
+
+    for text in (
+        "Nah",
+        "nah",
+        "No",
+        "no",
+        "Nope",
+        "nope",
+        "nee",
+        "Nee",
+        "niet",
+        "niet die",
+        "not that",
+        "no not that",
+        "anders",
+        "no thanks",
+    ):
+        assert looks_like_confirm_no(text), text
+        assert not looks_like_confirm_yes(text), text
+
+    for text in ("yes", "Yep", "another one", "The Matrix", "Niet the imitation game"):
+        assert not looks_like_confirm_no(text), text
+
+    row = [{"title": "The Elephant Man", "year": 1980, "tmdbId": 10934}]
+    for text in ("Nah", "No", "nope", "nee"):
+        assert instant_pick_decision(text, row) is None
+
+    for text in (
+        "Name a few more",
+        "name a few",
+        "a few more",
+        "give me options",
+        "give me a few options",
+        "een paar meer",
+    ):
+        assert looks_like_list_ask(text), text
+        assert looks_like_recommend_ask(text), text
+
+    assert not looks_like_list_ask("Yep")
+    assert not looks_like_list_ask("A cool scifi movie")
+    # Seed look-alike keeps Land reuse — not the multi-guess list path.
+    assert not looks_like_list_ask("Name a few that look like Land")
+    assert not looks_like_recommend_ask("Name a few that look like Land")
+    assert looks_like_media_ask("Name a few that look like Land")
+
+
 def test_looks_like_recommend_ask_and_not_title():
     from hearth.telegram.intent import (
         looks_like_concrete_title,
@@ -4344,3 +4399,311 @@ async def test_inbox_yes_duh_model_search_la_la_still_queues_pending_land(
     assert "Land" in result.reply
     assert "2021" in result.reply
     assert "La La Land" not in result.reply
+
+
+# --- Movies & Series reject + list ask (live Telegram 2026-09-01 00:19) -------
+
+
+@pytest.mark.asyncio
+async def test_inbox_screenshot_nah_yep_few_more_no_thread(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Replay Ruben's 00:19 thread: Nah/No must not queue; few more is a list.
+
+    1. Pending Elephant Man + Nah → never queue; pending cleared.
+    2. Cool scifi → Blade Runner confirm; Yep → queue Blade Runner.
+    3. Name a few more → numbered 2–4 list (not Did you mean The Matrix?).
+    4. No on that list / Matrix pending → never queue The Matrix.
+    """
+    import re as _re
+
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    elephant = {
+        "title": "The Elephant Man",
+        "year": 1980,
+        "tmdbId": 10934,
+        "mediaId": 10934,
+        "mediaType": "movie",
+    }
+    blade = {
+        "title": "Blade Runner",
+        "year": 1982,
+        "tmdbId": 78,
+        "mediaId": 78,
+        "mediaType": "movie",
+    }
+    matrix = {
+        "title": "The Matrix",
+        "year": 1999,
+        "tmdbId": 603,
+        "mediaId": 603,
+        "mediaType": "movie",
+    }
+    arrival = {
+        "title": "Arrival",
+        "year": 2016,
+        "tmdbId": 329865,
+        "mediaId": 329865,
+        "mediaType": "movie",
+    }
+    interstellar = {
+        "title": "Interstellar",
+        "year": 2014,
+        "tmdbId": 157336,
+        "mediaId": 157336,
+        "mediaType": "movie",
+    }
+    dune = {
+        "title": "Dune",
+        "year": 2021,
+        "tmdbId": 438631,
+        "mediaId": 438631,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        results = []
+        if "elephant" in q:
+            results.append(elephant)
+        if "blade" in q:
+            results.append(blade)
+        if "matrix" in q:
+            results.append(matrix)
+        if "arrival" in q:
+            results.append(arrival)
+        if "interstellar" in q:
+            results.append(interstellar)
+        if "dune" in q and "blade" not in q:
+            results.append(dune)
+        return {"mode": "mock", "service": "overseerr", "results": results}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # --- 1) Nah must NOT queue The Elephant Man (even if model invents pick) ---
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[dict(elephant)],
+        media_kind="movie",
+        query="The Elephant Man",
+        created_message_id=9000,
+        last_bot_reply="Did you mean The Elephant Man (1980)?",
+    )
+    inbox.memory.set_subject(
+        -1001, "The Elephant Man", media_kind="movie", offered=[elephant]
+    )
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean The Elephant Man (1980)?",
+        search_title="The Elephant Man",
+        media_kind="movie",
+        offered=[elephant],
+    )
+
+    pipeline.overseerr_queue.clear()
+    overseerr_requests.clear()
+    # Worst case: model invents pick / ungrounded search on reject.
+    _patch_openai_intent(
+        monkeypatch,
+        [
+            {
+                "action": "pick",
+                "indices": [1],
+                "confidence": 0.95,
+            },
+            {
+                "action": "search",
+                "search_title": "Blade Runner",
+                "year": 1982,
+                "media_kind": "movie",
+                "confidence": 0.92,
+            },
+            # Yep is an instant confirm — no model hop / no payload here.
+            {
+                "action": "search",
+                "search_title": "The Matrix",
+                "search_titles": [
+                    "The Matrix",
+                    "Arrival",
+                    "Interstellar",
+                    "Dune",
+                ],
+                "media_kind": "movie",
+                "confidence": 0.9,
+            },
+            {
+                "action": "pick",
+                "indices": [1],
+                "confidence": 0.95,
+            },
+        ],
+    )
+
+    nah = await inbox.handle_message(_msg("Nah", message_id=9001))
+    assert nah.grabbed is False, nah.reply
+    assert "Queued" not in (nah.reply or "")
+    assert overseerr_requests == []
+    rejected = {t.lower() for t in inbox.memory.rejected(-1001)}
+    assert any("elephant" in t for t in rejected)
+
+    # --- 2) Cool scifi → Blade Runner confirm; Yep queues it ---
+    ask = await inbox.handle_message(_msg("A cool scifi movie", message_id=9002))
+    assert ask.grabbed is False
+    assert "Blade Runner" in ask.reply
+    assert "Did you mean" in ask.reply
+    assert inbox.pending.get(-1001) is not None
+    assert len(inbox.pending[-1001].options) == 1
+
+    yep = await inbox.handle_message(_msg("Yep", message_id=9003))
+    assert yep.grabbed is True, yep.reply
+    assert "Blade Runner" in yep.reply
+    assert "Queued" in yep.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 78
+
+    # --- 3) Name a few more → short list, not single Matrix Did-you-mean ---
+    few = await inbox.handle_message(_msg("Name a few more", message_id=9004))
+    assert few.grabbed is False, few.reply
+    assert "Did you mean The Matrix" not in few.reply
+    assert "Queued" not in few.reply
+    assert _re.search(r"1\.\s*.+\n2\.\s*", few.reply or ""), few.reply
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert len(pending.options) >= 2
+    assert any(
+        t in (few.reply or "")
+        for t in ("Matrix", "Arrival", "Interstellar", "Dune")
+    )
+
+    # --- 4) No must NOT queue The Matrix (or first list row) ---
+    before_reqs = len(overseerr_requests)
+    no = await inbox.handle_message(_msg("No", message_id=9005))
+    assert no.grabbed is False, no.reply
+    assert "Queued" not in (no.reply or "")
+    assert len(overseerr_requests) == before_reqs
+    assert not any(r.get("media_id") == 603 for r in overseerr_requests)
+
+
+@pytest.mark.asyncio
+async def test_inbox_nah_clears_pending_even_when_model_searches_same_title(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Model naming the rejected pending title must still not queue it."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    elephant = {
+        "title": "The Elephant Man",
+        "year": 1980,
+        "tmdbId": 10934,
+        "mediaId": 10934,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "elephant" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [elephant]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[dict(elephant)],
+        media_kind="movie",
+        query="The Elephant Man",
+        created_message_id=9100,
+        last_bot_reply="Did you mean The Elephant Man (1980)?",
+    )
+
+    pipeline.overseerr_queue.clear()
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Elephant Man",
+            "year": 1980,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    result = await inbox.handle_message(_msg("Nah", message_id=9101))
+    assert result.grabbed is False
+    assert "Queued" not in (result.reply or "")
+    assert len(pipeline.overseerr_queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_inbox_no_on_matrix_confirm_does_not_queue(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Single Did-you-mean The Matrix? + No → never queue."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    matrix = {
+        "title": "The Matrix",
+        "year": 1999,
+        "tmdbId": 603,
+        "mediaId": 603,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "matrix" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [matrix]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[dict(matrix)],
+        media_kind="movie",
+        query="The Matrix",
+        created_message_id=9200,
+        last_bot_reply="Did you mean The Matrix?",
+    )
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean The Matrix?",
+        search_title="The Matrix",
+        media_kind="movie",
+        offered=[matrix],
+    )
+
+    pipeline.overseerr_queue.clear()
+    # Model invents pick (the live bug shape).
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "pick",
+            "indices": [1],
+            "confidence": 0.99,
+        },
+    )
+    result = await inbox.handle_message(_msg("No", message_id=9201))
+    assert result.grabbed is False, result.reply
+    assert "Queued" not in (result.reply or "")
+    assert len(pipeline.overseerr_queue) == 0

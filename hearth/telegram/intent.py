@@ -80,6 +80,39 @@ _CONFIRM_YES = re.compile(
 _CONFIRM_THUMBS = re.compile(
     r"^\s*👍[\U0001F3FB-\U0001F3FF]?\uFE0F?\s*[.!?]*\s*$"
 )
+# Bare reject of an on-screen Did-you-mean / numbered offer (NL+EN).
+# Keep short — longer "niet X, ik zoek Y" clues still go through the model.
+_CONFIRM_NO = re.compile(
+    r"^\s*(?:"
+    r"n+a+h+|"
+    r"n+o+p+e+|"
+    r"n+o+(?:\s+thanks?)?|"
+    r"n+e+e+(?:\s+hoor)?|"
+    r"niet(?:\s+die)?|"
+    r"not\s+that|"
+    r"no\s+not\s+(?:that|it|this)|"
+    r"anders|"
+    r"wrong"
+    r")\s*[.!?]*\s*$",
+    re.I,
+)
+# "name a few more" / "give me options" — want a short list, not one Did-you-mean.
+# Do NOT match "name a few that look like Land" (seed look-alike; reuse that title).
+_LIST_ASK = re.compile(
+    r"(?:"
+    r"\bname a few more\b|"
+    r"\ba few more\b|"
+    r"\bgive me (?:a few |some )?options\b|"
+    r"\b(?:show|give|list)\s+(?:me\s+)?(?:some\s+)?options\b|"
+    r"\bmore options\b|"
+    r"\been paar meer\b|"
+    r"\bnog een paar\b|"
+    r"^\s*name a few\s*[.!?]*\s*$|"
+    r"^\s*(?:show|give|list)\s+(?:me\s+)?(?:a\s+)?few\s*[.!?]*\s*$|"
+    r"^\s*opties\s*[.!?]*\s*$"
+    r")",
+    re.I,
+)
 # "another one" / "find one" / "surprise me" — bot must guess, not demand a title.
 # Do NOT match bare "Another Earth"-style title asks.
 _RECOMMEND_ASK = re.compile(
@@ -155,21 +188,25 @@ _SYSTEM = (
     "subject_title is the last resolved title — drop it when the user starts a "
     "NEW title ask that does not match it, or when they reject it. "
     "rejected_titles must NEVER be re-offered as search_title or implied picks. "
-    "When the user rejects the current/last suggestion (nee/niet die/not that/"
-    "no not X / we already have that) and adds new clues or asks for another, "
-    "return action=search with a NEW search_title from the original plot + new "
-    "clues; do not ask them to pick 1–2 for a rejected film. Bare nee/no with "
-    "no new info → action=clarify with a short useful question (not a 1–2 list). "
+    "When the user rejects the current/last suggestion (nah/no/nope/nee/niet die/"
+    "not that/anders/no not X / we already have that) and adds new clues or asks "
+    "for another, return action=search with a NEW search_title from the original "
+    "plot + new clues; do not ask them to pick 1–2 for a rejected film. NEVER "
+    "action=pick after a reject — that queues the rejected title. Bare "
+    "nah/no/nope/nee/anders with no new info → action=search a DIFFERENT catalog "
+    "title (preferred) or action=clarify asking what they want instead (not a "
+    "1–2 re-list of the rejected film). "
     "candidates are the live on-screen offer and/or Overseerr/TMDB hits for THIS "
     "turn. When candidates_are_live_pending is true, those rows are the sticky "
     "Did-you-mean / 1–N list still on screen — confirm → action=pick; reject "
     "with new clues → action=search a NEW title not in those candidates; bare "
-    "nee/no → action=clarify (short question, not a 1–N re-list). "
+    "nah/no/nope/nee → NEVER pick — search another or clarify. "
     "last_bot_reply may be 'Did you mean Title (year)?' — that row is "
-    "still pending. Confirmations that accept the on-screen offer (yes, or any "
-    "short accept/bring/get/download/queue of 'it'/'that'/the offered title) → "
-    "action=pick with indices=[1] (or the matching candidate). Do NOT ask which "
-    "movie when a single candidate is already on screen. "
+    "still pending. Confirmations that accept the on-screen offer (yes/yep/yeah/"
+    "ja/duh/1, or any short accept/bring/get/download/queue of 'it'/'that'/the "
+    "offered title) → action=pick with indices=[1] (or the matching candidate). "
+    "Reject phrases never confirm. Do NOT ask which movie when a single "
+    "candidate is already on screen and they confirmed. "
     "When candidates are listed: pick/pick_many with 1-based indices, OR "
     "action=search with search_title that MATCHES a candidate title (or the "
     "user's own words). NEVER invent a title that is not a candidate and not "
@@ -212,6 +249,11 @@ _SYSTEM = (
     "('name a few that look like Land') → action=search that seed title "
     "(or clarify listing exact/prefix catalog matches for it). Never the "
     "canned clue template — they already gave the seed. "
+    "Follow-ups that ask for a SHORT LIST of more titles after a genre or a "
+    "queued/suggested title ('name a few more', 'a few', 'give me options', "
+    "'een paar meer') → action=search with search_titles as a JSON array of "
+    "2–4 DIFFERENT catalog titles in that vibe (also set search_title to the "
+    "first). Never a single Did-you-mean for a list ask. "
     "Never clarify with 'send the title if you know it' when candidates, "
     "last_bot_reply, subject_title, pending_query, or recent_history already "
     "name a guessed/queued title, or when the user asked you to find/confirm/"
@@ -261,6 +303,7 @@ class IntentDecision:
     action: IntentAction = "passthrough"
     indices: list[int] = field(default_factory=list)
     search_title: str = ""
+    search_titles: list[str] = field(default_factory=list)
     year: int | None = None
     select_all: bool = False
     media_kind: str = ""
@@ -343,6 +386,8 @@ def looks_like_concrete_title(text: str) -> bool:
         return False
     # Confirmations / bare rejects are not catalog titles.
     if looks_like_confirm_yes(raw):
+        return False
+    if looks_like_confirm_no(raw):
         return False
     if re.fullmatch(
         r"(?:n+e+e+|n+o+|nope|nah|niet|no\s+thanks)\s*[.!?]*",
@@ -470,9 +515,32 @@ def looks_like_confirm_yes(text: str) -> bool:
     raw = (text or "").strip()
     if not raw or len(raw) > 40:
         return False
+    if looks_like_confirm_no(raw):
+        return False
     if _CONFIRM_THUMBS.match(raw):
         return True
     return bool(_CONFIRM_YES.match(raw))
+
+
+def looks_like_confirm_no(text: str) -> bool:
+    """True for short reject of a single on-screen Did-you-mean / list offer.
+
+    Nah / no / nope / nee / not that / anders clear pending and must NEVER queue.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 40:
+        return False
+    return bool(_CONFIRM_NO.match(raw))
+
+
+def looks_like_list_ask(text: str) -> bool:
+    """True when the user wants a short list of options, not one Did-you-mean."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 160:
+        return False
+    if looks_like_chatter(raw) or looks_like_confirm_yes(raw) or looks_like_confirm_no(raw):
+        return False
+    return bool(_LIST_ASK.search(raw))
 
 
 def looks_like_recommend_ask(text: str) -> bool:
@@ -480,8 +548,10 @@ def looks_like_recommend_ask(text: str) -> bool:
     raw = (text or "").strip()
     if not raw or len(raw) > 120:
         return False
-    if looks_like_chatter(raw) or looks_like_confirm_yes(raw):
+    if looks_like_chatter(raw) or looks_like_confirm_yes(raw) or looks_like_confirm_no(raw):
         return False
+    if looks_like_list_ask(raw):
+        return True
     return bool(_RECOMMEND_ASK.search(raw))
 
 
@@ -632,6 +702,9 @@ def instant_pick_decision(
         )
 
     # Single on-screen guess: yes / that's it → queue it.
+    # Rejects are never confirm — leave them for the inbox reject path / model.
+    if n == 1 and looks_like_confirm_no(raw):
+        return None
     if n == 1 and looks_like_confirm_yes(raw):
         return IntentDecision(
             action="pick",
@@ -985,6 +1058,19 @@ def _parse_model_json(
     confidence = max(0.0, min(1.0, confidence))
 
     search_title = str(data.get("search_title") or data.get("title") or "").strip()[:200]
+    search_titles: list[str] = []
+    titles_raw = data.get("search_titles") or data.get("alt_titles") or []
+    if isinstance(titles_raw, str):
+        titles_raw = [titles_raw]
+    if isinstance(titles_raw, list):
+        for item in titles_raw:
+            title = str(item or "").strip()[:200]
+            if title and title not in search_titles:
+                search_titles.append(title)
+            if len(search_titles) >= 4:
+                break
+    if search_title and search_title not in search_titles:
+        search_titles.insert(0, search_title)
     select_all = bool(data.get("select_all"))
     clarify = str(data.get("clarify_question") or data.get("question") or "").strip()[:400]
     media_kind = str(data.get("media_kind") or data.get("kind") or "").strip().lower()
@@ -1017,6 +1103,14 @@ def _parse_model_json(
         if str(t).strip()
     }
 
+    # Bare reject of an on-screen offer must never become pick/queue.
+    user_rejects = looks_like_confirm_no(user_message)
+    if user_rejects and action in {"pick", "pick_many"}:
+        action = "search" if search_title else "clarify"
+        indices = []
+        if action == "clarify" and not clarify:
+            clarify = "Ok — what should I grab instead?"
+
     if action in {"pick", "pick_many"} and not indices and select_all and candidate_count:
         indices = list(range(1, min(candidate_count, MAX_BATCH) + 1))
         action = "pick_many"
@@ -1024,7 +1118,8 @@ def _parse_model_json(
         action = "pick_many"
     if action == "pick" and not indices:
         # Unique candidate on screen → treat as that pick (never list-less 1–1).
-        if candidate_count == 1:
+        # Rejects never auto-pick the rejected row.
+        if candidate_count == 1 and not user_rejects:
             indices = [1]
         else:
             return IntentDecision(
@@ -1037,6 +1132,7 @@ def _parse_model_json(
                 ),
                 confidence=confidence,
                 people=people,
+                search_titles=search_titles,
             )
     if action == "pick_many" and not indices:
         return IntentDecision(
@@ -1044,8 +1140,11 @@ def _parse_model_json(
             clarify_question=clarify or "Which titles should I queue?",
             confidence=confidence,
             people=people,
+            search_titles=search_titles,
         )
-    recommend = looks_like_recommend_ask(user_message)
+    recommend = looks_like_recommend_ask(user_message) or looks_like_list_ask(
+        user_message
+    )
     # Pending/history already named a title → never demand one from the user.
     ctx = bool(has_context or candidate_count > 0 or recommend)
     fallback_clarify = _default_clarify_question(
@@ -1053,6 +1152,8 @@ def _parse_model_json(
     )
 
     if action == "search":
+        if not search_title and search_titles:
+            search_title = search_titles[0]
         if not search_title:
             return IntentDecision(
                 action="clarify",
@@ -1060,6 +1161,7 @@ def _parse_model_json(
                 confidence=confidence,
                 media_kind=media_kind,
                 people=people,
+                search_titles=search_titles,
             )
         if search_title.strip().lower() in rejected_norm:
             # Queued titles are remembered as rejected so "another one" won't
@@ -1075,6 +1177,7 @@ def _parse_model_json(
                     confidence=confidence,
                     media_kind=media_kind,
                     people=people,
+                    search_titles=search_titles,
                 )
         if not search_title_grounded(
             search_title,
@@ -1090,6 +1193,7 @@ def _parse_model_json(
             # confirm turn must NOT invent La La Land — pick the on-screen row.
             # Only pivot when the USER message itself grounds the new title
             # (shared tokens), a recommend ask, or an actor/year they typed.
+            # Bare reject is NOT a confirm — never force-pick the rejected row.
             user_grounds_new = bool(
                 _significant_tokens(user_message)
                 & _significant_tokens(search_title)
@@ -1099,6 +1203,8 @@ def _parse_model_json(
                 and candidate_count == 1
                 and not recommend
                 and not looks_like_recommend_ask(user_message)
+                and not looks_like_list_ask(user_message)
+                and not user_rejects
                 and not user_grounds_new
             ):
                 return IntentDecision(
@@ -1116,6 +1222,7 @@ def _parse_model_json(
                         :200
                     ],
                     year=_year_from_candidate((candidates or [{}])[0]),
+                    search_titles=search_titles,
                 )
             allow_pending_pivot = (
                 candidates_are_pending
@@ -1127,6 +1234,7 @@ def _parse_model_json(
                 and (
                     recommend
                     or looks_like_recommend_ask(user_message)
+                    or user_rejects
                     or user_grounds_new
                     or (
                         bool(people)
@@ -1161,6 +1269,7 @@ def _parse_model_json(
                     confidence=confidence,
                     media_kind=media_kind,
                     people=people,
+                    search_titles=search_titles,
                 )
         if confidence < MIN_RESOLVE_CONFIDENCE:
             # Recommend/find-one: keep the guess so inbox can ask "Did you mean …?".
@@ -1171,6 +1280,7 @@ def _parse_model_json(
                     confidence=confidence,
                     media_kind=media_kind,
                     people=people,
+                    search_titles=search_titles,
                 )
 
     # Plot/vibe/title asks must never be silently ignored (live: "coolest sci-fi
@@ -1322,6 +1432,7 @@ def _parse_model_json(
         action=action,  # type: ignore[arg-type]
         indices=indices,
         search_title=search_title,
+        search_titles=search_titles,
         year=year,
         select_all=select_all,
         media_kind=media_kind,
@@ -1407,7 +1518,9 @@ __all__ = [
     "is_explicit_title_year",
     "looks_like_chatter",
     "looks_like_concrete_title",
+    "looks_like_confirm_no",
     "looks_like_confirm_yes",
+    "looks_like_list_ask",
     "looks_like_media_ask",
     "looks_like_recommend_ask",
     "looks_like_collection_request",
