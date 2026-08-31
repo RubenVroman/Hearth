@@ -314,6 +314,40 @@ async def media_art(
     return _poster_placeholder_svg(label)
 
 
+class SuggestBody(BaseModel):
+    titles: list[str] | None = None
+    query: str | None = None
+    type: str = "any"
+    limit: int = Field(default=4, ge=1, le=6)
+
+
+@app.post("/api/media/suggest")
+async def media_suggest(body: SuggestBody) -> dict[str, Any]:
+    """Resolve recommended titles into overlay-ready metadata (keys stay server-side)."""
+    from hearth.tools.suggest import suggest_titles
+    from hearth import widgets as widget_bus
+
+    payload = await suggest_titles(
+        {
+            "titles": body.titles,
+            "query": body.query,
+            "type": body.type,
+            "limit": body.limit,
+        }
+    )
+    # Publish the same media glass overlay chat/tools use.
+    widget_bus.publish_tool(
+        {
+            "name": "suggest_titles",
+            "ok": bool(payload.get("ok")),
+            "needs_confirm": False,
+            "dry_run": False,
+            "data": payload,
+        }
+    )
+    return {**payload, "widgets": runtime.list_widgets()}
+
+
 @app.get("/api/plex/thumb/{rating_key}")
 async def plex_thumb(rating_key: str) -> Response:
     """Poster proxy — Plex token never leaves the server. Prefers real art via /api/media/art."""

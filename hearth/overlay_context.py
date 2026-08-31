@@ -34,6 +34,7 @@ _KIND_TOOLS: dict[str, frozenset[str]] = {
             "sonarr_add",
             "overseerr_search",
             "overseerr_request",
+            "suggest_titles",
             "infuse_play",
             "infuse_transport",
             "house_media",
@@ -91,6 +92,11 @@ _KIND_LEXICON: dict[str, frozenset[str]] = {
             "genres",
             "animation",
             "anime",
+            "suggest",
+            "suggested",
+            "recommend",
+            "recommendation",
+            "recommendations",
         }
     ),
     "downloads": frozenset(

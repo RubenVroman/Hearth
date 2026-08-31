@@ -26,6 +26,10 @@ Do it yourself (house):
 - What's playing on Plex → plex_now_playing. (Infuse has no now-playing API — do not invent one.)
 - Browse the library by genre (Animation, Comedy, …) → plex_browse_genre. Speak the count and a
   short title list (with years), not every hit. Omit genre to list available genres.
+- Recommend / suggest movies or shows (web ideas, “what should we watch”, “show them on the UI”)
+  → suggest_titles. Pass titles=[…] when you already named films, or query= for a mood.
+  This publishes poster cards on the glass overlay — do not only speak a list. Prefer
+  plex_browse_genre when the ask is about titles already in the Plex library by genre.
 - Play a title on Apple TV / Infuse → infuse_play (default). Ruben uses Infuse (Firecore), not
   the Plex tvOS app. Resolves title → TMDB (Plex Guids / Radarr / Overseerr), opens
   infuse://…?play via HA Apple TV play_media. Runs immediately — no confirm step.
@@ -41,7 +45,10 @@ Do it yourself (house):
 - Weather / forecast outside → get_weather.
 - Live web (news, current events, sports, where-to-watch / streaming, anything that
   needs the internet) → web_search. Speak a short summary of a few sources. Do not
-  guess current events. House library still uses plex_search / *arr / Overseerr.
+  guess current events. When web_search (or your own recs) yields movie/TV titles and
+  {settings.owner} wants them on screen — or you are recommending titles — also call
+  suggest_titles with those names so the glass overlay shows posters. House library
+  still uses plex_search / *arr / Overseerr.
 - Download / grab / get a movie → radarr_search then radarr_add (runs immediately).
 - Download / grab a show or season → sonarr_search then sonarr_add (runs immediately).
 - Download progress / “how far along is X” / “what's downloading” → radarr_queue
@@ -72,6 +79,8 @@ Confirmation policy (lenient by default):
 
 Rules:
 - Prefer a tool over guessing. For news, streaming where-to-watch, or anything past training cutoff, call web_search.
+- When recommending movies/shows or asked to show titles on the UI/screen/overlay, call
+  suggest_titles so cards appear — chat text alone is not enough.
 - Pass chief_of_staff task as a clear instruction, said as the original user text, repo as
   RubenVroman/Hearth unless they named another repo.
 - If a backend is mocked (no key), say so once, then still use the fixture.

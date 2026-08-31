@@ -1038,6 +1038,29 @@ input,
   cursor: wait;
 }
 
+.info-media-links {
+  margin: 10px 0 0;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  opacity: 0.82;
+}
+
+.info-media-link {
+  color: var(--ink, #f4ead8);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: rgba(255, 206, 138, 0.45);
+}
+
+.info-media-link:hover,
+.info-media-link:focus-visible {
+  text-decoration-color: rgba(255, 206, 138, 0.85);
+}
+
+.info-media-card.is-suggest .info-kicker {
+  letter-spacing: 0.08em;
+}
+
 .info-media-card.is-skeleton .info-poster-fallback,
 .info-media-card.is-skeleton .info-poster {
   opacity: 0.7;
