@@ -1403,6 +1403,7 @@ def test_confirmation_policy_marks_only_high_risk_tools():
     auto = {
         "ha_call_service",
         "ha_media_control",
+        "videoland_play",
         "plex_play",
         "infuse_play",
         "infuse_transport",
@@ -1528,3 +1529,108 @@ async def test_prefer_infuse_toggle(monkeypatch):
     monkeypatch.setattr(settings, "apple_tv_player", "infuse")
     plan = route_intent("play The Endless on the Apple TV")
     assert plan["tool"] == "infuse_play"
+
+
+async def test_videoland_play_opens_app_but_does_not_claim_playback():
+    """HA can launch Videoland; title play must stay honest (played=False)."""
+    from hearth.tools.ha import ha as ha_client
+
+    result = await registry.call(
+        "videoland_play",
+        {"query": "B&B Vol Liefde", "prepare_path": False},
+    )
+    assert result.ok
+    assert not result.needs_confirm
+    assert result.data["played"] is False
+    assert result.data["profile_selected"] is False
+    assert result.data["launched"] is True
+    assert result.data["title"] == "B&B Vol Liefde"
+    assert result.data["source"] == "Videoland"
+    assert result.data["limitation"] == "no_title_or_profile_api"
+    speak = result.data.get("speak") or ""
+    assert "did not start playback" in speak.lower() or "not start" in speak.lower()
+    assert "B&B Vol Liefde" in speak
+    assert "Videoland" in speak
+    # Bilingual limitation / workaround.
+    assert "Home Assistant" in speak
+    assert "afstandsbediening" in speak.lower() or "Kies" in speak
+
+    state = await ha_client.get_state("media_player.lg_webos_tv")
+    attrs = (state.get("state") or {}).get("attributes") or {}
+    assert attrs.get("source") == "Videoland"
+
+
+async def test_videoland_play_already_open_skips_relaunch():
+    from hearth.tools.ha import ha as ha_client
+
+    await ha_client.media_control("tv", "select_source", source="Videoland")
+    result = await registry.call(
+        "videoland_play",
+        {"query": "B&B Vol Liefde", "prepare_path": False},
+    )
+    assert result.ok
+    assert result.data["already_open"] is True
+    assert result.data["played"] is False
+    assert "already open" in (result.data.get("speak") or "").lower()
+
+
+async def test_videoland_profile_honest_failure():
+    result = await registry.call(
+        "videoland_play",
+        {"profile": "Parel", "prepare_path": False},
+    )
+    assert result.ok
+    assert result.data["profile_selected"] is False
+    assert result.data["played"] is False
+    assert result.data["profile"] == "Parel"
+    speak = result.data.get("speak") or ""
+    assert "Parel" in speak
+    assert "did not switch profiles" in speak.lower() or "geen profiel" in speak.lower()
+
+
+async def test_videoland_deep_link_attempt_never_marks_played(monkeypatch):
+    from hearth.config import settings
+
+    monkeypatch.setattr(settings, "videoland_app_id", "com.example.videoland")
+    result = await registry.call(
+        "videoland_play",
+        {"query": "B&B Vol Liefde", "prepare_path": False},
+    )
+    assert result.ok
+    assert result.data["played"] is False
+    assert result.data["deep_link_attempted"] is True
+    assert result.data["deep_link_verified"] is False
+
+
+def test_intent_videoland_dutch_title():
+    plan = route_intent('Zet B&B Vol Liefde aan op Videoland')
+    assert plan is not None
+    assert plan["tool"] == "videoland_play"
+    assert plan["args"]["query"] == "B&B Vol Liefde"
+
+
+def test_intent_videoland_english_title():
+    plan = route_intent("play B&B Vol Liefde on Videoland")
+    assert plan is not None
+    assert plan["tool"] == "videoland_play"
+    assert plan["args"]["query"] == "B&B Vol Liefde"
+
+
+def test_intent_videoland_open_and_profile():
+    open_plan = route_intent("Open Videoland")
+    assert open_plan == {"tool": "videoland_play", "args": {}}
+    profile = route_intent('Open het profiel "Parel"')
+    assert profile is not None
+    assert profile["tool"] == "videoland_play"
+    assert profile["args"]["profile"] == "Parel"
+    switch = route_intent("switch Videoland to Parel")
+    assert switch is not None
+    assert switch["tool"] == "videoland_play"
+    assert switch["args"]["profile"] == "Parel"
+
+
+def test_match_videoland_source_from_list():
+    from hearth.tools.videoland import match_videoland_source
+
+    assert match_videoland_source(["HDMI 1", "Videoland", "Netflix"]) == "Videoland"
+    assert match_videoland_source(["HDMI 1", "videoland app"]) == "videoland app"

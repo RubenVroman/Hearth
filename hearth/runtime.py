@@ -39,6 +39,7 @@ _HA_TOOLS = frozenset(
         "media_activity",
         "house_media",
         "house_network",
+        "videoland_play",
     }
 )
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
