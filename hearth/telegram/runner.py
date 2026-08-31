@@ -38,6 +38,8 @@ BANNED_REPLY_FRAGMENTS = (
     "send an imdb/tmdb link?",
     "send the title if you know it",
     "send the title",
+    "reply 1–1",
+    "reply 1-1",
 )
 
 
