@@ -414,7 +414,6 @@ class TelegramInbox:
         prior, prior_kind, prior_year = self._prior_titled_ask(view.chat_id)
         if (
             prior
-            and not self._title_is_rejected(view.chat_id, prior)
             and self._followup_should_reuse_prior(view.chat_id, view.text, prior)
         ):
             reused = await self._reuse_prior_title(
@@ -940,7 +939,6 @@ class TelegramInbox:
             prior, prior_kind, prior_year = self._prior_titled_ask(view.chat_id)
             if (
                 prior
-                and not self._title_is_rejected(view.chat_id, prior)
                 and self._followup_should_reuse_prior(
                     view.chat_id, view.text, prior
                 )
@@ -1449,11 +1447,21 @@ class TelegramInbox:
             return False
         if looks_like_recommend_ask(user_text):
             return False
-        if self._title_is_rejected(chat_id, prior):
-            return False
         if _significant_tokens(prior) & _significant_tokens(user_text):
             return True
         if titles_match(prior, user_text):
+            return True
+        if self._title_is_rejected(chat_id, prior):
+            return False
+        lowered = user_text.lower()
+        anaphoric = any(
+            verb in lowered
+            for verb in ("find", "match", "zoek", "resolve", "confirm")
+        ) and any(
+            pronoun in lowered.split()
+            for pronoun in ("that", "it", "this", "die", "dat", "deze")
+        )
+        if anaphoric:
             return True
         if (
             looks_like_media_ask(user_text)
@@ -1500,11 +1508,13 @@ class TelegramInbox:
 
     @staticmethod
     def _row_kind(row: dict[str, Any], hint: str = "") -> str:
+        catalog_kind = str(row.get("mediaType") or row.get("media_kind") or "")
+        if catalog_kind in {"movie", "tv"}:
+            return catalog_kind
+        if row.get("tvdbId"):
+            return "tv"
         kind = str(
-            hint
-            or row.get("mediaType")
-            or row.get("media_kind")
-            or ("tv" if row.get("tvdbId") else "movie")
+            hint if hint in {"movie", "tv"} else "movie"
         )
         return kind if kind in {"movie", "tv"} else "movie"
 
