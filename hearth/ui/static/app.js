@@ -47,6 +47,11 @@ const state = {
   /** Optimistic / client-flash activity (chat submit, fetch errors). */
   localActivity: null,
   localActivityTimer: null,
+  /**
+   * Live spoken-answer read-along panel (Realtime output transcript).
+   * Isolated from the voice path — failures never break audio.
+   */
+  spokenAnswer: null,
 };
 
 /** Client grace before fading when talk is clearly unrelated (ms). */
@@ -1803,11 +1808,45 @@ $("confirm-btn").addEventListener("click", async () => {
   refresh();
 });
 
+function ensureSpokenAnswer() {
+  if (state.spokenAnswer) return state.spokenAnswer;
+  try {
+    if (globalThis.HearthSpokenAnswer?.createFromDocument) {
+      state.spokenAnswer = globalThis.HearthSpokenAnswer.createFromDocument(document);
+    }
+  } catch (_) {
+    state.spokenAnswer = null;
+  }
+  return state.spokenAnswer;
+}
+
+function noteSpokenAnswer(type, event) {
+  try {
+    const panel = ensureSpokenAnswer();
+    panel?.onRealtimeEvent?.(type, event);
+  } catch (_) {
+    /* overlay must never break the voice path */
+  }
+}
+
+function dismissSpokenAnswer(opts) {
+  try {
+    const panel = ensureSpokenAnswer();
+    if (!panel) return;
+    if (opts && opts.callEnded) panel.onCallEnded();
+    else panel.dismiss?.(opts || { immediate: true });
+  } catch (_) {
+    /* ignore */
+  }
+}
+
 function onRealtimeEvent(event) {
   const type = event.type;
   if (state.call?.bargeIn) {
     state.call.bargeIn.noteRealtimeEvent(type);
   }
+  // Spoken read-along — same DC transcript events; fail-soft and independent of audio.
+  noteSpokenAnswer(type, event);
   if (
     type === "response.output_audio_transcript.delta" ||
     type === "response.audio_transcript.delta"
@@ -1828,6 +1867,7 @@ function onRealtimeEvent(event) {
     state.liveAssistantTranscript = "";
   }
   // User speech — requires session audio.input.transcription (see webrtc.session_config).
+  // User mic transcript is NOT shown on the spoken-answer panel (assistant only).
   if (
     type === "conversation.item.input_audio_transcription.completed" ||
     type === "conversation.item.audio_transcription.completed"
@@ -2015,6 +2055,8 @@ async function stopConversation() {
   const call = state.call;
   state.call = null;
   setRefreshInterval(8000);
+  // Conversation panel rule: voice session end → spoken read-along must go.
+  dismissSpokenAnswer({ callEnded: true });
   $("orb").classList.remove("live", "hot");
   $("orb").setAttribute("aria-label", "Tap to talk");
   $("orb-label").textContent = "Tap to talk";

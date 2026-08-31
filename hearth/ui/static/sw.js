@@ -4,6 +4,7 @@ const SHELL = [
   "/static/styles.css",
   "/static/app.js",
   "/static/vad.js",
+  "/static/spoken-answer.js",
   "/static/settings.js",
   "/static/login.js",
   "/static/pwa.js",
