@@ -2042,6 +2042,44 @@ async def test_overseerr_request_by_media_id_still_works():
     assert queued.get("id") == 300668 or queued.get("mediaId") == 300668
 
 
+async def test_overseerr_tv_request_posts_seasons_all(monkeypatch):
+    """Official contract: TV POST /api/v1/request uses seasons: 'all'."""
+    from hearth.tools import arr as arr_mod
+
+    posted: list[dict] = []
+
+    class _FakeResp:
+        status_code = 201
+
+        def raise_for_status(self):
+            return None
+
+    class _FakeHttp:
+        async def post(self, path, json=None):
+            posted.append({"path": path, "json": dict(json or {})})
+            return _FakeResp()
+
+    async def _http():
+        return _FakeHttp()
+
+    monkeypatch.setattr(arr_mod.settings, "overseerr_url", "http://overseerr.test")
+    monkeypatch.setattr(arr_mod.settings, "overseerr_api_key", "test-key")
+    monkeypatch.setattr(arr_mod.settings, "mock_if_unconfigured", False)
+    monkeypatch.setattr(type(arr_mod.overseerr), "live", property(lambda self: True))
+    monkeypatch.setattr(arr_mod.overseerr, "_http", _http)
+
+    result = await arr_mod.overseerr.request(
+        "Severance",
+        media_id=95396,
+        media_type="tv",
+    )
+    assert result.get("ok") is not False or result.get("requested")
+    assert posted
+    assert posted[-1]["json"]["mediaType"] == "tv"
+    assert posted[-1]["json"]["mediaId"] == 95396
+    assert posted[-1]["json"]["seasons"] == "all"
+
+
 async def test_overseerr_request_tool_speaks_mismatch(monkeypatch):
     from hearth.agent.loop import _pretty_tool
     from hearth.fixtures import pipeline

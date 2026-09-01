@@ -69,16 +69,21 @@ class ChatThread:
 
 
 def _compact_offered(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Persist enough for Yes recovery: tmdbId + mediaType + title + year."""
     out: list[dict[str, Any]] = []
     for row in (rows or [])[:12]:
-        out.append(
-            {
-                "title": str(row.get("title") or "")[:120],
-                "year": row.get("year"),
-                "tmdbId": row.get("tmdbId") or row.get("mediaId"),
-                "tvdbId": row.get("tvdbId"),
-            }
-        )
+        tid = row.get("tmdbId") or row.get("mediaId") or row.get("id")
+        mt = str(row.get("mediaType") or row.get("media_type") or "").strip().lower()
+        item: dict[str, Any] = {
+            "title": str(row.get("title") or row.get("name") or "")[:120],
+            "year": row.get("year"),
+            "tmdbId": tid,
+            "mediaId": tid,
+            "tvdbId": row.get("tvdbId"),
+        }
+        if mt in {"movie", "tv"}:
+            item["mediaType"] = mt
+        out.append(item)
     return out
 
 

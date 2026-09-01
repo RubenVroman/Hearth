@@ -5349,6 +5349,355 @@ def test_title_seed_matches_multiword_and_short_land():
     assert not title_seed_matches("Land", "La La Land")
 
 
+def test_resolve_offer_short_seed_rejects_la_la_land():
+    from hearth.telegram.offer import offer_row_matches_seed, short_seed_matches
+
+    assert short_seed_matches("Land", "Land")
+    assert not short_seed_matches("Land", "La La Land")
+    assert not offer_row_matches_seed("Land", "La La Land")
+    assert offer_row_matches_seed("Late Night with the Devil", "Late Night with the Devil")
+    assert offer_row_matches_seed("Rescued by ruby", "Rescued by Ruby")
+    assert offer_row_matches_seed("The Man from Earth", "The Man from Earth")
+
+
+@pytest.mark.asyncio
+async def test_inbox_late_night_with_the_devil_yes_queues_media_id(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live 2026-09-01: Did you mean Late Night with the Devil? → Yes must POST mediaId.
+
+    Never reply format_not_found / Couldn't find a match when Overseerr search
+    returns that title with an id — even if pending tmdb_id is missing.
+    """
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    late = {
+        "id": 1020006,
+        "title": "Late Night with the Devil",
+        "year": 2023,
+        "tmdbId": 1020006,
+        "mediaId": 1020006,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "late night" in q or "1020006" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [late]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # Pending lost its tmdb_id (history recovery / id-less Did-you-mean).
+    option = {
+        "title": "Late Night with the Devil",
+        "year": 2023,
+        "mediaType": "movie",
+    }
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[option],
+        media_kind="movie",
+        query="Late Night with the Devil",
+        created_message_id=9500,
+        last_bot_reply="Did you mean Late Night with the Devil?",
+    )
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean Late Night with the Devil?",
+        search_title="Late Night with the Devil",
+        media_kind="movie",
+        offered=[option],
+    )
+    pipeline.overseerr_queue.clear()
+    yes = await inbox.handle_message(_msg("Yes", message_id=9501))
+    assert yes.grabbed is True, yes.reply
+    assert "couldn't find a match" not in (yes.reply or "").lower()
+    assert "Couldn't find a match" not in (yes.reply or "")
+    assert "Late Night" in yes.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 1020006
+    assert overseerr_requests[-1]["media_type"] == "movie"
+
+
+@pytest.mark.asyncio
+async def test_inbox_late_night_retype_title_never_format_not_found(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Retyping the offered title after Yes must not loop format_not_found."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    late = {
+        "id": 1020006,
+        "title": "Late Night with the Devil",
+        "year": 2023,
+        "tmdbId": 1020006,
+        "mediaId": 1020006,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "late night" in q or "1020006" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [late]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Late Night with the Devil",
+            "year": 2023,
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    ask = await inbox.handle_message(
+        _msg("Late Night with the Devil", message_id=9510)
+    )
+    assert "couldn't find a match" not in (ask.reply or "").lower()
+    assert ask.grabbed is False
+    assert "Late Night" in (ask.reply or "")
+    pending = inbox.pending.get(-1001)
+    assert pending is not None and len(pending.options) == 1
+    assert pending.options[0].get("tmdbId") in (1020006, "1020006")
+
+    pipeline.overseerr_queue.clear()
+    overseerr_requests.clear()
+    yes = await inbox.handle_message(_msg("Yes", message_id=9511))
+    assert yes.grabbed is True, yes.reply
+    assert "couldn't find a match" not in (yes.reply or "").lower()
+    assert overseerr_requests[-1]["media_id"] == 1020006
+
+
+@pytest.mark.asyncio
+async def test_inbox_yes_fuzzy_recovers_when_pending_id_missing(
+    inbox: TelegramInbox, monkeypatch
+):
+    """History recovery + search fallback: fuzzy-match offered string → mediaId."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    man = {
+        "id": 17401,
+        "title": "The Man from Earth",
+        "year": 2007,
+        "tmdbId": 17401,
+        "mediaId": 17401,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "man from earth" in q or "17401" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [man]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    # No live pending — recover Did-you-mean from history (no tmdb on offered).
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean The Man from Earth (2007)?",
+        search_title="The Man from Earth",
+        media_kind="movie",
+        offered=[{"title": "The Man from Earth", "year": 2007, "mediaType": "movie"}],
+    )
+    assert -1001 not in inbox.pending
+    pipeline.overseerr_queue.clear()
+    yes = await inbox.handle_message(_msg("Yes", message_id=9520))
+    assert yes.grabbed is True, yes.reply
+    assert "couldn't find a match" not in (yes.reply or "").lower()
+    assert overseerr_requests[-1]["media_id"] == 17401
+    assert overseerr_requests[-1]["media_type"] == "movie"
+
+
+@pytest.mark.asyncio
+async def test_inbox_plot_man_from_earth_confirm_yes_never_not_found(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Plot confirm for The Man from Earth → Yes never format_not_found."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    man = {
+        "title": "The Man from Earth",
+        "year": 2007,
+        "tmdbId": 17401,
+        "mediaId": 17401,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "man from earth" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [man]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Man from Earth",
+            "year": 2007,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    ask = await inbox.handle_message(
+        _msg(
+            "that movie where a professor says he's been alive for 14000 years",
+            message_id=9530,
+        )
+    )
+    assert "couldn't find" not in (ask.reply or "").lower()
+    yes = await inbox.handle_message(_msg("Yes", message_id=9531))
+    assert yes.grabbed is True, yes.reply
+    assert "couldn't find a match" not in (yes.reply or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_inbox_tv_yes_requests_seasons_all(inbox: TelegramInbox, monkeypatch):
+    """TV confirm → Overseerr request(mediaId, mediaType=tv); seasons all on wire."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+    from hearth.tools import arr as arr_mod
+
+    show = {
+        "id": 95396,
+        "title": "Severance",
+        "year": 2022,
+        "tmdbId": 95396,
+        "mediaId": 95396,
+        "mediaType": "tv",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "severance" in q or "95396" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [show]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    posted: list[dict] = []
+
+    class _FakeResp:
+        status_code = 201
+
+        def raise_for_status(self):
+            return None
+
+    class _FakeHttp:
+        async def post(self, path, json=None):
+            posted.append({"path": path, "json": dict(json or {})})
+            return _FakeResp()
+
+    async def _http():
+        return _FakeHttp()
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        # Exercise the live POST body builder for seasons: "all".
+        monkeypatch.setattr(arr_mod.settings, "overseerr_url", "http://overseerr.test")
+        monkeypatch.setattr(arr_mod.settings, "overseerr_api_key", "test-key")
+        monkeypatch.setattr(arr_mod.settings, "mock_if_unconfigured", False)
+        monkeypatch.setattr(
+            type(arr_mod.overseerr), "live", property(lambda self: True)
+        )
+        monkeypatch.setattr(arr_mod.overseerr, "_http", _http)
+        return await arr_mod.overseerr._post_request(
+            {"title": query or "Severance", "mediaType": media_type or "tv"},
+            media_id=int(media_id),
+            media_type=str(media_type or "tv"),
+            query=query or "Severance",
+        )
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[
+            {
+                "title": "Severance",
+                "year": 2022,
+                "tmdbId": 95396,
+                "mediaId": 95396,
+                "mediaType": "tv",
+            }
+        ],
+        media_kind="tv",
+        query="Severance",
+        created_message_id=9540,
+        last_bot_reply="Did you mean Severance (2022)?",
+    )
+    pipeline.overseerr_queue.clear()
+
+    async def _not_queued(title: str, service: str = "") -> bool:
+        return False
+
+    monkeypatch.setattr(inbox, "_already_queued", _not_queued)
+    yes = await inbox.handle_message(_msg("Yes", message_id=9541))
+    assert yes.grabbed is True, yes.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 95396
+    assert overseerr_requests[-1]["media_type"] == "tv"
+    assert posted, "expected live Overseerr POST"
+    body = posted[-1]["json"]
+    assert body.get("mediaType") == "tv"
+    assert body.get("mediaId") == 95396
+    assert body.get("seasons") == "all"
+
+
 @pytest.mark.asyncio
 async def test_inbox_yes_duh_model_search_la_la_still_queues_pending_land(
     inbox: TelegramInbox, monkeypatch

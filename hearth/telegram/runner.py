@@ -321,7 +321,7 @@ def row_to_parsed(
         kind = "movie"
     title = str(row.get("title") or query or "Untitled")
     year = int(row["year"]) if row.get("year") not in (None, "") else None
-    tmdb = row.get("tmdbId") or row.get("mediaId")
+    tmdb = row.get("tmdbId") or row.get("mediaId") or row.get("id")
     tvdb = row.get("tvdbId")
     return ParsedRequest(
         kind="request",
