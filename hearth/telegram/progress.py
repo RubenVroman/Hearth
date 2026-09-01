@@ -152,7 +152,7 @@ def format_queued_many(titles: list[str], via: str) -> str:
 
 def format_already(title: str, *, queued: bool = False, library: bool = False) -> str:
     if library:
-        return f"{title} is already in the library."
+        return f"{title} is already in the library (in Plex)."
     if queued:
         return f"{title} is already queued."
     return f"{title} is already on the list."
