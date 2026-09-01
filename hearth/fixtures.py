@@ -371,6 +371,25 @@ MOCK_WEB_SEARCH_LAND: list[dict[str, Any]] = [
     },
 ]
 
+MOCK_WEB_SEARCH_MISS_YOU: list[dict[str, Any]] = [
+    {
+        "title": "Miss You, Love You (2026 film) — Wikipedia",
+        "url": "https://en.wikipedia.org/wiki/Miss_You,_Love_You",
+        "snippet": (
+            "Miss You, Love You is a 2026 American comedy film starring Jim Rash "
+            "and Allison Janney, scheduled for HBO on May 29, 2026. Rotten "
+            "Tomatoes score 88%."
+        ),
+        "source": "wikipedia.org",
+    },
+    {
+        "title": "Miss You, Love You — Rotten Tomatoes",
+        "url": "https://www.rottentomatoes.com/m/miss_you_love_you?utm_source=openai",
+        "snippet": "88% on Rotten Tomatoes. Cast includes Jim Rash and Allison Janney.",
+        "source": "rottentomatoes.com",
+    },
+]
+
 
 def mock_web_search_results(query: str, limit: int = 4) -> list[dict[str, Any]]:
     """Pick mock web rows; fantasy movie queries return classic released titles."""
@@ -379,6 +398,8 @@ def mock_web_search_results(query: str, limit: int = 4) -> list[dict[str, Any]]:
         r"\b(movie|film|cinema|released|classic)\b", q
     ):
         return [dict(row) for row in MOCK_WEB_SEARCH_FANTASY[:limit]]
+    if re.search(r"\bmiss\s+you\b", q) and re.search(r"\blove\s+you\b", q):
+        return [dict(row) for row in MOCK_WEB_SEARCH_MISS_YOU[:limit]]
     if re.search(r"\bland\b", q) and re.search(r"\b(movie|film|cinema|robin|wright)\b", q):
         return [dict(row) for row in MOCK_WEB_SEARCH_LAND[:limit]]
     if re.search(r"\bland\b", q) and not re.search(r"\bla\s*la\b", q):
@@ -968,6 +989,15 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
         "title": "Land",
         "year": 2021,
         "imdbId": "tt10320310",
+    },
+    {
+        "id": 1482001,
+        "mediaType": "movie",
+        "title": "Miss You, Love You",
+        "year": 2026,
+        "imdbId": "tt32002601",
+        "overview": "Upcoming HBO comedy — requestable before release.",
+        "releaseDate": "2026-05-29",
     },
     {
         "id": 1930,
