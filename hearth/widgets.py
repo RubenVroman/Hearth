@@ -28,6 +28,8 @@ _DOWNLOAD_TOOLS = {
     "sonarr_queue",
     "radarr_retry",
     "sonarr_retry",
+    "radarr_list_releases",
+    "radarr_grab_release",
 }
 
 _VISUAL_KINDS = frozenset({"weather", "media", "downloads"})
@@ -203,7 +205,10 @@ def _downloads_widget(result: dict[str, Any]) -> Widget:
     query = str(data.get("query") or data.get("title") or "").strip()
     downloads = _downloads_rows(list(data.get("downloads") or []))
     found = data.get("found")
-    is_retry = "retry" in name
+    is_retry = any(
+        key in name
+        for key in ("retry", "list_releases", "grab_release")
+    )
 
     if not ok and not is_retry:
         return runtime.upsert_widget(
@@ -232,12 +237,22 @@ def _downloads_widget(result: dict[str, Any]) -> Widget:
         reason = str(data.get("reason") or "")
         if data.get("ok") and reason == "retried":
             body = "Retrying another source"
+        elif data.get("ok") and reason == "switched":
+            body = "Grabbing alternate release"
+        elif reason in {"needs_pick", "needs_pick_large"}:
+            body = (
+                "No file / retrying smaller release"
+                if reason == "needs_pick"
+                else "Too large — pick smaller release"
+            )
         elif reason == "exhausted":
             body = "No more sources"
         elif reason == "no_alternate":
             body = "No other release"
         elif reason == "not_found":
             body = "Not in queue"
+        elif reason == "not_in_library":
+            body = "Not in library"
         elif not data.get("ok"):
             body = "Retry failed"
         else:

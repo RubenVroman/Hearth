@@ -734,7 +734,10 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "retry_download",
             "description": (
-                "Retry a stalled or failed download from another *arr source."
+                "Retry a stalled/failed download from another *arr source, OR "
+                "list alternate smaller releases when a library movie has no "
+                "usable file / is too big to play. Never auto-grabs library "
+                "switch options — present Get buttons and wait for confirm."
             ),
             "parameters": {
                 "type": "object",
@@ -1060,6 +1063,12 @@ def _absorb_tool_side_effects(
         titles = payload.get("titles")
         if isinstance(titles, list):
             result.titles.extend(str(t) for t in titles if t)
+    if name == "retry_download" and payload.get("ok") and payload.get("grabbed"):
+        result.grabbed = True
+        result.mode = "queued"
+        result.title = str(payload.get("title") or result.title or "")
+        if payload.get("reply"):
+            result.reply = str(payload["reply"])
     if name in {
         "search_title",
         "search_catalog",

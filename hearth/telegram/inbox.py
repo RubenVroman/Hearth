@@ -41,6 +41,7 @@ from hearth.telegram.buttons import (
     is_none_of_these_callback,
     offer_inline_keyboard,
     parse_queue_callback,
+    parse_release_callback,
     single_get_keyboard,
 )
 from hearth.telegram.catalog import (
@@ -125,6 +126,8 @@ class PendingDisambiguation:
     last_bot_reply: str = ""
     mode: SessionMode = "offer"
     reply_markup: dict[str, Any] | None = None
+    # "title" = Overseerr Get offer; "release" = Radarr alternate-release switch.
+    offer_kind: str = "title"
 
 
 @dataclass
@@ -200,6 +203,7 @@ class TelegramInbox:
         if is_none_of_these_callback(data):
             pending = self._pending_for(chat_id)
             genre_hint = ""
+            was_release = bool(pending and pending.offer_kind == "release")
             if pending is not None:
                 rejected = self._titles_from_options(pending.options)
                 self.memory.remember_shown(chat_id, pending.options)
@@ -209,6 +213,13 @@ class TelegramInbox:
                 genre_hint = str(pending.query or "")
                 self.pending.pop(chat_id, None)
             self._set_mode(chat_id, "browse")
+            # Release-switch dismiss — do not auto-fetch a genre pack.
+            if was_release:
+                return InboxResult(
+                    handled=True,
+                    reply="Ok — leaving that release alone. What should I look for?",
+                    mode="browse",
+                )
             # Auto-fetch the next pack when we still know the genre cursor.
             cursor = self.memory.discover_cursor(chat_id)
             if cursor.get("genre_ids"):
@@ -263,6 +274,43 @@ class TelegramInbox:
                 reply="Ok — none of those. What should I look for?",
                 mode="browse",
             )
+
+        release_parsed = parse_release_callback(data)
+        if release_parsed is not None:
+            media_type, token = release_parsed
+            pending = self._pending_for(chat_id)
+            if pending is None or pending.offer_kind != "release":
+                return InboxResult(
+                    handled=True,
+                    reply="That release offer expired — ask again if you still want another version.",
+                    mode="idle",
+                )
+            row: dict[str, Any] | None = None
+            for option in pending.options:
+                if str(option.get("releaseToken") or "") == token:
+                    row = dict(option)
+                    break
+            if row is None:
+                return InboxResult(
+                    handled=True,
+                    reply=(
+                        "That Get button is from an older list — "
+                        "tap one on the current offer."
+                    ),
+                    reply_markup=pending.reply_markup
+                    or offer_inline_keyboard(pending.options),
+                    mode="offer",
+                )
+            view = MessageView(
+                chat_id=chat_id,
+                message_id=int(message.get("message_id") or 0),
+                user_id=user_id,
+                text=f"[Get release:{token}]",
+                is_bot=False,
+            )
+            if not self.rate.allow():
+                return InboxResult(handled=True, reply=format_rate_limited(), mode="offer")
+            return await self._grab_pending_release(view, row, pending=pending)
 
         parsed = parse_queue_callback(data)
         if parsed is None:
@@ -530,6 +578,55 @@ class TelegramInbox:
                         self.pending[view.chat_id].options
                         if self.pending.get(view.chat_id)
                         else None
+                    ),
+                    user_text=view.text,
+                )
+
+        # Release-switch HITL: yes on a single pending release grabs that guid;
+        # multi-offer yes never auto-grabs ("all of them" / casual yes).
+        if pending is not None and pending.offer_kind == "release":
+            if looks_like_confirm_no(view.text):
+                self.pending.pop(view.chat_id, None)
+                self._set_mode(view.chat_id, "browse")
+                return await self._finish(
+                    view,
+                    InboxResult(
+                        handled=True,
+                        reply="Ok — leaving that release alone. What should I look for?",
+                        mode="browse",
+                    ),
+                    user_text=view.text,
+                )
+            if looks_like_confirm_yes(view.text) or re.search(
+                r"\b(?:download|queue|get|bring|add|grab|doe)\b",
+                view.text,
+                re.I,
+            ):
+                if len(pending.options) == 1:
+                    if not self.rate.allow():
+                        return await self._finish(
+                            view,
+                            InboxResult(handled=True, reply=format_rate_limited()),
+                            user_text=view.text,
+                        )
+                    return await self._finish(
+                        view,
+                        await self._grab_pending_release(
+                            view, pending.options[0], pending=pending
+                        ),
+                        user_text=view.text,
+                    )
+                return await self._finish(
+                    view,
+                    InboxResult(
+                        handled=True,
+                        reply=(
+                            "Tap a Get button for the release you want — "
+                            "I won't grab from 'yes' / 'all of them' on a list."
+                        ),
+                        reply_markup=pending.reply_markup
+                        or offer_inline_keyboard(pending.options),
+                        mode="offer",
                     ),
                     user_text=view.text,
                 )
@@ -2322,12 +2419,24 @@ class TelegramInbox:
             source="tool",
         )
         result = await self._handle_retry(view, intent)
-        return {
+        out: dict[str, Any] = {
             "ok": True,
             "title": title or result.title,
             "reply": result.reply,
-            "grabbed": False,
+            "grabbed": bool(result.grabbed),
+            "media_type": media_kind or "movie",
         }
+        if result.reply_markup:
+            out["reply_markup"] = result.reply_markup
+            out["needs_pick"] = True
+            pending = self._pending_for(view.chat_id)
+            if pending and pending.offer_kind == "release":
+                out["releases"] = pending.options
+                out["hint"] = (
+                    "Present Get buttons for these releases. "
+                    "Do not grab until the user taps Get or says yes on a single option."
+                )
+        return out
 
     async def _finish(
         self,
@@ -3470,10 +3579,24 @@ class TelegramInbox:
             except Exception as exc:  # noqa: BLE001
                 log.info("telegram Sonarr retry failed: %s", redact(str(exc)))
 
+        # Library / no-file / too-large → confirmable alternate-release menu.
+        if response.get("needs_pick") and response.get("releases"):
+            return self._offer_release_rows(
+                view,
+                str(response.get("title") or title),
+                list(response.get("releases") or []),
+                speak=str(response.get("speak") or ""),
+                reason=str(response.get("reason") or "needs_pick"),
+            )
+
         reply = str(response.get("speak") or "").strip()
         if not reply:
             reply = f"Couldn't retry {title}."
-        grabbed = bool(response.get("ok"))
+        grabbed = bool(response.get("ok")) and str(response.get("reason") or "") in {
+            "retried",
+            "grabbed",
+            "switched",
+        }
         if grabbed:
             self.progress.track(view.chat_id, title, service, intent.year)
             self.memory.set_subject(
@@ -3489,6 +3612,107 @@ class TelegramInbox:
             service=service,
             year=intent.year,
         )
+
+    def _offer_release_rows(
+        self,
+        view: MessageView,
+        movie_title: str,
+        releases: list[dict[str, Any]],
+        *,
+        speak: str = "",
+        reason: str = "needs_pick",
+    ) -> InboxResult:
+        rows = [dict(r) for r in releases[:4] if isinstance(r, dict) and r.get("releaseToken")]
+        if not rows:
+            return InboxResult(
+                handled=True,
+                reply=speak or f"No alternate releases found for {movie_title}.",
+            )
+        from hearth.tools.arr import format_release_offer
+
+        reply = speak or format_release_offer(movie_title, rows, reason=reason)
+        markup = (
+            single_get_keyboard(rows[0])
+            if len(rows) == 1
+            else offer_inline_keyboard(rows)
+        )
+        self.pending[view.chat_id] = PendingDisambiguation(
+            chat_id=view.chat_id,
+            options=rows,
+            media_kind="movie",
+            query=movie_title,
+            created_message_id=view.message_id,
+            last_bot_reply=reply,
+            mode="confirm" if len(rows) == 1 else "offer",
+            reply_markup=markup,
+            offer_kind="release",
+        )
+        self.memory.set_subject(view.chat_id, movie_title, media_kind="movie")
+        self.memory.clear_offered(view.chat_id)
+        self._set_mode(view.chat_id, "confirm" if len(rows) == 1 else "offer")
+        return InboxResult(
+            handled=True,
+            reply=reply,
+            title=movie_title,
+            service="radarr",
+            reply_markup=markup,
+            mode="confirm" if len(rows) == 1 else "offer",
+        )
+
+    async def _grab_pending_release(
+        self,
+        view: MessageView,
+        row: dict[str, Any],
+        *,
+        pending: PendingDisambiguation | None = None,
+    ) -> InboxResult:
+        """Confirm-gated Radarr release grab for a pending switch offer."""
+        token = str(row.get("releaseToken") or "").strip()
+        guid = str(row.get("guid") or "").strip()
+        movie_title = str(
+            (pending.query if pending else "")
+            or row.get("movieTitle")
+            or row.get("title")
+            or ""
+        ).strip()
+        if not token and not guid:
+            return InboxResult(
+                handled=True,
+                reply="That release offer is missing an id — ask again.",
+            )
+        try:
+            response = await radarr.grab_alternate_release(
+                movie_title,
+                guid=guid,
+                release_token_value=token,
+                confirm=True,
+                prefer_smaller=True,
+                reason="user:telegram",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("telegram release grab failed: %s", redact(str(exc)))
+            return InboxResult(
+                handled=True,
+                reply=f"Couldn't grab that release of {movie_title or 'that title'}.",
+            )
+        if response.get("ok") and response.get("reason") == "switched":
+            title = str(response.get("title") or movie_title)
+            self.pending.pop(view.chat_id, None)
+            self.progress.track(view.chat_id, title, "radarr", None)
+            self.memory.set_subject(view.chat_id, title, media_kind="movie")
+            self._set_mode(view.chat_id, "queued")
+            return InboxResult(
+                handled=True,
+                reply=str(response.get("speak") or f"Grabbing a different release of {title}."),
+                grabbed=True,
+                title=title,
+                service="radarr",
+                mode="queued",
+            )
+        reply = str(response.get("speak") or "").strip() or (
+            f"Couldn't grab that release of {movie_title or 'that title'}."
+        )
+        return InboxResult(handled=True, reply=reply, title=movie_title, service="radarr")
 
     async def _reuse_prior_title(
         self,
