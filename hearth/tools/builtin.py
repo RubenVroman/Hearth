@@ -279,21 +279,47 @@ async def _radarr_queue(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _radarr_retry(args: dict[str, Any]) -> dict[str, Any]:
+    keep_raw = args.get("keep_existing")
+    if keep_raw is None:
+        keep_raw = args.get("keepExisting")
+    keep_existing: bool | None
+    if keep_raw is None:
+        keep_existing = None
+    else:
+        keep_existing = bool(keep_raw)
     return await radarr.retry_download(
         str(args.get("query") or args.get("title") or ""),
         force=True,
         reason="user:house",
+        keep_existing=keep_existing,
     )
 
 
 async def _radarr_list_releases(args: dict[str, Any]) -> dict[str, Any]:
+    keep_raw = args.get("keep_existing")
+    if keep_raw is None:
+        keep_raw = args.get("keepExisting")
+    keep_existing: bool | None
+    if keep_raw is None:
+        keep_existing = None
+    else:
+        keep_existing = bool(keep_raw)
     return await radarr.list_alternate_releases(
         str(args.get("query") or args.get("title") or ""),
         prefer_smaller=bool(args.get("prefer_smaller", True)),
+        keep_existing=keep_existing,
     )
 
 
 async def _radarr_grab_release(args: dict[str, Any]) -> dict[str, Any]:
+    keep_raw = args.get("keep_existing")
+    if keep_raw is None:
+        keep_raw = args.get("keepExisting")
+    keep_existing: bool | None
+    if keep_raw is None:
+        keep_existing = None
+    else:
+        keep_existing = bool(keep_raw)
     return await radarr.grab_alternate_release(
         str(args.get("query") or args.get("title") or ""),
         guid=str(args.get("guid") or ""),
@@ -301,6 +327,7 @@ async def _radarr_grab_release(args: dict[str, Any]) -> dict[str, Any]:
         confirm=bool(args.get("confirm")),
         prefer_smaller=bool(args.get("prefer_smaller", True)),
         reason="user:house",
+        keep_existing=keep_existing,
     )
 
 
@@ -1086,20 +1113,30 @@ def register_builtin_tools() -> None:
             name="radarr_retry",
             description=(
                 "Retry a stalled/failed Radarr movie download from a different indexer/source, "
-                "OR offer alternate smaller releases when a library movie has no usable file "
-                "or the current file is too big / won't play. Queue retries blocklist + re-grab. "
-                "Library switches return needs_pick with release options — do NOT invent a grab; "
+                "OR offer alternate smaller releases when a library movie has no usable file, "
+                "the current file is too big / won't play, OR the user wants another download "
+                "while keeping the existing library file (keep_existing). Queue retries "
+                "blocklist + re-grab. Library offers return needs_pick — do NOT invent a grab; "
                 "call radarr_grab_release with confirm after the user picks one. "
-                "Does not delete the library entry; does not re-POST Overseerr."
+                "Does not delete the library entry; does not re-POST Overseerr. "
+                "Pass keep_existing=true when they say don't delete / already there but find "
+                "another / download another copy."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Movie title to retry or switch release for.",
+                        "description": "Movie title to retry or switch/keep-both release for.",
                     },
                     "title": {"type": "string", "description": "Alias for query."},
+                    "keep_existing": {
+                        "type": "boolean",
+                        "description": (
+                            "True to download an extra release without deleting the "
+                            "current library file."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
@@ -1112,7 +1149,8 @@ def register_builtin_tools() -> None:
             description=(
                 "List a few grab-able Radarr releases for a library movie (prefer smaller / "
                 "more playable when size is the complaint). Use when the title is known to "
-                "Radarr but has no file or a huge unplayable file. Does not grab."
+                "Radarr — including when it already has a file and the user wants another "
+                "copy (keep_existing). Does not grab."
             ),
             parameters={
                 "type": "object",
@@ -1120,6 +1158,10 @@ def register_builtin_tools() -> None:
                     "query": {"type": "string"},
                     "title": {"type": "string"},
                     "prefer_smaller": {"type": "boolean"},
+                    "keep_existing": {
+                        "type": "boolean",
+                        "description": "True when listing extras that must not replace the file.",
+                    },
                 },
                 "required": ["query"],
             },
@@ -1132,7 +1174,9 @@ def register_builtin_tools() -> None:
             description=(
                 "Grab one specific alternate Radarr release after the user confirmed. "
                 "Pass guid or releaseToken from radarr_retry / radarr_list_releases. "
-                "Requires confirm=true — never auto-grab."
+                "Requires confirm=true — never auto-grab. "
+                "Pass keep_existing=true to download an extra copy without deleting/"
+                "replacing the current library file; omit/false for the switch/replace path."
             ),
             parameters={
                 "type": "object",
@@ -1142,6 +1186,7 @@ def register_builtin_tools() -> None:
                     "guid": {"type": "string"},
                     "releaseToken": {"type": "string"},
                     "prefer_smaller": {"type": "boolean"},
+                    "keep_existing": {"type": "boolean"},
                     "confirm": {"type": "boolean"},
                     "dry_run": {"type": "boolean"},
                 },

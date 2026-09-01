@@ -661,6 +661,25 @@ MOCK_RADARR_LIBRARY: list[dict[str, Any]] = [
         },
         "overview": "Two brothers return to a UFO death cult.",
     },
+    # Already has a playable library file — keep-both alternate download.
+    {
+        "id": 105,
+        "title": "Event Horizon",
+        "year": 1997,
+        "tmdbId": 8413,
+        "hasFile": True,
+        "monitored": True,
+        "path": "/movies/Event Horizon (1997)",
+        "sizeOnDisk": 9_200_000_000,
+        "status": "released",
+        "movieFile": {
+            "id": 905,
+            "size": 9_200_000_000,
+            "relativePath": "Event.Horizon.1997.1080p.BluRay.mkv",
+            "quality": {"quality": {"name": "Bluray-1080p"}},
+        },
+        "overview": "A salvage crew investigates a spaceship that disappeared.",
+    },
 ]
 
 # Alternate indexer releases for retry-from-another-source (mock).
@@ -805,6 +824,44 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
             "score": 35,
             "movieId": 104,
             "size": 5_100_000_000,
+        },
+    ],
+    105: [
+        {
+            "guid": "event-horizon-4k-remux-huge",
+            "indexerId": 1,
+            "indexer": "MockIndexer",
+            "title": "Event.Horizon.1997.2160p.UHD.BluRay.REMUX",
+            "approved": True,
+            "score": 5,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 105,
+            "size": 52_000_000_000,
+        },
+        {
+            "guid": "event-horizon-1080p-web",
+            "indexerId": 2,
+            "indexer": "AltIndexer",
+            "title": "Event.Horizon.1997.1080p.WEB-DL.DD5.1.H264",
+            "approved": True,
+            "score": 40,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 105,
+            "size": 4_800_000_000,
+        },
+        {
+            "guid": "event-horizon-720p-web",
+            "indexerId": 3,
+            "indexer": "ThirdIndexer",
+            "title": "Event.Horizon.1997.720p.WEBRip",
+            "approved": True,
+            "score": 20,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 105,
+            "size": 2_100_000_000,
         },
     ],
 }
@@ -1482,6 +1539,9 @@ class MockPipeline:
         self.radarr_library: list[dict[str, Any]] | None = None
         self._download_seq = 1000
         self._deleted_movie_files: set[int] = set()
+        # Downloads detached from Radarr import (keep-both / extra copy).
+        self.radarr_client_downloads: list[dict[str, Any]] = []
+        self.sonarr_client_downloads: list[dict[str, Any]] = []
 
     def search_radarr(self, query: str) -> list[dict[str, Any]]:
         return _filter_title(MOCK_RADARR_LOOKUP, query)
@@ -1521,6 +1581,50 @@ class MockPipeline:
                 row.pop("movieFile", None)
                 return {"ok": True, "id": movie_file_id}
         return {"ok": True, "id": movie_file_id}
+
+    def detach_queue_item(self, kind: str, queue_id: int) -> dict[str, Any] | None:
+        """Remove from *arr queue but keep the download as a client-only extra."""
+        bucket = self._downloads_bucket(kind)
+        removed: dict[str, Any] | None = None
+        keep: list[dict[str, Any]] = []
+        for row in bucket:
+            try:
+                rid = int(row.get("id"))
+            except (TypeError, ValueError):
+                keep.append(row)
+                continue
+            if rid == int(queue_id):
+                removed = deepcopy(row)
+                removed["keepBoth"] = True
+                removed["managedByRadarr"] = False
+            else:
+                keep.append(row)
+        bucket[:] = keep
+        if removed is not None:
+            client_bucket = (
+                self.radarr_client_downloads
+                if kind == "radarr"
+                else self.sonarr_client_downloads
+            )
+            client_bucket.append(removed)
+        return removed
+
+    def list_client_downloads(self, kind: str, title: str = "") -> list[dict[str, Any]]:
+        source = (
+            self.radarr_client_downloads
+            if kind == "radarr"
+            else self.sonarr_client_downloads
+        )
+        needle = (title or "").strip().lower()
+        if not needle:
+            return deepcopy(source)
+        return [
+            deepcopy(row)
+            for row in source
+            if needle in str(row.get("title") or "").lower()
+            or needle
+            in str((row.get("movie") or {}).get("title") or "").lower()
+        ]
 
     def search_sonarr(self, query: str) -> list[dict[str, Any]]:
         return _filter_title(MOCK_SONARR_LOOKUP, query)

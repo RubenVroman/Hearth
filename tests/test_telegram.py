@@ -2331,6 +2331,73 @@ async def test_inbox_release_single_yes_confirms_without_auto_from_all(
 
 
 @pytest.mark.asyncio
+async def test_inbox_keep_both_offers_get_buttons_without_deleting(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Already-has-file + don't-delete → Get buttons; confirm keeps library file."""
+    from hearth.telegram.buttons import parse_release_callback
+
+    inbox.memory.set_subject(-1001, "Event Horizon", media_kind="movie")
+    pipeline.radarr_downloads = []
+    pipeline.radarr_client_downloads.clear()
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "retry",
+            "search_title": "Event Horizon",
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+
+    result = await inbox.handle_message(
+        _msg(
+            "Can you download Event Horizon? It's already there, but find another "
+            "download. Don't delete the old one.",
+            message_id=9301,
+        )
+    )
+    assert result.handled is True
+    assert result.grabbed is False
+    assert "already" in result.reply.lower() or "keep" in result.reply.lower() or "pick" in result.reply.lower()
+    assert result.reply_markup is not None
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert pending.offer_kind == "release"
+    assert pending.keep_existing is True
+    assert pending.options
+    assert pipeline.radarr_downloads == []
+    assert pipeline.radarr_client_downloads == []
+
+    # Vague multi-offer yes must NOT grab.
+    yes = await inbox.handle_message(_msg("yes", message_id=9302))
+    assert yes.grabbed is False
+    assert "get button" in yes.reply.lower() or "tap" in yes.reply.lower()
+    assert pipeline.radarr_downloads == []
+    assert pipeline.list_radarr_library("Event Horizon")[0].get("hasFile") is True
+
+    token = str(pending.options[0]["releaseToken"])
+    cb = {
+        "id": "cb-keep-1",
+        "from": {"id": 42},
+        "message": {"message_id": 9301, "chat": {"id": -1001}},
+        "data": f"r:movie:{token}",
+    }
+    assert parse_release_callback(cb["data"]) == ("movie", token)
+    grabbed = await inbox.handle_callback(cb)
+    assert grabbed.grabbed is True
+    assert "keeping" in grabbed.reply.lower() or "extra" in grabbed.reply.lower()
+    assert pipeline.radarr_downloads == []
+    assert pipeline.radarr_client_downloads
+    lib = pipeline.list_radarr_library("Event Horizon")
+    assert lib and lib[0].get("hasFile") is True
+    assert lib[0].get("movieFile", {}).get("id") == 905
+    assert 905 not in pipeline._deleted_movie_files
+    assert inbox.pending.get(-1001) is None
+
+
+@pytest.mark.asyncio
 async def test_progress_importing_stays_quiet_until_completed(monkeypatch):
     from hearth.telegram.progress import ProgressTracker
 

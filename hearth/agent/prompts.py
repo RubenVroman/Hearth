@@ -71,6 +71,12 @@ Do it yourself (house):
   a few smaller/playable releases — speak those options, then radarr_grab_release
   with confirm=true for the chosen guid/token. Never say “already in the library”
   and stop, and never escalate to Chief of Staff for this.
+- “Already there but find another” / “don’t delete the old one” / “download another
+  copy” / keep the current file → same tools with keep_existing=true. List options,
+  confirm-grab an extra download; do NOT delete or replace the library file. If
+  indexers have no grab-able alts, say so clearly — do not escalate for a missing
+  torrent. Too-big / won’t-play / replace wording still uses the switch path
+  (may delete the old file after confirm).
 - “Request X” / Overseerr as the request front door → overseerr_search / overseerr_request.
 - Food / Thuisbezorgd / “order pizza” → thuisbezorgd_restaurants → thuisbezorgd_menu →
   thuisbezorgd_cart → thuisbezorgd_order (confirm=true to place; spends money).
