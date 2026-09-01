@@ -21,11 +21,14 @@ from hearth.config import settings
 from hearth.memory.redact import redact
 from hearth.telegram.agent import (
     SessionMode,
+    claims_overseerr_catalog,
+    extract_person_name,
     looks_like_asking_for_others,
     looks_like_correction,
     looks_like_encyclopedia_dump,
     looks_like_exhausted_offer_reply,
     looks_like_explain,
+    looks_like_person_ask,
     run_telegram_agent,
     should_refuse_queue,
 )
@@ -141,6 +144,8 @@ class TelegramInbox:
     rate: RateLimiter = field(default_factory=RateLimiter)
     progress: ProgressTracker = field(default_factory=ProgressTracker)
     pending: dict[int, PendingDisambiguation] = field(default_factory=dict)
+    # Person-name typo confirm (no Get yet) — Yeah continues search_person credits.
+    pending_person: dict[int, dict[str, Any]] = field(default_factory=dict)
     outbound_message_ids: set[tuple[int, int]] = field(default_factory=set)
     bot_user_id: int | None = None
     memory: ChatMemory = field(default_factory=ChatMemory)
@@ -151,6 +156,7 @@ class TelegramInbox:
         self.rate.reset()
         self.progress.reset()
         self.pending.clear()
+        self.pending_person.clear()
         self.outbound_message_ids.clear()
         self.memory.reset()
         self.modes.clear()
@@ -432,6 +438,7 @@ class TelegramInbox:
         if (
             looks_like_chatter(view.text)
             and pending is None
+            and view.chat_id not in self.pending_person
             and not looks_like_media_ask(view.text)
             and not looks_like_explain(view.text)
             and not looks_like_correction(view.text)
@@ -453,6 +460,77 @@ class TelegramInbox:
                 InboxResult(handled=True, reply=apology, mode="explain"),
                 user_text=view.text,
             )
+
+        # Person-name typo confirm: Yeah → credits; Nah → clear (never catalog miss).
+        person_pending = self.pending_person.get(view.chat_id)
+        if person_pending is None and looks_like_confirm_yes(view.text):
+            person_pending = self._person_confirm_from_history(view.chat_id)
+            if person_pending is not None:
+                self.pending_person[view.chat_id] = person_pending
+        if person_pending is not None and looks_like_confirm_no(view.text):
+            self.pending_person.pop(view.chat_id, None)
+            self._set_mode(view.chat_id, "browse")
+            return await self._finish(
+                view,
+                InboxResult(
+                    handled=True,
+                    reply="Ok — who should I look up instead?",
+                    mode="browse",
+                ),
+                user_text=view.text,
+            )
+        if person_pending is not None and looks_like_confirm_yes(view.text):
+            # Prefer person credits over a stale title Did-you-mean without tmdb.
+            title_pending = self._pending_for(view.chat_id)
+            if title_pending is not None:
+                only = title_pending.options[0] if len(title_pending.options) == 1 else None
+                has_id = bool(
+                    only
+                    and (only.get("tmdbId") or only.get("mediaId"))
+                )
+                if has_id:
+                    # Real title Get confirm wins over person recovery.
+                    person_pending = None
+                    self.pending_person.pop(view.chat_id, None)
+            if person_pending is not None:
+                if not self.rate.allow():
+                    return await self._finish(
+                        view,
+                        InboxResult(handled=True, reply=format_rate_limited()),
+                        user_text=view.text,
+                    )
+                forced = await self._tool_search_person(
+                    view,
+                    {
+                        "name": str(person_pending.get("name") or ""),
+                        "person_id": person_pending.get("personId"),
+                        "confirmed": True,
+                        "media_type": person_pending.get("media_type") or "movie",
+                        "limit": int(person_pending.get("limit") or 4),
+                    },
+                )
+                result = InboxResult(
+                    handled=True,
+                    reply=str(forced.get("reply") or ""),
+                    reply_markup=forced.get("reply_markup")
+                    if isinstance(forced.get("reply_markup"), dict)
+                    else None,
+                    mode="offer" if forced.get("count", 0) > 1 else "confirm",
+                )
+                return await self._finish(
+                    view,
+                    result,
+                    search_title=str(
+                        forced.get("query") or person_pending.get("name") or ""
+                    ),
+                    media_kind=str(forced.get("media_type") or "movie"),
+                    offered=(
+                        self.pending[view.chat_id].options
+                        if self.pending.get(view.chat_id)
+                        else None
+                    ),
+                    user_text=view.text,
+                )
 
         rejected_this_turn = False
         if pending is not None and looks_like_confirm_no(view.text):
@@ -607,6 +685,7 @@ class TelegramInbox:
                 looks_like_named_title_year(view.text)
                 or looks_like_concrete_title(view.text)
             )
+            and not looks_like_person_ask(view.text)
         ):
             forced = await self._tool_search_catalog(
                 view,
@@ -631,6 +710,81 @@ class TelegramInbox:
                     result.reply_markup = forced["reply_markup"]
                 result.mode = "confirm" if forced.get("count") == 1 else "offer"
                 agent.search_title = str(forced.get("query") or agent.search_title)
+
+        # Actor / "movies with X" must use TMDB person credits — never Overseerr
+        # title search, never "couldn't find in the catalog".
+        if not result.grabbed and (
+            looks_like_person_ask(view.text)
+            or claims_overseerr_catalog(result.reply)
+        ):
+            used_person = any(
+                str(t.get("name") or "") == "search_person" for t in agent.tools_used
+            )
+            person_ok = used_person and (
+                bool(result.reply_markup)
+                or self.pending_person.get(view.chat_id) is not None
+            )
+            missish = bool(
+                re.search(
+                    r"(?i)couldn'?t find|could not find|not in the catalog|"
+                    r"no (?:specific )?(?:movies|films).{0,40}(?:catalog|found)",
+                    result.reply or "",
+                )
+            )
+            if (
+                looks_like_person_ask(view.text)
+                and (not person_ok or missish or claims_overseerr_catalog(result.reply))
+            ) or (
+                claims_overseerr_catalog(result.reply)
+                and looks_like_person_ask(view.text)
+            ):
+                name = extract_person_name(view.text) or extract_person_name(
+                    " ".join(
+                        str(t.get("args", {}).get("name") or "")
+                        for t in agent.tools_used
+                        if t.get("name") == "search_person"
+                    )
+                )
+                if not name:
+                    # Fall back to last user ask in history that named a person.
+                    for turn in reversed(history or []):
+                        if turn.get("role") == "user":
+                            name = extract_person_name(str(turn.get("text") or ""))
+                            if name:
+                                break
+                if name:
+                    forced = await self._tool_search_person(
+                        view,
+                        {"name": name, "media_type": "movie", "limit": 4},
+                    )
+                    if forced.get("ok") and forced.get("reply"):
+                        result.reply = str(forced["reply"])
+                        result.reply_markup = (
+                            forced["reply_markup"]
+                            if isinstance(forced.get("reply_markup"), dict)
+                            else None
+                        )
+                        if forced.get("confirm_person"):
+                            result.mode = "confirm"
+                        else:
+                            result.mode = (
+                                "offer" if (forced.get("count") or 0) > 1 else "confirm"
+                            )
+                        agent.search_title = str(
+                            forced.get("query") or name or agent.search_title
+                        )
+            elif claims_overseerr_catalog(result.reply):
+                # Non-person ask that leaked Overseerr-as-catalog wording.
+                result.reply = re.sub(
+                    r"(?i)\b(?:the\s+)?overseerr\s+catalog\b",
+                    "the movie catalog",
+                    result.reply,
+                )
+                result.reply = re.sub(
+                    r"(?i)I(?:'m| am) using (?:the )?Overseerr\b[^.?!]*[.?!]?",
+                    "",
+                    result.reply,
+                ).strip()
 
         if rejected_this_turn and not result.grabbed:
             self.pending.pop(view.chat_id, None)
@@ -698,6 +852,9 @@ class TelegramInbox:
         async def discover_by_genre(args: dict[str, Any]) -> dict[str, Any]:
             return await self._tool_discover_by_genre(view, args)
 
+        async def search_person(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_search_person(view, args)
+
         async def suggest_titles(args: dict[str, Any]) -> dict[str, Any]:
             return await self._tool_suggest_titles(view, args)
 
@@ -720,6 +877,7 @@ class TelegramInbox:
             "search_title": search_title,
             "search_catalog": search_title,  # back-compat alias
             "discover_by_genre": discover_by_genre,
+            "search_person": search_person,
             "suggest_titles": suggest_titles,
             "queue_request": queue_request,
             "library_status": library_status,
@@ -1083,6 +1241,270 @@ class TelegramInbox:
             "reply_markup": offered.reply_markup,
             "hint": "Present this list with Get buttons. Do not call queue_request.",
         }
+
+    async def _tool_search_person(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """TMDB person search + released movie credits with Get buttons.
+
+        Overseerr is not the browse catalog here — it only proxies TMDB person
+        endpoints. Typo-corrected names ask for Yeah before listing credits.
+        """
+        name = str(args.get("name") or args.get("query") or "").strip()
+        if not name:
+            name = extract_person_name(view.text)
+        if not name:
+            return {
+                "ok": False,
+                "error": "person name required",
+                "reply": "Which actor or person should I look up?",
+            }
+        media_type = str(args.get("media_type") or args.get("mediaType") or "").strip()
+        if media_type not in {"movie", "tv"}:
+            # Default movie for "movies with …"; Dutch "films met" too.
+            if re.search(r"(?i)\b(?:shows?|series|tv)\b", view.text) and not re.search(
+                r"(?i)\b(?:movies?|films?|flicks?)\b", view.text
+            ):
+                media_type = "tv"
+            else:
+                media_type = "movie"
+        try:
+            limit = int(args.get("limit") or 4)
+        except (TypeError, ValueError):
+            limit = 4
+        limit = max(2, min(4, limit))
+        confirmed = bool(args.get("confirmed"))
+        person_id = args.get("person_id") or args.get("personId")
+        try:
+            person_id_i = int(person_id) if person_id not in (None, "") else None
+        except (TypeError, ValueError):
+            person_id_i = None
+
+        person_name = name
+        if person_id_i is None:
+            found = await overseerr.search_person(name)
+            people = list(found.get("results") or [])
+            if not people:
+                self.pending_person.pop(view.chat_id, None)
+                return {
+                    "ok": False,
+                    "query": name,
+                    "error": f"No person match for {name!r}",
+                    "reply": (
+                        f"I couldn't match anyone named {name}. "
+                        "Want to try another spelling?"
+                    ),
+                    "reply_markup": None,
+                }
+            pick = people[0]
+            try:
+                person_id_i = int(pick.get("id"))
+            except (TypeError, ValueError):
+                person_id_i = None
+            person_name = str(pick.get("name") or name).strip() or name
+            if person_id_i is None:
+                return {
+                    "ok": False,
+                    "query": name,
+                    "error": "person id missing",
+                    "reply": f"I found {person_name} but couldn't load credits.",
+                }
+
+            # Typo / spelling correction — wait for Yeah before credits.
+            if (
+                not confirmed
+                and normalize_title(person_name) != normalize_title(name)
+            ):
+                self.pending.pop(view.chat_id, None)
+                self.pending_person[view.chat_id] = {
+                    "name": person_name,
+                    "personId": person_id_i,
+                    "media_type": media_type,
+                    "limit": limit,
+                    "query": name,
+                }
+                self._set_mode(view.chat_id, "confirm")
+                reply = f"Did you mean {person_name}?"
+                return {
+                    "ok": True,
+                    "query": person_name,
+                    "person_id": person_id_i,
+                    "person_name": person_name,
+                    "confirm_person": True,
+                    "count": 0,
+                    "results": [],
+                    "reply": reply,
+                    "reply_markup": None,
+                    "hint": (
+                        "Wait for Yeah/Yes before listing credits. "
+                        "Do not call search_title or claim a catalog miss."
+                    ),
+                    "source": "tmdb_person",
+                }
+        else:
+            # Confirmed path may still carry the corrected name.
+            pending = self.pending_person.get(view.chat_id) or {}
+            if pending.get("name"):
+                person_name = str(pending["name"])
+
+        self.pending_person.pop(view.chat_id, None)
+        credits = await overseerr.person_combined_credits(person_id_i)
+        rows = self._person_credit_rows(
+            credits,
+            media_type=media_type,
+            limit=limit,
+            ban_ids=self._discover_exclude_ids(view.chat_id),
+        )
+        if len(rows) < 1:
+            return {
+                "ok": False,
+                "query": person_name,
+                "person_id": person_id_i,
+                "error": "no released credits",
+                "reply": (
+                    f"I matched {person_name} but don't have released "
+                    f"{'movies' if media_type == 'movie' else 'shows'} to offer yet."
+                ),
+                "reply_markup": None,
+                "source": "tmdb_person",
+            }
+
+        label = f"movies with {person_name}" if media_type == "movie" else (
+            f"shows with {person_name}"
+        )
+        offered = self._offer_rows(
+            view,
+            label,
+            rows,
+            media_kind=media_type,
+            reply_prefix=f"A few with {person_name}:\n",
+        )
+        compact = [
+            {
+                "title": str(r.get("title") or ""),
+                "year": self._row_year(r),
+                "tmdbId": r.get("tmdbId") or r.get("mediaId"),
+                "mediaType": self._row_kind(r, media_type),
+            }
+            for r in rows
+        ]
+        self.memory.remember_shown(view.chat_id, compact)
+        self._set_mode(view.chat_id, "offer" if len(compact) > 1 else "confirm")
+        return {
+            "ok": True,
+            "query": person_name,
+            "person_id": person_id_i,
+            "person_name": person_name,
+            "media_type": media_type,
+            "results": compact,
+            "count": len(compact),
+            "reply": offered.reply,
+            "reply_markup": offered.reply_markup,
+            "hint": "Present this list with Get buttons. Do not call queue_request.",
+            "source": "tmdb_person",
+        }
+
+    def _person_credit_rows(
+        self,
+        credits: dict[str, Any],
+        *,
+        media_type: str,
+        limit: int,
+        ban_ids: list[int] | set[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pick popular released cast credits (skip unreleased filler)."""
+        today = self._amsterdam_today()
+        ban = set(ban_ids or [])
+        kind = media_type if media_type in {"movie", "tv"} else "movie"
+        cast = list(credits.get("cast") or [])
+        scored: list[tuple[float, dict[str, Any]]] = []
+        seen: set[int] = set()
+        for row in cast:
+            if not isinstance(row, dict):
+                continue
+            mt = str(row.get("mediaType") or row.get("media_type") or "").strip()
+            if mt and mt != kind:
+                continue
+            if not mt:
+                # Combined credits sometimes omit mediaType for movies.
+                if kind == "tv" and not (row.get("name") or row.get("firstAirDate")):
+                    continue
+                if kind == "movie" and not (row.get("title") or row.get("releaseDate")):
+                    continue
+                mt = kind
+            try:
+                tid = int(row.get("id") or row.get("tmdbId") or row.get("mediaId") or 0)
+            except (TypeError, ValueError):
+                tid = 0
+            if not tid or tid in ban or tid in seen:
+                continue
+            release = str(
+                row.get("releaseDate")
+                or row.get("firstAirDate")
+                or row.get("release_date")
+                or row.get("first_air_date")
+                or ""
+            )[:10]
+            year = self._year_from_credit(row)
+            if release and release > today:
+                continue
+            if year is not None and year > int(today[:4]):
+                continue
+            # Prefer known/popular titles; skip zero-signal vapor.
+            try:
+                popularity = float(row.get("popularity") or 0)
+            except (TypeError, ValueError):
+                popularity = 0.0
+            try:
+                votes = int(row.get("voteCount") or row.get("vote_count") or 0)
+            except (TypeError, ValueError):
+                votes = 0
+            title = str(
+                row.get("title") or row.get("name") or ""
+            ).strip()
+            if not title:
+                continue
+            seen.add(tid)
+            scored.append(
+                (
+                    popularity * 10 + votes,
+                    {
+                        "title": title,
+                        "year": year,
+                        "tmdbId": tid,
+                        "mediaId": tid,
+                        "mediaType": kind,
+                        "releaseDate": release or None,
+                        "popularity": popularity,
+                        "voteCount": votes,
+                    },
+                )
+            )
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [row for _score, row in scored[:limit]]
+
+    @staticmethod
+    def _year_from_credit(row: dict[str, Any]) -> int | None:
+        year = row.get("year")
+        try:
+            if year not in (None, ""):
+                y = int(year)
+                if 1900 <= y <= 2100:
+                    return y
+        except (TypeError, ValueError):
+            pass
+        for key in (
+            "releaseDate",
+            "firstAirDate",
+            "release_date",
+            "first_air_date",
+        ):
+            raw = str(row.get(key) or "")
+            if len(raw) >= 4 and raw[:4].isdigit():
+                y = int(raw[:4])
+                if 1900 <= y <= 2100:
+                    return y
+        return None
 
     def _discover_exclude_ids(self, chat_id: int) -> list[int]:
         ban: set[int] = set(self.memory.shown_tmdb_ids(chat_id))
@@ -1982,6 +2404,57 @@ class TelegramInbox:
             return None
         return pending
 
+    def _person_confirm_from_history(self, chat_id: int) -> dict[str, Any] | None:
+        """Recover a person typo-confirm from recent turns when state was lost.
+
+        Live path: bot said ``Did you mean Leonardo DiCaprio?`` (no year / Get)
+        after a ``movies with …`` ask; Yeah must continue credits, not title search.
+        """
+        history = self.memory.history_blob(chat_id)
+        if not history:
+            return None
+        last_bot = ""
+        prior_user = ""
+        for turn in reversed(history):
+            role = turn.get("role")
+            text = str(turn.get("text") or "").strip()
+            if not text:
+                continue
+            if role == "bot" and not last_bot:
+                last_bot = text
+                continue
+            if role == "user" and last_bot and not prior_user:
+                prior_user = text
+                break
+        if not last_bot or not prior_user:
+            return None
+        if not looks_like_person_ask(prior_user):
+            return None
+        match = re.match(
+            r"(?i)^\s*did you mean\s+(.+?)\s*\??\s*$",
+            last_bot.strip(),
+        )
+        if not match:
+            return None
+        guessed = match.group(1).strip().strip("\"'")
+        # Title confirms include (YYYY); person confirms usually do not.
+        if re.search(r"\(\s*(?:19|20)\d{2}\s*\)", guessed):
+            return None
+        if not guessed or len(guessed.split()) > 5:
+            return None
+        media_type = "movie"
+        if re.search(r"(?i)\b(?:shows?|series|tv)\b", prior_user) and not re.search(
+            r"(?i)\b(?:movies?|films?|flicks?)\b", prior_user
+        ):
+            media_type = "tv"
+        return {
+            "name": guessed[:80],
+            "personId": None,
+            "media_type": media_type,
+            "limit": 4,
+            "query": extract_person_name(prior_user) or guessed,
+        }
+
     def _remember_pending(
         self,
         view: MessageView,
@@ -2010,6 +2483,8 @@ class TelegramInbox:
             mode=mode if len(rows) != 1 else "confirm",
             reply_markup=reply_markup,
         )
+        # Title Get offer replaces any person-name typo confirm.
+        self.pending_person.pop(view.chat_id, None)
         self._set_mode(view.chat_id, "confirm" if len(rows) == 1 else "offer")
         self.memory.set_subject(
             view.chat_id,

@@ -1401,6 +1401,102 @@ class Overseerr:
                 }
             raise
 
+    async def search_person(self, query: str) -> dict[str, Any]:
+        """TMDB person search via Overseerr ``/api/v1/search`` (mediaType=person).
+
+        Title search alone cannot answer "movies with X" — use this then
+        ``person_combined_credits``.
+        """
+        query = (query or "").strip()
+        if not query:
+            return {
+                "mode": "mock" if not self.live else "live",
+                "service": "overseerr",
+                "query": query,
+                "results": [],
+            }
+        if not self.live:
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "query": query,
+                "results": pipeline.search_person(query),
+            }
+        client = await self._http()
+        try:
+            response = await client.get("/api/v1/search", params={"query": query})
+            response.raise_for_status()
+            payload = response.json() or {}
+            people: list[dict[str, Any]] = []
+            for row in payload.get("results") or []:
+                if str(row.get("mediaType") or "") != "person":
+                    continue
+                people.append(
+                    {
+                        "id": row.get("id"),
+                        "mediaType": "person",
+                        "name": row.get("name") or row.get("title"),
+                        "popularity": row.get("popularity"),
+                        "profilePath": row.get("profilePath") or row.get("posterPath"),
+                    }
+                )
+            return {
+                "mode": "live",
+                "service": "overseerr",
+                "query": query,
+                "results": people[:8],
+            }
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                return {
+                    "mode": "mock",
+                    "service": "overseerr",
+                    "query": query,
+                    "error": str(exc),
+                    "results": pipeline.search_person(query),
+                }
+            raise
+
+    async def person_combined_credits(self, person_id: int) -> dict[str, Any]:
+        """TMDB combined credits via Overseerr ``/api/v1/person/{id}/combined_credits``."""
+        try:
+            pid = int(person_id)
+        except (TypeError, ValueError):
+            return {"mode": "error", "service": "overseerr", "cast": [], "crew": [], "id": person_id}
+        if not self.live:
+            payload = pipeline.person_combined_credits(pid)
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "id": pid,
+                "cast": list(payload.get("cast") or []),
+                "crew": list(payload.get("crew") or []),
+            }
+        client = await self._http()
+        try:
+            response = await client.get(f"/api/v1/person/{pid}/combined_credits")
+            response.raise_for_status()
+            payload = response.json() or {}
+            return {
+                "mode": "live",
+                "service": "overseerr",
+                "id": pid,
+                "cast": list(payload.get("cast") or []),
+                "crew": list(payload.get("crew") or []),
+            }
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                payload = pipeline.person_combined_credits(pid)
+                return {
+                    "mode": "mock",
+                    "service": "overseerr",
+                    "id": pid,
+                    "error": str(exc),
+                    "cast": list(payload.get("cast") or []),
+                    "crew": list(payload.get("crew") or []),
+                }
+            raise
+
 
 radarr = StarrClient("radarr")
 sonarr = StarrClient("sonarr")

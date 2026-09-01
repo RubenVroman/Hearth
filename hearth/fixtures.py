@@ -1044,6 +1044,115 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
     },
 ]
 
+# TMDB person search + movie credits (Telegram "movies with X" / "films met …").
+# Overseerr proxies these; offline mocks keep keys server-side / unconfigured.
+MOCK_TMDB_PERSONS: list[dict[str, Any]] = [
+    {
+        "id": 6193,
+        "mediaType": "person",
+        "name": "Leonardo DiCaprio",
+        "popularity": 48.2,
+        # Typo / partial queries that must resolve to this person.
+        "aliases": [
+            "leonardo dicaprot",
+            "leonardo dicaprio",
+            "leo dicaprio",
+            "dicaprio",
+        ],
+    },
+]
+
+MOCK_PERSON_COMBINED_CREDITS: dict[int, dict[str, Any]] = {
+    6193: {
+        "id": 6193,
+        "cast": [
+            {
+                "id": 597,
+                "mediaType": "movie",
+                "title": "Titanic",
+                "releaseDate": "1997-12-19",
+                "year": 1997,
+                "popularity": 92.0,
+                "voteCount": 25000,
+                "character": "Jack Dawson",
+            },
+            {
+                "id": 27205,
+                "mediaType": "movie",
+                "title": "Inception",
+                "releaseDate": "2010-07-16",
+                "year": 2010,
+                "popularity": 88.0,
+                "voteCount": 36000,
+                "character": "Cobb",
+            },
+            {
+                "id": 11324,
+                "mediaType": "movie",
+                "title": "Shutter Island",
+                "releaseDate": "2010-02-19",
+                "year": 2010,
+                "popularity": 55.0,
+                "voteCount": 16000,
+                "character": "Teddy Daniels",
+            },
+            {
+                "id": 68718,
+                "mediaType": "movie",
+                "title": "Django Unchained",
+                "releaseDate": "2012-12-25",
+                "year": 2012,
+                "popularity": 70.0,
+                "voteCount": 27000,
+                "character": "Calvin Candie",
+            },
+            {
+                "id": 106646,
+                "mediaType": "movie",
+                "title": "The Wolf of Wall Street",
+                "releaseDate": "2013-12-25",
+                "year": 2013,
+                "popularity": 75.0,
+                "voteCount": 24000,
+                "character": "Jordan Belfort",
+            },
+            {
+                "id": 281957,
+                "mediaType": "movie",
+                "title": "The Revenant",
+                "releaseDate": "2015-12-25",
+                "year": 2015,
+                "popularity": 68.0,
+                "voteCount": 18000,
+                "character": "Hugh Glass",
+            },
+            # Unreleased filler — must be filtered from browse/person lists.
+            {
+                "id": 9006193,
+                "mediaType": "movie",
+                "title": "Untitled DiCaprio Project",
+                "releaseDate": "2027-11-01",
+                "year": 2027,
+                "popularity": 99.0,
+                "voteCount": 2,
+                "character": "TBD",
+            },
+            {
+                "id": 1668,
+                "mediaType": "tv",
+                "title": "Friends",
+                "name": "Friends",
+                "firstAirDate": "1994-09-22",
+                "year": 1994,
+                "popularity": 40.0,
+                "voteCount": 5000,
+                "character": "Guest",
+            },
+        ],
+        "crew": [],
+    },
+}
+
 
 def _as_overseerr_row(item: dict[str, Any], media_type: str) -> dict[str, Any]:
     """Mirror a Radarr/Sonarr catalog row into Overseerr search shape (offline mock)."""
@@ -1084,6 +1193,8 @@ class MockPipeline:
 
         Explicit MOCK_OVERSEERR rows win; otherwise mirror *arr catalog fixtures so
         offline tests keep working without duplicating every title.
+        Person rows are available via ``search_person`` — title search stays
+        movie/TV only so actor-name queries do not pretend to be titles.
         """
         primary = _filter_title(MOCK_OVERSEERR_RESULTS, query)
         real = [h for h in primary if h.get("matched") != "fallback"]
@@ -1106,6 +1217,43 @@ class MockPipeline:
         if merged:
             return merged
         return primary
+
+    def search_person(self, query: str) -> list[dict[str, Any]]:
+        """Mock TMDB/Overseerr person search (typos via aliases)."""
+        needle = re.sub(r"[^a-z0-9à-ÿ]+", " ", (query or "").lower()).strip()
+        if not needle:
+            return []
+        hits: list[dict[str, Any]] = []
+        for row in MOCK_TMDB_PERSONS:
+            name = str(row.get("name") or "")
+            names = [name] + [str(a) for a in (row.get("aliases") or [])]
+            loose = [
+                re.sub(r"[^a-z0-9à-ÿ]+", " ", n.lower()).strip() for n in names if n
+            ]
+            if needle in loose or any(
+                needle in n or n in needle for n in loose if n
+            ):
+                hits.append(
+                    {
+                        "id": row.get("id"),
+                        "mediaType": "person",
+                        "name": name,
+                        "popularity": row.get("popularity"),
+                    }
+                )
+        hits.sort(key=lambda r: float(r.get("popularity") or 0), reverse=True)
+        return hits
+
+    def person_combined_credits(self, person_id: int) -> dict[str, Any]:
+        """Mock Overseerr ``/person/{id}/combined_credits``."""
+        try:
+            pid = int(person_id)
+        except (TypeError, ValueError):
+            return {"id": person_id, "cast": [], "crew": []}
+        payload = MOCK_PERSON_COMBINED_CREDITS.get(pid)
+        if not payload:
+            return {"id": pid, "cast": [], "crew": []}
+        return deepcopy(payload)
 
     def discover_overseerr(
         self,

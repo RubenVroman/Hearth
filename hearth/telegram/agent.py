@@ -114,14 +114,93 @@ _EXPLAIN_WHY = re.compile(
     re.I,
 )
 
+# "movies with X" / Dutch "films met …" / starring — filmography, not plot.
+# Require media noun immediately before with/met/starring (not "movie about … with").
+_PERSON_ASK = re.compile(
+    r"(?:"
+    r"\b(?:(?:a|an|een|wat|paar|few|some|any|meerdere|couple|handful)\s+)?"
+    r"(?:movies?|films?|shows?|series|flicks?|titles?)\s+"
+    r"(?:with|met|starring|featuring|feat\.?|ft\.?)\s+"
+    r"(?P<head>[A-Za-zÀ-ÿ])"
+    r"|"
+    r"\b(?:with|met|starring|featuring|feat\.?|ft\.?)\s+"
+    r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*(?:\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*){0,3}\s+"
+    r"(?:movies?|films?|shows?|series|flicks?)\b"
+    r")",
+    re.I,
+)
+
+_PERSON_NAME_AFTER = re.compile(
+    r"\b(?:with|met|starring|featuring|feat\.?|ft\.?)\s+"
+    r"(?P<name>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*(?:\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*){0,4})",
+    re.I,
+)
+
+_PERSON_NAME_STOP = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "die",
+        "dat",
+        "de",
+        "het",
+        "een",
+        "that",
+        "this",
+        "those",
+        "these",
+        "some",
+        "any",
+        "his",
+        "her",
+        "my",
+        "our",
+        "their",
+        "boy",
+        "girl",
+        "man",
+        "guy",
+        "dude",
+        "woman",
+        "person",
+        "someone",
+        "somebody",
+        "iemand",
+        "mannetje",
+        "jongetje",
+        "meisje",
+    }
+)
+
+_OVERSEERR_CATALOG_CLAIM = re.compile(
+    r"(?:"
+    r"overseerr\s+catalog|"
+    r"using\s+(?:the\s+)?overseerr|"
+    r"looking\s+in\s+(?:the\s+)?overseerr|"
+    r"search(?:ing)?\s+(?:the\s+)?overseerr|"
+    r"overseerr\s+(?:for|search)"
+    r")",
+    re.I,
+)
+
 
 SYSTEM_PROMPT = """You are Hearth, a Telegram bot for movies and TV series (Dutch + English).
-Users ask in a group chat; you help request titles via Overseerr.
+Users ask in a group chat; you help them find titles and request them after Get.
+
+Identity vs queue (never confuse these for the user):
+- TMDB (search_title / discover_by_genre / search_person) finds films, people, and
+  credits. That is the discover catalog.
+- Overseerr only queues AFTER the user taps Get (or yes for one pending id).
+- NEVER tell the user you are "searching the Overseerr catalog" or that the
+  browse catalog is Overseerr. If asked where results come from, say movie data
+  / TMDB credits — not Overseerr.
 
 Session modes: idle → browse → offer → confirm → queued.
-- browse: searching / discovering (genre or title). Never queue here.
+- browse: searching / discovering (genre, title, or person). Never queue here.
 - offer: numbered list with Get buttons on screen. Wait for a button or yes to ONE id.
 - confirm: single Did-you-mean / Get pending. Yes → queue that tmdb_id only.
+  Person-name typo confirm (no Get yet) → Yes/Yeah continues search_person credits.
 - explain: user asked why something happened — apologize + say what happened. Do NOT
   re-search or re-offer the same wrong set unless they ask again.
 Correction ("those are all sci-fi", "fantasy not sci-fi") stays in browse: acknowledge,
@@ -135,14 +214,20 @@ READ tools (auto-run):
   On a catalog miss for an exact-ish title, the tool itself runs web_search
   then search_title on the resolved name (e.g. Land → Land (2021)).
   Named title + year / "the 2026 film X" MUST call search_title and offer Get.
-  Upcoming/unreleased titles still get a Get/request offer (Overseerr can hold them).
+  Upcoming/unreleased titles still get a Get/request offer (can be requested).
+  NEVER use search_title for "movies with Actor" / bare actor names.
+- search_person: actor/person filmography. REQUIRED for "movies with Leonardo
+  DiCaprio", "films met …", typos like "leonardo dicaprot", or Yeah after a
+  person-name typo confirm. Resolves the person (TMDB), lists a few popular
+  RELEASED movie credits with Get buttons. Do not auto-queue. Do not dump
+  Wikipedia/RT. Never say you couldn't find them in the catalog when credits exist.
 - web_search: house live web search. ALWAYS call this for "do a websearch" /
   "zoek op het web" / "search the web" — NEVER say you cannot search the web.
   Use web_search only to disambiguate identity (which film), never to write a
   synopsis. After web results, resolve a catalog title and offer Get (do not
   auto-queue). Never paste Wikipedia, Rotten Tomatoes, IMDb essays, plot
   paragraphs, cast/RT scores, or utm_source=openai links as the main reply.
-- discover_by_genre: TMDB discover via Overseerr. Pass genre_ids and optional
+- discover_by_genre: TMDB discover. Pass genre_ids and optional
   exclude_genre_ids. Fantasy = 14 (ALWAYS exclude 878 Sci-Fi). Sci-Fi = 878.
   Horror = 27. "cool fantasy" MUST call discover_by_genre([14], exclude=[878]).
   Never invent Matrix/Arrival/Interstellar as a fantasy set.
@@ -161,8 +246,11 @@ WRITE (HITL — Python only executes after Get button or explicit yes for that i
 
 Conversation rules:
 - Rejects (no/nah/nope/nee): never queue. Discover alternatives or ask what they want.
-- Confirms (yes/yep/ja) of a single pending offer → queue_request with THAT pending tmdb_id.
+- Confirms (yes/yep/yeah/ja) of a single pending title offer → queue_request with
+  THAT pending tmdb_id. Confirms of a person-name typo → search_person (credits).
 - Genre / vibe list asks → discover_by_genre (not a single Did-you-mean).
+- Actor / "movies with X" / "films met X" → search_person (not search_title,
+  not discover_by_genre).
 - "None of these" / "give me some others" / "you've just mentioned these" →
   call discover_by_genre again for a NEW pack (exclusions applied). Never
   re-list the same three titles or re-attach the same Get buttons.
@@ -180,6 +268,7 @@ Conversation rules:
 - After a wrong genre: "You're right — those were sci-fi. Fantasy instead: …"
 - Never say "Queued 3" / "Queued N via".
 - Never say "Queued tmdb:123" — always use the human title.
+- Never say "Overseerr catalog" / "I'm using the Overseerr catalog".
 """
 
 
@@ -225,6 +314,62 @@ def looks_like_explain(text: str) -> bool:
     if not raw or len(raw) > 160:
         return False
     return bool(_EXPLAIN_WHY.search(raw))
+
+
+def looks_like_person_ask(text: str) -> bool:
+    """True for actor filmography asks (movies with X / films met …).
+
+    Plot sentences ("movie about a boy with glasses", "film met die bebrilde
+    tovenaar") stay False — those are title guesses, not person credits.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 240:
+        return False
+    if not _PERSON_ASK.search(raw):
+        return False
+    name = extract_person_name(raw)
+    if not name:
+        return False
+    first = name.split()[0].lower()
+    if first in _PERSON_NAME_STOP:
+        return False
+    # Proper-ish person: 1–4 tokens, not a long descriptive clause.
+    if len(name.split()) > 4:
+        return False
+    return True
+
+
+def extract_person_name(text: str) -> str:
+    """Pull the person name from 'movies with X' / 'films met X' style asks."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    # Prefer the filmography-shaped clause (media noun + with/met).
+    filmography = re.search(
+        r"(?i)\b(?:movies?|films?|shows?|series|flicks?|titles?)\s+"
+        r"(?:with|met|starring|featuring|feat\.?|ft\.?)\s+"
+        r"([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*(?:\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*){0,4})",
+        raw,
+    )
+    if filmography:
+        name = filmography.group(1).strip(" .,!?;:")
+    else:
+        match = _PERSON_NAME_AFTER.search(raw)
+        if not match:
+            return ""
+        name = (match.group("name") or "").strip(" .,!?;:")
+    # Drop trailing media words accidentally captured.
+    name = re.sub(
+        r"(?i)\s+(?:movies?|films?|shows?|series|flicks?|titles?)\s*$",
+        "",
+        name,
+    ).strip(" .,!?;:")
+    return name[:80]
+
+
+def claims_overseerr_catalog(text: str) -> bool:
+    """True when a reply wrongly says the browse catalog is Overseerr."""
+    return bool(_OVERSEERR_CATALOG_CLAIM.search(text or ""))
 
 
 def looks_like_asking_for_others(text: str) -> bool:
@@ -335,6 +480,47 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["genre_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_person",
+            "description": (
+                "Find released movies (or TV) with an actor/person via TMDB person "
+                "search + credits. Use for 'movies with Leonardo DiCaprio', "
+                "'films met …', actor typos, and Yeah after a person-name typo "
+                "confirm. Never use search_title for a bare actor name. Returns a "
+                "short list with Get buttons — never auto-queues."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Person name (typos ok), e.g. 'leonardo dicaprot'",
+                    },
+                    "person_id": {
+                        "type": "integer",
+                        "description": "Optional known TMDB person id",
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": (
+                            "True after the user confirmed a typo-corrected name"
+                        ),
+                    },
+                    "media_type": {
+                        "type": "string",
+                        "description": "movie (default) or tv",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many credits to offer (2–4, default 4)",
+                    },
+                },
+                "required": ["name"],
             },
         },
     },
@@ -778,6 +964,7 @@ def _absorb_tool_side_effects(
         "search_title",
         "search_catalog",
         "discover_by_genre",
+        "search_person",
         "suggest_titles",
         "web_search",
         "retry_download",
@@ -795,10 +982,11 @@ def _absorb_tool_side_effects(
                 "retry_download",
                 "suggest_titles",
                 "discover_by_genre",
+                "search_person",
                 "web_search",
             }:
                 result.reply = str(payload["reply"])
-        if name in {"discover_by_genre", "suggest_titles", "web_search"}:
+        if name in {"discover_by_genre", "suggest_titles", "web_search", "search_person"}:
             if payload.get("ok") and payload.get("reply_markup") and isinstance(
                 payload["reply_markup"], dict
             ):
@@ -806,8 +994,18 @@ def _absorb_tool_side_effects(
                 result.mode = "offer" if name != "web_search" else (
                     "confirm" if payload.get("count") == 1 else "offer"
                 )
+                if name == "search_person":
+                    if payload.get("confirm_person"):
+                        result.mode = "confirm"
+                    elif payload.get("count") == 1:
+                        result.mode = "confirm"
+                    else:
+                        result.mode = "offer"
             elif not payload.get("ok"):
                 # Failed refresh must not keep prior Get buttons.
+                result.reply_markup = None
+            elif name == "search_person" and payload.get("confirm_person"):
+                result.mode = "confirm"
                 result.reply_markup = None
         elif payload.get("reply_markup") and isinstance(payload["reply_markup"], dict):
             result.reply_markup = payload["reply_markup"]
