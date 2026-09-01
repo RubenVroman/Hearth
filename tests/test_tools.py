@@ -799,7 +799,11 @@ async def test_radarr_grab_release_tool_is_confirm_gated():
 
 
 async def test_radarr_keep_both_lists_and_confirm_grabs_without_deleting():
-    """Library title with an existing file → list alts; confirm keeps the file."""
+    """Library title with an existing file → list alts; confirm keeps the file.
+
+    Live Radarr marks other torrents with library-state rejections when hasFile;
+    those must still appear as needs_pick_keep (not no_alternate).
+    """
     from hearth.agent.registry import registry
     from hearth.fixtures import pipeline
     from hearth.tools.arr import radarr, want_keep_existing
@@ -812,6 +816,7 @@ async def test_radarr_keep_both_lists_and_confirm_grabs_without_deleting():
         "Can you download Event Horizon? It's already there, but find another download. "
         "Don't delete the old one."
     )
+    assert want_keep_existing("Download a new version of the Event Horizon")
     assert not want_keep_existing(
         "The Endless is too big and won't play, get another version"
     )
@@ -826,8 +831,15 @@ async def test_radarr_keep_both_lists_and_confirm_grabs_without_deleting():
     assert listed["keepExisting"] is True
     releases = listed["releases"]
     assert 1 <= len(releases) <= 4
+    guids = {str(r.get("guid") or "") for r in releases}
+    # Soft library-state rejections still offered.
+    assert "event-horizon-1080p-web" in guids or "event-horizon-720p-web" in guids
+    # Current imported BluRay identity excluded; hard passworded rejection skipped.
+    assert "event-horizon-current-bluray" not in guids
+    assert "event-horizon-passworded" not in guids
+    # Keep-both must not empty the menu by filtering out larger qualities.
     titles = " ".join(str(r.get("title") or "") for r in releases).lower()
-    assert "1080" in titles or "720" in titles
+    assert "1080" in titles or "720" in titles or "2160" in titles or "remux" in titles
     assert pipeline.radarr_downloads == []
     assert pipeline.radarr_client_downloads == []
 
@@ -895,6 +907,39 @@ async def test_radarr_keep_both_lists_and_confirm_grabs_without_deleting():
     assert pipeline.list_radarr_library("Event Horizon")[0].get("hasFile") is True
 
 
+async def test_radarr_keep_both_offers_soft_library_rejections():
+    """Releases rejected only for already-in-library / cutoff still offered."""
+    from hearth.tools.arr import (
+        radarr,
+        release_is_hard_rejected,
+    )
+
+    soft = {
+        "guid": "x",
+        "indexerId": 1,
+        "rejected": True,
+        "rejections": ["Movie already downloaded", "Quality cutoff already met"],
+    }
+    hard = {
+        "guid": "y",
+        "indexerId": 1,
+        "rejected": True,
+        "rejections": ["Password protected rar"],
+    }
+    assert release_is_hard_rejected(soft) is False
+    assert release_is_hard_rejected(hard) is True
+
+    listed = await radarr.list_alternate_releases(
+        "Event Horizon", keep_existing=True
+    )
+    assert listed["ok"] is True
+    assert listed["reason"] == "needs_pick_keep"
+    assert listed["releases"]
+    assert all(
+        "password" not in str(r.get("title") or "").lower() for r in listed["releases"]
+    )
+
+
 async def test_intent_retry_routes_to_radarr_retry():
     plan = route_intent("this download didn't work for Annihilation")
     assert plan is not None
@@ -934,6 +979,12 @@ async def test_intent_retry_routes_to_radarr_retry():
     assert copy is not None
     assert copy["tool"] == "radarr_retry"
     assert copy["args"].get("keep_existing") is True
+
+    new_ver = route_intent("Download a new version of the Event Horizon")
+    assert new_ver is not None
+    assert new_ver["tool"] == "radarr_retry"
+    assert "event horizon" in new_ver["args"]["query"].lower()
+    assert new_ver["args"].get("keep_existing") is True
 
 
 async def test_house_media_inventory_speaks_tv_avr_plex():

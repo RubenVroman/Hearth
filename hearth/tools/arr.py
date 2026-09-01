@@ -554,6 +554,126 @@ def release_identity(release: dict[str, Any]) -> str:
     return f"{indexer}|{title}"
 
 
+# Radarr interactive search marks other torrents as rejected when the movie
+# already has a file / meets cutoff. Those are still grab-able for keep-both /
+# switch paths — only hard quality / safety rejections should hide a row.
+_SOFT_LIBRARY_REJECTION = re.compile(
+    r"already\s+(?:downloaded|have|in(?:\s+the)?\s+library)|"
+    r"existing\s+file|"
+    r"(?:quality\s+)?cutoff\s+already\s+met|"
+    r"cutoff\s+met|"
+    r"not\s+wanted\s+because\s+already|"
+    r"equal\s+or\s+higher\s+(?:preference|quality)|"
+    r"already\s+being\s+downloaded|"
+    r"meets?\s+cut[\s-]?off",
+    re.I,
+)
+_HARD_RELEASE_REJECTION = re.compile(
+    r"password|"
+    r"encrypt|"
+    r"\bsample\b|"
+    r"\bmissing\b|"
+    r"quality\s+rejected|"
+    r"unknown\s+movie|"
+    r"does\s+not\s+meet|"
+    r"must\s+(?:contain|not)|"
+    r"custom\s+format|"
+    r"\bbanned\b|"
+    r"unavailable|"
+    r"not\s+a\s+movie|"
+    r"invalid|"
+    r"failed\s+to\s+parse",
+    re.I,
+)
+
+
+def _rejection_messages(release: dict[str, Any]) -> list[str]:
+    raw = release.get("rejections") or []
+    if not isinstance(raw, list):
+        return [str(raw)] if raw else []
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            text = str(
+                item.get("reason") or item.get("message") or item.get("rejection") or item
+            ).strip()
+        else:
+            text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _is_soft_library_rejection(message: str) -> bool:
+    return bool(message and _SOFT_LIBRARY_REJECTION.search(message))
+
+
+def release_is_hard_rejected(release: dict[str, Any]) -> bool:
+    """True when a release should be hidden from alternate-offer menus.
+
+    Soft library-state rejections (already downloaded / cutoff met / existing
+    file) are NOT hard — Radarr still returns grab-able guids for them.
+    """
+    msgs = _rejection_messages(release)
+    if not msgs:
+        # Bare rejected=true with no detail — treat as unusable.
+        return bool(release.get("rejected") is True)
+    for msg in msgs:
+        if _HARD_RELEASE_REJECTION.search(msg):
+            return True
+        if not _is_soft_library_rejection(msg):
+            # Unknown non-soft rejection — keep conservative and skip.
+            return True
+    return False
+
+
+def _normalize_release_blob(text: str) -> str:
+    raw = (text or "").strip().lower()
+    raw = re.sub(r"[\\/]+", " ", raw)
+    raw = re.sub(r"\.(mkv|mp4|avi|m4v|ts|m2ts|iso)$", "", raw)
+    raw = re.sub(r"[.\-_]+", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def release_matches_blocked(release: dict[str, Any], blocked: str) -> bool:
+    """True when this row is the current / blocked library release."""
+    blocked_norm = (blocked or "").strip().lower()
+    if not blocked_norm:
+        return False
+    ident = release_identity(release)
+    if ident and (
+        ident == blocked_norm
+        or blocked_norm in ident
+        or ident in blocked_norm
+    ):
+        return True
+    blocked_blob = _normalize_release_blob(blocked_norm)
+    title_blob = _normalize_release_blob(
+        str(release.get("title") or release.get("releaseTitle") or "")
+    )
+    if blocked_blob and title_blob and (
+        blocked_blob == title_blob
+        or blocked_blob in title_blob
+        or title_blob in blocked_blob
+    ):
+        return True
+    return False
+
+
+def library_file_block_token(movie_raw: dict[str, Any] | None) -> str:
+    """Token used to exclude the currently imported release from offer menus."""
+    if not isinstance(movie_raw, dict):
+        return ""
+    mf = movie_raw.get("movieFile") if isinstance(movie_raw.get("movieFile"), dict) else {}
+    for key in ("relativePath", "path", "sceneName", "originalFilePath"):
+        value = mf.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
 def speak_retry(
     *,
     title: str,
@@ -601,7 +721,9 @@ def speak_retry(
             f"after {max_attempts or attempt or 'several'} tries{mock_bit}."
         )
     if reason == "no_alternate":
-        return f"{label} failed — no other release found{mock_bit}."
+        return (
+            f"{label} — no other grab-able release found on the indexers{mock_bit}."
+        )
     if reason == "not_found":
         return f"{label} is not in the download queue{mock_bit}."
     if reason == "not_in_library":
@@ -811,7 +933,9 @@ def want_keep_existing(text: str) -> bool:
     if re.search(
         r"\balready\s+(?:there|in\s+(?:the\s+)?library)\b"
         r"|\b(?:find|get|grab|download)\s+another\s+(?:download|copy|one|release|version)\b"
-        r"|\banother\s+copy\b"
+        r"|\b(?:get|grab|download)\s+(?:a\s+)?new\s+version\b"
+        r"|\b(?:a\s+)?new\s+version\b"
+        r"|\banother\s+(?:copy|version|release|download)\b"
         r"|\bextra\s+(?:download|copy|release)\b",
         raw,
         re.I,
@@ -1270,23 +1394,14 @@ class StarrClient:
         prefer_smaller: bool = False,
     ) -> dict[str, Any] | None:
         """Best acceptable release that is not the blocklisted one."""
-        blocked_norm = (blocked or "").strip().lower()
         ranked: list[tuple[int, dict[str, Any]]] = []
         for row in releases:
             if not isinstance(row, dict):
                 continue
-            # Skip rejected / already-grabbed flags when present.
-            if row.get("rejected") is True:
+            # Soft library-state rejections stay offerable; hard ones skip.
+            if release_is_hard_rejected(row):
                 continue
-            rejections = row.get("rejections") or []
-            if rejections:
-                continue
-            ident = release_identity(row)
-            if blocked_norm and (
-                ident == blocked_norm
-                or blocked_norm in ident
-                or (ident and ident in blocked_norm)
-            ):
+            if release_matches_blocked(row, blocked):
                 continue
             score = _playability_score(row, prefer_smaller=prefer_smaller)
             ranked.append((score, row))
@@ -1303,26 +1418,23 @@ class StarrClient:
         prefer_smaller: bool = True,
         limit: int = 4,
     ) -> list[dict[str, Any]]:
-        """Return top grab-able releases (raw *arr rows), ranked."""
-        blocked_norm = (blocked or "").strip().lower()
+        """Return top grab-able releases (raw *arr rows), ranked.
+
+        Soft Radarr library-state rejections (already downloaded / cutoff met /
+        existing file) are included — interactive search still returns grab-able
+        guids for them. Hard rejections (passworded, encrypted, etc.) are skipped.
+        """
         ranked: list[tuple[int, dict[str, Any]]] = []
         for row in releases:
             if not isinstance(row, dict):
                 continue
-            if row.get("rejected") is True:
-                continue
-            if row.get("rejections"):
+            if release_is_hard_rejected(row):
                 continue
             guid = row.get("guid")
             indexer_id = row.get("indexerId")
             if not guid or indexer_id in (None, ""):
                 continue
-            ident = release_identity(row)
-            if blocked_norm and (
-                ident == blocked_norm
-                or blocked_norm in ident
-                or (ident and ident in blocked_norm)
-            ):
+            if release_matches_blocked(row, blocked):
                 continue
             ranked.append((_playability_score(row, prefer_smaller=prefer_smaller), row))
         ranked.sort(key=lambda pair: pair[0], reverse=True)
@@ -1401,7 +1513,7 @@ class StarrClient:
             if title and self.kind == "radarr":
                 switch = await self.list_alternate_releases(
                     title,
-                    prefer_smaller=True,
+                    prefer_smaller=keep_existing is not True,
                     keep_existing=keep_existing,
                 )
                 if switch.get("ok") and switch.get("releases"):
@@ -1815,20 +1927,24 @@ class StarrClient:
                     "speak": speak_retry(title=display, ok=False, reason="error", mock=False),
                 }
 
-        # When replacing a huge file, skip releases that are also huge remuxes
-        # of similar size so the menu is actually smaller / more playable.
-        blocked = ""
-        if too_large and not keep_existing:
-            mf = movie_raw.get("movieFile") if isinstance(movie_raw.get("movieFile"), dict) else {}
-            blocked = str(mf.get("relativePath") or "")
+        # Exclude the currently imported release identity from the offer menu.
+        # Keep-both and switch both need this so we do not re-offer the same file.
+        blocked = library_file_block_token(movie_raw) if has_file else ""
+
+        # Prefer-smaller ranking is for no-file / too-big switch paths.
+        # Keep-both should offer other qualities/sizes, not empty the menu.
+        if keep_existing:
+            use_prefer_smaller = False
+        else:
+            use_prefer_smaller = bool(prefer_smaller or too_large or not has_file)
 
         ranked = self._rank_releases(
             raw_releases,
             blocked=blocked,
-            prefer_smaller=prefer_smaller or too_large or not has_file or keep_existing,
+            prefer_smaller=use_prefer_smaller,
             limit=limit,
         )
-        if too_large or prefer_smaller or keep_existing:
+        if use_prefer_smaller:
             # Drop remaining giant remuxes from the offer when size is the ask.
             filtered: list[dict[str, Any]] = []
             for row in ranked:
