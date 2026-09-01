@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -20,6 +21,101 @@ DOWNLOAD_STATUSES = (
     "failed",
     "unknown",
 )
+
+_TITLE_YEAR_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>(?:19|20)\d{2})\)\s*$")
+_ARTICLES = frozenset({"the", "a", "an", "de", "het", "een"})
+
+
+def _normalize_title_tokens(value: str) -> list[str]:
+    text = re.sub(r"[^a-z0-9à-ÿ]+", " ", (value or "").lower()).strip()
+    tokens = [t for t in text.split() if t]
+    while tokens and tokens[0] in _ARTICLES:
+        tokens = tokens[1:]
+    return tokens
+
+
+def title_seed_matches(seed: str, title: str) -> bool:
+    """Exact / multi-word franchise-prefix match — never Land→La La Land.
+
+    Shared gate for Overseerr auto-request: mismatched search/fallback hits
+    must not be queued.
+    """
+    seed_tokens = _normalize_title_tokens(seed)
+    title_tokens = _normalize_title_tokens(title)
+    if not seed_tokens or not title_tokens:
+        return False
+    if seed_tokens == title_tokens:
+        return True
+    if len(seed_tokens) >= 2 and title_tokens[: len(seed_tokens)] == seed_tokens:
+        return True
+    return False
+
+
+def _split_query_year(query: str) -> tuple[str, int | None]:
+    raw = (query or "").strip()
+    match = _TITLE_YEAR_RE.match(raw)
+    if not match:
+        return raw, None
+    try:
+        return match.group("title").strip(), int(match.group("year"))
+    except (TypeError, ValueError):
+        return match.group("title").strip(), None
+
+
+def _row_title(row: dict[str, Any]) -> str:
+    return str(row.get("title") or row.get("name") or "").strip()
+
+
+def _confident_overseerr_hits(
+    results: list[dict[str, Any]],
+    *,
+    query: str,
+    media_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Keep only non-fallback hits whose title clearly matches the ask."""
+    asked, year = _split_query_year(query)
+    seed = asked or query
+    out: list[dict[str, Any]] = []
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        if row.get("matched") == "fallback":
+            continue
+        mt = str(row.get("mediaType") or "").lower()
+        if mt == "person" or _is_person_result(row):
+            continue
+        if media_type in {"movie", "tv"} and mt and mt != media_type:
+            continue
+        title = _row_title(row)
+        if not title_seed_matches(seed, title):
+            continue
+        out.append(row)
+    if year is not None:
+        year_hits = []
+        for row in out:
+            try:
+                row_year = int(row.get("year")) if row.get("year") not in (None, "") else None
+            except (TypeError, ValueError):
+                row_year = None
+            if row_year == year:
+                year_hits.append(row)
+        if year_hits:
+            return year_hits
+    return out
+
+
+def _indistinguishable_overseerr_hits(hits: list[dict[str, Any]]) -> bool:
+    if len(hits) <= 1:
+        return True
+    labels = {
+        (
+            " ".join(_normalize_title_tokens(_row_title(h))),
+            str(h.get("year") or ""),
+            str(h.get("mediaType") or ""),
+        )
+        for h in hits
+    }
+    return len(labels) == 1
 
 
 def _poster_path(item: dict[str, Any]) -> str | None:
@@ -1234,27 +1330,134 @@ class Overseerr:
         media_type: str | None = None,
     ) -> dict[str, Any]:
         query = (query or "").strip()
+        mt = media_type if media_type in {"movie", "tv"} else None
+
+        # Explicit TMDB id — never fuzzy-pick a mismatched search/fallback hit.
+        if media_id and not mt:
+            # Resolve media type from an id search when the caller omitted it.
+            id_found = await self.search(str(int(media_id)))
+            for row in id_found.get("results") or []:
+                rid = row.get("mediaId") or row.get("tmdbId") or row.get("id")
+                try:
+                    if int(rid) != int(media_id):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if row.get("matched") == "fallback":
+                    continue
+                row_mt = str(row.get("mediaType") or "")
+                if row_mt in {"movie", "tv"}:
+                    mt = row_mt
+                    if not query:
+                        query = _row_title(row)
+                    break
+            if not mt:
+                return {
+                    "ok": False,
+                    "service": "overseerr",
+                    "error": f"mediaType required for Overseerr id {media_id}",
+                    "speak": f"I need to know if TMDB {media_id} is a movie or a show before requesting it.",
+                }
+
+        if media_id and mt:
+            pick: dict[str, Any] = {
+                "mediaId": media_id,
+                "id": media_id,
+                "mediaType": mt,
+                "title": query or f"TMDB {media_id}",
+            }
+            if not self.live:
+                enriched = [
+                    h
+                    for h in pipeline.search_overseerr(query or str(media_id))
+                    if (h.get("id") == media_id or h.get("mediaId") == media_id)
+                    and h.get("matched") != "fallback"
+                ]
+                if enriched:
+                    pick = {**enriched[0], "mediaType": mt}
+                item = pipeline.request_overseerr(pick)
+                return {
+                    "mode": "mock",
+                    "service": "overseerr",
+                    "requested": _summarize_overseerr(item),
+                }
+            return await self._post_request(pick, media_id=int(media_id), media_type=mt, query=query)
+
+        # Title-only path: require a confident title match (never results[0] fallback).
+        found = await self.search(query) if query else {"results": []}
+        results = list(found.get("results") or [])
+        confident = _confident_overseerr_hits(results, query=query, media_type=mt)
+        if not confident:
+            label = query or "that title"
+            return {
+                "ok": False,
+                "service": "overseerr",
+                "not_found": True,
+                "mismatch": True,
+                "query": query,
+                "error": f"no confident Overseerr match for {label}",
+                "speak": (
+                    f"I couldn't find a confident Overseerr match for {label}. "
+                    "Want to pick from search results, or send a TMDB/IMDb link?"
+                ),
+                "results": [_summarize_overseerr(r) for r in results[:6] if isinstance(r, dict)],
+            }
+        if len(confident) > 1 and not _indistinguishable_overseerr_hits(confident):
+            choices = [_summarize_overseerr(r) for r in confident[:6]]
+            bits = "; ".join(
+                f"{c.get('title')} ({c.get('year')})" if c.get("year") else str(c.get("title"))
+                for c in choices
+                if c.get("title")
+            )
+            return {
+                "ok": False,
+                "service": "overseerr",
+                "ambiguous": True,
+                "query": query,
+                "choices": choices,
+                "error": f"ambiguous Overseerr match for {query}",
+                "speak": f"Which one for {query}? {bits}",
+            }
+
+        pick = confident[0]
+        pick_id = pick.get("mediaId") or pick.get("tmdbId") or pick.get("id")
+        pick_type = str(pick.get("mediaType") or mt or "movie")
+        if pick_type not in {"movie", "tv"}:
+            pick_type = mt or "movie"
+        try:
+            pick_id_i = int(pick_id)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "service": "overseerr",
+                "not_found": True,
+                "query": query,
+                "error": f"Overseerr hit for {query} has no TMDB id",
+                "speak": f"I found {pick.get('title') or query}, but it has no TMDB id to request.",
+            }
+
         if not self.live:
-            hits = pipeline.search_overseerr(query or "dune")
-            if media_id:
-                hits = [h for h in hits if h.get("id") == media_id] or hits
-            pick = hits[0] if hits else {"title": query or "unknown", "id": media_id, "mediaType": media_type or "movie"}
-            if media_type:
-                pick = {**pick, "mediaType": media_type}
-            item = pipeline.request_overseerr(pick)
-            return {"mode": "mock", "service": "overseerr", "requested": _summarize_overseerr(item)}
+            item = pipeline.request_overseerr({**pick, "mediaType": pick_type, "id": pick_id_i})
+            return {
+                "mode": "mock",
+                "service": "overseerr",
+                "requested": _summarize_overseerr(item),
+            }
+        return await self._post_request(
+            pick,
+            media_id=pick_id_i,
+            media_type=pick_type,
+            query=query,
+        )
 
-        if not media_id or not media_type:
-            found = await self.search(query)
-            results = found.get("results") or []
-            if not results:
-                return {"ok": False, "service": "overseerr", "error": f"no Overseerr match for {query}"}
-            media_id = results[0].get("mediaId")
-            media_type = results[0].get("mediaType") or "movie"
-            pick = results[0]
-        else:
-            pick = {"mediaId": media_id, "mediaType": media_type, "title": query}
-
+    async def _post_request(
+        self,
+        pick: dict[str, Any],
+        *,
+        media_id: int,
+        media_type: str,
+        query: str = "",
+    ) -> dict[str, Any]:
         client = await self._http()
         body: dict[str, Any] = {"mediaId": media_id, "mediaType": media_type}
         if media_type == "tv":

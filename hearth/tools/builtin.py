@@ -1219,7 +1219,10 @@ def register_builtin_tools() -> None:
         ToolSpec(
             name="overseerr_request",
             description=(
-                "Request a movie or show via Overseerr (feeds Radarr/Sonarr). Runs immediately."
+                "Request a movie or show via Overseerr (feeds Radarr/Sonarr). "
+                "Runs immediately when the title (or mediaId+mediaType) is a confident "
+                "match. Refuses mismatched search/fallback hits — returns choices to "
+                "disambiguate instead of queueing the wrong film."
             ),
             parameters={
                 "type": "object",

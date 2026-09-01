@@ -1365,11 +1365,18 @@ class MockPipeline:
             if s.get("matched") != "fallback"
         ]
         # Also match discover catalog rows (fantasy / sci-fi packs).
-        discover_hits = _filter_title(MOCK_TMDB_DISCOVER, query)
+        # Never keep _filter_title catalog-wide fallbacks — those surface the
+        # first discover row (e.g. The Odyssey) for unrelated asks.
+        discover_hits = [
+            h
+            for h in _filter_title(MOCK_TMDB_DISCOVER, query)
+            if h.get("matched") != "fallback"
+        ]
         merged = movies + shows + discover_hits
         if merged:
             return merged
-        return primary
+        # Empty miss — do not return MOCK_OVERSEERR_RESULTS[0] as a fake hit.
+        return []
 
     def search_person(self, query: str) -> list[dict[str, Any]]:
         """Mock Overseerr multi-search person rows (typos via aliases)."""

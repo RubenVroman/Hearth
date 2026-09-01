@@ -216,7 +216,9 @@ def _pick_best(hits: list[dict[str, Any]], *, needle: str, year: int | None) -> 
         if score > best_score:
             best = hit
             best_score = score
-    if best is None or best_score < 0:
+    # Require at least a partial title overlap (40+) — a lone TMDB-id bonus
+    # must not promote an unrelated Overseerr/TMDB hit into a card.
+    if best is None or best_score < 40:
         return None
     return best
 
@@ -369,9 +371,17 @@ async def resolve_title(raw: str, *, media_type: str = "any") -> dict[str, Any]:
         return _skeleton(asked, year=year, media_type=media_type if media_type != "any" else "movie")
 
     # Reject weak Overseerr/Radarr fallbacks that clearly aren't the asked title.
-    if pick.get("matched") == "fallback" and asked.lower() not in str(pick.get("title") or "").lower():
+    from hearth.tools.arr import title_seed_matches
+
+    if pick.get("matched") == "fallback" and not title_seed_matches(
+        asked, str(pick.get("title") or pick.get("name") or "")
+    ):
         soft = _mock_fallback(asked, year, media_type)
-        if soft is not None and soft.get("matched") != "fallback":
+        if (
+            soft is not None
+            and soft.get("matched") != "fallback"
+            and title_seed_matches(asked, str(soft.get("title") or soft.get("name") or ""))
+        ):
             pick = soft
         else:
             return _skeleton(asked, year=year, media_type=media_type if media_type != "any" else "movie")

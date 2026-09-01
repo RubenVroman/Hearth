@@ -397,6 +397,20 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         )
         return f"Overseerr{mock} found: {titles or 'nothing'}."
     if name == "overseerr_request":
+        if data.get("ok") is False:
+            spoken = data.get("speak")
+            if spoken:
+                return str(spoken)
+            if data.get("ambiguous"):
+                choices = data.get("choices") or []
+                bits = "; ".join(
+                    f"{c.get('title')} ({c.get('year')})" if c.get("year") else str(c.get("title"))
+                    for c in choices[:4]
+                    if c.get("title")
+                )
+                return f"Which title should I request{mock}? {bits or 'say the year or send a link'}."
+            q = data.get("query") or "that"
+            return f"I couldn't find a confident Overseerr match for {q}{mock}."
         item = data.get("requested") or {}
         return f"I'll request {item.get('title') or 'that'} in Overseerr{mock}."
     if name == "suggest_titles":
