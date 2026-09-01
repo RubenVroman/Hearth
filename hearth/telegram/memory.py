@@ -1,8 +1,9 @@
 """Per-chat Telegram conversation window for plot/follow-up context.
 
-Rolling ~8 turns, 30-minute idle TTL. Persists under ``data/`` so a container
-recreate does not wipe a mid-chat. No new env keys — fixed path next to the
-other house data files.
+Rolling ~24 turns, 6-hour idle TTL. Persists under ``data/`` so a container
+recreate does not wipe a mid-chat. Tracks offered TMDB ids across that window
+so "others" / None-of-these can paginate without repeats. No new env keys —
+fixed path next to the other house data files.
 """
 
 from __future__ import annotations
@@ -20,8 +21,9 @@ from hearth.memory.redact import redact
 
 log = logging.getLogger("hearth.telegram")
 
-MAX_TURNS = 8
-IDLE_TTL_S = 30 * 60
+MAX_TURNS = 24
+IDLE_TTL_S = 6 * 60 * 60
+MAX_SHOWN_IDS = 64
 DEFAULT_PATH = Path("./data/telegram-chat-memory.json")
 
 Role = Literal["user", "bot"]
@@ -45,11 +47,25 @@ class ChatThread:
     subject_media_kind: str = ""
     offered: list[dict[str, Any]] = field(default_factory=list)
     rejected_titles: list[str] = field(default_factory=list)
+    shown_tmdb_ids: list[int] = field(default_factory=list)
+    last_genre_ids: list[int] = field(default_factory=list)
+    last_exclude_genre_ids: list[int] = field(default_factory=list)
+    last_discover_page: int = 1
+    last_discover_media_type: str = "movie"
     updated_at: float = field(default_factory=time.time)
 
     def alive(self, *, now: float | None = None, ttl_s: float = IDLE_TTL_S) -> bool:
         stamp = now if now is not None else time.time()
-        return bool(self.turns) and (stamp - self.updated_at) <= ttl_s
+        if (stamp - self.updated_at) > ttl_s:
+            return False
+        # Turns OR discover/session metadata keep the window warm.
+        return bool(
+            self.turns
+            or self.shown_tmdb_ids
+            or self.last_genre_ids
+            or self.offered
+            or self.rejected_titles
+        )
 
 
 def _compact_offered(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -63,6 +79,36 @@ def _compact_offered(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
                 "tvdbId": row.get("tvdbId"),
             }
         )
+    return out
+
+
+def _tmdb_ids_from_rows(rows: list[dict[str, Any]] | None) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for row in rows or []:
+        raw = row.get("tmdbId") if isinstance(row, dict) else row
+        if isinstance(row, dict) and raw in (None, ""):
+            raw = row.get("mediaId")
+        try:
+            tid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if tid in seen:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
+
+def _int_list(raw: Any) -> list[int]:
+    out: list[int] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
     return out
 
 
@@ -129,6 +175,75 @@ class ChatMemory:
             return []
         return list(thread.rejected_titles)
 
+    def shown_tmdb_ids(self, chat_id: int) -> list[int]:
+        thread = self.get(chat_id)
+        if thread is None:
+            return []
+        return list(thread.shown_tmdb_ids)
+
+    def remember_shown(
+        self,
+        chat_id: int,
+        rows: list[dict[str, Any]] | None,
+    ) -> None:
+        ids = _tmdb_ids_from_rows(rows)
+        if not ids:
+            return
+        with self._lock:
+            thread = self._ensure_unlocked(int(chat_id))
+            existing = list(thread.shown_tmdb_ids)
+            seen = set(existing)
+            for tid in ids:
+                if tid not in seen:
+                    seen.add(tid)
+                    existing.append(tid)
+            thread.shown_tmdb_ids = existing[-MAX_SHOWN_IDS:]
+            thread.updated_at = time.time()
+            self._persist_unlocked()
+
+    def set_discover_cursor(
+        self,
+        chat_id: int,
+        *,
+        genre_ids: list[int] | None = None,
+        exclude_genre_ids: list[int] | None = None,
+        page: int | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        with self._lock:
+            thread = self._ensure_unlocked(int(chat_id))
+            if genre_ids is not None:
+                thread.last_genre_ids = [int(g) for g in genre_ids]
+            if exclude_genre_ids is not None:
+                thread.last_exclude_genre_ids = [int(g) for g in exclude_genre_ids]
+            if page is not None:
+                try:
+                    thread.last_discover_page = max(1, int(page))
+                except (TypeError, ValueError):
+                    thread.last_discover_page = 1
+            if media_type in {"movie", "tv"}:
+                thread.last_discover_media_type = media_type
+            thread.updated_at = time.time()
+            self._persist_unlocked()
+
+    def discover_cursor(self, chat_id: int) -> dict[str, Any]:
+        thread = self.get(chat_id)
+        if thread is None:
+            return {
+                "genre_ids": [],
+                "exclude_genre_ids": [],
+                "page": 1,
+                "media_type": "movie",
+            }
+        return {
+            "genre_ids": list(thread.last_genre_ids),
+            "exclude_genre_ids": list(thread.last_exclude_genre_ids),
+            "page": int(thread.last_discover_page or 1),
+            "media_type": thread.last_discover_media_type
+            if thread.last_discover_media_type in {"movie", "tv"}
+            else "movie",
+        }
+
     def remember_rejected(
         self,
         chat_id: int,
@@ -158,7 +273,7 @@ class ChatMemory:
             }
             for title in cleaned:
                 existing[title.lower()] = title
-            thread.rejected_titles = list(existing.values())[-12:]
+            thread.rejected_titles = list(existing.values())[-24:]
             if clear_offered:
                 thread.offered = []
             if clear_subject:
@@ -234,6 +349,10 @@ class ChatMemory:
                 ]
             if offered is not None:
                 thread.offered = compact or []
+                for tid in _tmdb_ids_from_rows(compact):
+                    if tid not in thread.shown_tmdb_ids:
+                        thread.shown_tmdb_ids.append(tid)
+                thread.shown_tmdb_ids = thread.shown_tmdb_ids[-MAX_SHOWN_IDS:]
             self._trim_unlocked(thread)
             thread.updated_at = time.time()
             self._persist_unlocked()
@@ -261,6 +380,10 @@ class ChatMemory:
                 thread.offered = []
             elif compact:
                 thread.offered = compact
+                for tid in _tmdb_ids_from_rows(compact):
+                    if tid not in thread.shown_tmdb_ids:
+                        thread.shown_tmdb_ids.append(tid)
+                thread.shown_tmdb_ids = thread.shown_tmdb_ids[-MAX_SHOWN_IDS:]
             if clear_rejected:
                 thread.rejected_titles = [
                     t
@@ -272,7 +395,15 @@ class ChatMemory:
 
     def _ensure_unlocked(self, chat_id: int) -> ChatThread:
         thread = self._threads.get(chat_id)
-        if thread is None or not thread.alive():
+        now = time.time()
+        if thread is None:
+            thread = ChatThread(chat_id=chat_id)
+            self._threads[chat_id] = thread
+            return thread
+        # Idle TTL expired → fresh thread. Do NOT wipe a brand-new thread that
+        # only has discover cursor / shown ids before the first turn is recorded
+        # (alive() requires turns, which land in _finish after tools run).
+        if (now - thread.updated_at) > IDLE_TTL_S:
             thread = ChatThread(chat_id=chat_id)
             self._threads[chat_id] = thread
         return thread
@@ -335,7 +466,16 @@ class ChatMemory:
                     str(t)[:200]
                     for t in (blob.get("rejected_titles") or [])
                     if str(t).strip()
-                ][:12],
+                ][:24],
+                shown_tmdb_ids=_int_list(blob.get("shown_tmdb_ids"))[-MAX_SHOWN_IDS:],
+                last_genre_ids=_int_list(blob.get("last_genre_ids")),
+                last_exclude_genre_ids=_int_list(blob.get("last_exclude_genre_ids")),
+                last_discover_page=max(1, int(blob.get("last_discover_page") or 1)),
+                last_discover_media_type=(
+                    "tv"
+                    if str(blob.get("last_discover_media_type") or "") == "tv"
+                    else "movie"
+                ),
                 updated_at=float(blob.get("updated_at") or now),
             )
             if thread.alive(now=now):
@@ -352,6 +492,11 @@ class ChatMemory:
                     "subject_media_kind": th.subject_media_kind,
                     "offered": th.offered,
                     "rejected_titles": th.rejected_titles,
+                    "shown_tmdb_ids": th.shown_tmdb_ids[-MAX_SHOWN_IDS:],
+                    "last_genre_ids": th.last_genre_ids,
+                    "last_exclude_genre_ids": th.last_exclude_genre_ids,
+                    "last_discover_page": th.last_discover_page,
+                    "last_discover_media_type": th.last_discover_media_type,
                     "updated_at": th.updated_at,
                     "turns": [asdict(t) for t in th.turns[-MAX_TURNS:]],
                 }
@@ -374,6 +519,7 @@ class ChatMemory:
 __all__ = [
     "DEFAULT_PATH",
     "IDLE_TTL_S",
+    "MAX_SHOWN_IDS",
     "MAX_TURNS",
     "ChatMemory",
     "ChatThread",

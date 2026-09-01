@@ -326,6 +326,43 @@ MOCK_WEB_SEARCH_RESULTS: list[dict[str, Any]] = [
     },
 ]
 
+MOCK_WEB_SEARCH_FANTASY: list[dict[str, Any]] = [
+    {
+        "title": "Best fantasy movies — Willow (1988)",
+        "url": "https://en.wikipedia.org/wiki/Willow_(1988_film)",
+        "snippet": "Classic released fantasy film: Willow (1988).",
+        "source": "wikipedia.org",
+    },
+    {
+        "title": "The Dark Crystal (1982) — Jim Henson",
+        "url": "https://en.wikipedia.org/wiki/The_Dark_Crystal",
+        "snippet": "Released fantasy classic The Dark Crystal (1982).",
+        "source": "wikipedia.org",
+    },
+    {
+        "title": "Labyrinth (1986) fantasy film",
+        "url": "https://en.wikipedia.org/wiki/Labyrinth_(1986_film)",
+        "snippet": "Well-known released fantasy: Labyrinth (1986).",
+        "source": "wikipedia.org",
+    },
+    {
+        "title": "The Princess Bride (1987)",
+        "url": "https://en.wikipedia.org/wiki/The_Princess_Bride_(film)",
+        "snippet": "Guillermo del Toro fans also love The Princess Bride (1987).",
+        "source": "wikipedia.org",
+    },
+]
+
+
+def mock_web_search_results(query: str, limit: int = 4) -> list[dict[str, Any]]:
+    """Pick mock web rows; fantasy movie queries return classic released titles."""
+    q = (query or "").lower()
+    if re.search(r"\bfantas(?:y|ie)\b", q) and re.search(
+        r"\b(movie|film|cinema|released|classic)\b", q
+    ):
+        return [dict(row) for row in MOCK_WEB_SEARCH_FANTASY[:limit]]
+    return [dict(row) for row in MOCK_WEB_SEARCH_RESULTS[:limit]]
+
 
 MOCK_DOCKER_CONTAINERS: list[dict[str, Any]] = [
     {"Id": "plex01", "Names": ["/plex"], "Image": "lscr.io/linuxserver/plex", "State": "running", "Status": "Up 3 days"},
@@ -611,11 +648,45 @@ MOCK_SONARR_RELEASES: dict[int, list[dict[str, Any]]] = {
 # TMDB discover fixtures (Telegram genre browse). Fantasy=14, Sci-Fi=878.
 # Fantasy pack must NOT be Matrix / Arrival / Interstellar.
 MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
+    # Unreleased / upcoming TMDB popularity hits — must be filtered out by
+    # primary_release_date.lte + vote_count.gte in discover_by_genre.
+    {
+        "id": 1110001,
+        "mediaType": "movie",
+        "title": "The Odyssey",
+        "year": 2026,
+        "releaseDate": "2026-11-12",
+        "voteCount": 18,
+        "genreIds": [14, 12],
+        "overview": "Upcoming Homer adaptation (not yet released).",
+    },
+    {
+        "id": 1110002,
+        "mediaType": "movie",
+        "title": "Moana",
+        "year": 2026,
+        "releaseDate": "2026-12-01",
+        "voteCount": 42,
+        "genreIds": [14, 16, 12],
+        "overview": "Upcoming Moana entry (not yet released).",
+    },
+    {
+        "id": 1110003,
+        "mediaType": "movie",
+        "title": "Minions & Monsters",
+        "year": 2026,
+        "releaseDate": "2026-10-20",
+        "voteCount": 9,
+        "genreIds": [14, 16, 35],
+        "overview": "Upcoming animated fantasy (not yet released).",
+    },
     {
         "id": 497698,
         "mediaType": "movie",
         "title": "The Green Knight",
         "year": 2021,
+        "releaseDate": "2021-07-30",
+        "voteCount": 2100,
         "genreIds": [14, 12, 18],
         "overview": "A fantasy retelling of Sir Gawain and the Green Knight.",
     },
@@ -624,6 +695,8 @@ MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
         "mediaType": "movie",
         "title": "Pan's Labyrinth",
         "year": 2006,
+        "releaseDate": "2006-10-11",
+        "voteCount": 9800,
         "genreIds": [14, 18, 27],
         "overview": "A young girl enters a mythical labyrinth in Francoist Spain.",
     },
@@ -632,6 +705,8 @@ MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
         "mediaType": "movie",
         "title": "The Lord of the Rings: The Fellowship of the Ring",
         "year": 2001,
+        "releaseDate": "2001-12-19",
+        "voteCount": 24000,
         "genreIds": [14, 12, 28],
         "overview": "A hobbit begins a quest to destroy the One Ring.",
     },
@@ -640,14 +715,93 @@ MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
         "mediaType": "movie",
         "title": "Spirited Away",
         "year": 2001,
+        "releaseDate": "2001-07-20",
+        "voteCount": 16000,
         "genreIds": [14, 16, 12],
         "overview": "A girl enters a spirit world to save her parents.",
+    },
+    {
+        "id": 4935,
+        "mediaType": "movie",
+        "title": "Howl's Moving Castle",
+        "year": 2004,
+        "releaseDate": "2004-11-20",
+        "voteCount": 9200,
+        "genreIds": [14, 16, 12],
+        "overview": "A young woman is cursed and seeks help from a wizard.",
+    },
+    {
+        "id": 118,
+        "mediaType": "movie",
+        "title": "Stardust",
+        "year": 2007,
+        "releaseDate": "2007-08-10",
+        "voteCount": 4100,
+        "genreIds": [14, 12, 10749],
+        "overview": "A young man enters a magical realm to retrieve a fallen star.",
+    },
+    {
+        "id": 2493,
+        "mediaType": "movie",
+        "title": "The Princess Bride",
+        "year": 1987,
+        "releaseDate": "1987-09-25",
+        "voteCount": 12000,
+        "genreIds": [14, 12, 35, 10749],
+        "overview": "A farm boy becomes a pirate to reclaim his true love.",
+    },
+    {
+        "id": 114,
+        "mediaType": "movie",
+        "title": "Pretty Woman",
+        "year": 1990,
+        "releaseDate": "1990-03-23",
+        "voteCount": 7000,
+        "genreIds": [35, 10749],
+        "overview": "A businessman hires a sex worker for a week.",
+    },
+    # Web-search fallback classics — NOT in discover genre packs so exhaustion
+    # tests can still resolve them via search_title after web_search.
+    {
+        "id": 106,
+        "mediaType": "movie",
+        "title": "Willow",
+        "year": 1988,
+        "releaseDate": "1988-05-20",
+        "voteCount": 1800,
+        "genreIds": [14, 12],
+        "overview": "A Nelwyn farmer protects a special baby.",
+        "discover": False,
+    },
+    {
+        "id": 116,
+        "mediaType": "movie",
+        "title": "The Dark Crystal",
+        "year": 1982,
+        "releaseDate": "1982-12-17",
+        "voteCount": 2100,
+        "genreIds": [14, 12],
+        "overview": "Gelflings seek to heal a broken crystal.",
+        "discover": False,
+    },
+    {
+        "id": 117,
+        "mediaType": "movie",
+        "title": "Labyrinth",
+        "year": 1986,
+        "releaseDate": "1986-06-27",
+        "voteCount": 3200,
+        "genreIds": [14, 12, 10402],
+        "overview": "A teen navigates a goblin king's maze.",
+        "discover": False,
     },
     {
         "id": 603,
         "mediaType": "movie",
         "title": "The Matrix",
         "year": 1999,
+        "releaseDate": "1999-03-31",
+        "voteCount": 25000,
         "genreIds": [28, 878],
         "overview": "A hacker learns the nature of his reality.",
     },
@@ -656,6 +810,8 @@ MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
         "mediaType": "movie",
         "title": "Arrival",
         "year": 2016,
+        "releaseDate": "2016-11-11",
+        "voteCount": 16000,
         "genreIds": [18, 878],
         "overview": "A linguist makes contact with alien visitors.",
     },
@@ -664,6 +820,8 @@ MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
         "mediaType": "movie",
         "title": "Interstellar",
         "year": 2014,
+        "releaseDate": "2014-11-07",
+        "voteCount": 34000,
         "genreIds": [12, 18, 878],
         "overview": "Explorers travel through a wormhole in space.",
     },
@@ -672,6 +830,8 @@ MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
         "mediaType": "movie",
         "title": "Blade Runner",
         "year": 1982,
+        "releaseDate": "1982-06-25",
+        "voteCount": 14000,
         "genreIds": [878, 18, 53],
         "overview": "A blade runner hunts replicants in a dystopian future.",
     },
@@ -680,6 +840,8 @@ MOCK_TMDB_DISCOVER: list[dict[str, Any]] = [
         "mediaType": "movie",
         "title": "Dune",
         "year": 2021,
+        "releaseDate": "2021-10-22",
+        "voteCount": 11000,
         "genreIds": [878, 12],
         "overview": "Paul Atreides arrives on Arrakis.",
     },
@@ -886,13 +1048,32 @@ class MockPipeline:
         exclude_genre_ids: list[int] | None = None,
         media_type: str = "movie",
         limit: int = 4,
+        page: int = 1,
+        primary_release_date_lte: str | None = None,
+        vote_count_gte: int | None = None,
+        exclude_tmdb_ids: list[int] | None = None,
     ) -> list[dict[str, Any]]:
-        """Mock TMDB discover — Fantasy (14) never returns Matrix/Arrival/Interstellar."""
+        """Mock TMDB discover — Fantasy (14) never returns Matrix/Arrival/Interstellar.
+
+        Applies released-only + vote-floor filters so 2026 vaporware is dropped.
+        """
         include = set(int(g) for g in (genre_ids or []))
         exclude = set(int(g) for g in (exclude_genre_ids or []))
+        ban = {int(x) for x in (exclude_tmdb_ids or [])}
         kind = media_type if media_type in {"movie", "tv"} else "movie"
-        out: list[dict[str, Any]] = []
+        try:
+            page_i = max(1, int(page or 1))
+        except (TypeError, ValueError):
+            page_i = 1
+        try:
+            vote_floor = int(vote_count_gte) if vote_count_gte is not None else None
+        except (TypeError, ValueError):
+            vote_floor = None
+        date_lte = str(primary_release_date_lte or "").strip() or None
+        matched: list[dict[str, Any]] = []
         for row in MOCK_TMDB_DISCOVER:
+            if row.get("discover") is False:
+                continue
             if str(row.get("mediaType") or "movie") != kind:
                 continue
             genres = {int(g) for g in (row.get("genreIds") or [])}
@@ -900,10 +1081,37 @@ class MockPipeline:
                 continue
             if exclude and genres.intersection(exclude):
                 continue
-            out.append(dict(row))
-            if len(out) >= max(1, min(int(limit or 4), 8)):
-                break
-        return out
+            try:
+                tid = int(row.get("id") or row.get("tmdbId") or 0)
+            except (TypeError, ValueError):
+                tid = 0
+            if tid and tid in ban:
+                continue
+            if vote_floor is not None and vote_floor > 0:
+                try:
+                    votes = int(row.get("voteCount") or 0)
+                except (TypeError, ValueError):
+                    votes = 0
+                if votes < vote_floor:
+                    continue
+            if date_lte:
+                release = str(row.get("releaseDate") or row.get("firstAirDate") or "")[:10]
+                if not release and row.get("year") not in (None, ""):
+                    try:
+                        release = f"{int(row['year']):04d}-12-31"
+                    except (TypeError, ValueError):
+                        release = ""
+                if release and release > date_lte:
+                    continue
+            matched.append(dict(row))
+        cap = max(1, min(int(limit or 4), 20))
+        # Exclusion-based paging: when ids are banned, walk from the start so
+        # "others" still gets the next unused titles. Otherwise use TMDB pages.
+        if ban:
+            return matched[:cap]
+        page_size = 20
+        start = (page_i - 1) * page_size
+        return matched[start : start + page_size][:cap]
 
     def add_radarr(self, item: dict[str, Any]) -> dict[str, Any]:
         queued = {**item, "queued": True}

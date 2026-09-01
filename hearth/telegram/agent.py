@@ -29,7 +29,7 @@ from hearth.telegram.intent import (
 log = logging.getLogger("hearth.telegram")
 
 MAX_TOOL_TURNS = 6
-HISTORY_TURNS = 8
+HISTORY_TURNS = 24
 
 SessionMode = Literal["idle", "browse", "offer", "confirm", "queued", "explain"]
 
@@ -43,6 +43,36 @@ _ASKING_FOR_LIST = re.compile(
     r"\bwant(?:ed)? a (?:few|list|options)\b|"
     r"\ba few\b.+\b(?:movies?|films?|shows?|series|titles?|options|sci-?fi|fantas)\b|"
     r"\b(?:give|name|show|list)\s+(?:me\s+)?(?:a\s+)?few\b"
+    r")",
+    re.I,
+)
+
+_ASKING_FOR_OTHERS = re.compile(
+    r"(?:"
+    r"\b(?:give|show|list|find|get)\s+(?:me\s+)?(?:some\s+)?others?\b|"
+    r"\b(?:some|any)\s+(?:other|more)\b|"
+    r"\byou(?:'ve| have)\s+just\s+mentioned\b|"
+    r"\b(?:already|just)\s+(?:mentioned|showed|offered)\b|"
+    r"\bnone of (?:these|those|them)\b|"
+    r"\bnot (?:these|those)\b|"
+    r"\bsame (?:titles?|ones?|movies?)\b|"
+    r"\bdifferent (?:ones?|titles?|movies?|options)\b|"
+    r"\bmore (?:options|titles|movies|films)\b"
+    r")",
+    re.I,
+)
+
+_EXHAUSTED_OFFER_REPLY = re.compile(
+    r"(?:"
+    r"trouble finding|"
+    r"same titles? keep|"
+    r"keep(?:s|ing)? appearing|"
+    r"could(?:n't| not) find (?:new|other|more)|"
+    r"no (?:new|other|more) (?:options|titles|movies)|"
+    r"specify a different genre|"
+    r"different genre or type|"
+    r"nothing (?:else|new)|"
+    r"ran out of"
     r")",
     re.I,
 )
@@ -106,6 +136,11 @@ READ tools (auto-run):
   exclude_genre_ids. Fantasy = 14 (ALWAYS exclude 878 Sci-Fi). Sci-Fi = 878.
   Horror = 27. "cool fantasy" MUST call discover_by_genre([14], exclude=[878]).
   Never invent Matrix/Arrival/Interstellar as a fantasy set.
+  Discover is released-only (primary_release_date ≤ today) with a vote-count
+  floor — never offer unreleased 2026 popularity vapor. Already-shown /
+  rejected tmdb ids are excluded automatically; "others" / "none of these"
+  must call discover_by_genre again (next pack), never re-attach the same
+  Get buttons. If discover is exhausted the tool falls back to web_search.
 - library_status / download_progress: status checks.
 
 WRITE (HITL — Python only executes after Get button or explicit yes for that id):
@@ -116,6 +151,11 @@ Conversation rules:
 - Rejects (no/nah/nope/nee): never queue. Discover alternatives or ask what they want.
 - Confirms (yes/yep/ja) of a single pending offer → queue_request with THAT pending tmdb_id.
 - Genre / vibe list asks → discover_by_genre (not a single Did-you-mean).
+- "None of these" / "give me some others" / "you've just mentioned these" →
+  call discover_by_genre again for a NEW pack (exclusions applied). Never
+  re-list the same three titles or re-attach the same Get buttons.
+- If you cannot refresh the list, say so WITHOUT Get buttons — never attach
+  Get 1/2/3 for titles you just said you could not replace.
 - Exact Title (YYYY) / IMDb-TMDB URL: search_title then offer Get — do not assume queued.
 - Ignore pure group chatter/emoji (empty reply).
 - Prefer short Telegram replies. Numbered lists as "1. Title (year)\\n2. …".
@@ -136,6 +176,22 @@ def looks_like_explain(text: str) -> bool:
     if not raw or len(raw) > 160:
         return False
     return bool(_EXPLAIN_WHY.search(raw))
+
+
+def looks_like_asking_for_others(text: str) -> bool:
+    """True when the user wants a fresh pack, not the same Get buttons."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > 240:
+        return False
+    return bool(_ASKING_FOR_OTHERS.search(raw))
+
+
+def looks_like_exhausted_offer_reply(text: str) -> bool:
+    """True when the assistant admits it could not refresh the offer list."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return bool(_EXHAUSTED_OFFER_REPLY.search(raw))
 
 
 def should_refuse_queue(user_text: str) -> bool:
@@ -195,8 +251,9 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
             "name": "discover_by_genre",
             "description": (
                 "TMDB discover by genre ids. Fantasy=14 (exclude 878), Sci-Fi=878, "
-                "Horror=27. Use for 'cool fantasy', genre corrections, vibe lists. "
-                "Never queues."
+                "Horror=27. Use for 'cool fantasy', genre corrections, vibe lists, "
+                "and 'others' / none-of-these follow-ups (excludes already-shown ids). "
+                "Released-only with vote floor. Never queues."
             ),
             "parameters": {
                 "type": "object",
@@ -218,6 +275,10 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
                     "limit": {
                         "type": "integer",
                         "description": "How many options (2–4, default 4)",
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Discover page (1+). Use next page for 'others'.",
                     },
                     "query": {
                         "type": "string",
@@ -374,6 +435,7 @@ def _context_block(
     rejected_titles: list[str],
     offered: list[dict[str, Any]],
     mode: str = "idle",
+    shown_tmdb_ids: list[int] | None = None,
 ) -> str:
     payload = {
         "mode": mode,
@@ -382,11 +444,14 @@ def _context_block(
         "subject_media_kind": subject_media_kind or "",
         "rejected_titles": [redact(t)[:80] for t in (rejected_titles or [])[:12]],
         "offered": offered[:8],
+        "shown_tmdb_ids": list(shown_tmdb_ids or [])[:32],
     }
     return (
         "Session context (JSON). mode is the explicit session state. "
         "pending/offered are live on-screen titles with tmdb ids; "
-        "never re-offer rejected_titles. queue_request only for a confirmed pending id.\n"
+        "never re-offer rejected_titles or shown_tmdb_ids. "
+        "For 'others' call discover_by_genre again. "
+        "queue_request only for a confirmed pending id.\n"
         + json.dumps(payload, ensure_ascii=False, default=str)
     )
 
@@ -401,6 +466,7 @@ async def run_telegram_agent(
     subject_media_kind: str = "",
     rejected_titles: list[str] | None = None,
     offered: list[dict[str, Any]] | None = None,
+    shown_tmdb_ids: list[int] | None = None,
     mode: SessionMode | str = "idle",
     model: str | None = None,
     queue_approved: bool = False,
@@ -448,6 +514,7 @@ async def run_telegram_agent(
                 subject_media_kind=subject_media_kind,
                 rejected_titles=list(rejected_titles or []),
                 offered=list(offered or []),
+                shown_tmdb_ids=list(shown_tmdb_ids or []),
                 mode=session_mode,
             ),
         },
@@ -550,6 +617,8 @@ async def run_telegram_agent(
 
         reply = (msg.content or "").strip()
         result.reply = reply
+        if looks_like_exhausted_offer_reply(reply):
+            result.reply_markup = None
         return result
 
     if not result.reply and result.grabbed:
@@ -557,6 +626,8 @@ async def run_telegram_agent(
         if result.year:
             label = f"{label} ({result.year})"
         result.reply = f"Queued {label} via Overseerr."
+    if result.reply and looks_like_exhausted_offer_reply(result.reply):
+        result.reply_markup = None
     return result
 
 
@@ -642,11 +713,18 @@ def _absorb_tool_side_effects(
                 "discover_by_genre",
             }:
                 result.reply = str(payload["reply"])
-        if payload.get("reply_markup") and isinstance(payload["reply_markup"], dict):
+        if name in {"discover_by_genre", "suggest_titles"}:
+            if payload.get("ok") and payload.get("reply_markup") and isinstance(
+                payload["reply_markup"], dict
+            ):
+                result.reply_markup = payload["reply_markup"]
+                result.mode = "offer"
+            elif not payload.get("ok"):
+                # Failed refresh must not keep prior Get buttons.
+                result.reply_markup = None
+        elif payload.get("reply_markup") and isinstance(payload["reply_markup"], dict):
             result.reply_markup = payload["reply_markup"]
-        if name in {"discover_by_genre", "suggest_titles"} and payload.get("ok"):
-            result.mode = "offer"
-        elif name in {"search_title", "search_catalog"} and payload.get("count") == 1:
+        if name in {"search_title", "search_catalog"} and payload.get("count") == 1:
             result.mode = "confirm"
         elif name in {"search_title", "search_catalog"} and (payload.get("count") or 0) > 1:
             result.mode = "offer"
