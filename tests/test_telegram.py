@@ -870,11 +870,43 @@ def _patch_openai_intent(monkeypatch, payload: dict | list[dict]):
                 if str(t).strip()
             ]
             primary = str(body.get("search_title") or "").strip()
+            people = [
+                str(p).strip()
+                for p in (body.get("people") or [])
+                if str(p).strip()
+            ]
             listish = (
                 looks_like_list_ask(user)
                 or len(titles) >= 2
                 or bool(_re.search(r"\ba few\b", user, _re.I))
             )
+            from hearth.telegram.agent import (
+                extract_person_name as _person_name,
+                looks_like_person_ask as _person_ask,
+            )
+
+            # Only clear filmography asks — actor clues on a titled search stay
+            # on search_title / suggest_titles.
+            if _person_ask(user):
+                person_name = (people[0] if people else "") or _person_name(user)
+                args = {
+                    "name": person_name or primary or user,
+                    "limit": 4,
+                }
+                if body.get("media_kind"):
+                    args["media_type"] = body["media_kind"]
+                elif _re.search(r"(?i)\b(?:movies?|films?)\b", user):
+                    args["media_type"] = "movie"
+                return [
+                    {
+                        "id": _next_id(),
+                        "type": "function",
+                        "function": {
+                            "name": "search_person",
+                            "arguments": _json.dumps(args),
+                        },
+                    }
+                ]
             if listish and not body.get("select_all"):
                 from hearth.telegram.buttons import genre_hint_from_text
 
@@ -6883,3 +6915,213 @@ async def test_inbox_1002_discover_still_skips_unreleased_vapor(
     assert "odyssey" not in joined
     assert "moana" not in joined
     assert "miss you" not in joined
+
+
+# --- actor / person filmography (TMDB person credits, not Overseerr title) ---
+
+
+def test_looks_like_person_ask_and_extract_name():
+    from hearth.telegram.agent import extract_person_name, looks_like_person_ask
+
+    assert looks_like_person_ask("Give me a few movies with leonardo dicaprot")
+    assert looks_like_person_ask("films met Leonardo DiCaprio")
+    assert looks_like_person_ask("Geef me een paar films met Leonardo DiCaprio")
+    assert not looks_like_person_ask("Land (2021)")
+    # Plot / descriptive asks are title guesses — not person filmography.
+    assert not looks_like_person_ask(
+        "a movie about a boy with glasses who is a wizard"
+    )
+    assert not looks_like_person_ask(
+        "Ik zoek die film met die bebrilde tovenaar."
+    )
+    assert not looks_like_person_ask(
+        "Nee, niet die. Ik denk dat het van die kunstenaar leonardo dicaprio was"
+    )
+    assert extract_person_name("Give me a few movies with leonardo dicaprot") == (
+        "leonardo dicaprot"
+    )
+    assert extract_person_name("films met Leonardo DiCaprio") == "Leonardo DiCaprio"
+
+
+@pytest.mark.asyncio
+async def test_inbox_movies_with_dicaprot_typo_yeah_lists_credits(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: leonardo dicaprot → Yeah must list DiCaprio films with Get.
+
+    Never 'couldn't find in the catalog' / 'Overseerr catalog'. Overseerr title
+    search is the wrong catalog — TMDB person credits is required.
+    """
+    from hearth.fixtures import pipeline
+    from hearth.telegram import inbox as inbox_mod
+
+    person_calls: list[str] = []
+    credit_calls: list[int] = []
+    original_person = inbox_mod.overseerr.search_person
+    original_credits = inbox_mod.overseerr.person_combined_credits
+
+    async def _cap_person(query: str, *args, **kwargs):
+        person_calls.append(str(query))
+        return await original_person(query)
+
+    async def _cap_credits(person_id: int, *args, **kwargs):
+        credit_calls.append(int(person_id))
+        return await original_credits(person_id)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search_person", _cap_person)
+    monkeypatch.setattr(inbox_mod.overseerr, "person_combined_credits", _cap_credits)
+
+    # Model wrongly tries Overseerr title search for the person string.
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "search_title",
+                            "arguments": {
+                                "title": "Leonardo DiCaprio",
+                                "media_type": "movie",
+                            },
+                        }
+                    }
+                ]
+            },
+            {
+                "content": (
+                    "I couldn't find specific movies with Leonardo DiCaprio "
+                    "in the catalog."
+                )
+            },
+        ],
+    )
+    pipeline.overseerr_queue.clear()
+    first = await inbox.handle_message(
+        _msg("Give me a few movies with leonardo dicaprot", message_id=11001)
+    )
+    assert first.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0
+    body = (first.reply or "").lower()
+    assert "overseerr catalog" not in body
+    assert "couldn't find" not in body or "did you mean" in body
+    # Typo path: confirm the corrected person name (no Get yet).
+    assert "leonardo dicaprio" in body
+    assert "did you mean" in body
+    assert first.reply_markup is None
+    assert inbox.pending_person.get(-1001) is not None
+    assert person_calls, "must call TMDB/Overseerr person search"
+
+    # Yeah continues actor credits — not a dead catalog miss.
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "content": (
+                    "I couldn't find specific movies with Leonardo DiCaprio "
+                    "in the catalog. I'm using the Overseerr catalog."
+                )
+            }
+        ],
+    )
+    yeah = await inbox.handle_message(_msg("Yeah", message_id=11002))
+    assert yeah.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0
+    ybody = (yeah.reply or "").lower()
+    assert "overseerr catalog" not in ybody
+    assert "i'm using the overseerr" not in ybody
+    assert "couldn't find" not in ybody
+    assert credit_calls and 6193 in credit_calls
+    pending = inbox.pending.get(-1001)
+    assert pending is not None and len(pending.options) >= 2
+    titles = {str(o.get("title") or "").lower() for o in pending.options}
+    assert "titanic" in titles or "inception" in titles or "the revenant" in titles
+    # Unreleased filler must not appear.
+    assert "untitled dicaprio project" not in titles
+    assert yeah.reply_markup is not None
+    assert "get" in str(yeah.reply_markup).lower() or any(
+        "Get" in (btn.get("text") or "")
+        for row in (yeah.reply_markup or {}).get("inline_keyboard") or []
+        for btn in row
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbox_films_met_person_offers_get_no_overseerr_catalog_claim(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Dutch 'films met …' uses person credits; never claims Overseerr catalog."""
+    from hearth.fixtures import pipeline
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "search_person",
+                            "arguments": {
+                                "name": "Leonardo DiCaprio",
+                                "media_type": "movie",
+                                "confirmed": True,
+                                "limit": 3,
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(
+        _msg("Geef me een paar films met Leonardo DiCaprio", message_id=11010)
+    )
+    assert result.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0
+    assert "overseerr catalog" not in (result.reply or "").lower()
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert any(int(o.get("tmdbId") or 0) in {597, 27205, 11324, 68718, 106646, 281957} for o in pending.options)
+    assert result.reply_markup is not None
+
+
+@pytest.mark.asyncio
+async def test_inbox_person_typo_confirm_from_history_on_yeah(
+    inbox: TelegramInbox, monkeypatch
+):
+    """When the model typo-confirmed in prose (no tool state), Yeah still credits."""
+    from hearth.fixtures import pipeline
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    # Seed: prior person ask + bot typo confirm without pending_person.
+    inbox.memory.record_user(
+        -1001, "Give me a few movies with leonardo dicaprot"
+    )
+    inbox.memory.record_bot(-1001, "Did you mean Leonardo DiCaprio?")
+    assert inbox.pending_person.get(-1001) is None
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "content": (
+                    "I couldn't find specific movies with Leonardo DiCaprio "
+                    "in the catalog. I'm using the Overseerr catalog…"
+                )
+            }
+        ],
+    )
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(_msg("Yeah", message_id=11020))
+    assert result.grabbed is False
+    assert "overseerr" not in (result.reply or "").lower() or "queued" in (
+        result.reply or ""
+    ).lower()
+    assert "couldn't find" not in (result.reply or "").lower()
+    assert "overseerr catalog" not in (result.reply or "").lower()
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert len(pending.options) >= 2
+    assert isinstance(pending, PendingDisambiguation)
+    assert result.reply_markup is not None
