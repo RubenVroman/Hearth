@@ -239,12 +239,15 @@ def _downloads_widget(result: dict[str, Any]) -> Widget:
             body = "Retrying another source"
         elif data.get("ok") and reason == "switched":
             body = "Grabbing alternate release"
-        elif reason in {"needs_pick", "needs_pick_large"}:
-            body = (
-                "No file / retrying smaller release"
-                if reason == "needs_pick"
-                else "Too large — pick smaller release"
-            )
+        elif data.get("ok") and reason == "kept_both":
+            body = "Extra download — keeping library file"
+        elif reason in {"needs_pick", "needs_pick_large", "needs_pick_keep"}:
+            if reason == "needs_pick_keep":
+                body = "Already has file — pick extra release"
+            elif reason == "needs_pick":
+                body = "No file / retrying smaller release"
+            else:
+                body = "Too large — pick smaller release"
         elif reason == "exhausted":
             body = "No more sources"
         elif reason == "no_alternate":

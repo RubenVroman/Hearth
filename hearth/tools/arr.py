@@ -567,9 +567,14 @@ def speak_retry(
     """User-facing copy for Telegram + house tools (no fake percents)."""
     label = (title or "That download").strip() or "That download"
     mock_bit = " (mock)" if mock else ""
-    if ok and reason in {"retried", "grabbed", "switched"}:
+    if ok and reason in {"retried", "grabbed", "switched", "kept_both"}:
         source = f" via {indexer}" if indexer else ""
         cap = f" (attempt {attempt}/{max_attempts})" if attempt and max_attempts else ""
+        if reason == "kept_both":
+            return (
+                f"Downloading an extra release of {label}{source}{mock_bit} — "
+                f"keeping your current library file."
+            )
         if reason == "switched":
             return f"Grabbing a different release of {label}{source}{mock_bit}."
         return (
@@ -584,6 +589,11 @@ def speak_retry(
         return (
             f"{label} has a huge / hard-to-play file — "
             f"pick a smaller release to replace it{mock_bit}."
+        )
+    if reason == "needs_pick_keep":
+        return (
+            f"{label} is already in the library — "
+            f"pick another release to download without deleting the current file{mock_bit}."
         )
     if reason == "exhausted":
         return (
@@ -752,7 +762,12 @@ def format_release_offer(
     if reason == "needs_pick_large":
         header = (
             f"{label} is too big / won't play well. "
-            f"Pick a smaller release:"
+            f"Pick a smaller release (this replaces the current file):"
+        )
+    elif reason == "needs_pick_keep":
+        header = (
+            f"{label} is already in the library. "
+            f"Pick another release to download — the current file stays:"
         )
     else:
         header = (
@@ -768,6 +783,41 @@ def format_release_offer(
         lines.append(f"{idx}. {bit}")
     lines.append("Tap Get for the one you want — I won't grab until you confirm.")
     return "\n".join(lines)
+
+
+def want_keep_existing(text: str) -> bool:
+    """True when the user asks for an extra download without replacing the library file."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    # Explicit keep always wins over too-big / replace wording.
+    if re.search(
+        r"\b(?:don'?t|do\s+not)\s+delete\b"
+        r"|\bkeep\s+(?:the\s+)?(?:old|current|existing|both)\b"
+        r"|\bwithout\s+(?:deleting|replacing)\b",
+        raw,
+        re.I,
+    ):
+        return True
+    # Too-big / won't-play / replace → switch/delete path (not keep-both),
+    # unless they also said keep (handled above).
+    if re.search(
+        r"\btoo\s+big\b|\bwon'?t\s+play\b|\bdoesn'?t\s+play\b|\breplace\b|"
+        r"\bte\s+groot\b|\bspeelt\s+niet\b",
+        raw,
+        re.I,
+    ):
+        return False
+    if re.search(
+        r"\balready\s+(?:there|in\s+(?:the\s+)?library)\b"
+        r"|\b(?:find|get|grab|download)\s+another\s+(?:download|copy|one|release|version)\b"
+        r"|\banother\s+copy\b"
+        r"|\bextra\s+(?:download|copy|release)\b",
+        raw,
+        re.I,
+    ):
+        return True
+    return False
 
 
 def title_matches_download(item: dict[str, Any], title: str) -> bool:
@@ -1101,6 +1151,76 @@ class StarrClient:
         )
         response.raise_for_status()
 
+    async def _detach_queue_keep_client(self, queue_id: int) -> None:
+        """Stop Radarr from importing/replacing; leave the torrent in the download client.
+
+        Radarr only tracks one movie file. Grabbing via POST /release would normally
+        import and replace the library file. Removing the queue row with
+        removeFromClient=false keeps the download as an extra copy on disk without
+        deleting the existing library entry.
+        """
+        if not self.live:
+            pipeline.detach_queue_item(self.kind, queue_id)
+            return
+        client = await self._http()
+        response = await client.delete(
+            f"/api/v3/queue/{int(queue_id)}",
+            params={
+                "removeFromClient": "false",
+                "blocklist": "false",
+                "skipRedownload": "true",
+            },
+        )
+        response.raise_for_status()
+
+    async def _queue_id_for_release(
+        self,
+        *,
+        guid: str = "",
+        movie_id: Any = None,
+        indexer: str = "",
+        release_title: str = "",
+    ) -> int | None:
+        """Best-effort match of a just-grabbed release in the *arr queue."""
+        raw = await self.queue_raw("")
+        records = list(raw.get("records") or [])
+        guid_norm = (guid or "").strip().lower()
+        indexer_norm = (indexer or "").strip().lower()
+        title_norm = (release_title or "").strip().lower()
+        try:
+            movie_id_i = int(movie_id) if movie_id is not None else None
+        except (TypeError, ValueError):
+            movie_id_i = None
+
+        def _score(row: dict[str, Any]) -> int:
+            score = 0
+            download_id = str(row.get("downloadId") or "").strip().lower()
+            if guid_norm and download_id and (
+                download_id == guid_norm or guid_norm in download_id or download_id in guid_norm
+            ):
+                score += 100
+            ids = _queue_media_ids(row, service=self.kind)
+            if movie_id_i is not None and ids.get("movieId") == movie_id_i:
+                score += 40
+            if indexer_norm and str(row.get("indexer") or "").strip().lower() == indexer_norm:
+                score += 20
+            row_title = str(row.get("title") or "").strip().lower()
+            if title_norm and title_norm in row_title:
+                score += 15
+            return score
+
+        ranked = sorted(
+            (( _score(row), row) for row in records if isinstance(row, dict)),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        if not ranked or ranked[0][0] <= 0:
+            return None
+        try:
+            return int(ranked[0][1].get("id"))
+        except (TypeError, ValueError):
+            return None
+
     async def _search_releases(self, item: dict[str, Any]) -> list[dict[str, Any]]:
         ids = _queue_media_ids(item, service=self.kind)
         if not self.live:
@@ -1240,6 +1360,7 @@ class StarrClient:
         *,
         force: bool = False,
         reason: str = "",
+        keep_existing: bool | None = None,
     ) -> dict[str, Any]:
         """Blocklist the bad release and grab an alternate for the SAME title.
 
@@ -1275,11 +1396,13 @@ class StarrClient:
                         title=display, ok=False, reason="healthy", mock=mock
                     ),
                 }
-            # Not in the active queue — offer library switch when the title is
-            # monitored but missing a usable file (or the file is huge).
+            # Not in the active queue — offer library alternate releases when the
+            # title is monitored (missing file, too big, or keep-both extra copy).
             if title and self.kind == "radarr":
                 switch = await self.list_alternate_releases(
-                    title, prefer_smaller=True
+                    title,
+                    prefer_smaller=True,
+                    keep_existing=keep_existing,
                 )
                 if switch.get("ok") and switch.get("releases"):
                     return switch
@@ -1626,6 +1749,7 @@ class StarrClient:
         *,
         prefer_smaller: bool = True,
         limit: int = 4,
+        keep_existing: bool | None = None,
     ) -> dict[str, Any]:
         """List grab-able alternate releases for a library movie (no auto-grab)."""
         query = (query or "").strip()
@@ -1663,10 +1787,10 @@ class StarrClient:
         display = str(movie_sum.get("title") or query)
         has_file = bool(movie_raw.get("hasFile"))
         too_large = has_file and self._library_file_too_large(movie_raw)
-        if has_file and not too_large:
-            # Usable file already present and not flagged huge — still allow
-            # explicit switch lists when the user asked (caller decides).
-            pass
+        # Default: keep-both when a usable (non-huge) file is already present;
+        # too-big without an explicit keep → switch/replace path.
+        if keep_existing is None:
+            keep_existing = bool(has_file) and not too_large
 
         search_item = {
             "movieId": movie_raw.get("id") or movie_sum.get("libraryId"),
@@ -1694,17 +1818,17 @@ class StarrClient:
         # When replacing a huge file, skip releases that are also huge remuxes
         # of similar size so the menu is actually smaller / more playable.
         blocked = ""
-        if too_large:
+        if too_large and not keep_existing:
             mf = movie_raw.get("movieFile") if isinstance(movie_raw.get("movieFile"), dict) else {}
             blocked = str(mf.get("relativePath") or "")
 
         ranked = self._rank_releases(
             raw_releases,
             blocked=blocked,
-            prefer_smaller=prefer_smaller or too_large or not has_file,
+            prefer_smaller=prefer_smaller or too_large or not has_file or keep_existing,
             limit=limit,
         )
-        if too_large or prefer_smaller:
+        if too_large or prefer_smaller or keep_existing:
             # Drop remaining giant remuxes from the offer when size is the ask.
             filtered: list[dict[str, Any]] = []
             for row in ranked:
@@ -1729,6 +1853,7 @@ class StarrClient:
                 "title": display,
                 "hasFile": has_file,
                 "tooLarge": too_large,
+                "keepExisting": bool(keep_existing),
                 "movie": movie_sum,
                 "releases": [],
                 "speak": speak_retry(
@@ -1736,8 +1861,11 @@ class StarrClient:
                 ),
             }
 
-        reason = "needs_pick_large" if too_large else "needs_pick"
-        if has_file and not too_large:
+        if too_large and not keep_existing:
+            reason = "needs_pick_large"
+        elif has_file and keep_existing:
+            reason = "needs_pick_keep"
+        else:
             reason = "needs_pick"
         speak = format_release_offer(display, summarized, reason=reason)
         return {
@@ -1750,6 +1878,7 @@ class StarrClient:
             "title": display,
             "hasFile": has_file,
             "tooLarge": too_large,
+            "keepExisting": bool(keep_existing),
             "movie": movie_sum,
             "releases": summarized,
             "preferred": summarized[0],
@@ -1765,21 +1894,32 @@ class StarrClient:
         confirm: bool = False,
         prefer_smaller: bool = True,
         reason: str = "",
+        keep_existing: bool | None = None,
     ) -> dict[str, Any]:
         """Grab one alternate release for a library movie (confirm-gated).
 
         Never auto-grabs from a vague yes — caller must pass confirm=True and a
         concrete guid/token (or confirm the single preferred pick explicitly).
+
+        keep_existing=True downloads an extra copy without deleting/replacing the
+        current library file (Radarr queue detach, download client keeps the torrent).
+        keep_existing=False is the switch path (may delete oversized files so the
+        replacement can import).
         """
         query = (query or "").strip()
         guid = (guid or "").strip()
         token = (release_token_value or "").strip()
         mock = not self.live
         listed = await self.list_alternate_releases(
-            query, prefer_smaller=prefer_smaller
+            query,
+            prefer_smaller=prefer_smaller,
+            keep_existing=keep_existing,
         )
         if not listed.get("ok"):
             return listed
+
+        if keep_existing is None:
+            keep_existing = bool(listed.get("keepExisting"))
 
         display = str(listed.get("title") or query)
         releases = list(listed.get("releases") or [])
@@ -1806,6 +1946,7 @@ class StarrClient:
                 "ok": True,
                 "needs_pick": True,
                 "reason": listed.get("reason") or "needs_pick",
+                "keepExisting": bool(keep_existing),
                 "speak": listed.get("speak")
                 or format_release_offer(
                     display, releases, reason=str(listed.get("reason") or "needs_pick")
@@ -1825,6 +1966,7 @@ class StarrClient:
                 "release": pick_sum,
                 "releases": releases,
                 "movie": listed.get("movie"),
+                "keepExisting": bool(keep_existing),
                 "speak": speak_retry(
                     title=display,
                     ok=False,
@@ -1848,29 +1990,79 @@ class StarrClient:
         if isinstance(found.get("raw"), dict):
             movie_raw = found["raw"]
 
+        has_file = bool(movie_raw and movie_raw.get("hasFile"))
+        # Never pretend keep-both if we are about to delete the library file.
+        will_delete = (
+            (not keep_existing)
+            and has_file
+            and bool(movie_raw and self._library_file_too_large(movie_raw))
+        )
+        if keep_existing and will_delete:
+            return {
+                "ok": False,
+                "mode": listed.get("mode") or ("mock" if mock else "live"),
+                "service": self.kind,
+                "query": query or None,
+                "reason": "would_replace",
+                "title": display,
+                "keepExisting": True,
+                "hasFile": has_file,
+                "speak": (
+                    f"I won't grab that for {display} — it would replace the "
+                    f"current library file, and you asked to keep it."
+                ),
+            }
+
         try:
-            # Replace oversized / unplayable file so the new grab can import.
-            if (
-                movie_raw
-                and movie_raw.get("hasFile")
-                and self._library_file_too_large(movie_raw)
-            ):
-                mf = movie_raw.get("movieFile")
+            # Switch path: replace oversized / unplayable file so the new grab
+            # can import. Keep-both never deletes.
+            if will_delete:
+                mf = movie_raw.get("movieFile") if movie_raw else None
                 if isinstance(mf, dict) and mf.get("id") is not None:
                     await self._delete_movie_file(int(mf["id"]))
 
             await self._grab_release(raw_body)
+
+            # Keep-both: detach from Radarr import so the existing file stays.
+            if keep_existing and has_file:
+                queue_id = await self._queue_id_for_release(
+                    guid=str(pick_sum.get("guid") or ""),
+                    movie_id=pick_sum.get("movieId")
+                    or (movie_raw or {}).get("id"),
+                    indexer=str(pick_sum.get("indexer") or ""),
+                    release_title=str(pick_sum.get("title") or ""),
+                )
+                if queue_id is not None:
+                    await self._detach_queue_keep_client(queue_id)
+                elif not mock:
+                    # Could not detach — refuse rather than risk a replace on import.
+                    return {
+                        "ok": False,
+                        "mode": "live",
+                        "service": self.kind,
+                        "query": query or None,
+                        "reason": "would_replace",
+                        "title": display,
+                        "keepExisting": True,
+                        "speak": (
+                            f"Started a grab for {display} but couldn't detach it "
+                            f"from Radarr import — not safe to keep your current file. "
+                            f"Check the Radarr queue."
+                        ),
+                    }
         except Exception as exc:  # noqa: BLE001
             if settings.mock_if_unconfigured and self.live:
                 try:
-                    if (
-                        movie_raw
-                        and movie_raw.get("hasFile")
-                        and isinstance(movie_raw.get("movieFile"), dict)
-                        and movie_raw["movieFile"].get("id") is not None
-                    ):
-                        pipeline.delete_movie_file(int(movie_raw["movieFile"]["id"]))
-                    pipeline.grab_release(self.kind, raw_body)
+                    if will_delete and movie_raw:
+                        mf = movie_raw.get("movieFile")
+                        if isinstance(mf, dict) and mf.get("id") is not None:
+                            pipeline.delete_movie_file(int(mf["id"]))
+                    grabbed = pipeline.grab_release(self.kind, raw_body)
+                    if keep_existing and has_file:
+                        queued = grabbed.get("queued") if isinstance(grabbed, dict) else None
+                        qid = queued.get("id") if isinstance(queued, dict) else None
+                        if qid is not None:
+                            pipeline.detach_queue_item(self.kind, int(qid))
                 except Exception as mock_exc:  # noqa: BLE001
                     return {
                         "ok": False,
@@ -1899,22 +2091,50 @@ class StarrClient:
                 }
 
         indexer = str(pick_sum.get("indexer") or "")
+        outcome = "kept_both" if (keep_existing and has_file) else "switched"
         refreshed = await self.queue(display)
+        # Confirm library file still present after keep-both.
+        still_has_file = has_file
+        if keep_existing and has_file:
+            check = await self.library_lookup(query or display)
+            raw_check = check.get("raw") if isinstance(check.get("raw"), dict) else {}
+            still_has_file = bool(raw_check.get("hasFile"))
+            if not still_has_file:
+                return {
+                    "ok": False,
+                    "mode": listed.get("mode") or ("mock" if mock else "live"),
+                    "service": self.kind,
+                    "query": query or None,
+                    "reason": "would_replace",
+                    "title": display,
+                    "keepExisting": True,
+                    "speak": (
+                        f"Something cleared the library file for {display} — "
+                        f"I won't claim keep-both succeeded."
+                    ),
+                }
         return {
             "ok": True,
             "mode": listed.get("mode") or ("mock" if mock else "live"),
             "service": self.kind,
             "query": query or None,
-            "reason": "switched",
+            "reason": outcome,
             "title": display,
             "indexer": indexer or None,
             "release": pick_sum,
             "trigger": reason or "user",
+            "keepExisting": bool(keep_existing),
+            "hasFile": still_has_file,
             "downloads": refreshed.get("downloads") or [],
+            "clientDownloads": (
+                pipeline.list_client_downloads(self.kind, display)
+                if outcome == "kept_both" and mock
+                else []
+            ),
             "speak": speak_retry(
                 title=display,
                 ok=True,
-                reason="switched",
+                reason=outcome,
                 indexer=indexer,
                 mock=mock,
             ),

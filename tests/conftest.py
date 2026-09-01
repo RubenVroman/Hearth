@@ -95,6 +95,8 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     pipeline.sonarr_blocklist.clear()
     pipeline.radarr_library = None
     pipeline._deleted_movie_files.clear()
+    pipeline.radarr_client_downloads.clear()
+    pipeline.sonarr_client_downloads.clear()
     pipeline._download_seq = 1000
     radarr.reset_retry_counts()
     sonarr.reset_retry_counts()

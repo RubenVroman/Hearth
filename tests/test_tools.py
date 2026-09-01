@@ -798,6 +798,103 @@ async def test_radarr_grab_release_tool_is_confirm_gated():
     assert pipeline.radarr_downloads
 
 
+async def test_radarr_keep_both_lists_and_confirm_grabs_without_deleting():
+    """Library title with an existing file → list alts; confirm keeps the file."""
+    from hearth.agent.registry import registry
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import radarr, want_keep_existing
+
+    radarr.reset_retry_counts()
+    pipeline.radarr_downloads = []
+    pipeline.radarr_client_downloads.clear()
+
+    assert want_keep_existing(
+        "Can you download Event Horizon? It's already there, but find another download. "
+        "Don't delete the old one."
+    )
+    assert not want_keep_existing(
+        "The Endless is too big and won't play, get another version"
+    )
+
+    listed = await radarr.list_alternate_releases(
+        "Event Horizon", prefer_smaller=True, keep_existing=True
+    )
+    assert listed["ok"] is True
+    assert listed["needs_pick"] is True
+    assert listed["reason"] == "needs_pick_keep"
+    assert listed["hasFile"] is True
+    assert listed["keepExisting"] is True
+    releases = listed["releases"]
+    assert 1 <= len(releases) <= 4
+    titles = " ".join(str(r.get("title") or "") for r in releases).lower()
+    assert "1080" in titles or "720" in titles
+    assert pipeline.radarr_downloads == []
+    assert pipeline.radarr_client_downloads == []
+
+    preferred = listed["preferred"]
+    denied = await radarr.grab_alternate_release(
+        "Event Horizon",
+        guid=str(preferred.get("guid") or ""),
+        confirm=False,
+        keep_existing=True,
+    )
+    assert denied["ok"] is False
+    assert denied["reason"] == "confirm_required"
+    assert pipeline.radarr_downloads == []
+    lib_before = pipeline.list_radarr_library("Event Horizon")
+    assert lib_before and lib_before[0].get("hasFile") is True
+    assert lib_before[0].get("movieFile", {}).get("id") == 905
+
+    grabbed = await radarr.grab_alternate_release(
+        "Event Horizon",
+        guid=str(preferred.get("guid") or ""),
+        confirm=True,
+        keep_existing=True,
+        reason="user:house",
+    )
+    assert grabbed["ok"] is True
+    assert grabbed["reason"] == "kept_both"
+    assert grabbed["hasFile"] is True
+    # Detached from Radarr import — not replacing the library file.
+    assert pipeline.radarr_downloads == []
+    assert pipeline.radarr_client_downloads
+    assert any(
+        row.get("downloadId") == preferred.get("guid")
+        or row.get("indexer") == preferred.get("indexer")
+        for row in pipeline.radarr_client_downloads
+    )
+    lib_after = pipeline.list_radarr_library("Event Horizon")
+    assert lib_after and lib_after[0].get("hasFile") is True
+    assert lib_after[0].get("movieFile", {}).get("id") == 905
+    assert 905 not in pipeline._deleted_movie_files
+
+    # House tool also requires confirm and keep_existing.
+    pipeline.radarr_downloads = []
+    pipeline.radarr_client_downloads.clear()
+    token = preferred["releaseToken"]
+    preview = await registry.call(
+        "radarr_grab_release",
+        {
+            "query": "Event Horizon",
+            "releaseToken": token,
+            "keep_existing": True,
+        },
+    )
+    assert preview.needs_confirm is True
+    done = await registry.call(
+        "radarr_grab_release",
+        {
+            "query": "Event Horizon",
+            "releaseToken": token,
+            "keep_existing": True,
+            "confirm": True,
+        },
+    )
+    assert done.ok is True
+    assert done.data.get("reason") == "kept_both"
+    assert pipeline.list_radarr_library("Event Horizon")[0].get("hasFile") is True
+
+
 async def test_intent_retry_routes_to_radarr_retry():
     plan = route_intent("this download didn't work for Annihilation")
     assert plan is not None
@@ -818,10 +915,25 @@ async def test_intent_retry_routes_to_radarr_retry():
     assert big is not None
     assert big["tool"] == "radarr_retry"
     assert "endless" in big["args"]["query"].lower()
+    assert big["args"].get("keep_existing") is not True
 
     nofile = route_intent("The Brutalist has no file, download another one")
     assert nofile is not None
     assert nofile["tool"] == "radarr_retry"
+
+    keep = route_intent(
+        "Can you download Event Horizon? It's already there, but find another "
+        "download. Don't delete the old one."
+    )
+    assert keep is not None
+    assert keep["tool"] == "radarr_retry"
+    assert "event horizon" in keep["args"]["query"].lower()
+    assert keep["args"].get("keep_existing") is True
+
+    copy = route_intent("download another copy of Event Horizon")
+    assert copy is not None
+    assert copy["tool"] == "radarr_retry"
+    assert copy["args"].get("keep_existing") is True
 
 
 async def test_house_media_inventory_speaks_tv_avr_plex():

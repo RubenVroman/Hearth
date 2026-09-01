@@ -383,6 +383,7 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         if data.get("needs_pick") or data.get("reason") in {
             "needs_pick",
             "needs_pick_large",
+            "needs_pick_keep",
         }:
             return str(spoken or f"{title} needs a release pick.")
         if data.get("ok"):
@@ -399,6 +400,11 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
             return str(spoken)
         title = data.get("title") or "that title"
         if data.get("ok"):
+            if data.get("reason") == "kept_both":
+                return (
+                    f"Downloading an extra release of {title} — "
+                    f"keeping the current file{mock}."
+                )
             return f"Grabbing a different release of {title}{mock}."
         return f"Couldn't grab that release of {title}{mock}."
     if name == "sonarr_search":
@@ -740,8 +746,15 @@ _DOWNLOAD_RETRY = re.compile(
     r"try\s+(?:it\s+)?(?:again|another\s+source)|"
     r"another\s+source|"
     r"(?:get|grab|download)\s+a\s+new\s+one|"
-    r"(?:get|grab|download)\s+another\s+(?:one|version|release|copy)|"
+    r"(?:get|grab|download)\s+another\s+(?:one|version|release|copy|download)|"
     r"(?:smaller|other)\s+(?:version|release|one|copy)|"
+    r"find\s+another(?:\s+download)?"
+    r"|already\s+(?:there|in\s+(?:the\s+)?library)"
+    r"|don'?t\s+delete"
+    r"|do\s+not\s+delete"
+    r"|keep\s+(?:the\s+)?(?:old|current|existing|both)"
+    r"|another\s+copy"
+    r"|extra\s+(?:download|copy|release)|"
     r"too\s+big|"
     r"won'?t\s+play|"
     r"doesn'?t\s+play|"
@@ -1186,9 +1199,10 @@ def _download_retry_plan(raw: str) -> dict[str, Any] | None:
         re.I,
     ) and not re.search(
         r"\b("
-        r"another\s+source|new\s+one|another\s+(?:version|release)|"
+        r"another\s+source|new\s+one|another\s+(?:version|release|copy|download)|"
         r"didn'?t\s+work|failed|stalled|retry|stuck|"
-        r"too\s+big|won'?t\s+play|smaller"
+        r"too\s+big|won'?t\s+play|smaller|"
+        r"already\s+(?:there|in)|don'?t\s+delete|find\s+another|keep\s+(?:the\s+)?old"
         r")\b",
         raw,
         re.I,
@@ -1229,6 +1243,15 @@ def _download_retry_plan(raw: str) -> dict[str, Any] | None:
             r"^(.+?)\s+(?:is\s+)?missing\s+(?:the\s+)?file\b",
             raw,
             re.I,
+        ) or re.search(
+            r"(?:download|grab|get)\s+(.+?)\s*[?.!]?\s*"
+            r"(?:it'?s\s+)?already\s+(?:there|in)",
+            raw,
+            re.I,
+        ) or re.search(
+            r"(?:download|grab|get)\s+(.+?)(?:\s*[?.!].*)?$",
+            raw,
+            re.I,
         )
         if named:
             title = _play_title_clean(named.group(1))
@@ -1250,13 +1273,20 @@ def _download_retry_plan(raw: str) -> dict[str, Any] | None:
         "anything",
         "download",
         "one",
+        "can you",
+        "could you",
     }:
         title = ""
     if not title:
         return None
 
     tool = "sonarr_retry" if _SERIES.search(raw) and not _MOVIE.search(raw) else "radarr_retry"
-    return {"tool": tool, "args": {"query": title}}
+    from hearth.tools.arr import want_keep_existing
+
+    args: dict[str, Any] = {"query": title}
+    if want_keep_existing(raw):
+        args["keep_existing"] = True
+    return {"tool": tool, "args": args}
 
 
 def _download_progress_plan(raw: str) -> dict[str, Any] | None:

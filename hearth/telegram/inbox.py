@@ -126,8 +126,10 @@ class PendingDisambiguation:
     last_bot_reply: str = ""
     mode: SessionMode = "offer"
     reply_markup: dict[str, Any] | None = None
-    # "title" = Overseerr Get offer; "release" = Radarr alternate-release switch.
+    # "title" = Overseerr Get offer; "release" = Radarr alternate-release switch/keep-both.
     offer_kind: str = "title"
+    # When offer_kind=release: True = keep library file (extra download).
+    keep_existing: bool = False
 
 
 @dataclass
@@ -3548,6 +3550,10 @@ class TelegramInbox:
                 reply="Which download should I retry?",
             )
 
+        from hearth.tools.arr import want_keep_existing
+
+        keep_existing = want_keep_existing(view.text) or None
+
         media_kind = intent.media_kind or subject_kind
         service = self.progress.active_service_for(view.chat_id, title)
         if not service:
@@ -3558,6 +3564,7 @@ class TelegramInbox:
                 title,
                 force=True,
                 reason="user:telegram",
+                keep_existing=keep_existing if service == "radarr" else None,
             )
         except Exception as exc:  # noqa: BLE001
             log.info("telegram retry failed: %s", redact(str(exc)))
@@ -3579,7 +3586,7 @@ class TelegramInbox:
             except Exception as exc:  # noqa: BLE001
                 log.info("telegram Sonarr retry failed: %s", redact(str(exc)))
 
-        # Library / no-file / too-large → confirmable alternate-release menu.
+        # Library / no-file / too-large / keep-both → confirmable alternate-release menu.
         if response.get("needs_pick") and response.get("releases"):
             return self._offer_release_rows(
                 view,
@@ -3587,6 +3594,7 @@ class TelegramInbox:
                 list(response.get("releases") or []),
                 speak=str(response.get("speak") or ""),
                 reason=str(response.get("reason") or "needs_pick"),
+                keep_existing=bool(response.get("keepExisting")),
             )
 
         reply = str(response.get("speak") or "").strip()
@@ -3596,6 +3604,7 @@ class TelegramInbox:
             "retried",
             "grabbed",
             "switched",
+            "kept_both",
         }
         if grabbed:
             self.progress.track(view.chat_id, title, service, intent.year)
@@ -3621,6 +3630,7 @@ class TelegramInbox:
         *,
         speak: str = "",
         reason: str = "needs_pick",
+        keep_existing: bool = False,
     ) -> InboxResult:
         rows = [dict(r) for r in releases[:4] if isinstance(r, dict) and r.get("releaseToken")]
         if not rows:
@@ -3646,6 +3656,7 @@ class TelegramInbox:
             mode="confirm" if len(rows) == 1 else "offer",
             reply_markup=markup,
             offer_kind="release",
+            keep_existing=bool(keep_existing) or reason == "needs_pick_keep",
         )
         self.memory.set_subject(view.chat_id, movie_title, media_kind="movie")
         self.memory.clear_offered(view.chat_id)
@@ -3688,6 +3699,7 @@ class TelegramInbox:
                 confirm=True,
                 prefer_smaller=True,
                 reason="user:telegram",
+                keep_existing=bool(pending.keep_existing) if pending else None,
             )
         except Exception as exc:  # noqa: BLE001
             log.info("telegram release grab failed: %s", redact(str(exc)))
@@ -3695,7 +3707,7 @@ class TelegramInbox:
                 handled=True,
                 reply=f"Couldn't grab that release of {movie_title or 'that title'}.",
             )
-        if response.get("ok") and response.get("reason") == "switched":
+        if response.get("ok") and response.get("reason") in {"switched", "kept_both"}:
             title = str(response.get("title") or movie_title)
             self.pending.pop(view.chat_id, None)
             self.progress.track(view.chat_id, title, "radarr", None)
@@ -3703,7 +3715,14 @@ class TelegramInbox:
             self._set_mode(view.chat_id, "queued")
             return InboxResult(
                 handled=True,
-                reply=str(response.get("speak") or f"Grabbing a different release of {title}."),
+                reply=str(
+                    response.get("speak")
+                    or (
+                        f"Downloading an extra release of {title} — keeping the current file."
+                        if response.get("reason") == "kept_both"
+                        else f"Grabbing a different release of {title}."
+                    )
+                ),
                 grabbed=True,
                 title=title,
                 service="radarr",
