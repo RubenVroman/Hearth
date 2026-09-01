@@ -5960,3 +5960,369 @@ async def test_inbox_0132_all_of_them_does_not_queue(
     assert result.grabbed is False
     assert "Queued" not in (result.reply or "")
     assert len(pipeline.overseerr_queue) == 0
+
+
+# --- Fantasy released-only / others / no stale Get (live 2026-09-01 02:03) ---
+
+
+@pytest.mark.asyncio
+async def test_inbox_0203_fantasy_not_unreleased_2026(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Fantasy discover must not offer Odyssey/Moana/Minions 2026 vaporware."""
+    from hearth.telegram.buttons import GENRE_FANTASY, GENRE_SCI_FI
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "discover_by_genre",
+                            "arguments": {
+                                "genre_ids": [GENRE_FANTASY],
+                                "exclude_genre_ids": [GENRE_SCI_FI],
+                                "query": "Fantasy",
+                                "limit": 3,
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    result = await inbox.handle_message(_msg("Fantasy", message_id=20101))
+    assert result.grabbed is False
+    assert result.reply_markup
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    titles = [str(r.get("title") or "") for r in pending.options]
+    years = [r.get("year") for r in pending.options]
+    joined = " | ".join(titles).lower()
+    assert "odyssey" not in joined
+    assert "moana" not in joined
+    assert "minions" not in joined
+    assert all(y is None or int(y) <= 2026 for y in years)
+    # Real released fantasy — not all-2026.
+    assert any(
+        "green knight" in t.lower()
+        or "labyrinth" in t.lower()
+        or "spirited" in t.lower()
+        or "lord of the rings" in t.lower()
+        for t in titles
+    )
+    assert any(y is not None and int(y) < 2026 for y in years)
+
+
+@pytest.mark.asyncio
+async def test_inbox_0204_none_of_these_and_others_new_pack(
+    inbox: TelegramInbox, monkeypatch
+):
+    """None-of-these + 'others' yields different titles; no duplicate Get row."""
+    import json
+
+    from hearth.telegram.buttons import GENRE_FANTASY, GENRE_SCI_FI
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "discover_by_genre",
+                            "arguments": {
+                                "genre_ids": [GENRE_FANTASY],
+                                "exclude_genre_ids": [GENRE_SCI_FI],
+                                "query": "Fantasy",
+                                "limit": 3,
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    first = await inbox.handle_message(_msg("Fantasy", message_id=20201))
+    assert first.reply_markup
+    first_ids = {
+        int(r.get("tmdbId") or r.get("mediaId"))
+        for r in inbox.pending[-1001].options
+    }
+    first_markup = json.dumps(first.reply_markup, sort_keys=True)
+
+    none = await inbox.handle_callback(
+        {
+            "id": "cb-none",
+            "data": "q:none",
+            "from": {"id": 42},
+            "message": {"message_id": 20201, "chat": {"id": -1001}},
+        }
+    )
+    assert none.grabbed is False
+    # Auto next-pack or a clear exhausted message — never the same Get ids alone.
+    if none.reply_markup:
+        second_ids = {
+            int(btn["callback_data"].split(":")[-1])
+            for row in none.reply_markup.get("inline_keyboard") or []
+            for btn in row
+            if str(btn.get("callback_data") or "").startswith("q:movie:")
+            or str(btn.get("callback_data") or "").startswith("q:tv:")
+        }
+        assert second_ids
+        assert second_ids.isdisjoint(first_ids)
+        assert json.dumps(none.reply_markup, sort_keys=True) != first_markup
+    else:
+        assert "different genre" in (none.reply or "").lower() or "out of" in (
+            none.reply or ""
+        ).lower() or "what should i look for" in (none.reply or "").lower()
+
+    # Text follow-up "you've just mentioned these, give me some others".
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "discover_by_genre",
+                            "arguments": {
+                                "genre_ids": [GENRE_FANTASY],
+                                "exclude_genre_ids": [GENRE_SCI_FI],
+                                "query": "fantasy others",
+                                "limit": 3,
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    # Seed a stale pending that matches the first pack (bug reproduction).
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    stale = [
+        {
+            "title": "The Odyssey",
+            "year": 2026,
+            "tmdbId": 1110001,
+            "mediaType": "movie",
+        },
+        {
+            "title": "Moana",
+            "year": 2026,
+            "tmdbId": 1110002,
+            "mediaType": "movie",
+        },
+        {
+            "title": "Minions & Monsters",
+            "year": 2026,
+            "tmdbId": 1110003,
+            "mediaType": "movie",
+        },
+    ]
+    inbox.memory.remember_shown(-1001, list(stale))
+    inbox.memory.set_discover_cursor(
+        -1001,
+        genre_ids=[GENRE_FANTASY],
+        exclude_genre_ids=[GENRE_SCI_FI],
+        page=1,
+        media_type="movie",
+    )
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=stale,
+        media_kind="movie",
+        query="Fantasy",
+        created_message_id=20210,
+        last_bot_reply="1. The Odyssey (2026)\n2. Moana (2026)\n3. Minions & Monsters (2026)",
+        reply_markup={
+            "inline_keyboard": [
+                [
+                    {"text": "Get 1", "callback_data": "q:movie:1110001"},
+                    {"text": "Get 2", "callback_data": "q:movie:1110002"},
+                    {"text": "Get 3", "callback_data": "q:movie:1110003"},
+                ],
+                [{"text": "None of these", "callback_data": "q:none"}],
+            ]
+        },
+    )
+    others = await inbox.handle_message(
+        _msg(
+            "You've just mentioned these, give me some others",
+            message_id=20211,
+        )
+    )
+    assert others.grabbed is False
+    assert "Queued" not in (others.reply or "")
+    # Must not re-attach the same three Get buttons for the 2026 vapor set.
+    markup = others.reply_markup
+    if markup:
+        get_ids = {
+            int(btn["callback_data"].split(":")[-1])
+            for row in markup.get("inline_keyboard") or []
+            for btn in row
+            if str(btn.get("callback_data") or "").startswith("q:")
+            and btn["callback_data"] != "q:none"
+        }
+        assert get_ids.isdisjoint({1110001, 1110002, 1110003})
+        body = (others.reply or "").lower()
+        assert not (
+            "trouble" in body and {"1110001", "1110002", "1110003"}.issubset(
+                {str(i) for i in get_ids}
+            )
+        )
+    else:
+        assert markup is None
+
+
+@pytest.mark.asyncio
+async def test_inbox_0204_exhausted_reply_has_no_get_buttons(
+    inbox: TelegramInbox, monkeypatch
+):
+    """If the model admits it can't refresh, do not re-attach prior Get buttons."""
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    options = [
+        {"title": "The Odyssey", "year": 2026, "tmdbId": 1110001, "mediaType": "movie"},
+        {"title": "Moana", "year": 2026, "tmdbId": 1110002, "mediaType": "movie"},
+        {
+            "title": "Minions & Monsters",
+            "year": 2026,
+            "tmdbId": 1110003,
+            "mediaType": "movie",
+        },
+    ]
+    markup = {
+        "inline_keyboard": [
+            [
+                {"text": "Get 1", "callback_data": "q:movie:1110001"},
+                {"text": "Get 2", "callback_data": "q:movie:1110002"},
+                {"text": "Get 3", "callback_data": "q:movie:1110003"},
+            ],
+            [{"text": "None of these", "callback_data": "q:none"}],
+        ]
+    }
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=options,
+        media_kind="movie",
+        query="Fantasy",
+        created_message_id=20300,
+        last_bot_reply="1. The Odyssey (2026)\n2. Moana (2026)\n3. Minions",
+        reply_markup=markup,
+    )
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "content": (
+                    "It seems I'm having trouble finding new fantasy options for you "
+                    "right now. The same titles keep appearing. Could you specify a "
+                    "different genre or type of movie you might be interested in?"
+                )
+            }
+        ],
+    )
+    result = await inbox.handle_message(
+        _msg("You've just mentioned these, give me some others", message_id=20301)
+    )
+    assert result.grabbed is False
+    assert result.reply_markup is None
+    assert "trouble" in (result.reply or "").lower() or "same titles" in (
+        result.reply or ""
+    ).lower()
+
+
+@pytest.mark.asyncio
+async def test_inbox_0204_web_search_fallback_when_discover_exhausted(
+    inbox: TelegramInbox, monkeypatch
+):
+    """When discover has nothing left, fall back to web_search + search_title."""
+    from hearth.telegram.buttons import GENRE_FANTASY, GENRE_SCI_FI
+
+    # Ban every released fantasy fixture id so discover is empty.
+    exhaust_ids = [
+        497698,
+        1417,
+        120,
+        129,
+        4935,
+        118,
+        2493,
+        1110001,
+        1110002,
+        1110003,
+    ]
+    inbox.memory.remember_shown(
+        -1001,
+        [{"tmdbId": tid} for tid in exhaust_ids],
+    )
+    inbox.memory.set_discover_cursor(
+        -1001,
+        genre_ids=[GENRE_FANTASY],
+        exclude_genre_ids=[GENRE_SCI_FI],
+        page=1,
+        media_type="movie",
+    )
+    web_calls: list[str] = []
+    from hearth.tools import websearch as websearch_mod
+
+    original = websearch_mod.web_search
+
+    async def _cap(args):
+        web_calls.append(str(args.get("query") or ""))
+        return await original(args)
+
+    monkeypatch.setattr(websearch_mod, "web_search", _cap)
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "discover_by_genre",
+                            "arguments": {
+                                "genre_ids": [GENRE_FANTASY],
+                                "exclude_genre_ids": [GENRE_SCI_FI],
+                                "query": "fantasy others",
+                                "limit": 3,
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    result = await inbox.handle_message(
+        _msg("give me some others", message_id=20401)
+    )
+    assert web_calls, "expected web_search fallback when discover exhausted"
+    assert result.grabbed is False
+    if result.reply_markup:
+        body = (result.reply or "").lower()
+        assert (
+            "willow" in body
+            or "dark crystal" in body
+            or "labyrinth" in body
+            or "princess bride" in body
+        )
+
+
+def test_telegram_memory_window_is_24_turns_and_6h():
+    from hearth.telegram import memory as mem
+
+    assert mem.MAX_TURNS >= 24
+    assert mem.IDLE_TTL_S >= 6 * 60 * 60
+
+
+def test_amsterdam_today_helper():
+    import re
+
+    from hearth.telegram.inbox import TelegramInbox
+
+    day = TelegramInbox._amsterdam_today()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)

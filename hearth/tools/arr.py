@@ -1252,25 +1252,53 @@ class Overseerr:
         exclude_genre_ids: list[int] | None = None,
         media_type: str = "movie",
         limit: int = 4,
+        page: int = 1,
+        primary_release_date_lte: str | None = None,
+        vote_count_gte: int | None = None,
+        exclude_tmdb_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         """TMDB discover via Overseerr (genre include / exclude).
 
         Fantasy=14, Sci-Fi=878, Horror=27. Results with an excluded genre id
         are filtered out client-side when the API cannot exclude them.
+
+        Released-only defaults: pass ``primary_release_date_lte`` (YYYY-MM-DD)
+        and ``vote_count_gte`` so upcoming vaporware does not dominate.
+        ``exclude_tmdb_ids`` drops titles already shown this chat session.
         """
         kind = media_type if media_type in {"movie", "tv"} else "movie"
         include = [int(g) for g in (genre_ids or []) if str(g).isdigit() or isinstance(g, int)]
         exclude = [
             int(g) for g in (exclude_genre_ids or []) if str(g).isdigit() or isinstance(g, int)
         ]
+        try:
+            page_i = max(1, int(page or 1))
+        except (TypeError, ValueError):
+            page_i = 1
+        try:
+            vote_floor = int(vote_count_gte) if vote_count_gte is not None else None
+        except (TypeError, ValueError):
+            vote_floor = None
+        date_lte = str(primary_release_date_lte or "").strip() or None
+        ban_ids = {
+            int(x)
+            for x in (exclude_tmdb_ids or [])
+            if str(x).isdigit() or isinstance(x, int)
+        }
+        # Fetch a wider page so client-side exclude/vote filters still fill limit.
         cap = max(1, min(int(limit or 4), 8))
+        fetch_cap = max(cap + len(ban_ids), cap * 3)
 
         if not self.live:
             rows = pipeline.discover_overseerr(
                 genre_ids=include,
                 exclude_genre_ids=exclude,
                 media_type=kind,
-                limit=cap,
+                limit=fetch_cap,
+                page=page_i,
+                primary_release_date_lte=date_lte,
+                vote_count_gte=vote_floor,
+                exclude_tmdb_ids=sorted(ban_ids),
             )
             return {
                 "mode": "mock",
@@ -1278,15 +1306,25 @@ class Overseerr:
                 "media_type": kind,
                 "genre_ids": include,
                 "exclude_genre_ids": exclude,
-                "results": [_summarize_overseerr(h) for h in rows],
+                "page": page_i,
+                "primary_release_date_lte": date_lte,
+                "vote_count_gte": vote_floor,
+                "results": [_summarize_overseerr(h) for h in rows[:cap]],
             }
 
         client = await self._http()
         path = "/api/v1/discover/movies" if kind == "movie" else "/api/v1/discover/tv"
-        params: dict[str, Any] = {}
+        params: dict[str, Any] = {"page": page_i}
         if include:
-            # Overseerr accepts comma-separated genre ids.
+            # Overseerr accepts comma-separated genre ids (with_genres).
             params["genre"] = ",".join(str(g) for g in include)
+        if date_lte:
+            if kind == "movie":
+                params["primaryReleaseDateLte"] = date_lte
+            else:
+                params["firstAirDateLte"] = date_lte
+        if vote_floor is not None and vote_floor > 0:
+            params["voteCountGte"] = str(vote_floor)
         try:
             response = await client.get(path, params=params)
             response.raise_for_status()
@@ -1301,6 +1339,28 @@ class Overseerr:
                     gset = set()
                 if exclude and gset and gset.intersection(exclude):
                     continue
+                try:
+                    tid = int(row.get("id") or row.get("tmdbId") or 0)
+                except (TypeError, ValueError):
+                    tid = 0
+                if tid and tid in ban_ids:
+                    continue
+                if vote_floor is not None and vote_floor > 0:
+                    try:
+                        votes = int(row.get("voteCount") or row.get("vote_count") or 0)
+                    except (TypeError, ValueError):
+                        votes = 0
+                    if votes < vote_floor:
+                        continue
+                if date_lte:
+                    release = str(
+                        row.get("releaseDate")
+                        or row.get("firstAirDate")
+                        or row.get("release_date")
+                        or ""
+                    )[:10]
+                    if release and release > date_lte:
+                        continue
                 filtered.append(row)
                 if len(filtered) >= cap:
                     break
@@ -1310,6 +1370,9 @@ class Overseerr:
                 "media_type": kind,
                 "genre_ids": include,
                 "exclude_genre_ids": exclude,
+                "page": page_i,
+                "primary_release_date_lte": date_lte,
+                "vote_count_gte": vote_floor,
                 "results": [_summarize_overseerr(h) for h in filtered[:cap]],
             }
         except Exception as exc:  # noqa: BLE001
@@ -1318,7 +1381,11 @@ class Overseerr:
                     genre_ids=include,
                     exclude_genre_ids=exclude,
                     media_type=kind,
-                    limit=cap,
+                    limit=fetch_cap,
+                    page=page_i,
+                    primary_release_date_lte=date_lte,
+                    vote_count_gte=vote_floor,
+                    exclude_tmdb_ids=sorted(ban_ids),
                 )
                 return {
                     "mode": "mock",
@@ -1326,8 +1393,11 @@ class Overseerr:
                     "media_type": kind,
                     "genre_ids": include,
                     "exclude_genre_ids": exclude,
+                    "page": page_i,
+                    "primary_release_date_lte": date_lte,
+                    "vote_count_gte": vote_floor,
                     "error": str(exc),
-                    "results": [_summarize_overseerr(h) for h in rows],
+                    "results": [_summarize_overseerr(h) for h in rows[:cap]],
                 }
             raise
 

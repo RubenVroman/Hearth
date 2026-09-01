@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 from hearth.config import settings
-from hearth.fixtures import MOCK_WEB_SEARCH_RESULTS
+from hearth.fixtures import MOCK_WEB_SEARCH_RESULTS, mock_web_search_results
 
 MAX_QUERY_LEN = 240
 MIN_QUERY_LEN = 2
@@ -321,7 +321,7 @@ def _ok(query: str, results: list[dict[str, Any]], *, mode: str, **extra: Any) -
 
 
 def _mock_payload(query: str, limit: int) -> dict[str, Any]:
-    results = [dict(row) for row in MOCK_WEB_SEARCH_RESULTS[:limit]]
+    results = mock_web_search_results(query, limit)
     return _ok(query, results, mode="mock")
 
 

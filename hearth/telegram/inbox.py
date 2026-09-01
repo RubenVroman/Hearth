@@ -21,7 +21,9 @@ from hearth.config import settings
 from hearth.memory.redact import redact
 from hearth.telegram.agent import (
     SessionMode,
+    looks_like_asking_for_others,
     looks_like_correction,
+    looks_like_exhausted_offer_reply,
     looks_like_explain,
     run_telegram_agent,
     should_refuse_queue,
@@ -90,6 +92,10 @@ log = logging.getLogger("hearth.telegram")
 
 PENDING_TTL_S = 15 * 60
 SAFE_CLARIFY = "Which movie or series did you mean?"
+DISCOVER_VOTE_COUNT_GTE = 200
+_TITLE_YEAR = re.compile(
+    r"([A-Z][\w'&.:\-]*(?:\s+[A-Z][\w'&.:\-]*){0,6})\s*\((\d{4})\)"
+)
 
 
 # --- Public state -----------------------------------------------------------
@@ -177,13 +183,65 @@ class TelegramInbox:
         data = str(callback.get("data") or "")
         if is_none_of_these_callback(data):
             pending = self._pending_for(chat_id)
+            genre_hint = ""
             if pending is not None:
                 rejected = self._titles_from_options(pending.options)
+                self.memory.remember_shown(chat_id, pending.options)
                 self.memory.remember_rejected(
                     chat_id, rejected, clear_offered=True, clear_subject=False
                 )
+                genre_hint = str(pending.query or "")
                 self.pending.pop(chat_id, None)
             self._set_mode(chat_id, "browse")
+            # Auto-fetch the next pack when we still know the genre cursor.
+            cursor = self.memory.discover_cursor(chat_id)
+            if cursor.get("genre_ids"):
+                view = MessageView(
+                    chat_id=chat_id,
+                    message_id=int(message.get("message_id") or 0),
+                    user_id=user_id,
+                    text=genre_hint or "others",
+                    is_bot=False,
+                )
+                nxt = await self._tool_discover_by_genre(
+                    view,
+                    {
+                        "genre_ids": cursor["genre_ids"],
+                        "exclude_genre_ids": cursor.get("exclude_genre_ids") or [],
+                        "media_type": cursor.get("media_type") or "movie",
+                        "page": int(cursor.get("page") or 1) + 1,
+                        "query": genre_hint or "others",
+                        "limit": 4,
+                    },
+                )
+                if nxt.get("ok") and nxt.get("reply"):
+                    reply = str(nxt["reply"])
+                    if not reply.lower().startswith("ok"):
+                        reply = f"Ok — none of those. Here are some others:\n{reply}"
+                    self.memory.record_user(chat_id, "[button None of these]")
+                    self.memory.record_bot(
+                        chat_id,
+                        reply,
+                        search_title=str(nxt.get("query") or genre_hint or ""),
+                        media_kind=str(nxt.get("media_type") or "movie"),
+                        offered=list(nxt.get("results") or []),
+                    )
+                    return InboxResult(
+                        handled=True,
+                        reply=reply,
+                        reply_markup=nxt.get("reply_markup")
+                        if isinstance(nxt.get("reply_markup"), dict)
+                        else None,
+                        mode="offer",
+                    )
+                # Exhausted — no Get buttons for a list we couldn't refresh.
+                fail = (
+                    "Ok — none of those. I'm out of fresh options in that genre "
+                    "right now. Want a different genre or a specific title?"
+                )
+                self.memory.record_user(chat_id, "[button None of these]")
+                self.memory.record_bot(chat_id, fail)
+                return InboxResult(handled=True, reply=fail, mode="browse")
             return InboxResult(
                 handled=True,
                 reply="Ok — none of those. What should I look for?",
@@ -381,6 +439,18 @@ class TelegramInbox:
                 self.pending.pop(view.chat_id, None)
                 pending = None
 
+        # "others" / "you've just mentioned these" — keep shown ids, stay browse.
+        if looks_like_asking_for_others(view.text) and pending is not None:
+            self.memory.remember_shown(view.chat_id, pending.options)
+            rejected_rows = self._titles_from_options(pending.options)
+            self.memory.remember_rejected(
+                view.chat_id,
+                rejected_rows,
+                clear_offered=False,
+                clear_subject=False,
+            )
+            self._set_mode(view.chat_id, "browse")
+
         history = self.memory.history_blob(view.chat_id)
         subject_title, subject_kind = self.memory.subject(view.chat_id)
         rejected = list(self.memory.rejected(view.chat_id))
@@ -469,6 +539,7 @@ class TelegramInbox:
             subject_media_kind=subject_kind,
             rejected_titles=rejected,
             offered=offered_rows,
+            shown_tmdb_ids=self.memory.shown_tmdb_ids(view.chat_id),
             mode=session_mode,
             queue_approved=queue_approved,
         )
@@ -491,14 +562,34 @@ class TelegramInbox:
 
         live = self.pending.get(view.chat_id)
         if live is not None:
-            if not result.reply_markup:
-                result.reply_markup = live.reply_markup
-            if not result.reply and live.last_bot_reply:
-                result.reply = live.last_bot_reply
-            self._set_mode(
-                view.chat_id,
-                "confirm" if len(live.options) == 1 else "offer",
-            )
+            if looks_like_exhausted_offer_reply(result.reply):
+                # Don't show Get buttons for a list we just said we couldn't refresh.
+                result.reply_markup = None
+                self.pending.pop(view.chat_id, None)
+                self.memory.clear_offered(view.chat_id)
+                self._set_mode(view.chat_id, "browse")
+            elif not result.reply_markup:
+                if looks_like_asking_for_others(view.text):
+                    # Asking for a new pack without a fresh offer — drop stale Get ids.
+                    result.reply_markup = None
+                    self.pending.pop(view.chat_id, None)
+                    self.memory.clear_offered(view.chat_id)
+                    self._set_mode(view.chat_id, "browse")
+                else:
+                    result.reply_markup = live.reply_markup
+                    if not result.reply and live.last_bot_reply:
+                        result.reply = live.last_bot_reply
+                    self._set_mode(
+                        view.chat_id,
+                        "confirm" if len(live.options) == 1 else "offer",
+                    )
+            elif self.pending.get(view.chat_id) is live:
+                if not result.reply and live.last_bot_reply:
+                    result.reply = live.last_bot_reply
+                self._set_mode(
+                    view.chat_id,
+                    "confirm" if len(live.options) == 1 else "offer",
+                )
         elif result.mode:
             self._set_mode(view.chat_id, result.mode)
 
@@ -734,37 +825,106 @@ class TelegramInbox:
             if gid not in exclude_ids:
                 exclude_ids.append(gid)
 
+        # "others" with empty genre_ids → reuse last discover cursor.
+        cursor = self.memory.discover_cursor(view.chat_id)
+        if not genre_ids and cursor.get("genre_ids"):
+            genre_ids = list(cursor["genre_ids"])
+            for gid in cursor.get("exclude_genre_ids") or []:
+                if gid not in exclude_ids:
+                    exclude_ids.append(int(gid))
+
         if not genre_ids:
             return {"ok": False, "error": "genre_ids required"}
 
-        media_type = str(args.get("media_type") or args.get("mediaType") or "movie").strip()
+        media_type = str(args.get("media_type") or args.get("mediaType") or "").strip()
+        if media_type not in {"movie", "tv"}:
+            media_type = str(cursor.get("media_type") or "movie")
         kind = media_type if media_type in {"movie", "tv"} else "movie"
         try:
             limit = int(args.get("limit") or 4)
         except (TypeError, ValueError):
             limit = 4
         limit = max(2, min(4, limit))
+        try:
+            page = int(args.get("page") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        if page < 1:
+            # Bump page when the user asks for others / none-of-these.
+            if looks_like_asking_for_others(view.text) and cursor.get("genre_ids"):
+                page = int(cursor.get("page") or 1) + 1
+            else:
+                page = 1
         query = str(args.get("query") or view.text or "discover").strip()[:120]
+        today = self._amsterdam_today()
+        ban_ids = self._discover_exclude_ids(view.chat_id)
 
-        discovered = await overseerr.discover(
+        rows: list[dict[str, Any]] = []
+        used_page = page
+        for attempt in range(page, page + 3):
+            discovered = await overseerr.discover(
+                genre_ids=genre_ids,
+                exclude_genre_ids=exclude_ids,
+                media_type=kind,
+                limit=limit + 4,
+                page=attempt,
+                primary_release_date_lte=today,
+                vote_count_gte=DISCOVER_VOTE_COUNT_GTE,
+                exclude_tmdb_ids=ban_ids,
+            )
+            batch = list(discovered.get("results") or [])
+            batch = [
+                r
+                for r in batch
+                if not self._row_is_excluded(view.chat_id, r, ban_ids)
+            ]
+            if batch:
+                rows = batch[:limit]
+                used_page = attempt
+                break
+
+        source = "discover"
+        if len(rows) < 2:
+            fallback = await self._discover_web_search_fallback(
+                view,
+                genre_ids=genre_ids,
+                media_kind=kind,
+                limit=limit,
+                ban_ids=ban_ids,
+                query=query,
+            )
+            if fallback is not None:
+                rows = fallback
+                source = "web_search"
+
+        self.memory.set_discover_cursor(
+            view.chat_id,
             genre_ids=genre_ids,
             exclude_genre_ids=exclude_ids,
+            page=used_page,
             media_type=kind,
-            limit=limit + 2,
         )
-        rows = list(discovered.get("results") or [])
-        rows = [
-            r
-            for r in rows
-            if not self._title_is_rejected(view.chat_id, str(r.get("title") or ""))
-        ][:limit]
 
         if len(rows) < 2:
+            # Clear stale pending so we never re-attach the same Get buttons.
+            self.pending.pop(view.chat_id, None)
+            self.memory.clear_offered(view.chat_id)
+            self._set_mode(view.chat_id, "browse")
             return {
                 "ok": False,
-                "error": "discover_by_genre returned fewer than 2 titles",
+                "error": (
+                    "No fresh released titles left in this genre. "
+                    "Ask for a different genre or a specific title — "
+                    "do not re-attach the previous Get buttons."
+                ),
                 "genre_ids": genre_ids,
                 "exclude_genre_ids": exclude_ids,
+                "page": used_page,
+                "reply": (
+                    "I'm out of fresh released options in that genre right now. "
+                    "Want a different genre or a specific title?"
+                ),
+                "reply_markup": None,
                 "partial": [
                     {"title": str(r.get("title") or ""), "year": self._row_year(r)}
                     for r in rows
@@ -792,6 +952,7 @@ class TelegramInbox:
             }
             for r in rows
         ]
+        self.memory.remember_shown(view.chat_id, compact)
         self._set_mode(view.chat_id, "offer")
         return {
             "ok": True,
@@ -799,12 +960,151 @@ class TelegramInbox:
             "media_type": kind,
             "genre_ids": genre_ids,
             "exclude_genre_ids": exclude_ids,
+            "page": used_page,
+            "source": source,
+            "primary_release_date_lte": today,
+            "vote_count_gte": DISCOVER_VOTE_COUNT_GTE,
             "results": compact,
             "count": len(compact),
             "reply": offered.reply,
             "reply_markup": offered.reply_markup,
             "hint": "Present this list with Get buttons. Do not call queue_request.",
         }
+
+    def _discover_exclude_ids(self, chat_id: int) -> list[int]:
+        ban: set[int] = set(self.memory.shown_tmdb_ids(chat_id))
+        for row in self.memory.offered(chat_id):
+            raw = row.get("tmdbId") or row.get("mediaId")
+            try:
+                ban.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+        pending = self.pending.get(int(chat_id))
+        if pending is not None:
+            for row in pending.options:
+                raw = row.get("tmdbId") or row.get("mediaId")
+                try:
+                    ban.add(int(raw))
+                except (TypeError, ValueError):
+                    continue
+        return sorted(ban)
+
+    def _row_is_excluded(
+        self,
+        chat_id: int,
+        row: dict[str, Any],
+        ban_ids: list[int] | set[int],
+    ) -> bool:
+        title = str(row.get("title") or "")
+        if self._title_is_rejected(chat_id, title):
+            return True
+        raw = row.get("tmdbId") or row.get("mediaId")
+        try:
+            tid = int(raw)
+        except (TypeError, ValueError):
+            return False
+        return tid in set(ban_ids)
+
+    @staticmethod
+    def _amsterdam_today() -> str:
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime
+
+            return datetime.now(ZoneInfo("Europe/Amsterdam")).date().isoformat()
+        except Exception:  # noqa: BLE001
+            from datetime import date
+
+            return date.today().isoformat()
+
+    async def _discover_web_search_fallback(
+        self,
+        view: MessageView,
+        *,
+        genre_ids: list[int],
+        media_kind: str,
+        limit: int,
+        ban_ids: list[int],
+        query: str,
+    ) -> list[dict[str, Any]] | None:
+        """When discover is exhausted, use the house web_search tool + search_title."""
+        from hearth.tools.websearch import web_search
+
+        genre_label = "fantasy" if GENRE_FANTASY in genre_ids else "movie"
+        if GENRE_SCI_FI in genre_ids:
+            genre_label = "sci-fi"
+        search_q = (
+            f"well-known released classic {genre_label} movies films "
+            f"(not upcoming {self._amsterdam_today()[:4]})"
+        )
+        try:
+            payload = await web_search({"query": search_q, "limit": 5})
+        except Exception as exc:  # noqa: BLE001
+            log.info("discover web_search fallback failed: %s", redact(str(exc)))
+            return None
+        if not payload.get("ok"):
+            return None
+
+        names = self._titles_from_web_search(payload)
+        if not names:
+            return None
+
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        ban = set(ban_ids)
+        for name in names:
+            seed = re.sub(r"\s*\(\d{4}\)\s*$", "", name).strip() or name
+            year_m = re.search(r"\((\d{4})\)\s*$", name)
+            year_i = int(year_m.group(1)) if year_m else None
+            found = await tool_lookup_title(seed, year=year_i, media_kind=media_kind)
+            if not found:
+                continue
+            row = dict(found[0])
+            label = str(row.get("title") or seed).strip()
+            key = normalize_title(label)
+            if not key or key in seen:
+                continue
+            if self._row_is_excluded(view.chat_id, row, ban):
+                continue
+            # Skip unreleased / future years relative to Amsterdam today.
+            year = self._row_year(row)
+            try:
+                today_year = int(self._amsterdam_today()[:4])
+            except ValueError:
+                today_year = 2026
+            if year is not None and year > today_year:
+                continue
+            seen.add(key)
+            rows.append(row)
+            raw = row.get("tmdbId") or row.get("mediaId")
+            try:
+                ban.add(int(raw))
+            except (TypeError, ValueError):
+                pass
+            if len(rows) >= limit:
+                break
+        return rows if len(rows) >= 2 else None
+
+    @classmethod
+    def _titles_from_web_search(cls, payload: dict[str, Any]) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+        blobs: list[str] = []
+        for row in payload.get("results") or []:
+            if not isinstance(row, dict):
+                continue
+            blobs.append(str(row.get("title") or ""))
+            blobs.append(str(row.get("snippet") or ""))
+        blobs.append(str(payload.get("speak") or ""))
+        for blob in blobs:
+            for match in _TITLE_YEAR.finditer(blob):
+                title = f"{match.group(1).strip()} ({match.group(2)})"
+                key = title.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(title)
+        return names[:8]
 
     async def _tool_suggest_titles(
         self, view: MessageView, args: dict[str, Any]
