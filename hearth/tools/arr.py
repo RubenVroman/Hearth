@@ -2460,19 +2460,10 @@ class Overseerr:
         query: str = "",
     ) -> dict[str, Any]:
         client = await self._http()
+        # Official Overseerr contract: mediaType + mediaId; TV uses seasons "all".
         body: dict[str, Any] = {"mediaId": media_id, "mediaType": media_type}
         if media_type == "tv":
-            try:
-                detail = await client.get(f"/api/v1/tv/{media_id}")
-                detail.raise_for_status()
-                seasons = [
-                    int(s["seasonNumber"])
-                    for s in (detail.json().get("seasons") or [])
-                    if int(s.get("seasonNumber") or 0) > 0
-                ]
-                body["seasons"] = seasons or [1]
-            except Exception:  # noqa: BLE001
-                body["seasons"] = [1]
+            body["seasons"] = "all"
         body["is4k"] = False
         try:
             response = await client.post("/api/v1/request", json=body)
