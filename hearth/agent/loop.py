@@ -1266,6 +1266,8 @@ def _download_retry_plan(raw: str) -> dict[str, Any] | None:
         flags=re.I,
     )
     title = re.sub(r"\s+", " ", title).strip(" .?!'\"")
+    # Drop a leftover leading article ("the Event Horizon" → "Event Horizon").
+    title = re.sub(r"^(?:the|a|an)\s+", "", title, flags=re.I).strip()
     if title.lower() in {
         "",
         "it",

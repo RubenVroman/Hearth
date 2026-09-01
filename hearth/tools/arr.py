@@ -1768,19 +1768,20 @@ class StarrClient:
             payload = response.json()
             rows = payload if isinstance(payload, list) else []
             needle = query.lower()
-            matches = [
-                row
-                for row in rows
-                if isinstance(row, dict)
-                and needle in str(row.get("title") or "").lower()
-            ]
-            # Prefer exact / tight title matches.
-            exact = [
-                row
-                for row in matches
-                if " ".join(_normalize_title_tokens(str(row.get("title") or "")))
-                == " ".join(_normalize_title_tokens(query))
-            ]
+            query_tokens = " ".join(_normalize_title_tokens(query))
+            matches: list[dict[str, Any]] = []
+            exact: list[dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("title") or "")
+                title_l = title.lower()
+                title_tokens = " ".join(_normalize_title_tokens(title))
+                if query_tokens and title_tokens == query_tokens:
+                    exact.append(row)
+                    matches.append(row)
+                elif needle and (needle in title_l or title_l in needle):
+                    matches.append(row)
             movie = (exact or matches)[0] if (exact or matches) else None
             return {
                 "ok": bool(movie),

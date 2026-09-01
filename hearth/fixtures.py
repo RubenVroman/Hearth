@@ -1577,6 +1577,8 @@ class MockPipeline:
 
     def list_radarr_library(self, title: str = "") -> list[dict[str, Any]]:
         """Monitored Radarr library rows (may lack a usable file)."""
+        from hearth.tools.arr import _normalize_title_tokens
+
         source = (
             self.radarr_library
             if self.radarr_library is not None
@@ -1592,11 +1594,17 @@ class MockPipeline:
         needle = (title or "").strip().lower()
         if not needle:
             return rows
-        return [
-            row
-            for row in rows
-            if needle in str(row.get("title") or "").lower()
-        ]
+        needle_tokens = " ".join(_normalize_title_tokens(title))
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            row_title = str(row.get("title") or "")
+            row_l = row_title.lower()
+            row_tokens = " ".join(_normalize_title_tokens(row_title))
+            if needle_tokens and row_tokens == needle_tokens:
+                out.append(row)
+            elif needle in row_l or row_l in needle:
+                out.append(row)
+        return out
 
     def delete_movie_file(self, movie_file_id: int) -> dict[str, Any]:
         self._deleted_movie_files.add(int(movie_file_id))
