@@ -604,6 +604,65 @@ MOCK_SONARR_DOWNLOADS: list[dict[str, Any]] = [
     },
 ]
 
+# Library catalog (monitored movies) — includes no-file and oversized-file cases
+# used by the retry/switch-release path (not the active download queue).
+MOCK_RADARR_LIBRARY: list[dict[str, Any]] = [
+    {
+        "id": 101,
+        "title": "Annihilation",
+        "year": 2018,
+        "tmdbId": 300668,
+        "hasFile": False,
+        "monitored": True,
+        "path": "/movies/Annihilation (2018)",
+        "sizeOnDisk": 0,
+        "status": "released",
+    },
+    {
+        "id": 102,
+        "title": "Dune: Part Two",
+        "year": 2024,
+        "tmdbId": 693134,
+        "hasFile": False,
+        "monitored": True,
+        "path": "/movies/Dune Part Two (2024)",
+        "sizeOnDisk": 0,
+        "status": "released",
+    },
+    # Known to the library, monitored, no usable file — not in the download queue.
+    {
+        "id": 103,
+        "title": "The Brutalist",
+        "year": 2024,
+        "tmdbId": 974950,
+        "hasFile": False,
+        "monitored": True,
+        "path": "/movies/The Brutalist (2024)",
+        "sizeOnDisk": 0,
+        "status": "released",
+        "overview": "A Hungarian-born Jewish architect starts over in America.",
+    },
+    # Has a huge unplayable remux — switch to a smaller release.
+    {
+        "id": 104,
+        "title": "The Endless",
+        "year": 2017,
+        "tmdbId": 430231,
+        "hasFile": True,
+        "monitored": True,
+        "path": "/movies/The Endless (2017)",
+        "sizeOnDisk": 48_000_000_000,
+        "status": "released",
+        "movieFile": {
+            "id": 904,
+            "size": 48_000_000_000,
+            "relativePath": "The.Endless.2017.2160p.UHD.BluRay.REMUX.mkv",
+            "quality": {"quality": {"name": "Remux-2160p"}},
+        },
+        "overview": "Two brothers return to a UFO death cult.",
+    },
+]
+
 # Alternate indexer releases for retry-from-another-source (mock).
 MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
     101: [
@@ -617,6 +676,7 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
             "rejected": False,
             "rejections": [],
             "movieId": 101,
+            "size": 8_000_000_000,
         },
         {
             "guid": "anni-alt-indexer-good",
@@ -628,6 +688,7 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
             "rejected": False,
             "rejections": [],
             "movieId": 101,
+            "size": 7_500_000_000,
         },
         {
             "guid": "anni-third-indexer",
@@ -639,6 +700,7 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
             "rejected": False,
             "rejections": [],
             "movieId": 101,
+            "size": 3_200_000_000,
         },
     ],
     102: [
@@ -650,6 +712,7 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
             "approved": True,
             "score": 10,
             "movieId": 102,
+            "size": 35_000_000_000,
         },
         {
             "guid": "dune-alt-indexer",
@@ -659,6 +722,89 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
             "approved": True,
             "score": 50,
             "movieId": 102,
+            "size": 32_000_000_000,
+        },
+    ],
+    103: [
+        {
+            "guid": "brutalist-4k-remux-huge",
+            "indexerId": 1,
+            "indexer": "MockIndexer",
+            "title": "The.Brutalist.2024.2160p.UHD.BluRay.REMUX",
+            "approved": True,
+            "score": 5,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 103,
+            "size": 55_000_000_000,
+        },
+        {
+            "guid": "brutalist-1080p-web-good",
+            "indexerId": 2,
+            "indexer": "AltIndexer",
+            "title": "The.Brutalist.2024.1080p.WEB-DL.DD5.1.H264",
+            "approved": True,
+            "score": 30,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 103,
+            "size": 6_500_000_000,
+        },
+        {
+            "guid": "brutalist-720p-web-small",
+            "indexerId": 3,
+            "indexer": "ThirdIndexer",
+            "title": "The.Brutalist.2024.720p.WEBRip",
+            "approved": True,
+            "score": 15,
+            "rejected": False,
+            "rejections": [],
+            "movieId": 103,
+            "size": 2_800_000_000,
+        },
+        {
+            "guid": "brutalist-rejected-cam",
+            "indexerId": 4,
+            "indexer": "JunkIndexer",
+            "title": "The.Brutalist.2024.CAM",
+            "approved": False,
+            "score": 0,
+            "rejected": True,
+            "rejections": ["Quality rejected"],
+            "movieId": 103,
+            "size": 1_000_000_000,
+        },
+    ],
+    104: [
+        {
+            "guid": "endless-4k-remux-current",
+            "indexerId": 1,
+            "indexer": "MockIndexer",
+            "title": "The.Endless.2017.2160p.UHD.BluRay.REMUX",
+            "approved": True,
+            "score": 5,
+            "movieId": 104,
+            "size": 48_000_000_000,
+        },
+        {
+            "guid": "endless-1080p-bluray",
+            "indexerId": 2,
+            "indexer": "AltIndexer",
+            "title": "The.Endless.2017.1080p.BluRay",
+            "approved": True,
+            "score": 40,
+            "movieId": 104,
+            "size": 8_200_000_000,
+        },
+        {
+            "guid": "endless-1080p-web",
+            "indexerId": 3,
+            "indexer": "ThirdIndexer",
+            "title": "The.Endless.2017.1080p.WEB-DL",
+            "approved": True,
+            "score": 35,
+            "movieId": 104,
+            "size": 5_100_000_000,
         },
     ],
 }
@@ -1333,10 +1479,48 @@ class MockPipeline:
         self.sonarr_downloads: list[dict[str, Any]] | None = None
         self.radarr_blocklist: list[dict[str, Any]] = []
         self.sonarr_blocklist: list[dict[str, Any]] = []
+        self.radarr_library: list[dict[str, Any]] | None = None
         self._download_seq = 1000
+        self._deleted_movie_files: set[int] = set()
 
     def search_radarr(self, query: str) -> list[dict[str, Any]]:
         return _filter_title(MOCK_RADARR_LOOKUP, query)
+
+    def list_radarr_library(self, title: str = "") -> list[dict[str, Any]]:
+        """Monitored Radarr library rows (may lack a usable file)."""
+        source = (
+            self.radarr_library
+            if self.radarr_library is not None
+            else MOCK_RADARR_LIBRARY
+        )
+        rows = deepcopy(source)
+        for row in rows:
+            mf = row.get("movieFile")
+            if isinstance(mf, dict) and mf.get("id") in self._deleted_movie_files:
+                row["hasFile"] = False
+                row["sizeOnDisk"] = 0
+                row.pop("movieFile", None)
+        needle = (title or "").strip().lower()
+        if not needle:
+            return rows
+        return [
+            row
+            for row in rows
+            if needle in str(row.get("title") or "").lower()
+        ]
+
+    def delete_movie_file(self, movie_file_id: int) -> dict[str, Any]:
+        self._deleted_movie_files.add(int(movie_file_id))
+        if self.radarr_library is None:
+            self.radarr_library = deepcopy(MOCK_RADARR_LIBRARY)
+        for row in self.radarr_library:
+            mf = row.get("movieFile")
+            if isinstance(mf, dict) and int(mf.get("id") or 0) == int(movie_file_id):
+                row["hasFile"] = False
+                row["sizeOnDisk"] = 0
+                row.pop("movieFile", None)
+                return {"ok": True, "id": movie_file_id}
+        return {"ok": True, "id": movie_file_id}
 
     def search_sonarr(self, query: str) -> list[dict[str, Any]]:
         return _filter_title(MOCK_SONARR_LOOKUP, query)
@@ -1605,6 +1789,16 @@ class MockPipeline:
                         (seed.get("movie") or {}).get("title") or seed.get("title") or title
                     )
                     break
+            for lib in self.list_radarr_library():
+                if lib.get("id") == movie_id:
+                    movie = {
+                        "id": lib.get("id"),
+                        "title": lib.get("title"),
+                        "year": lib.get("year"),
+                        "tmdbId": lib.get("tmdbId"),
+                    }
+                    title = str(lib.get("title") or title)
+                    break
             for blocked in reversed(self.radarr_blocklist):
                 if blocked.get("movieId") == movie_id or (blocked.get("movie") or {}).get(
                     "id"
@@ -1616,6 +1810,18 @@ class MockPipeline:
                         or title
                     )
                     break
+            try:
+                size_i = int(release.get("size") or 8_000_000_000)
+            except (TypeError, ValueError):
+                size_i = 8_000_000_000
+            quality_name = "Bluray-1080p"
+            rel_title = str(release.get("title") or "")
+            if "720p" in rel_title:
+                quality_name = "WEBDL-720p"
+            elif "2160" in rel_title or "UHD" in rel_title:
+                quality_name = "Bluray-2160p"
+            elif "WEB" in rel_title.upper():
+                quality_name = "WEBDL-1080p"
             row = {
                 "id": new_id,
                 "movieId": movie_id,
@@ -1623,12 +1829,12 @@ class MockPipeline:
                 "status": "downloading",
                 "trackedDownloadState": "downloading",
                 "trackedDownloadStatus": "ok",
-                "size": 8_000_000_000,
-                "sizeleft": 7_500_000_000,
+                "size": size_i,
+                "sizeleft": max(size_i - 500_000_000, size_i // 10),
                 "timeleft": "00:40:00",
                 "indexer": release.get("indexer") or "AltIndexer",
                 "downloadId": str(release.get("guid") or f"grab-{new_id}"),
-                "quality": {"quality": {"name": "Bluray-1080p"}},
+                "quality": {"quality": {"name": quality_name}},
                 "downloadClient": "qBittorrent",
                 "movie": movie,
             }

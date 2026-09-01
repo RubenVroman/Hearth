@@ -66,6 +66,11 @@ Do it yourself (house):
   That blocklists the bad release and grabs an alternate indexer for the SAME title
   (not a new Overseerr request, not a library delete). Say clearly when retrying
   or when alternate sources ran out.
+- Library movie with no file / too big / won’t play / “download another version” /
+  “smaller one” → radarr_retry (or radarr_list_releases). It returns needs_pick with
+  a few smaller/playable releases — speak those options, then radarr_grab_release
+  with confirm=true for the chosen guid/token. Never say “already in the library”
+  and stop, and never escalate to Chief of Staff for this.
 - “Request X” / Overseerr as the request front door → overseerr_search / overseerr_request.
 - Food / Thuisbezorgd / “order pizza” → thuisbezorgd_restaurants → thuisbezorgd_menu →
   thuisbezorgd_cart → thuisbezorgd_order (confirm=true to place; spends money).

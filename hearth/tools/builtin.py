@@ -286,6 +286,24 @@ async def _radarr_retry(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+async def _radarr_list_releases(args: dict[str, Any]) -> dict[str, Any]:
+    return await radarr.list_alternate_releases(
+        str(args.get("query") or args.get("title") or ""),
+        prefer_smaller=bool(args.get("prefer_smaller", True)),
+    )
+
+
+async def _radarr_grab_release(args: dict[str, Any]) -> dict[str, Any]:
+    return await radarr.grab_alternate_release(
+        str(args.get("query") or args.get("title") or ""),
+        guid=str(args.get("guid") or ""),
+        release_token_value=str(args.get("releaseToken") or args.get("release_token") or ""),
+        confirm=bool(args.get("confirm")),
+        prefer_smaller=bool(args.get("prefer_smaller", True)),
+        reason="user:house",
+    )
+
+
 async def _sonarr_search(args: dict[str, Any]) -> dict[str, Any]:
     return await sonarr.search(str(args.get("query") or ""))
 
@@ -1067,24 +1085,70 @@ def register_builtin_tools() -> None:
         ToolSpec(
             name="radarr_retry",
             description=(
-                "Retry a stalled/failed Radarr movie download from a different indexer/source. "
-                "Blocklists the bad release and grabs an alternate *arr release for the SAME "
-                "movie (does not delete the library entry; does not re-POST Overseerr). "
-                "Use when the user says the download didn’t work, stalled, or wants another "
-                "source / a new one for a title already downloading. Pass query/title."
+                "Retry a stalled/failed Radarr movie download from a different indexer/source, "
+                "OR offer alternate smaller releases when a library movie has no usable file "
+                "or the current file is too big / won't play. Queue retries blocklist + re-grab. "
+                "Library switches return needs_pick with release options — do NOT invent a grab; "
+                "call radarr_grab_release with confirm after the user picks one. "
+                "Does not delete the library entry; does not re-POST Overseerr."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Movie title already in the Radarr queue to retry.",
+                        "description": "Movie title to retry or switch release for.",
                     },
                     "title": {"type": "string", "description": "Alias for query."},
                 },
                 "required": ["query"],
             },
             handler=_radarr_retry,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="radarr_list_releases",
+            description=(
+                "List a few grab-able Radarr releases for a library movie (prefer smaller / "
+                "more playable when size is the complaint). Use when the title is known to "
+                "Radarr but has no file or a huge unplayable file. Does not grab."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "title": {"type": "string"},
+                    "prefer_smaller": {"type": "boolean"},
+                },
+                "required": ["query"],
+            },
+            handler=_radarr_list_releases,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="radarr_grab_release",
+            description=(
+                "Grab one specific alternate Radarr release after the user confirmed. "
+                "Pass guid or releaseToken from radarr_retry / radarr_list_releases. "
+                "Requires confirm=true — never auto-grab."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "title": {"type": "string"},
+                    "guid": {"type": "string"},
+                    "releaseToken": {"type": "string"},
+                    "prefer_smaller": {"type": "boolean"},
+                    "confirm": {"type": "boolean"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["query"],
+            },
+            handler=_radarr_grab_release,
+            destructive=True,
         )
     )
     registry.register(

@@ -380,9 +380,27 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         if spoken:
             return str(spoken)
         title = data.get("title") or "that download"
+        if data.get("needs_pick") or data.get("reason") in {
+            "needs_pick",
+            "needs_pick_large",
+        }:
+            return str(spoken or f"{title} needs a release pick.")
         if data.get("ok"):
             return f"Retrying {title} from another source{mock}."
         return f"Couldn't retry {title}{mock}."
+    if name == "radarr_list_releases":
+        spoken = data.get("speak")
+        if spoken:
+            return str(spoken)
+        return f"No alternate releases{mock}."
+    if name == "radarr_grab_release":
+        spoken = data.get("speak")
+        if spoken:
+            return str(spoken)
+        title = data.get("title") or "that title"
+        if data.get("ok"):
+            return f"Grabbing a different release of {title}{mock}."
+        return f"Couldn't grab that release of {title}{mock}."
     if name == "sonarr_search":
         titles = ", ".join(
             f"{r.get('title')} ({r.get('year')})" for r in (data.get("results") or [])[:4] if r.get("title")
@@ -722,12 +740,23 @@ _DOWNLOAD_RETRY = re.compile(
     r"try\s+(?:it\s+)?(?:again|another\s+source)|"
     r"another\s+source|"
     r"(?:get|grab|download)\s+a\s+new\s+one|"
+    r"(?:get|grab|download)\s+another\s+(?:one|version|release|copy)|"
+    r"(?:smaller|other)\s+(?:version|release|one|copy)|"
+    r"too\s+big|"
+    r"won'?t\s+play|"
+    r"doesn'?t\s+play|"
+    r"no\s+(?:usable\s+)?file|"
+    r"missing\s+(?:the\s+)?file|"
     r"(?:this\s+)?download\s+(?:didn'?t|doesn'?t|won'?t|isn'?t)\s+work|"
     r"download\s+(?:failed|stalled|stuck)|"
     r"(?:is\s+)?stalled|"
     r"retry|"
     r"blocklist|"
     r"andere\s+bron|"
+    r"andere\s+versie|"
+    r"te\s+groot|"
+    r"speelt\s+niet|"
+    r"kleinere?\s+(?:versie|release)|"
     r"download\s+werkt\s+niet|"
     r"probeer\s+(?:opnieuw|een\s+andere)"
     r")\b",
@@ -738,6 +767,8 @@ _DOWNLOAD_RETRY_TITLE = re.compile(
     r"retry(?:\s+the)?(?:\s+download)?(?:\s+of|\s+for)?|"
     r"try\s+another\s+source\s+(?:for|on)|"
     r"(?:get|grab)\s+a\s+new\s+(?:one\s+)?(?:for|of)|"
+    r"(?:get|grab|download)\s+another\s+(?:version|release|one|copy)\s+(?:for|of)|"
+    r"(?:too\s+big|won'?t\s+play|doesn'?t\s+play).{0,40}\b(?:for|of|on)\b|"
     r"download\s+(?:of|for)"
     r")\s+(.+?)(?:\s+didn'?t\s+work)?[.?!]*$",
     re.I,
@@ -1144,17 +1175,21 @@ def _about_media_plan(raw: str) -> dict[str, Any] | None:
 
 
 def _download_retry_plan(raw: str) -> dict[str, Any] | None:
-    """Route stalled/failed / try-another-source asks to radarr_retry / sonarr_retry."""
+    """Route stalled/failed / try-another-source / too-big asks to radarr_retry."""
     if not _DOWNLOAD_RETRY.search(raw):
         return None
     # Don't steal a fresh grab (“download the movie Dune”) unless it also
-    # clearly asks for another source / says the download failed.
+    # clearly asks for another source / says the download failed / too big.
     if re.search(
         r"\b(download|grab|snatch|get me)\b.+\b(movie|film|show|series|season)\b",
         raw,
         re.I,
     ) and not re.search(
-        r"\b(another\s+source|new\s+one|didn'?t\s+work|failed|stalled|retry|stuck)\b",
+        r"\b("
+        r"another\s+source|new\s+one|another\s+(?:version|release)|"
+        r"didn'?t\s+work|failed|stalled|retry|stuck|"
+        r"too\s+big|won'?t\s+play|smaller"
+        r")\b",
         raw,
         re.I,
     ):
@@ -1178,11 +1213,28 @@ def _download_retry_plan(raw: str) -> dict[str, Any] | None:
             r"^(.+?)\s+(?:didn'?t|doesn'?t)\s+work\b",
             raw,
             re.I,
+        ) or re.search(
+            r"^(.+?)\s+is\s+too\s+big\b",
+            raw,
+            re.I,
+        ) or re.search(
+            r"^(.+?)\s+won'?t\s+play\b",
+            raw,
+            re.I,
+        ) or re.search(
+            r"^(.+?)\s+has\s+no\s+(?:usable\s+)?file\b",
+            raw,
+            re.I,
+        ) or re.search(
+            r"^(.+?)\s+(?:is\s+)?missing\s+(?:the\s+)?file\b",
+            raw,
+            re.I,
         )
         if named:
             title = _play_title_clean(named.group(1))
     title = re.sub(
-        r"\b(the )?(movie|film|show|series|episode|download|source|one|it|that|this)\b",
+        r"\b(the )?(movie|film|show|series|episode|download|source|one|it|that|this|"
+        r"version|release|copy|file)\b",
         " ",
         title,
         flags=re.I,

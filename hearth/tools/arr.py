@@ -567,11 +567,23 @@ def speak_retry(
     """User-facing copy for Telegram + house tools (no fake percents)."""
     label = (title or "That download").strip() or "That download"
     mock_bit = " (mock)" if mock else ""
-    if ok and reason in {"retried", "grabbed"}:
+    if ok and reason in {"retried", "grabbed", "switched"}:
         source = f" via {indexer}" if indexer else ""
         cap = f" (attempt {attempt}/{max_attempts})" if attempt and max_attempts else ""
+        if reason == "switched":
+            return f"Grabbing a different release of {label}{source}{mock_bit}."
         return (
             f"{label} stalled — trying another source{source}{cap}{mock_bit}."
+        )
+    if reason == "needs_pick":
+        return (
+            f"{label} is in the library without a usable file — "
+            f"pick a smaller release to grab{mock_bit}."
+        )
+    if reason == "needs_pick_large":
+        return (
+            f"{label} has a huge / hard-to-play file — "
+            f"pick a smaller release to replace it{mock_bit}."
         )
     if reason == "exhausted":
         return (
@@ -582,16 +594,180 @@ def speak_retry(
         return f"{label} failed — no other release found{mock_bit}."
     if reason == "not_found":
         return f"{label} is not in the download queue{mock_bit}."
+    if reason == "not_in_library":
+        return f"{label} is not in the Radarr library{mock_bit}."
     if reason == "healthy":
         return (
             f"{label} is still downloading — say you want another source "
             f"if this one is stuck{mock_bit}."
+        )
+    if reason == "confirm_required":
+        return (
+            f"Confirm to grab that release of {label}"
+            f"{(' via ' + indexer) if indexer else ''}{mock_bit}."
         )
     if reason == "error":
         return f"Couldn't retry {label}{mock_bit}."
     if ok:
         return f"Retrying {label} from another source{mock_bit}."
     return f"Couldn't retry {label}{mock_bit}."
+
+
+def release_token(release: dict[str, Any]) -> str:
+    """Short stable token for Telegram callback_data (not a secret)."""
+    import hashlib
+
+    ident = release_identity(release) or str(release.get("title") or "x")
+    digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()
+    return digest[:10]
+
+
+def _release_size_bytes(release: dict[str, Any]) -> int | None:
+    for key in ("size", "sizebytes", "sizeBytes"):
+        raw = release.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _release_quality_label(release: dict[str, Any]) -> str:
+    quality = release.get("quality")
+    if isinstance(quality, dict):
+        inner = quality.get("quality")
+        if isinstance(inner, dict) and inner.get("name"):
+            return str(inner["name"])
+        if quality.get("name"):
+            return str(quality["name"])
+    title = str(release.get("title") or release.get("releaseTitle") or "")
+    return title
+
+
+def _format_size_gb(size: int | None) -> str | None:
+    if size is None or size <= 0:
+        return None
+    gb = size / 1_000_000_000
+    if gb >= 10:
+        return f"{gb:.0f} GB"
+    return f"{gb:.1f} GB"
+
+
+def summarize_release(
+    release: dict[str, Any],
+    *,
+    movie: dict[str, Any] | None = None,
+    service: str = "radarr",
+) -> dict[str, Any]:
+    """User-facing release row — ids stay server-side; token is for HITL."""
+    movie = movie or {}
+    size = _release_size_bytes(release)
+    quality = _release_quality_label(release)
+    title = str(release.get("title") or release.get("releaseTitle") or "Release")
+    indexer = str(release.get("indexer") or release.get("indexerId") or "")
+    movie_id = release.get("movieId") or movie.get("id") or movie.get("libraryId")
+    tmdb = movie.get("tmdbId") or release.get("tmdbId")
+    try:
+        movie_id_i = int(movie_id) if movie_id is not None else None
+    except (TypeError, ValueError):
+        movie_id_i = None
+    try:
+        tmdb_i = int(tmdb) if tmdb is not None else None
+    except (TypeError, ValueError):
+        tmdb_i = None
+    token = release_token(release)
+    size_label = _format_size_gb(size)
+    label_bits = [title]
+    if size_label:
+        label_bits.append(size_label)
+    out: dict[str, Any] = {
+        "title": title,
+        "label": " · ".join(label_bits),
+        "indexer": indexer or None,
+        "quality": quality or None,
+        "size": size,
+        "sizeLabel": size_label,
+        "releaseToken": token,
+        "guid": release.get("guid"),
+        "indexerId": release.get("indexerId"),
+        "movieId": movie_id_i,
+        "tmdbId": tmdb_i,
+        "mediaType": "movie" if service == "radarr" else "tv",
+        "approved": bool(release.get("approved")),
+        # Movie title for subject memory (not the release torrent name).
+        "movieTitle": str(movie.get("title") or "") or None,
+        "year": movie.get("year"),
+    }
+    return out
+
+
+def _playability_score(release: dict[str, Any], *, prefer_smaller: bool) -> int:
+    """Rank grab-able releases; prefer smaller / 1080p when size is the complaint."""
+    score = 0
+    if release.get("approved") is True:
+        score += 40
+    try:
+        score += int(release.get("score") or 0)
+    except (TypeError, ValueError):
+        pass
+    blob = (
+        f"{release.get('title') or ''} {_release_quality_label(release)}"
+    ).lower()
+    size = _release_size_bytes(release)
+    if prefer_smaller:
+        if any(tag in blob for tag in ("2160", "4k", "uhd")):
+            score -= 90
+        if "remux" in blob:
+            score -= 70
+        if "1080" in blob:
+            score += 45
+        if "720" in blob:
+            score += 35
+        if size is not None:
+            if size <= 4_000_000_000:
+                score += 35
+            elif size <= 10_000_000_000:
+                score += 25
+            elif size <= 20_000_000_000:
+                score += 5
+            else:
+                score -= 50
+    else:
+        if size is not None:
+            # Default *arr preference: higher score already applied; slight size nudge.
+            score += max(0, 20 - size // 5_000_000_000)
+    return score
+
+
+def format_release_offer(
+    movie_title: str,
+    releases: list[dict[str, Any]],
+    *,
+    reason: str = "needs_pick",
+) -> str:
+    """Numbered alternate-release menu for Telegram / voice."""
+    label = (movie_title or "That title").strip() or "That title"
+    if reason == "needs_pick_large":
+        header = (
+            f"{label} is too big / won't play well. "
+            f"Pick a smaller release:"
+        )
+    else:
+        header = (
+            f"{label} is in the library but has no usable file. "
+            f"Pick a release to grab:"
+        )
+    lines = [header]
+    for idx, row in enumerate(releases[:4], start=1):
+        bit = str(row.get("label") or row.get("title") or f"Release {idx}")
+        indexer = row.get("indexer")
+        if indexer:
+            bit = f"{bit} ({indexer})"
+        lines.append(f"{idx}. {bit}")
+    lines.append("Tap Get for the one you want — I won't grab until you confirm.")
+    return "\n".join(lines)
 
 
 def title_matches_download(item: dict[str, Any], title: str) -> bool:
@@ -971,8 +1147,9 @@ class StarrClient:
         releases: list[dict[str, Any]],
         *,
         blocked: str,
+        prefer_smaller: bool = False,
     ) -> dict[str, Any] | None:
-        """First acceptable release that is not the blocklisted one."""
+        """Best acceptable release that is not the blocklisted one."""
         blocked_norm = (blocked or "").strip().lower()
         ranked: list[tuple[int, dict[str, Any]]] = []
         for row in releases:
@@ -991,19 +1168,45 @@ class StarrClient:
                 or (ident and ident in blocked_norm)
             ):
                 continue
-            # Prefer approved / higher score when available.
-            score = 0
-            if row.get("approved") is True:
-                score += 100
-            try:
-                score += int(row.get("score") or 0)
-            except (TypeError, ValueError):
-                pass
+            score = _playability_score(row, prefer_smaller=prefer_smaller)
             ranked.append((score, row))
         if not ranked:
             return None
         ranked.sort(key=lambda pair: pair[0], reverse=True)
         return ranked[0][1]
+
+    def _rank_releases(
+        self,
+        releases: list[dict[str, Any]],
+        *,
+        blocked: str = "",
+        prefer_smaller: bool = True,
+        limit: int = 4,
+    ) -> list[dict[str, Any]]:
+        """Return top grab-able releases (raw *arr rows), ranked."""
+        blocked_norm = (blocked or "").strip().lower()
+        ranked: list[tuple[int, dict[str, Any]]] = []
+        for row in releases:
+            if not isinstance(row, dict):
+                continue
+            if row.get("rejected") is True:
+                continue
+            if row.get("rejections"):
+                continue
+            guid = row.get("guid")
+            indexer_id = row.get("indexerId")
+            if not guid or indexer_id in (None, ""):
+                continue
+            ident = release_identity(row)
+            if blocked_norm and (
+                ident == blocked_norm
+                or blocked_norm in ident
+                or (ident and ident in blocked_norm)
+            ):
+                continue
+            ranked.append((_playability_score(row, prefer_smaller=prefer_smaller), row))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        return [row for _, row in ranked[: max(1, limit)]]
 
     def _select_retry_target(
         self,
@@ -1072,6 +1275,18 @@ class StarrClient:
                         title=display, ok=False, reason="healthy", mock=mock
                     ),
                 }
+            # Not in the active queue — offer library switch when the title is
+            # monitored but missing a usable file (or the file is huge).
+            if title and self.kind == "radarr":
+                switch = await self.list_alternate_releases(
+                    title, prefer_smaller=True
+                )
+                if switch.get("ok") and switch.get("releases"):
+                    return switch
+                if switch.get("reason") in {"no_alternate", "not_in_library"}:
+                    # Fall through to classic not_found when nothing to offer.
+                    if switch.get("reason") == "no_alternate":
+                        return switch
             return {
                 "ok": False,
                 "mode": "mock" if mock else "live",
@@ -1267,6 +1482,443 @@ class StarrClient:
                 "error": str(exc),
                 "speak": speak_retry(title=display, ok=False, reason="error", mock=False),
             }
+
+    async def library_lookup(self, query: str) -> dict[str, Any]:
+        """Find a monitored library title (hasFile may be false)."""
+        query = (query or "").strip()
+        mock = not self.live
+        if self.kind != "radarr":
+            return {
+                "ok": False,
+                "mode": "mock" if mock else "live",
+                "service": self.kind,
+                "query": query or None,
+                "reason": "unsupported",
+                "movie": None,
+                "speak": "Library switch is only wired for Radarr movies.",
+            }
+        if not query:
+            return {
+                "ok": False,
+                "mode": "mock" if mock else "live",
+                "service": self.kind,
+                "query": None,
+                "reason": "not_in_library",
+                "movie": None,
+                "speak": speak_retry(title="That title", ok=False, reason="not_in_library", mock=mock),
+            }
+        if not self.live:
+            rows = pipeline.list_radarr_library(query)
+            movie = rows[0] if rows else None
+            return {
+                "ok": bool(movie),
+                "mode": "mock",
+                "service": self.kind,
+                "query": query,
+                "movie": _summarize_movie(movie) if movie else None,
+                "raw": movie,
+                "reason": None if movie else "not_in_library",
+                "speak": (
+                    f"Found {movie.get('title')} in the library."
+                    if movie
+                    else speak_retry(
+                        title=query, ok=False, reason="not_in_library", mock=True
+                    )
+                ),
+            }
+        client = await self._http()
+        try:
+            response = await client.get("/api/v3/movie")
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload if isinstance(payload, list) else []
+            needle = query.lower()
+            matches = [
+                row
+                for row in rows
+                if isinstance(row, dict)
+                and needle in str(row.get("title") or "").lower()
+            ]
+            # Prefer exact / tight title matches.
+            exact = [
+                row
+                for row in matches
+                if " ".join(_normalize_title_tokens(str(row.get("title") or "")))
+                == " ".join(_normalize_title_tokens(query))
+            ]
+            movie = (exact or matches)[0] if (exact or matches) else None
+            return {
+                "ok": bool(movie),
+                "mode": "live",
+                "service": self.kind,
+                "query": query,
+                "movie": _summarize_movie(movie) if movie else None,
+                "raw": movie,
+                "reason": None if movie else "not_in_library",
+                "speak": (
+                    f"Found {movie.get('title')} in the library."
+                    if movie
+                    else speak_retry(
+                        title=query, ok=False, reason="not_in_library", mock=False
+                    )
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                rows = pipeline.list_radarr_library(query)
+                movie = rows[0] if rows else None
+                return {
+                    "ok": bool(movie),
+                    "mode": "mock",
+                    "service": self.kind,
+                    "query": query,
+                    "error": str(exc),
+                    "movie": _summarize_movie(movie) if movie else None,
+                    "raw": movie,
+                    "reason": None if movie else "not_in_library",
+                    "speak": (
+                        f"Found {movie.get('title')} in the library (mock)."
+                        if movie
+                        else speak_retry(
+                            title=query, ok=False, reason="not_in_library", mock=True
+                        )
+                    ),
+                }
+            raise
+
+    def _library_file_too_large(self, movie: dict[str, Any]) -> bool:
+        """Heuristic: huge remux / 4K on disk that won't play well."""
+        size = movie.get("sizeOnDisk")
+        try:
+            size_i = int(size) if size not in (None, "") else 0
+        except (TypeError, ValueError):
+            size_i = 0
+        mf = movie.get("movieFile") if isinstance(movie.get("movieFile"), dict) else {}
+        if not size_i and mf.get("size") not in (None, ""):
+            try:
+                size_i = int(mf.get("size") or 0)
+            except (TypeError, ValueError):
+                size_i = 0
+        quality = ""
+        q = mf.get("quality")
+        if isinstance(q, dict):
+            inner = q.get("quality") if isinstance(q.get("quality"), dict) else q
+            quality = str((inner or {}).get("name") or "")
+        path = str(mf.get("relativePath") or mf.get("path") or "")
+        blob = f"{quality} {path}".lower()
+        if size_i >= 20_000_000_000:
+            return True
+        if any(tag in blob for tag in ("remux", "2160", "uhd", "4k")) and size_i >= 12_000_000_000:
+            return True
+        return False
+
+    async def _delete_movie_file(self, movie_file_id: int) -> None:
+        if not self.live:
+            pipeline.delete_movie_file(int(movie_file_id))
+            return
+        client = await self._http()
+        response = await client.delete(f"/api/v3/moviefile/{int(movie_file_id)}")
+        response.raise_for_status()
+
+    async def list_alternate_releases(
+        self,
+        query: str,
+        *,
+        prefer_smaller: bool = True,
+        limit: int = 4,
+    ) -> dict[str, Any]:
+        """List grab-able alternate releases for a library movie (no auto-grab)."""
+        query = (query or "").strip()
+        mock = not self.live
+        if self.kind != "radarr":
+            return {
+                "ok": False,
+                "mode": "mock" if mock else "live",
+                "service": self.kind,
+                "query": query or None,
+                "reason": "unsupported",
+                "releases": [],
+                "speak": "Alternate releases are only wired for Radarr movies.",
+            }
+        found = await self.library_lookup(query)
+        movie_raw = found.get("raw") if isinstance(found.get("raw"), dict) else None
+        movie_sum = found.get("movie") if isinstance(found.get("movie"), dict) else None
+        if not movie_raw or not movie_sum:
+            return {
+                "ok": False,
+                "mode": found.get("mode") or ("mock" if mock else "live"),
+                "service": self.kind,
+                "query": query or None,
+                "reason": "not_in_library",
+                "title": query,
+                "releases": [],
+                "speak": speak_retry(
+                    title=query or "That title",
+                    ok=False,
+                    reason="not_in_library",
+                    mock=mock,
+                ),
+            }
+
+        display = str(movie_sum.get("title") or query)
+        has_file = bool(movie_raw.get("hasFile"))
+        too_large = has_file and self._library_file_too_large(movie_raw)
+        if has_file and not too_large:
+            # Usable file already present and not flagged huge — still allow
+            # explicit switch lists when the user asked (caller decides).
+            pass
+
+        search_item = {
+            "movieId": movie_raw.get("id") or movie_sum.get("libraryId"),
+            "movie": movie_raw,
+            "title": display,
+        }
+        try:
+            raw_releases = await self._search_releases(search_item)
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                raw_releases = pipeline.list_releases(self.kind, search_item)
+            else:
+                return {
+                    "ok": False,
+                    "mode": "live",
+                    "service": self.kind,
+                    "query": query,
+                    "reason": "error",
+                    "title": display,
+                    "error": str(exc),
+                    "releases": [],
+                    "speak": speak_retry(title=display, ok=False, reason="error", mock=False),
+                }
+
+        # When replacing a huge file, skip releases that are also huge remuxes
+        # of similar size so the menu is actually smaller / more playable.
+        blocked = ""
+        if too_large:
+            mf = movie_raw.get("movieFile") if isinstance(movie_raw.get("movieFile"), dict) else {}
+            blocked = str(mf.get("relativePath") or "")
+
+        ranked = self._rank_releases(
+            raw_releases,
+            blocked=blocked,
+            prefer_smaller=prefer_smaller or too_large or not has_file,
+            limit=limit,
+        )
+        if too_large or prefer_smaller:
+            # Drop remaining giant remuxes from the offer when size is the ask.
+            filtered: list[dict[str, Any]] = []
+            for row in ranked:
+                blob = str(row.get("title") or "").lower()
+                size = _release_size_bytes(row) or 0
+                if ("remux" in blob or "2160" in blob or "uhd" in blob) and size >= 20_000_000_000:
+                    continue
+                filtered.append(row)
+            if filtered:
+                ranked = filtered
+
+        summarized = [
+            summarize_release(row, movie=movie_sum, service=self.kind) for row in ranked
+        ]
+        if not summarized:
+            return {
+                "ok": False,
+                "mode": "mock" if mock else str(found.get("mode") or "live"),
+                "service": self.kind,
+                "query": query,
+                "reason": "no_alternate",
+                "title": display,
+                "hasFile": has_file,
+                "tooLarge": too_large,
+                "movie": movie_sum,
+                "releases": [],
+                "speak": speak_retry(
+                    title=display, ok=False, reason="no_alternate", mock=mock
+                ),
+            }
+
+        reason = "needs_pick_large" if too_large else "needs_pick"
+        if has_file and not too_large:
+            reason = "needs_pick"
+        speak = format_release_offer(display, summarized, reason=reason)
+        return {
+            "ok": True,
+            "mode": "mock" if mock else str(found.get("mode") or "live"),
+            "service": self.kind,
+            "query": query,
+            "reason": reason,
+            "needs_pick": True,
+            "title": display,
+            "hasFile": has_file,
+            "tooLarge": too_large,
+            "movie": movie_sum,
+            "releases": summarized,
+            "preferred": summarized[0],
+            "speak": speak,
+        }
+
+    async def grab_alternate_release(
+        self,
+        query: str = "",
+        *,
+        guid: str = "",
+        release_token_value: str = "",
+        confirm: bool = False,
+        prefer_smaller: bool = True,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Grab one alternate release for a library movie (confirm-gated).
+
+        Never auto-grabs from a vague yes — caller must pass confirm=True and a
+        concrete guid/token (or confirm the single preferred pick explicitly).
+        """
+        query = (query or "").strip()
+        guid = (guid or "").strip()
+        token = (release_token_value or "").strip()
+        mock = not self.live
+        listed = await self.list_alternate_releases(
+            query, prefer_smaller=prefer_smaller
+        )
+        if not listed.get("ok"):
+            return listed
+
+        display = str(listed.get("title") or query)
+        releases = list(listed.get("releases") or [])
+        pick_sum: dict[str, Any] | None = None
+        if guid:
+            for row in releases:
+                if str(row.get("guid") or "") == guid:
+                    pick_sum = row
+                    break
+        elif token:
+            for row in releases:
+                if str(row.get("releaseToken") or "") == token:
+                    pick_sum = row
+                    break
+        elif confirm and len(releases) == 1:
+            pick_sum = releases[0]
+        elif confirm and listed.get("preferred"):
+            # Explicit confirm on preferred after the menu was shown.
+            pick_sum = listed["preferred"] if isinstance(listed["preferred"], dict) else None
+
+        if pick_sum is None:
+            return {
+                **listed,
+                "ok": True,
+                "needs_pick": True,
+                "reason": listed.get("reason") or "needs_pick",
+                "speak": listed.get("speak")
+                or format_release_offer(
+                    display, releases, reason=str(listed.get("reason") or "needs_pick")
+                ),
+            }
+
+        if not confirm:
+            indexer = str(pick_sum.get("indexer") or "")
+            return {
+                "ok": False,
+                "mode": listed.get("mode") or ("mock" if mock else "live"),
+                "service": self.kind,
+                "query": query or None,
+                "reason": "confirm_required",
+                "needs_confirm": True,
+                "title": display,
+                "release": pick_sum,
+                "releases": releases,
+                "movie": listed.get("movie"),
+                "speak": speak_retry(
+                    title=display,
+                    ok=False,
+                    reason="confirm_required",
+                    indexer=indexer,
+                    mock=mock,
+                ),
+            }
+
+        # Rebuild a raw release body for POST /release.
+        raw_body = {
+            "guid": pick_sum.get("guid"),
+            "indexerId": pick_sum.get("indexerId"),
+            "title": pick_sum.get("title"),
+            "indexer": pick_sum.get("indexer"),
+            "movieId": pick_sum.get("movieId"),
+            "size": pick_sum.get("size"),
+        }
+        movie_raw = None
+        found = await self.library_lookup(query or display)
+        if isinstance(found.get("raw"), dict):
+            movie_raw = found["raw"]
+
+        try:
+            # Replace oversized / unplayable file so the new grab can import.
+            if (
+                movie_raw
+                and movie_raw.get("hasFile")
+                and self._library_file_too_large(movie_raw)
+            ):
+                mf = movie_raw.get("movieFile")
+                if isinstance(mf, dict) and mf.get("id") is not None:
+                    await self._delete_movie_file(int(mf["id"]))
+
+            await self._grab_release(raw_body)
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured and self.live:
+                try:
+                    if (
+                        movie_raw
+                        and movie_raw.get("hasFile")
+                        and isinstance(movie_raw.get("movieFile"), dict)
+                        and movie_raw["movieFile"].get("id") is not None
+                    ):
+                        pipeline.delete_movie_file(int(movie_raw["movieFile"]["id"]))
+                    pipeline.grab_release(self.kind, raw_body)
+                except Exception as mock_exc:  # noqa: BLE001
+                    return {
+                        "ok": False,
+                        "mode": "mock",
+                        "service": self.kind,
+                        "query": query or None,
+                        "reason": "error",
+                        "title": display,
+                        "error": str(mock_exc),
+                        "speak": speak_retry(
+                            title=display, ok=False, reason="error", mock=True
+                        ),
+                    }
+            else:
+                return {
+                    "ok": False,
+                    "mode": "live" if self.live else "mock",
+                    "service": self.kind,
+                    "query": query or None,
+                    "reason": "error",
+                    "title": display,
+                    "error": str(exc),
+                    "speak": speak_retry(
+                        title=display, ok=False, reason="error", mock=mock
+                    ),
+                }
+
+        indexer = str(pick_sum.get("indexer") or "")
+        refreshed = await self.queue(display)
+        return {
+            "ok": True,
+            "mode": listed.get("mode") or ("mock" if mock else "live"),
+            "service": self.kind,
+            "query": query or None,
+            "reason": "switched",
+            "title": display,
+            "indexer": indexer or None,
+            "release": pick_sum,
+            "trigger": reason or "user",
+            "downloads": refreshed.get("downloads") or [],
+            "speak": speak_retry(
+                title=display,
+                ok=True,
+                reason="switched",
+                indexer=indexer,
+                mock=mock,
+            ),
+        }
 
 
 class Overseerr:

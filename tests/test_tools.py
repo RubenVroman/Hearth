@@ -697,6 +697,107 @@ async def test_radarr_retry_force_on_healthy_user_request():
     assert denied["reason"] == "healthy"
 
 
+async def test_radarr_library_nofile_lists_smaller_releases_no_auto_grab():
+    """Monitored library title, not in queue, no file → offer releases, do not grab."""
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import radarr
+
+    radarr.reset_retry_counts()
+    pipeline.radarr_downloads = []  # empty queue — not actively downloading
+    listed = await radarr.list_alternate_releases("The Brutalist", prefer_smaller=True)
+    assert listed["ok"] is True
+    assert listed["needs_pick"] is True
+    assert listed["reason"] == "needs_pick"
+    assert listed["hasFile"] is False
+    releases = listed["releases"]
+    assert 1 <= len(releases) <= 4
+    # Prefer playable 1080p/720p over the 55GB 4K remux.
+    titles = " ".join(str(r.get("title") or "") for r in releases).lower()
+    assert "1080" in titles or "720" in titles
+    assert not any(
+        "remux" in str(r.get("title") or "").lower()
+        and (r.get("size") or 0) >= 20_000_000_000
+        for r in releases
+    )
+    # Listing must not enqueue anything.
+    assert pipeline.radarr_downloads == []
+
+    # retry_download falls through to the same offer when not in queue.
+    retried = await radarr.retry_download("The Brutalist", force=True, reason="user:house")
+    assert retried["needs_pick"] is True
+    assert retried["ok"] is True
+    assert pipeline.radarr_downloads == []
+
+
+async def test_radarr_too_large_file_offers_smaller_and_confirm_grabs():
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import radarr
+
+    radarr.reset_retry_counts()
+    pipeline.radarr_downloads = []
+    listed = await radarr.list_alternate_releases("The Endless", prefer_smaller=True)
+    assert listed["ok"] is True
+    assert listed["tooLarge"] is True
+    assert listed["reason"] == "needs_pick_large"
+    preferred = listed["preferred"]
+    assert preferred is not None
+    assert (preferred.get("size") or 0) < 20_000_000_000
+
+    # Without confirm — no grab.
+    denied = await radarr.grab_alternate_release(
+        "The Endless",
+        guid=str(preferred.get("guid") or ""),
+        confirm=False,
+    )
+    assert denied["ok"] is False
+    assert denied["reason"] == "confirm_required"
+    assert pipeline.radarr_downloads == []
+
+    grabbed = await radarr.grab_alternate_release(
+        "The Endless",
+        guid=str(preferred.get("guid") or ""),
+        confirm=True,
+        reason="user:house",
+    )
+    assert grabbed["ok"] is True
+    assert grabbed["reason"] == "switched"
+    assert any(
+        row.get("downloadId") == preferred.get("guid")
+        or row.get("indexer") == preferred.get("indexer")
+        for row in pipeline.radarr_downloads or []
+    )
+    # Oversized movie file was cleared so the new grab can import.
+    lib = pipeline.list_radarr_library("The Endless")
+    assert lib and lib[0].get("hasFile") is False
+
+
+async def test_radarr_grab_release_tool_is_confirm_gated():
+    from hearth.agent.registry import registry
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import radarr
+
+    radarr.reset_retry_counts()
+    pipeline.radarr_downloads = []
+    listed = await radarr.list_alternate_releases("The Brutalist")
+    token = listed["preferred"]["releaseToken"]
+
+    preview = await registry.call(
+        "radarr_grab_release",
+        {"query": "The Brutalist", "releaseToken": token},
+    )
+    assert preview.needs_confirm is True
+    assert pipeline.radarr_downloads == []
+
+    done = await registry.call(
+        "radarr_grab_release",
+        {"query": "The Brutalist", "releaseToken": token, "confirm": True},
+    )
+    assert done.ok is True
+    assert done.needs_confirm is False
+    assert done.data.get("reason") == "switched"
+    assert pipeline.radarr_downloads
+
+
 async def test_intent_retry_routes_to_radarr_retry():
     plan = route_intent("this download didn't work for Annihilation")
     assert plan is not None
@@ -712,6 +813,15 @@ async def test_intent_retry_routes_to_radarr_retry():
     # Fresh grab must not become a retry.
     grab = route_intent("download the movie Dune")
     assert grab["tool"] == "radarr_add"
+
+    big = route_intent("The Endless is too big and won't play, get another version")
+    assert big is not None
+    assert big["tool"] == "radarr_retry"
+    assert "endless" in big["args"]["query"].lower()
+
+    nofile = route_intent("The Brutalist has no file, download another one")
+    assert nofile is not None
+    assert nofile["tool"] == "radarr_retry"
 
 
 async def test_house_media_inventory_speaks_tv_avr_plex():
