@@ -471,13 +471,22 @@ async def test_inbox_not_found(inbox: TelegramInbox, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_inbox_instant_title_year_still_not_found(inbox: TelegramInbox):
-    """Explicit Title (YYYY) instant path may still 404 when catalog misses."""
+async def test_inbox_instant_title_year_still_offers_get(inbox: TelegramInbox):
+    """Explicit Title (YYYY) miss still offers Get/request — no encyclopedia 404 lecture."""
     result = await inbox.handle_message(
         _msg("ZzzNotARealFilm999 (2099)", message_id=71)
     )
     assert result.grabbed is False
-    assert "Couldn't find" in result.reply
+    assert "Couldn't find" not in (result.reply or "")
+    assert "Did you mean" in (result.reply or "") or "Get" in (result.reply or "")
+    assert "ZzzNotARealFilm999" in (result.reply or "")
+    # Upcoming year may note it's not out yet, but must still offer.
+    assert "wikipedia" not in (result.reply or "").lower()
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert any(
+        "ZzzNotARealFilm999" in str(o.get("title") or "") for o in pending.options
+    )
 
 
 # --- intent / follow-ups ----------------------------------------------------
@@ -2439,6 +2448,10 @@ def test_catalog_search_title_strips_actor_clause():
         catalog_search_title("The Fall and Rise of Reggie Dinkins")
         == "The Fall and Rise of Reggie Dinkins"
     )
+    assert catalog_search_title("Miss you love you 2026 film") == "Miss you love you"
+    assert catalog_search_title("Miss You, Love You (2026)") == "Miss You, Love You"
+    # Year-in-title stays when there is no film/movie disambiguator.
+    assert catalog_search_title("Blade Runner 2049") == "Blade Runner 2049"
 
 
 @pytest.mark.asyncio
@@ -6692,3 +6705,181 @@ async def test_inbox_0227_do_a_websearch_uses_tool(
     titles = " ".join(str(o.get("title") or "") for o in pending.options)
     assert "Land" in titles
     assert "La La Land" not in titles
+
+# --- Named title+year → Get, not encyclopedia (live 2026-09-01 ~10:02) ---
+
+
+def test_named_title_year_helpers():
+    from hearth.telegram.intent import looks_like_named_title_year
+    from hearth.telegram.parse import parse_message_text, strip_title_year_media
+
+    assert looks_like_named_title_year("Miss you love you 2026 film")
+    assert looks_like_named_title_year("Miss You, Love You (2026)")
+    assert looks_like_named_title_year("the 2026 film Miss you love you")
+    assert not looks_like_named_title_year("show me cool fantasy")
+    assert strip_title_year_media("Miss you love you 2026 film") == (
+        "Miss you love you",
+        2026,
+    )
+    parsed = parse_message_text("Miss you love you 2026 film")
+    assert parsed.title == "Miss you love you"
+    assert parsed.year == 2026
+    assert parsed.media_kind == "movie"
+
+
+def test_looks_like_encyclopedia_dump():
+    from hearth.telegram.agent import looks_like_encyclopedia_dump
+
+    dump = (
+        "Miss You, Love You is a 2026 comedy starring Jim Rash and Allison Janney, "
+        "set for HBO on May 29 2026 with 88% on Rotten Tomatoes. "
+        "https://en.wikipedia.org/wiki/Miss_You,_Love_You "
+        "https://www.rottentomatoes.com/m/x?utm_source=openai"
+    )
+    assert looks_like_encyclopedia_dump(dump)
+    assert not looks_like_encyclopedia_dump("Did you mean Miss You, Love You (2026)?")
+
+
+@pytest.mark.asyncio
+async def test_inbox_1002_miss_you_love_you_2026_film_offers_get(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Named title+year must offer Get — never a Wikipedia/RT encyclopedia dump."""
+    from hearth.fixtures import pipeline
+
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(
+        _msg("Miss you love you 2026 film", message_id=100201)
+    )
+    assert result.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0
+    body = result.reply or ""
+    lowered = body.lower()
+    assert "wikipedia.org" not in lowered
+    assert "rottentomatoes.com" not in lowered
+    assert "utm_source=openai" not in lowered
+    assert "jim rash" not in lowered
+    assert "allison janney" not in lowered
+    assert "88%" not in body
+    assert "Miss You" in body or "Miss you" in body or "miss you" in lowered
+    assert "2026" in body
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert any(
+        int(o.get("tmdbId") or o.get("mediaId") or 0) == 1482001
+        or "miss you" in str(o.get("title") or "").lower()
+        for o in pending.options
+    )
+    assert result.reply_markup is not None
+    markup = str(result.reply_markup)
+    assert "q:movie:" in markup or "Get" in markup
+
+
+@pytest.mark.asyncio
+async def test_inbox_1002_named_title_year_agent_dump_forced_to_get(
+    inbox: TelegramInbox, monkeypatch
+):
+    """If the model dumps wiki/RT text, Python forces search_title → Get."""
+    from hearth.fixtures import pipeline
+
+    dump = (
+        "Miss You, Love You (2026) is an upcoming comedy starring Jim Rash and "
+        "Allison Janney, premiering on HBO May 29 2026 (88% RT). "
+        "Read more: https://en.wikipedia.org/wiki/Miss_You,_Love_You "
+        "https://www.rottentomatoes.com/m/miss_you_love_you?utm_source=openai"
+    )
+    pipeline.overseerr_queue.clear()
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "web_search",
+                            "arguments": {
+                                "query": "Miss you love you 2026 film",
+                                "year": 2026,
+                                "media_type": "movie",
+                            },
+                        }
+                    }
+                ]
+            },
+            {"content": dump},
+        ],
+    )
+    # Concrete title without bare year+film so the agent loop runs (not instant).
+    result = await inbox.handle_message(
+        _msg("Miss you love you film", message_id=100211)
+    )
+    assert result.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0
+    body = (result.reply or "").lower()
+    assert "wikipedia.org" not in body
+    assert "rottentomatoes.com" not in body
+    assert "utm_source=openai" not in body
+    assert "jim rash" not in body
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert result.reply_markup is not None or any(
+        "miss you" in str(o.get("title") or "").lower() for o in pending.options
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbox_1002_paren_title_year_offers_get(inbox: TelegramInbox):
+    """Miss You, Love You (2026) instant path offers Get, no auto-queue."""
+    from hearth.fixtures import pipeline
+
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(
+        _msg("Miss You, Love You (2026)", message_id=100220)
+    )
+    assert result.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0
+    body = (result.reply or "").lower()
+    assert "wikipedia.org" not in body
+    assert "utm_source=openai" not in body
+    assert "miss you" in body
+    assert result.reply_markup is not None
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert any(int(o.get("tmdbId") or 0) == 1482001 for o in pending.options)
+
+
+@pytest.mark.asyncio
+async def test_inbox_1002_discover_still_skips_unreleased_vapor(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Discover/browse lists still skip random unreleased filler (not named titles)."""
+    from hearth.telegram.buttons import GENRE_FANTASY, GENRE_SCI_FI
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "discover_by_genre",
+                            "arguments": {
+                                "genre_ids": [GENRE_FANTASY],
+                                "exclude_genre_ids": [GENRE_SCI_FI],
+                                "query": "Fantasy",
+                                "limit": 3,
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    result = await inbox.handle_message(_msg("show me cool fantasy", message_id=100230))
+    assert result.grabbed is False
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    joined = " | ".join(str(r.get("title") or "") for r in pending.options).lower()
+    assert "odyssey" not in joined
+    assert "moana" not in joined
+    assert "miss you" not in joined

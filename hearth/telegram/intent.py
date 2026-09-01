@@ -510,6 +510,34 @@ def is_explicit_title_year(text: str) -> bool:
     return True
 
 
+def looks_like_named_title_year(text: str) -> bool:
+    """True for a specific titled ask with a year — download/Get path.
+
+    Covers ``Title (YYYY)``, ``Title 2026 film``, and ``the 2026 film Title``.
+    Genre browse / plot sentences stay False.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 120:
+        return False
+    if is_explicit_title_year(raw):
+        return True
+    if looks_like_list_ask(raw) or looks_like_recommend_ask(raw):
+        return False
+    if looks_like_chatter(raw) or looks_like_confirm_yes(raw) or looks_like_confirm_no(raw):
+        return False
+    from hearth.telegram.parse import strip_title_year_media
+
+    stripped, year = strip_title_year_media(raw)
+    if year is None or not stripped:
+        return False
+    # Need a real title left after stripping year/media words.
+    if not re.search(r"[A-Za-zÀ-ÿ]", stripped):
+        return False
+    if len(stripped.split()) > 8:
+        return False
+    return looks_like_concrete_title(stripped) or looks_like_concrete_title(raw)
+
+
 def looks_like_confirm_yes(text: str) -> bool:
     """True for short yes / that's it confirmations of a single guess.
 
@@ -1537,6 +1565,7 @@ __all__ = [
     "looks_like_confirm_yes",
     "looks_like_list_ask",
     "looks_like_media_ask",
+    "looks_like_named_title_year",
     "looks_like_recommend_ask",
     "looks_like_collection_request",
     "looks_like_contextual_followup",

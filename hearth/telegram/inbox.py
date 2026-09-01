@@ -23,6 +23,7 @@ from hearth.telegram.agent import (
     SessionMode,
     looks_like_asking_for_others,
     looks_like_correction,
+    looks_like_encyclopedia_dump,
     looks_like_exhausted_offer_reply,
     looks_like_explain,
     run_telegram_agent,
@@ -55,13 +56,20 @@ from hearth.telegram.intent import (
     looks_like_confirm_yes,
     looks_like_list_ask,
     looks_like_media_ask,
+    looks_like_named_title_year,
     looks_like_recommend_ask,
     search_title_grounded,
     subject_matches_user_title,
     titles_match,
 )
 from hearth.telegram.memory import ChatMemory
-from hearth.telegram.parse import MessageView, ParsedRequest, normalize_title, parse_message
+from hearth.telegram.parse import (
+    MessageView,
+    ParsedRequest,
+    normalize_title,
+    parse_message,
+    strip_title_year_media,
+)
 from hearth.telegram.progress import (
     ProgressTracker,
     format_already,
@@ -591,6 +599,39 @@ class TelegramInbox:
             mode=agent.mode,
         )
 
+        # Named title+year must never leave as a Wikipedia/RT encyclopedia dump.
+        if (
+            not result.grabbed
+            and looks_like_encyclopedia_dump(result.reply)
+            and (
+                looks_like_named_title_year(view.text)
+                or looks_like_concrete_title(view.text)
+            )
+        ):
+            forced = await self._tool_search_catalog(
+                view,
+                {
+                    "title": catalog_search_title(view.text) or view.text,
+                    "year": (
+                        parsed.year
+                        if parsed.kind == "request" and parsed.year
+                        else strip_title_year_media(view.text)[1]
+                    ),
+                    "media_type": (
+                        parsed.media_kind
+                        if parsed.kind == "request"
+                        and parsed.media_kind in {"movie", "tv"}
+                        else "movie"
+                    ),
+                },
+            )
+            if forced.get("ok") and forced.get("reply"):
+                result.reply = str(forced["reply"])
+                if isinstance(forced.get("reply_markup"), dict):
+                    result.reply_markup = forced["reply_markup"]
+                result.mode = "confirm" if forced.get("count") == 1 else "offer"
+                agent.search_title = str(forced.get("query") or agent.search_title)
+
         if rejected_this_turn and not result.grabbed:
             self.pending.pop(view.chat_id, None)
             self.memory.clear_offered(view.chat_id)
@@ -701,8 +742,22 @@ class TelegramInbox:
             year_i = int(year) if year not in (None, "") else None
         except (TypeError, ValueError):
             year_i = None
+        # Pull year from the user message when the model omits it
+        # ("Miss you love you 2026 film").
+        if year_i is None:
+            _seed, year_from_msg = strip_title_year_media(view.text)
+            if year_from_msg is not None:
+                year_i = year_from_msg
+            else:
+                _seed2, year_from_title = strip_title_year_media(
+                    str(args.get("title") or "")
+                )
+                if year_from_title is not None:
+                    year_i = year_from_title
         media_type = str(args.get("media_type") or args.get("mediaType") or "").strip()
         kind = media_type if media_type in {"movie", "tv"} else ""
+        if not kind and re.search(r"(?i)\b(?:films?|movies?|flicks?)\b", view.text):
+            kind = "movie"
 
         # Prefer the user's concrete seed when the model invents a different
         # title (Christophers + McKellen ≠ Christopher Guest; Land ≠ La La Land).
@@ -1334,6 +1389,20 @@ class TelegramInbox:
             year_i = int(year) if year not in (None, "") else None
         except (TypeError, ValueError):
             year_i = None
+        if year_i is None:
+            _bare, year_from_q = strip_title_year_media(query)
+            if year_from_q is not None:
+                year_i = year_from_q
+            else:
+                _bare2, year_from_msg = strip_title_year_media(view.text)
+                if year_from_msg is not None:
+                    year_i = year_from_msg
+        if not kind and re.search(r"(?i)\b(?:films?|movies?|flicks?)\b", view.text or query):
+            kind = "movie"
+        # Prefer a clean catalog seed (strip "2026 film").
+        bare_seed, _ = strip_title_year_media(seed)
+        if bare_seed:
+            seed = bare_seed
 
         names = self._titles_from_web_search(payload if isinstance(payload, dict) else {})
         if year_i and seed:
@@ -1395,25 +1464,86 @@ class TelegramInbox:
                 "reply": offered.reply,
                 "reply_markup": offered.reply_markup,
                 "web": {
-                    "speak": str(payload.get("speak") or "")[:400],
-                    "results": (payload.get("results") or [])[:3],
+                    "identity_hints": [
+                        {
+                            "title": str(r.get("title") or "")[:80],
+                            "source": str(r.get("source") or "")[:40],
+                        }
+                        for r in (payload.get("results") or [])[:3]
+                        if isinstance(r, dict)
+                    ],
                 },
                 "hint": (
                     "Offer Get for the resolved title. Do not auto-queue. "
+                    "Do not paste Wikipedia/RT/plot text. "
                     "Never say you cannot search the web."
                 ),
                 "source": "web_search",
             }
 
-        speak = str(payload.get("speak") or "").strip()
+        # Named title asks must still Get/request — never dump speak/synopses.
+        named = looks_like_named_title_year(view.text) or looks_like_concrete_title(
+            seed
+        ) or looks_like_named_title_year(query)
+        if named:
+            bare, year_guess = strip_title_year_media(seed)
+            if year_i is None:
+                year_i = year_guess
+            offer_title = bare or catalog_search_title(seed) or seed
+            note = ""
+            try:
+                today_year = int(self._amsterdam_today()[:4])
+            except ValueError:
+                today_year = 2026
+            if year_i is not None and year_i > today_year:
+                note = "Not out yet — I can still request it. "
+            offered = self._ask_guess_confirm(
+                view,
+                {
+                    "title": offer_title,
+                    "year": year_i,
+                    "mediaType": kind or "movie",
+                },
+                query=offer_title,
+            )
+            reply = offered.reply or ""
+            if note:
+                reply = f"{note}{reply}"
+            return {
+                "ok": True,
+                "query": query,
+                "resolved_title": offer_title,
+                "results": [],
+                "count": 0,
+                "reply": reply,
+                "reply_markup": offered.reply_markup,
+                "hint": (
+                    "Offer Get for the named title. Do not summarize web pages. "
+                    "Never paste wikipedia.org, rottentomatoes.com, or "
+                    "utm_source=openai links."
+                ),
+                "source": "web_search",
+            }
+
         return {
             "ok": bool(payload.get("ok")),
             "query": query,
-            "results": payload.get("results") or [],
-            "speak": speak,
-            "reply": speak
-            or "I searched the web but couldn't pin a catalog title. Any other clue?",
-            "hint": "Summarize web findings; never claim you cannot search the web.",
+            "results": [
+                {
+                    "title": str(r.get("title") or "")[:80],
+                    "source": str(r.get("source") or "")[:40],
+                }
+                for r in (payload.get("results") or [])[:3]
+                if isinstance(r, dict)
+            ],
+            "reply": (
+                "I searched the web but couldn't pin a catalog title. "
+                "Any other clue?"
+            ),
+            "hint": (
+                "Do not paste Wikipedia/RT essays or utm_source=openai links. "
+                "Ask a short clarifying question or call search_title."
+            ),
             "source": "web_search",
         }
 
@@ -1963,10 +2093,14 @@ class TelegramInbox:
             return False
         if parsed.imdb_id or parsed.tmdb_id or parsed.tvdb_id:
             return True
+        # Title (YYYY) or "Title 2026 film" — download/Get path, not explain.
         return bool(
             parsed.title
             and parsed.year
-            and is_explicit_title_year(view.text)
+            and (
+                is_explicit_title_year(view.text)
+                or looks_like_named_title_year(view.text)
+            )
         )
 
     async def _catalog_candidates_for_message(
@@ -2004,14 +2138,46 @@ class TelegramInbox:
         view: MessageView,
         parsed: ParsedRequest,
     ) -> InboxResult:
-        """Exact Title (YYYY) / URL → offer Get, never silently grab."""
+        """Exact Title (YYYY) / named title+year → offer Get, never silently grab."""
         hits, label = await tool_lookup_parsed(parsed)
-        if not hits:
-            return InboxResult(
-                handled=True,
-                reply=format_not_found(label or parsed.display_label()),
+        rows = dedupe_choice_rows([hit.as_dict() for hit in hits]) if hits else []
+        if not rows:
+            # Catalog miss → web identity resolve, then still offer Get/request
+            # (including upcoming/unreleased — Overseerr can hold them).
+            seed = catalog_search_title(parsed.title) or parsed.title or label
+            kind = (
+                parsed.media_kind
+                if parsed.media_kind in {"movie", "tv"}
+                else "movie"
             )
-        rows = dedupe_choice_rows([hit.as_dict() for hit in hits])
+            web_rows = await self._title_web_search_resolve(
+                view,
+                seed,
+                year=parsed.year,
+                media_kind=kind,
+            )
+            if web_rows:
+                rows = dedupe_choice_rows(web_rows)
+            else:
+                note = ""
+                try:
+                    today_year = int(self._amsterdam_today()[:4])
+                except ValueError:
+                    today_year = 2026
+                if parsed.year is not None and parsed.year > today_year:
+                    note = "Not out yet — I can still request it. "
+                offered = self._ask_guess_confirm(
+                    view,
+                    {
+                        "title": seed,
+                        "year": parsed.year,
+                        "mediaType": kind,
+                    },
+                    query=seed,
+                )
+                if note and offered.reply:
+                    offered.reply = f"{note}{offered.reply}"
+                return offered
         if len(rows) > 1 and not choices_are_indistinguishable(rows):
             return self._offer_rows(
                 view,

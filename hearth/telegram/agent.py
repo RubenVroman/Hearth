@@ -134,18 +134,25 @@ READ tools (auto-run):
   (Land ≠ La La Land, Wild ≠ The Wild Robot). Use for named titles.
   On a catalog miss for an exact-ish title, the tool itself runs web_search
   then search_title on the resolved name (e.g. Land → Land (2021)).
+  Named title + year / "the 2026 film X" MUST call search_title and offer Get.
+  Upcoming/unreleased titles still get a Get/request offer (Overseerr can hold them).
 - web_search: house live web search. ALWAYS call this for "do a websearch" /
   "zoek op het web" / "search the web" — NEVER say you cannot search the web.
-  After web results, resolve a catalog title and offer Get (do not auto-queue).
+  Use web_search only to disambiguate identity (which film), never to write a
+  synopsis. After web results, resolve a catalog title and offer Get (do not
+  auto-queue). Never paste Wikipedia, Rotten Tomatoes, IMDb essays, plot
+  paragraphs, cast/RT scores, or utm_source=openai links as the main reply.
 - discover_by_genre: TMDB discover via Overseerr. Pass genre_ids and optional
   exclude_genre_ids. Fantasy = 14 (ALWAYS exclude 878 Sci-Fi). Sci-Fi = 878.
   Horror = 27. "cool fantasy" MUST call discover_by_genre([14], exclude=[878]).
   Never invent Matrix/Arrival/Interstellar as a fantasy set.
   Discover is released-only (primary_release_date ≤ today) with a vote-count
-  floor — never offer unreleased 2026 popularity vapor. Already-shown /
-  rejected tmdb ids are excluded automatically; "others" / "none of these"
-  must call discover_by_genre again (next pack), never re-attach the same
-  Get buttons. If discover is exhausted the tool falls back to web_search.
+  floor — never offer unreleased 2026 popularity vapor in browse lists.
+  Already-shown / rejected tmdb ids are excluded automatically; "others" /
+  "none of these" must call discover_by_genre again (next pack), never
+  re-attach the same Get buttons. If discover is exhausted the tool falls
+  back to web_search. Skipping unreleased applies to discover/browse lists
+  ONLY — not when the user named a specific film.
 - library_status / download_progress: status checks.
 
 WRITE (HITL — Python only executes after Get button or explicit yes for that id):
@@ -161,7 +168,12 @@ Conversation rules:
   re-list the same three titles or re-attach the same Get buttons.
 - If you cannot refresh the list, say so WITHOUT Get buttons — never attach
   Get 1/2/3 for titles you just said you could not replace.
-- Exact Title (YYYY) / IMDb-TMDB URL: search_title then offer Get — do not assume queued.
+- Exact Title (YYYY) / "Title 2026 film" / IMDb-TMDB URL: search_title then
+  offer Get — do not assume queued, do not explain the plot.
+- One short line is enough: "Title (year) — Get?" (or Did-you-mean). No
+  director/cast/RT dump. Unreleased is fine with a half-sentence + Get.
+- Vague first message without year can ask "movie?" once; the follow-up with
+  year must take the download/Get path, not an encyclopedia reply.
 - "Do a websearch" / "zoek op het web": call web_search (never claim you cannot).
 - Ignore pure group chatter/emoji (empty reply).
 - Prefer short Telegram replies. Numbered lists as "1. Title (year)\\n2. …".
@@ -169,6 +181,36 @@ Conversation rules:
 - Never say "Queued 3" / "Queued N via".
 - Never say "Queued tmdb:123" — always use the human title.
 """
+
+
+_ENCYCLOPEDIA_DUMP = re.compile(
+    r"(?:"
+    r"wikipedia\.org|"
+    r"rottentomatoes\.com|"
+    r"imdb\.com/title|"
+    r"utm_source=openai|"
+    r"\brotten\s+tomatoes\b|"
+    r"\b\d{1,3}%\s*(?:on\s+)?(?:rotten|rt)\b|"
+    r"\bstarring\b.+\bdirected\b|"
+    r"\bdirected\s+by\b.+\bstarring\b"
+    r")",
+    re.I,
+)
+
+
+def looks_like_encyclopedia_dump(text: str) -> bool:
+    """True when a reply looks like a Wikipedia/RT synopsis dump, not a Get offer."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _ENCYCLOPEDIA_DUMP.search(raw):
+        return True
+    # Long plot paragraph without a Get/confirm cue.
+    if len(raw) >= 280 and not re.search(
+        r"(?i)\b(?:get|did you mean|tap|queue|request)\b", raw
+    ):
+        return True
+    return False
 
 
 def looks_like_correction(text: str) -> bool:
@@ -304,7 +346,9 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
                 "Search the live web (house web_search tool). REQUIRED for "
                 "'do a websearch' / 'zoek op het web' / 'search the web'. "
                 "Also used when search_title misses an exact film name. "
+                "Use only to disambiguate identity — never to write a synopsis. "
                 "Resolves a catalog title and offers Get — never auto-queues. "
+                "Never paste Wikipedia/RT/IMDb essays or utm_source=openai links. "
                 "Never claim you cannot search the web."
             ),
             "parameters": {
@@ -648,8 +692,15 @@ async def run_telegram_agent(
             continue
 
         reply = (msg.content or "").strip()
-        result.reply = reply
-        if looks_like_exhausted_offer_reply(reply):
+        # Prefer a tool-built Get/offer reply over an encyclopedia dump the
+        # model wrote after tools (Wikipedia/RT/utm_source=openai paragraphs).
+        keep_tool_offer = bool(result.reply_markup and result.reply)
+        if reply and not (
+            keep_tool_offer
+            and (looks_like_encyclopedia_dump(reply) or len(reply) > 220)
+        ):
+            result.reply = reply
+        if looks_like_exhausted_offer_reply(result.reply):
             result.reply_markup = None
         return result
 

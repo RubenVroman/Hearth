@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from hearth.memory.redact import redact
-from hearth.telegram.parse import ParsedRequest, normalize_title
+from hearth.telegram.parse import ParsedRequest, normalize_title, strip_title_year_media
 from hearth.tools.arr import overseerr
 
 log = logging.getLogger("hearth.telegram")
@@ -40,7 +40,7 @@ _WITH_PERSON = re.compile(
 
 
 def catalog_search_title(title: str) -> str:
-    """Strip trailing actor/cast clauses from a catalog search string."""
+    """Strip trailing actor/cast clauses, film/movie words, and year disambiguators."""
     raw = (title or "").strip()
     if not raw:
         return ""
@@ -48,6 +48,7 @@ def catalog_search_title(title: str) -> str:
     match = _WITH_PERSON.search(cleaned)
     if match and match.group(1).lower() not in _CAST_STOP:
         cleaned = cleaned[: match.start()].strip(" -–—|,.")
+    cleaned, _year = strip_title_year_media(cleaned)
     return cleaned or raw
 
 

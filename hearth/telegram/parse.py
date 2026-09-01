@@ -120,6 +120,61 @@ _QUALITY = re.compile(
     r"\b(?P<q>2160p|1080p|720p|480p|4k|uhd|hdr|dv|dolby\s*vision)\b",
     re.I,
 )
+# "Miss you love you 2026 film" → title + year; keep "Blade Runner 2049".
+_TRAILING_MEDIA_KIND = re.compile(
+    r"(?i)(?:\s+the)?\s+(?:films?|movies?|flicks?|series|shows?|tv)\s*$"
+)
+_MEDIA_KIND_WORD = re.compile(
+    r"(?i)\b(?:films?|movies?|flicks?|series|shows?|tv)\b"
+)
+_PAREN_YEAR_TAIL = re.compile(r"\s*\(\s*((?:19|20)\d{2})\s*\)\s*$")
+_BARE_YEAR_TAIL = re.compile(r"\s+((?:19|20)\d{2})\s*$")
+_LEADING_YEAR_FILM = re.compile(
+    r"(?i)^(?:the\s+)?((?:19|20)\d{2})\s+(?:films?|movies?|flicks?)\s+(.+)$"
+)
+
+
+def strip_title_year_media(title: str) -> tuple[str, int | None]:
+    """Return (catalog title, year) stripping film/movie words + year disambiguators.
+
+    Parenthetical ``(YYYY)`` is always a release year. Bare trailing ``YYYY``
+    is only stripped when a film/movie/tv word is also present so titles like
+    ``Blade Runner 2049`` stay intact.
+    """
+    raw = (title or "").strip()
+    if not raw:
+        return "", None
+    cleaned = raw
+    year: int | None = None
+    had_media = bool(_MEDIA_KIND_WORD.search(cleaned))
+    cleaned = _TRAILING_MEDIA_KIND.sub("", cleaned).strip(" -–—|,.")
+
+    paren = _PAREN_YEAR_TAIL.search(cleaned)
+    if paren:
+        try:
+            year = int(paren.group(1))
+        except (TypeError, ValueError):
+            year = None
+        cleaned = cleaned[: paren.start()].strip(" -–—|,.")
+    elif had_media:
+        bare = _BARE_YEAR_TAIL.search(cleaned)
+        if bare:
+            try:
+                year = int(bare.group(1))
+            except (TypeError, ValueError):
+                year = None
+            cleaned = cleaned[: bare.start()].strip(" -–—|,.")
+        cleaned = _TRAILING_MEDIA_KIND.sub("", cleaned).strip(" -–—|,.")
+
+    leading = _LEADING_YEAR_FILM.match(cleaned)
+    if leading:
+        try:
+            year = year or int(leading.group(1))
+        except (TypeError, ValueError):
+            pass
+        cleaned = leading.group(2).strip(" -–—|,.")
+
+    return (cleaned or raw), year
 _URL = re.compile(r"https?://[^\s<>\[\]()\"']+", re.I)
 _MAGNET = re.compile(r"magnet:\?[^\s]+", re.I)
 _BINARYISH = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -460,9 +515,22 @@ def _parse_plain_title(text: str) -> ParsedRequest | None:
     year = None
     y = _YEAR.search(cleaned)
     title = cleaned
+    media_kind: MediaKind = "unknown"
     if y:
         year = int(y.group(0)[1:-1])
         title = _YEAR.sub("", cleaned).strip(" -–—|")
+    else:
+        # "Miss you love you 2026 film" / "the 2026 film Title" — bare year
+        # with a film/movie word is a release-year disambiguator, not part of
+        # the catalog title (unlike Blade Runner 2049 with no media word).
+        stripped, bare_year = strip_title_year_media(cleaned)
+        if bare_year is not None and stripped and stripped != cleaned:
+            title = stripped
+            year = bare_year
+            if re.search(r"(?i)\b(?:films?|movies?|flicks?)\b", cleaned):
+                media_kind = "movie"
+            elif re.search(r"(?i)\b(?:series|shows?|tv)\b", cleaned):
+                media_kind = "tv"
     title = title.strip(" \"'`")
     if len(title) < 2:
         return None
@@ -471,7 +539,7 @@ def _parse_plain_title(text: str) -> ParsedRequest | None:
         return None
     return ParsedRequest(
         kind="request",
-        media_kind="unknown",
+        media_kind=media_kind,
         title=title,
         year=year,
         quality=quality,
