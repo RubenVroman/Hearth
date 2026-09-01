@@ -29,6 +29,8 @@ from hearth.telegram.agent import (
     looks_like_exhausted_offer_reply,
     looks_like_explain,
     looks_like_person_ask,
+    looks_like_person_followup,
+    resolve_person_query,
     run_telegram_agent,
     should_refuse_queue,
 )
@@ -620,6 +622,50 @@ class TelegramInbox:
                 user_text=view.text,
             )
 
+        # Actor / "movies with X" / person follow-ups after a miss: always use
+        # Overseerr multi-search person rows + combined_credits — never title search.
+        person_query = resolve_person_query(view.text, history)
+        if (
+            person_query
+            and (
+                looks_like_person_ask(view.text)
+                or looks_like_person_followup(view.text, history)
+            )
+            and not looks_like_confirm_yes(view.text)
+            and not looks_like_confirm_no(view.text)
+        ):
+            forced = await self._tool_search_person(
+                view,
+                {"name": person_query, "media_type": "movie", "limit": 4},
+            )
+            result = InboxResult(
+                handled=True,
+                reply=str(forced.get("reply") or ""),
+                reply_markup=(
+                    forced["reply_markup"]
+                    if isinstance(forced.get("reply_markup"), dict)
+                    else None
+                ),
+                mode=(
+                    "confirm"
+                    if forced.get("confirm_person")
+                    or (forced.get("count") or 0) <= 1
+                    else "offer"
+                ),
+            )
+            return await self._finish(
+                view,
+                result,
+                search_title=str(forced.get("query") or person_query),
+                media_kind=str(forced.get("media_type") or "movie"),
+                offered=(
+                    self.pending[view.chat_id].options
+                    if self.pending.get(view.chat_id)
+                    else None
+                ),
+                user_text=view.text,
+            )
+
         # Explicit yes / download-of-pending bound to a single pending tmdb_id.
         queue_approved = False
         if pending is not None and len(pending.options) == 1:
@@ -711,10 +757,11 @@ class TelegramInbox:
                 result.mode = "confirm" if forced.get("count") == 1 else "offer"
                 agent.search_title = str(forced.get("query") or agent.search_title)
 
-        # Actor / "movies with X" must use TMDB person credits — never Overseerr
-        # title search, never "couldn't find in the catalog".
+        # Actor / "movies with X" must use Overseerr person credits — never
+        # title-only search, never "couldn't find in the catalog".
         if not result.grabbed and (
             looks_like_person_ask(view.text)
+            or looks_like_person_followup(view.text, history)
             or claims_overseerr_catalog(result.reply)
         ):
             used_person = any(
@@ -727,37 +774,32 @@ class TelegramInbox:
             missish = bool(
                 re.search(
                     r"(?i)couldn'?t find|could not find|not in the catalog|"
-                    r"no (?:specific )?(?:movies|films).{0,40}(?:catalog|found)",
+                    r"no (?:specific )?(?:movies|films).{0,40}(?:catalog|found)|"
+                    r"check (?:the )?spelling|try another spelling",
                     result.reply or "",
                 )
             )
-            if (
-                looks_like_person_ask(view.text)
-                and (not person_ok or missish or claims_overseerr_catalog(result.reply))
-            ) or (
-                claims_overseerr_catalog(result.reply)
-                and looks_like_person_ask(view.text)
+            want_person = looks_like_person_ask(view.text) or looks_like_person_followup(
+                view.text, history
+            )
+            if want_person and (
+                not person_ok or missish or claims_overseerr_catalog(result.reply)
             ):
-                name = extract_person_name(view.text) or extract_person_name(
+                name = resolve_person_query(view.text, history) or extract_person_name(
                     " ".join(
                         str(t.get("args", {}).get("name") or "")
                         for t in agent.tools_used
                         if t.get("name") == "search_person"
                     )
                 )
-                if not name:
-                    # Fall back to last user ask in history that named a person.
-                    for turn in reversed(history or []):
-                        if turn.get("role") == "user":
-                            name = extract_person_name(str(turn.get("text") or ""))
-                            if name:
-                                break
                 if name:
                     forced = await self._tool_search_person(
                         view,
                         {"name": name, "media_type": "movie", "limit": 4},
                     )
-                    if forced.get("ok") and forced.get("reply"):
+                    # Always replace catalog-miss wording for person asks —
+                    # even when the person lookup itself returns ok=False.
+                    if forced.get("reply"):
                         result.reply = str(forced["reply"])
                         result.reply_markup = (
                             forced["reply_markup"]
@@ -1245,10 +1287,11 @@ class TelegramInbox:
     async def _tool_search_person(
         self, view: MessageView, args: dict[str, Any]
     ) -> dict[str, Any]:
-        """TMDB person search + released movie credits with Get buttons.
+        """Overseerr multi-search person + released movie credits with Get buttons.
 
-        Overseerr is not the browse catalog here — it only proxies TMDB person
-        endpoints. Typo-corrected names ask for Yeah before listing credits.
+        Uses the same ``GET /api/v1/search?query=`` the UI uses (movies/TV/people),
+        keeps person rows, then ``/api/v1/person/{id}/combined_credits``. Never
+        title-search an actor name. Never claim the browse catalog is Overseerr.
         """
         name = str(args.get("name") or args.get("query") or "").strip()
         if not name:
@@ -1292,7 +1335,7 @@ class TelegramInbox:
                     "error": f"No person match for {name!r}",
                     "reply": (
                         f"I couldn't match anyone named {name}. "
-                        "Want to try another spelling?"
+                        "Want to try a different name?"
                     ),
                     "reply_markup": None,
                 }

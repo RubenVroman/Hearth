@@ -130,16 +130,54 @@ def _summarize_movie(item: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _row_media_type(item: dict[str, Any]) -> str:
+    """Normalize Overseerr/TMDB media type (camelCase or snake_case)."""
+    raw = item.get("mediaType") if item.get("mediaType") not in (None, "") else item.get(
+        "media_type"
+    )
+    return str(raw or "").strip().lower()
+
+
+def _is_person_result(item: dict[str, Any]) -> bool:
+    """True for Overseerr multi-search person hits.
+
+    Overseerr maps TMDB multi-search people with ``mediaType: person`` and
+    ``knownFor``. Some payloads omit mediaType — treat name + knownFor as person
+    so title-only filters cannot silently drop them.
+    """
+    if not isinstance(item, dict):
+        return False
+    if _row_media_type(item) == "person":
+        return True
+    known = item.get("knownFor")
+    if known is None:
+        known = item.get("known_for")
+    name = str(item.get("name") or "").strip()
+    # Person rows have a name and knownFor; movie/tv use title/name + release dates.
+    if name and isinstance(known, list):
+        # Avoid mistaking a titled movie that somehow carries an empty knownFor.
+        if item.get("title") and _row_media_type(item) in {"movie", "tv"}:
+            return False
+        return True
+    return False
+
+
 def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
     year = item.get("year")
     if not year:
         date = item.get("releaseDate") or item.get("firstAirDate") or ""
         year = str(date)[:4] or None
     media_id = item.get("id") or item.get("mediaId")
+    media_type = _row_media_type(item)
+    if not media_type and _is_person_result(item):
+        media_type = "person"
+    name = item.get("name")
+    title = item.get("title") or name
     out = {
-        "title": item.get("title") or item.get("name"),
+        "title": title,
+        "name": name or (title if media_type == "person" else None),
         "year": year,
-        "mediaType": item.get("mediaType"),
+        "mediaType": media_type or item.get("mediaType"),
         "mediaId": media_id,
         "tmdbId": media_id,
         "imdbId": item.get("imdbId"),
@@ -148,6 +186,13 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
         "posterPath": _poster_path(item),
         "popularity": item.get("popularity"),
     }
+    known = item.get("knownFor")
+    if known is None:
+        known = item.get("known_for")
+    if isinstance(known, list):
+        out["knownFor"] = known
+    if item.get("profilePath") or item.get("profile_path"):
+        out["profilePath"] = item.get("profilePath") or item.get("profile_path")
     if item.get("matched"):
         out["matched"] = item.get("matched")
     return out
@@ -1401,11 +1446,46 @@ class Overseerr:
                 }
             raise
 
-    async def search_person(self, query: str) -> dict[str, Any]:
-        """TMDB person search via Overseerr ``/api/v1/search`` (mediaType=person).
+    def _people_from_search_rows(self, rows: list[Any]) -> list[dict[str, Any]]:
+        """Keep Overseerr multi-search person hits (never title-only movie/tv filter)."""
+        people: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for row in rows:
+            if not isinstance(row, dict) or not _is_person_result(row):
+                continue
+            try:
+                pid = int(row.get("id") or row.get("mediaId") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid and pid in seen:
+                continue
+            if pid:
+                seen.add(pid)
+            known = row.get("knownFor")
+            if known is None:
+                known = row.get("known_for")
+            people.append(
+                {
+                    "id": pid or row.get("id"),
+                    "mediaType": "person",
+                    "name": row.get("name") or row.get("title"),
+                    "popularity": row.get("popularity"),
+                    "profilePath": row.get("profilePath")
+                    or row.get("profile_path")
+                    or row.get("posterPath"),
+                    "knownFor": known if isinstance(known, list) else [],
+                }
+            )
+        people.sort(key=lambda r: float(r.get("popularity") or 0), reverse=True)
+        return people
 
-        Title search alone cannot answer "movies with X" — use this then
-        ``person_combined_credits``.
+    async def search_person(self, query: str) -> dict[str, Any]:
+        """Person search via the same Overseerr multi-search the UI uses.
+
+        ``GET /api/v1/search?query=…`` is TMDB multi-search (movies, TV, AND
+        people). Do **not** pass a ``mediaType=person`` query param — that route
+        has no such filter and it can break or be ignored. Keep person rows
+        (``mediaType``/``knownFor``), then call ``person_combined_credits``.
         """
         query = (query or "").strip()
         if not query:
@@ -1424,21 +1504,32 @@ class Overseerr:
             }
         client = await self._http()
         try:
-            response = await client.get("/api/v1/search", params={"query": query})
+            # Same endpoint as Overseerr.search / the UI — query only.
+            # Scan the full first page (typically 20) before truncating so a
+            # person ranked after several title hits is not dropped.
+            response = await client.get(
+                "/api/v1/search",
+                params={"query": query, "page": 1},
+            )
             response.raise_for_status()
             payload = response.json() or {}
-            people: list[dict[str, Any]] = []
-            for row in payload.get("results") or []:
-                if str(row.get("mediaType") or "") != "person":
-                    continue
-                people.append(
-                    {
-                        "id": row.get("id"),
-                        "mediaType": "person",
-                        "name": row.get("name") or row.get("title"),
-                        "popularity": row.get("popularity"),
-                        "profilePath": row.get("profilePath") or row.get("posterPath"),
-                    }
+            raw_rows = list(payload.get("results") or [])
+            # Never forward mediaType as a search filter param.
+            people = self._people_from_search_rows(raw_rows)
+            # If page 1 had no person but more pages exist, check page 2 once.
+            try:
+                total_pages = int(payload.get("totalPages") or payload.get("total_pages") or 1)
+            except (TypeError, ValueError):
+                total_pages = 1
+            if not people and total_pages > 1:
+                response2 = await client.get(
+                    "/api/v1/search",
+                    params={"query": query, "page": 2},
+                )
+                response2.raise_for_status()
+                payload2 = response2.json() or {}
+                people = self._people_from_search_rows(
+                    list(payload2.get("results") or [])
                 )
             return {
                 "mode": "live",
@@ -1458,7 +1549,7 @@ class Overseerr:
             raise
 
     async def person_combined_credits(self, person_id: int) -> dict[str, Any]:
-        """TMDB combined credits via Overseerr ``/api/v1/person/{id}/combined_credits``."""
+        """Combined credits via Overseerr ``GET /api/v1/person/{id}/combined_credits``."""
         try:
             pid = int(person_id)
         except (TypeError, ValueError):

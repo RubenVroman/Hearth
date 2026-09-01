@@ -1044,14 +1044,29 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
     },
 ]
 
-# TMDB person search + movie credits (Telegram "movies with X" / "films met …").
-# Overseerr proxies these; offline mocks keep keys server-side / unconfigured.
+# TMDB/Overseerr person search + movie credits (Telegram "movies with X").
+# Fixtures mirror live Overseerr multi-search person rows (knownFor) + credits.
+# Production code must not hardcode these names — tests/fixtures only.
 MOCK_TMDB_PERSONS: list[dict[str, Any]] = [
     {
         "id": 6193,
         "mediaType": "person",
         "name": "Leonardo DiCaprio",
         "popularity": 48.2,
+        "knownFor": [
+            {
+                "id": 597,
+                "mediaType": "movie",
+                "title": "Titanic",
+                "releaseDate": "1997-12-19",
+            },
+            {
+                "id": 27205,
+                "mediaType": "movie",
+                "title": "Inception",
+                "releaseDate": "2010-07-16",
+            },
+        ],
         # Typo / partial queries that must resolve to this person.
         "aliases": [
             "leonardo dicaprot",
@@ -1059,6 +1074,42 @@ MOCK_TMDB_PERSONS: list[dict[str, Any]] = [
             "leo dicaprio",
             "dicaprio",
         ],
+    },
+    {
+        "id": 31,
+        "mediaType": "person",
+        "name": "Tom Hanks",
+        "popularity": 82.4,
+        "knownFor": [
+            {
+                "id": 13,
+                "mediaType": "movie",
+                "title": "Forrest Gump",
+                "releaseDate": "1994-07-06",
+            },
+            {
+                "id": 862,
+                "mediaType": "movie",
+                "title": "Toy Story",
+                "releaseDate": "1995-11-22",
+            },
+        ],
+        "aliases": ["tom hanks", "thomas hanks"],
+    },
+    {
+        "id": 5064,
+        "mediaType": "person",
+        "name": "Meryl Streep",
+        "popularity": 55.1,
+        "knownFor": [
+            {
+                "id": 644,
+                "mediaType": "movie",
+                "title": "A.I. Artificial Intelligence",
+                "releaseDate": "2001-06-29",
+            }
+        ],
+        "aliases": ["meryl streep", "streep"],
     },
 ]
 
@@ -1151,6 +1202,108 @@ MOCK_PERSON_COMBINED_CREDITS: dict[int, dict[str, Any]] = {
         ],
         "crew": [],
     },
+    31: {
+        "id": 31,
+        "cast": [
+            {
+                "id": 13,
+                "mediaType": "movie",
+                "title": "Forrest Gump",
+                "releaseDate": "1994-07-06",
+                "year": 1994,
+                "popularity": 95.0,
+                "voteCount": 27000,
+                "character": "Forrest Gump",
+            },
+            {
+                "id": 862,
+                "mediaType": "movie",
+                "title": "Toy Story",
+                "releaseDate": "1995-11-22",
+                "year": 1995,
+                "popularity": 90.0,
+                "voteCount": 18000,
+                "character": "Woody",
+            },
+            {
+                "id": 857,
+                "mediaType": "movie",
+                "title": "Saving Private Ryan",
+                "releaseDate": "1998-07-24",
+                "year": 1998,
+                "popularity": 78.0,
+                "voteCount": 15000,
+                "character": "Captain Miller",
+            },
+            {
+                "id": 497,
+                "mediaType": "movie",
+                "title": "The Green Mile",
+                "releaseDate": "1999-12-10",
+                "year": 1999,
+                "popularity": 72.0,
+                "voteCount": 16000,
+                "character": "Paul Edgecomb",
+            },
+            {
+                "id": 9010031,
+                "mediaType": "movie",
+                "title": "Untitled Hanks Project",
+                "releaseDate": "2028-01-01",
+                "year": 2028,
+                "popularity": 99.0,
+                "voteCount": 1,
+                "character": "TBD",
+            },
+        ],
+        "crew": [],
+    },
+    5064: {
+        "id": 5064,
+        "cast": [
+            {
+                "id": 152601,
+                "mediaType": "movie",
+                "title": "The Devil Wears Prada",
+                "releaseDate": "2006-06-30",
+                "year": 2006,
+                "popularity": 70.0,
+                "voteCount": 12000,
+                "character": "Miranda Priestly",
+            },
+            {
+                "id": 453,
+                "mediaType": "movie",
+                "title": "A Bridge Too Far",
+                "releaseDate": "1977-06-15",
+                "year": 1977,
+                "popularity": 25.0,
+                "voteCount": 800,
+                "character": "Kate ter Horst",
+            },
+            {
+                "id": 981,
+                "mediaType": "movie",
+                "title": "The Deer Hunter",
+                "releaseDate": "1978-12-08",
+                "year": 1978,
+                "popularity": 40.0,
+                "voteCount": 3000,
+                "character": "Linda",
+            },
+            {
+                "id": 205596,
+                "mediaType": "movie",
+                "title": "Sophie's Choice",
+                "releaseDate": "1982-12-08",
+                "year": 1982,
+                "popularity": 35.0,
+                "voteCount": 1500,
+                "character": "Sophie",
+            },
+        ],
+        "crew": [],
+    },
 }
 
 
@@ -1219,7 +1372,7 @@ class MockPipeline:
         return primary
 
     def search_person(self, query: str) -> list[dict[str, Any]]:
-        """Mock TMDB/Overseerr person search (typos via aliases)."""
+        """Mock Overseerr multi-search person rows (typos via aliases)."""
         needle = re.sub(r"[^a-z0-9à-ÿ]+", " ", (query or "").lower()).strip()
         if not needle:
             return []
@@ -1239,6 +1392,7 @@ class MockPipeline:
                         "mediaType": "person",
                         "name": name,
                         "popularity": row.get("popularity"),
+                        "knownFor": list(row.get("knownFor") or []),
                     }
                 )
         hits.sort(key=lambda r: float(r.get("popularity") or 0), reverse=True)

@@ -6921,11 +6921,18 @@ async def test_inbox_1002_discover_still_skips_unreleased_vapor(
 
 
 def test_looks_like_person_ask_and_extract_name():
-    from hearth.telegram.agent import extract_person_name, looks_like_person_ask
+    from hearth.telegram.agent import (
+        extract_person_name,
+        looks_like_person_ask,
+        looks_like_person_followup,
+        resolve_person_query,
+    )
 
     assert looks_like_person_ask("Give me a few movies with leonardo dicaprot")
     assert looks_like_person_ask("films met Leonardo DiCaprio")
     assert looks_like_person_ask("Geef me een paar films met Leonardo DiCaprio")
+    assert looks_like_person_ask("Give me a few movies with tom hanks")
+    assert looks_like_person_ask("Tom Hanks? Movies starring that guy?")
     assert not looks_like_person_ask("Land (2021)")
     # Plot / descriptive asks are title guesses — not person filmography.
     assert not looks_like_person_ask(
@@ -6941,6 +6948,19 @@ def test_looks_like_person_ask_and_extract_name():
         "leonardo dicaprot"
     )
     assert extract_person_name("films met Leonardo DiCaprio") == "Leonardo DiCaprio"
+    assert extract_person_name("Tom Hanks? Movies starring that guy?") == "Tom Hanks"
+    hist = [
+        {"role": "user", "text": "Give me a few movies with tom hanks"},
+        {
+            "role": "bot",
+            "text": "I couldn't find any movies with Tom Hanks in the catalog.",
+        },
+    ]
+    assert looks_like_person_followup("He's like, sortof famous?", hist)
+    assert resolve_person_query("He's like, sortof famous?", hist).lower() == "tom hanks"
+    assert not looks_like_person_followup(
+        "a movie about a boy with glasses who is a wizard", hist
+    )
 
 
 @pytest.mark.asyncio
@@ -7125,3 +7145,333 @@ async def test_inbox_person_typo_confirm_from_history_on_yeah(
     assert len(pending.options) >= 2
     assert isinstance(pending, PendingDisambiguation)
     assert result.reply_markup is not None
+
+
+@pytest.mark.asyncio
+async def test_inbox_tom_hanks_person_credits_not_catalog_miss(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: movies with Tom Hanks must offer Get credits, never catalog miss."""
+    from hearth.fixtures import pipeline
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "content": (
+                    "I couldn't find any movies with Tom Hanks in the catalog."
+                )
+            }
+        ],
+    )
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(
+        _msg("Give me a few movies with tom hanks", message_id=12001)
+    )
+    assert result.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0
+    body = (result.reply or "").lower()
+    assert "overseerr catalog" not in body
+    assert "couldn't find" not in body
+    assert "in the catalog" not in body
+    pending = inbox.pending.get(-1001)
+    assert pending is not None and len(pending.options) >= 2
+    titles = {str(o.get("title") or "").lower() for o in pending.options}
+    assert "forrest gump" in titles or "toy story" in titles or "saving private ryan" in titles
+    assert "untitled hanks project" not in titles
+    assert result.reply_markup is not None
+
+
+@pytest.mark.asyncio
+async def test_inbox_person_followup_after_miss_retries_search_person(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Tom Hanks? Movies starring that guy? after a miss must retry person search."""
+    from hearth.fixtures import pipeline
+
+    inbox.memory.record_user(-1001, "Give me a few movies with tom hanks")
+    inbox.memory.record_bot(
+        -1001, "I couldn't find any movies with Tom Hanks in the catalog."
+    )
+    _patch_openai_tools(
+        monkeypatch,
+        [{"content": "Maybe check the spelling? I'm using the Overseerr catalog."}],
+    )
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(
+        _msg("Tom Hanks? Movies starring that guy?", message_id=12002)
+    )
+    assert result.grabbed is False
+    body = (result.reply or "").lower()
+    assert "overseerr catalog" not in body
+    assert "spelling" not in body
+    assert "couldn't find" not in body
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert any(int(o.get("tmdbId") or 0) in {13, 862, 857, 497} for o in pending.options)
+    assert result.reply_markup is not None
+
+
+@pytest.mark.asyncio
+async def test_inbox_second_actor_streep_not_hardcoded(
+    inbox: TelegramInbox, monkeypatch
+):
+    """A second actor (not DiCaprio/Hanks aliases only) must also resolve via person search."""
+    from hearth.fixtures import pipeline
+
+    _patch_openai_tools(monkeypatch, [{"content": "nope"}])
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(
+        _msg("films met Meryl Streep", message_id=12003)
+    )
+    assert result.grabbed is False
+    assert "overseerr catalog" not in (result.reply or "").lower()
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    titles = {str(o.get("title") or "").lower() for o in pending.options}
+    assert "the devil wears prada" in titles or "the deer hunter" in titles
+    assert result.reply_markup is not None
+
+
+@pytest.mark.asyncio
+async def test_overseerr_search_person_keeps_person_when_title_filter_would_drop(
+    monkeypatch,
+):
+    """Live-shaped Overseerr multi-search: person after 8 title hits + knownFor.
+
+    Title-only movie/tv filtering (or truncating to 8 before person filter) would
+    drop the person. search_person must keep them. Also accept knownFor when
+    mediaType is missing. Never pass mediaType=person as a query param.
+    """
+    import httpx
+    from hearth.config import settings
+    from hearth.tools.arr import Overseerr, _is_person_result
+
+    # 8 movie rows first (what title-only / [:8] would keep), then person.
+    movie_rows = [
+        {
+            "id": 1000 + i,
+            "mediaType": "movie",
+            "title": f"Tom Hanks Doc Part {i}",
+            "releaseDate": "2010-01-01",
+            "popularity": 1.0 + i,
+        }
+        for i in range(8)
+    ]
+    person_row = {
+        "id": 31,
+        # mediaType intentionally omitted — live edge; knownFor marks person.
+        "name": "Tom Hanks",
+        "popularity": 82.4,
+        "profilePath": "/hanks.jpg",
+        "knownFor": [
+            {
+                "id": 13,
+                "mediaType": "movie",
+                "title": "Forrest Gump",
+                "releaseDate": "1994-07-06",
+            }
+        ],
+    }
+    credits_payload = {
+        "id": 31,
+        "cast": [
+            {
+                "id": 13,
+                "mediaType": "movie",
+                "title": "Forrest Gump",
+                "releaseDate": "1994-07-06",
+                "popularity": 95.0,
+                "voteCount": 27000,
+            },
+            {
+                "id": 862,
+                "mediaType": "movie",
+                "title": "Toy Story",
+                "releaseDate": "1995-11-22",
+                "popularity": 90.0,
+                "voteCount": 18000,
+            },
+            {
+                "id": 857,
+                "mediaType": "movie",
+                "title": "Saving Private Ryan",
+                "releaseDate": "1998-07-24",
+                "popularity": 78.0,
+                "voteCount": 15000,
+            },
+        ],
+        "crew": [],
+    }
+
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict | None = None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "err",
+                    request=httpx.Request("GET", "http://overseerr.test"),
+                    response=httpx.Response(self.status_code),
+                )
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get(self, path, params=None, headers=None):
+            calls.append({"path": path, "params": dict(params or {})})
+            if path == "/api/v1/search":
+                # Prove title-only filter would drop the person.
+                title_only = [
+                    r for r in movie_rows + [person_row] if r.get("mediaType") in {"movie", "tv"}
+                ]
+                assert len(title_only) == 8
+                assert not any(_is_person_result(r) for r in title_only)
+                assert _is_person_result(person_row)
+                return FakeResponse(
+                    200,
+                    {
+                        "page": 1,
+                        "totalPages": 1,
+                        "totalResults": 9,
+                        "results": movie_rows + [person_row],
+                    },
+                )
+            if path == "/api/v1/person/31/combined_credits":
+                return FakeResponse(200, credits_payload)
+            return FakeResponse(404, {})
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(settings, "overseerr_api_key", "test-key")
+    monkeypatch.setattr(settings, "overseerr_url", "http://overseerr.test")
+    monkeypatch.setattr(settings, "mock_if_unconfigured", False)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    client = Overseerr()
+    await client.aclose()
+    found = await client.search_person("tom hanks")
+    assert found.get("mode") == "live"
+    people = found.get("results") or []
+    assert people and int(people[0]["id"]) == 31
+    assert people[0]["name"] == "Tom Hanks"
+    assert people[0]["mediaType"] == "person"
+    assert people[0].get("knownFor")
+
+    search_calls = [c for c in calls if c["path"] == "/api/v1/search"]
+    assert search_calls
+    for c in search_calls:
+        assert "mediaType" not in c["params"]
+        assert c["params"].get("query") == "tom hanks"
+
+    credits = await client.person_combined_credits(31)
+    assert len(credits.get("cast") or []) >= 3
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_overseerr_search_person_second_actor_live_http(monkeypatch):
+    """Second actor via live-shaped multi-search JSON (no production hardcoding)."""
+    import httpx
+    from hearth.config import settings
+    from hearth.tools.arr import Overseerr
+
+    calls: list[dict] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict | None = None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "err",
+                    request=httpx.Request("GET", "http://overseerr.test"),
+                    response=httpx.Response(self.status_code),
+                )
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get(self, path, params=None, headers=None):
+            calls.append({"path": path, "params": dict(params or {})})
+            if path == "/api/v1/search":
+                return FakeResponse(
+                    200,
+                    {
+                        "page": 1,
+                        "totalPages": 1,
+                        "results": [
+                            {
+                                "id": 9001,
+                                "mediaType": "movie",
+                                "title": "Streep: A Documentary",
+                                "releaseDate": "2012-01-01",
+                                "popularity": 3.0,
+                            },
+                            {
+                                "id": 5064,
+                                "mediaType": "person",
+                                "name": "Meryl Streep",
+                                "popularity": 55.1,
+                                "knownFor": [
+                                    {
+                                        "id": 152601,
+                                        "mediaType": "movie",
+                                        "title": "The Devil Wears Prada",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                )
+            if path.startswith("/api/v1/person/"):
+                return FakeResponse(
+                    200,
+                    {
+                        "id": 5064,
+                        "cast": [
+                            {
+                                "id": 152601,
+                                "mediaType": "movie",
+                                "title": "The Devil Wears Prada",
+                                "releaseDate": "2006-06-30",
+                                "popularity": 70.0,
+                                "voteCount": 12000,
+                            }
+                        ],
+                        "crew": [],
+                    },
+                )
+            return FakeResponse(404, {})
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(settings, "overseerr_api_key", "test-key")
+    monkeypatch.setattr(settings, "overseerr_url", "http://overseerr.test")
+    monkeypatch.setattr(settings, "mock_if_unconfigured", False)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    client = Overseerr()
+    await client.aclose()
+    found = await client.search_person("meryl streep")
+    assert any(int(p.get("id") or 0) == 5064 for p in (found.get("results") or []))
+    for c in calls:
+        if c["path"] == "/api/v1/search":
+            assert "mediaType" not in c["params"]
+    await client.aclose()
