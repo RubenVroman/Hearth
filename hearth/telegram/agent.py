@@ -735,11 +735,12 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
             "name": "retry_download",
             "description": (
                 "Retry a stalled/failed download from another *arr source, OR "
-                "list alternate smaller releases when a library movie has no "
-                "usable file / is too big to play / already has a file and the "
-                "user wants another download without deleting it (keep-both). "
+                "list alternate releases when a library movie has no usable file / "
+                "is too big to play / already has a file and the user wants another "
+                "download or a new version without deleting it (keep-both). "
                 "Never auto-grabs library options — present Get buttons and wait "
-                "for confirm."
+                "for confirm. Empty indexer / no_alternate is a normal answer — "
+                "do not escalate to Chief of Staff."
             ),
             "parameters": {
                 "type": "object",

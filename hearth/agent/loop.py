@@ -746,7 +746,9 @@ _DOWNLOAD_RETRY = re.compile(
     r"try\s+(?:it\s+)?(?:again|another\s+source)|"
     r"another\s+source|"
     r"(?:get|grab|download)\s+a\s+new\s+one|"
+    r"(?:get|grab|download)\s+(?:a\s+)?new\s+version|"
     r"(?:get|grab|download)\s+another\s+(?:one|version|release|copy|download)|"
+    r"(?:a\s+)?new\s+version|"
     r"(?:smaller|other)\s+(?:version|release|one|copy)|"
     r"find\s+another(?:\s+download)?"
     r"|already\s+(?:there|in\s+(?:the\s+)?library)"
@@ -780,6 +782,7 @@ _DOWNLOAD_RETRY_TITLE = re.compile(
     r"retry(?:\s+the)?(?:\s+download)?(?:\s+of|\s+for)?|"
     r"try\s+another\s+source\s+(?:for|on)|"
     r"(?:get|grab)\s+a\s+new\s+(?:one\s+)?(?:for|of)|"
+    r"(?:get|grab|download)\s+(?:a\s+)?new\s+version\s+(?:for|of)|"
     r"(?:get|grab|download)\s+another\s+(?:version|release|one|copy)\s+(?:for|of)|"
     r"(?:too\s+big|won'?t\s+play|doesn'?t\s+play).{0,40}\b(?:for|of|on)\b|"
     r"download\s+(?:of|for)"
@@ -1199,7 +1202,7 @@ def _download_retry_plan(raw: str) -> dict[str, Any] | None:
         re.I,
     ) and not re.search(
         r"\b("
-        r"another\s+source|new\s+one|another\s+(?:version|release|copy|download)|"
+        r"another\s+source|new\s+one|new\s+version|another\s+(?:version|release|copy|download)|"
         r"didn'?t\s+work|failed|stalled|retry|stuck|"
         r"too\s+big|won'?t\s+play|smaller|"
         r"already\s+(?:there|in)|don'?t\s+delete|find\s+another|keep\s+(?:the\s+)?old"
@@ -1263,6 +1266,8 @@ def _download_retry_plan(raw: str) -> dict[str, Any] | None:
         flags=re.I,
     )
     title = re.sub(r"\s+", " ", title).strip(" .?!'\"")
+    # Drop a leftover leading article ("the Event Horizon" → "Event Horizon").
+    title = re.sub(r"^(?:the|a|an)\s+", "", title, flags=re.I).strip()
     if title.lower() in {
         "",
         "it",

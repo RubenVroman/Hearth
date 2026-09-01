@@ -304,9 +304,15 @@ async def _radarr_list_releases(args: dict[str, Any]) -> dict[str, Any]:
         keep_existing = None
     else:
         keep_existing = bool(keep_raw)
+    prefer_raw = args.get("prefer_smaller")
+    if prefer_raw is None:
+        # Keep-both: do not inherit the too-big "prefer smaller" default.
+        prefer_smaller = False if keep_existing else True
+    else:
+        prefer_smaller = bool(prefer_raw)
     return await radarr.list_alternate_releases(
         str(args.get("query") or args.get("title") or ""),
-        prefer_smaller=bool(args.get("prefer_smaller", True)),
+        prefer_smaller=prefer_smaller,
         keep_existing=keep_existing,
     )
 
@@ -320,12 +326,17 @@ async def _radarr_grab_release(args: dict[str, Any]) -> dict[str, Any]:
         keep_existing = None
     else:
         keep_existing = bool(keep_raw)
+    prefer_raw = args.get("prefer_smaller")
+    if prefer_raw is None:
+        prefer_smaller = False if keep_existing else True
+    else:
+        prefer_smaller = bool(prefer_raw)
     return await radarr.grab_alternate_release(
         str(args.get("query") or args.get("title") or ""),
         guid=str(args.get("guid") or ""),
         release_token_value=str(args.get("releaseToken") or args.get("release_token") or ""),
         confirm=bool(args.get("confirm")),
-        prefer_smaller=bool(args.get("prefer_smaller", True)),
+        prefer_smaller=prefer_smaller,
         reason="user:house",
         keep_existing=keep_existing,
     )
@@ -1113,14 +1124,15 @@ def register_builtin_tools() -> None:
             name="radarr_retry",
             description=(
                 "Retry a stalled/failed Radarr movie download from a different indexer/source, "
-                "OR offer alternate smaller releases when a library movie has no usable file, "
+                "OR offer alternate releases when a library movie has no usable file, "
                 "the current file is too big / won't play, OR the user wants another download "
                 "while keeping the existing library file (keep_existing). Queue retries "
                 "blocklist + re-grab. Library offers return needs_pick — do NOT invent a grab; "
                 "call radarr_grab_release with confirm after the user picks one. "
                 "Does not delete the library entry; does not re-POST Overseerr. "
                 "Pass keep_existing=true when they say don't delete / already there but find "
-                "another / download another copy."
+                "another / download another copy / download a new version. "
+                "If reason is no_alternate, tell the user — never escalate to chief_of_staff."
             ),
             parameters={
                 "type": "object",

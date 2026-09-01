@@ -827,15 +827,32 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
         },
     ],
     105: [
+        # Soft library-state rejections — live Radarr marks these when hasFile.
+        # Keep-both / switch must still offer them (not no_alternate).
+        {
+            "guid": "event-horizon-current-bluray",
+            "indexerId": 1,
+            "indexer": "MockIndexer",
+            "title": "Event.Horizon.1997.1080p.BluRay",
+            "approved": False,
+            "score": 5,
+            "rejected": True,
+            "rejections": ["Movie already downloaded"],
+            "movieId": 105,
+            "size": 9_200_000_000,
+        },
         {
             "guid": "event-horizon-4k-remux-huge",
             "indexerId": 1,
             "indexer": "MockIndexer",
             "title": "Event.Horizon.1997.2160p.UHD.BluRay.REMUX",
-            "approved": True,
+            "approved": False,
             "score": 5,
-            "rejected": False,
-            "rejections": [],
+            "rejected": True,
+            "rejections": [
+                "Existing file is of equal or higher preference",
+                "Quality cutoff already met: Bluray-1080p",
+            ],
             "movieId": 105,
             "size": 52_000_000_000,
         },
@@ -844,10 +861,10 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
             "indexerId": 2,
             "indexer": "AltIndexer",
             "title": "Event.Horizon.1997.1080p.WEB-DL.DD5.1.H264",
-            "approved": True,
+            "approved": False,
             "score": 40,
-            "rejected": False,
-            "rejections": [],
+            "rejected": True,
+            "rejections": ["Movie already downloaded"],
             "movieId": 105,
             "size": 4_800_000_000,
         },
@@ -856,12 +873,24 @@ MOCK_RADARR_RELEASES: dict[int, list[dict[str, Any]]] = {
             "indexerId": 3,
             "indexer": "ThirdIndexer",
             "title": "Event.Horizon.1997.720p.WEBRip",
-            "approved": True,
+            "approved": False,
             "score": 20,
-            "rejected": False,
-            "rejections": [],
+            "rejected": True,
+            "rejections": ["Not wanted because already have it"],
             "movieId": 105,
             "size": 2_100_000_000,
+        },
+        {
+            "guid": "event-horizon-passworded",
+            "indexerId": 4,
+            "indexer": "JunkIndexer",
+            "title": "Event.Horizon.1997.1080p.PASSWORD.PROTECTED",
+            "approved": False,
+            "score": 0,
+            "rejected": True,
+            "rejections": ["Password protected rar"],
+            "movieId": 105,
+            "size": 3_000_000_000,
         },
     ],
 }
@@ -1548,6 +1577,8 @@ class MockPipeline:
 
     def list_radarr_library(self, title: str = "") -> list[dict[str, Any]]:
         """Monitored Radarr library rows (may lack a usable file)."""
+        from hearth.tools.arr import _normalize_title_tokens
+
         source = (
             self.radarr_library
             if self.radarr_library is not None
@@ -1563,11 +1594,17 @@ class MockPipeline:
         needle = (title or "").strip().lower()
         if not needle:
             return rows
-        return [
-            row
-            for row in rows
-            if needle in str(row.get("title") or "").lower()
-        ]
+        needle_tokens = " ".join(_normalize_title_tokens(title))
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            row_title = str(row.get("title") or "")
+            row_l = row_title.lower()
+            row_tokens = " ".join(_normalize_title_tokens(row_title))
+            if needle_tokens and row_tokens == needle_tokens:
+                out.append(row)
+            elif needle in row_l or row_l in needle:
+                out.append(row)
+        return out
 
     def delete_movie_file(self, movie_file_id: int) -> dict[str, Any]:
         self._deleted_movie_files.add(int(movie_file_id))
