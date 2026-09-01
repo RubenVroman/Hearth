@@ -2378,6 +2378,14 @@ class Overseerr:
         confident = _confident_overseerr_hits(results, query=query, media_type=mt)
         if not confident:
             label = query or "that title"
+            media_rows = [
+                r
+                for r in results
+                if isinstance(r, dict)
+                and r.get("matched") != "fallback"
+                and str(r.get("mediaType") or "").lower() in {"movie", "tv", ""}
+                and not _is_person_result(r)
+            ]
             return {
                 "ok": False,
                 "service": "overseerr",
@@ -2389,7 +2397,11 @@ class Overseerr:
                     f"I couldn't find a confident Overseerr match for {label}. "
                     "Want to pick from search results, or send a TMDB/IMDb link?"
                 ),
-                "results": [_summarize_overseerr(r) for r in results[:6] if isinstance(r, dict)],
+                "results": [
+                    _summarize_overseerr(r)
+                    for r in (media_rows or results)[:6]
+                    if isinstance(r, dict)
+                ],
             }
         if len(confident) > 1 and not _indistinguishable_overseerr_hits(confident):
             choices = [_summarize_overseerr(r) for r in confident[:6]]

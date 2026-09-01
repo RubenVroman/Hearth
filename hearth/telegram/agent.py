@@ -269,7 +269,11 @@ WRITE (HITL — Python only executes after Get button or explicit yes for that i
 Conversation rules:
 - Rejects (no/nah/nope/nee): never queue. Discover alternatives or ask what they want.
 - Confirms (yes/yep/yeah/ja) of a single pending title offer → queue_request with
-  THAT pending tmdb_id. Confirms of a person-name typo → search_person (credits).
+  THAT pending tmdb_id (or title+year so Python can search Overseerr and request
+  by mediaId). Confirms of a person-name typo → search_person (credits).
+- Never tell the user a title "isn't available" / "couldn't find in the catalog"
+  when search_title returned results, or when a Did-you-mean / Get is pending for
+  that title. If it is already in the library / Plex, say that honestly.
 - Genre / vibe list asks → discover_by_genre (not a single Did-you-mean).
 - Actor / "movies with X" / "films met X" → search_person (not search_title,
   not discover_by_genre).
@@ -987,11 +991,29 @@ async def run_telegram_agent(
         # Prefer a tool-built Get/offer reply over an encyclopedia dump the
         # model wrote after tools (Wikipedia/RT/utm_source=openai paragraphs).
         keep_tool_offer = bool(result.reply_markup and result.reply)
+        tool_did_you_mean = bool(
+            result.reply
+            and re.search(r"(?i)\bdid you mean\b", result.reply)
+        )
+        model_catalog_miss = bool(
+            reply
+            and re.search(
+                r"(?i)couldn'?t find|could not find|not in the catalog|"
+                r"isn'?t available|is not available|no (?:exact )?match",
+                reply,
+            )
+        )
         if reply and not (
             keep_tool_offer
             and (looks_like_encyclopedia_dump(reply) or len(reply) > 220)
         ):
-            result.reply = reply
+            # Never let the model overwrite a tool Did-you-mean / Get offer
+            # with a fake "not in catalog" after Overseerr search returned rows
+            # (or even count=0 pending confirm — Yes will re-search + queue).
+            if tool_did_you_mean and model_catalog_miss:
+                pass
+            else:
+                result.reply = reply
         if looks_like_exhausted_offer_reply(result.reply):
             result.reply_markup = None
         return result

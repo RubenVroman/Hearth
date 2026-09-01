@@ -633,6 +633,62 @@ class TelegramInbox:
                     user_text=view.text,
                 )
 
+        # Title Did-you-mean / single Get: Yes MUST queue THAT pending row via
+        # Overseerr (resolve tmdb_id if needed). Never re-run a model search that
+        # invents "not in catalog" when Overseerr has the title.
+        if pending is None and looks_like_confirm_yes(view.text):
+            recovered = self._title_confirm_from_history(view.chat_id)
+            if recovered is not None:
+                self.pending[view.chat_id] = recovered
+                pending = recovered
+        if (
+            pending is not None
+            and pending.offer_kind != "release"
+            and len(pending.options) == 1
+            and not should_refuse_queue(view.text)
+        ):
+            option = pending.options[0]
+            pending_title = str(option.get("title") or pending.query or "")
+            names_pending = bool(
+                pending_title
+                and normalize_title(pending_title)
+                and normalize_title(pending_title) in normalize_title(view.text)
+            )
+            download_verb = bool(
+                re.search(
+                    r"\b(?:download|queue|get|bring|add|grab|doe)\b",
+                    view.text,
+                    re.I,
+                )
+            )
+            if looks_like_confirm_yes(view.text) or (
+                names_pending and download_verb
+            ):
+                if not self.rate.allow():
+                    return await self._finish(
+                        view,
+                        InboxResult(handled=True, reply=format_rate_limited()),
+                        user_text=view.text,
+                    )
+                result = await self._grab_catalog_row(
+                    view,
+                    dict(option),
+                    query=pending_title or pending.query,
+                    media_kind_hint=str(
+                        option.get("mediaType") or pending.media_kind or "movie"
+                    ),
+                    skip_rate=True,
+                )
+                return await self._finish(
+                    view,
+                    result,
+                    search_title=result.title or pending_title,
+                    media_kind=str(
+                        option.get("mediaType") or pending.media_kind or ""
+                    ),
+                    user_text=view.text,
+                )
+
         rejected_this_turn = False
         if pending is not None and looks_like_confirm_no(view.text):
             rejected_rows = self._titles_from_options(pending.options)
@@ -765,13 +821,12 @@ class TelegramInbox:
                 user_text=view.text,
             )
 
-        # Explicit yes / download-of-pending bound to a single pending tmdb_id.
+        # Explicit yes / download-of-pending bound to a single pending title.
+        # tmdb_id may still be missing (Did-you-mean before resolve) — Yes still
+        # queues after Overseerr search+mediaId request.
         queue_approved = False
         if pending is not None and len(pending.options) == 1:
             pending_title = str(pending.options[0].get("title") or "")
-            has_id = bool(
-                pending.options[0].get("tmdbId") or pending.options[0].get("mediaId")
-            )
             names_pending = bool(
                 pending_title
                 and normalize_title(pending_title)
@@ -784,9 +839,8 @@ class TelegramInbox:
                     re.I,
                 )
             )
-            queue_approved = has_id and (
-                looks_like_confirm_yes(view.text)
-                or (names_pending and download_verb)
+            queue_approved = looks_like_confirm_yes(view.text) or (
+                names_pending and download_verb
             )
 
         session_mode = self._mode(view.chat_id)
@@ -1079,17 +1133,13 @@ class TelegramInbox:
                 title = user_seed
                 rows = user_rows
             else:
-                rows = await tool_lookup_title(title, year=year_i, media_kind=kind)
-                rows = filter_seed_rows(rows, title) if rows else []
+                rows = await self._overseerr_title_hits(
+                    title, year=year_i, media_kind=kind
+                )
         else:
-            rows = await tool_lookup_title(title, year=year_i, media_kind=kind)
-            rows = [
-                r
-                for r in rows
-                if catalog_seed_matches_title(title, str(r.get("title") or ""))
-                or titles_match(title, str(r.get("title") or ""))
-            ]
-            rows = filter_seed_rows(rows, title) if rows else []
+            rows = await self._overseerr_title_hits(
+                title, year=year_i, media_kind=kind
+            )
 
         # Drop rejected titles.
         rows = [
@@ -1150,6 +1200,7 @@ class TelegramInbox:
                     "tmdbId": compact[0]["tmdbId"],
                     "mediaId": compact[0]["tmdbId"],
                     "mediaType": compact[0]["mediaType"],
+                    "inLibrary": compact[0]["inLibrary"],
                 },
                 query=title,
             )
@@ -1180,8 +1231,8 @@ class TelegramInbox:
                 "hint": "Present the numbered list with Get buttons; wait for a tap or yes.",
             }
 
-        # No catalog hit — still offer a confirm on the model-named title so
-        # Eat Pray Love / plot guesses can proceed without a 404/link nag.
+        # No Overseerr hit — still offer a confirm on the model-named title so
+        # Yes can re-search + queue. Never claim "not in catalog" here.
         offered = self._ask_guess_confirm(
             view,
             {
@@ -1199,7 +1250,12 @@ class TelegramInbox:
             "count": 0,
             "reply": offered.reply,
             "reply_markup": offered.reply_markup,
-            "hint": "No exact catalog hit; confirm the guessed title with the user.",
+            "hint": (
+                "No exact Overseerr hit yet; confirm the guessed title. "
+                "On yes, queue_request will search Overseerr again by that title "
+                "and request with mediaId — never say the title is missing from "
+                "the catalog if Overseerr search returns it."
+            ),
         }
 
     async def _tool_discover_by_genre(
@@ -2609,6 +2665,141 @@ class TelegramInbox:
             "query": extract_person_name(prior_user) or guessed,
         }
 
+    def _title_confirm_from_history(self, chat_id: int) -> PendingDisambiguation | None:
+        """Recover a title Did-you-mean when pending state was lost.
+
+        Live path: bot said ``Did you mean The Man from Earth?`` (or with year)
+        without a sticky pending row; Yes must still queue THAT title via
+        Overseerr search + mediaId — never invent a catalog miss.
+        """
+        history = self.memory.history_blob(chat_id)
+        if not history:
+            return None
+        last_bot = ""
+        offered: list[dict[str, Any]] = []
+        for turn in reversed(history):
+            role = turn.get("role")
+            text = str(turn.get("text") or "").strip()
+            if role == "bot" and not last_bot:
+                last_bot = text
+                raw_offered = turn.get("offered")
+                if isinstance(raw_offered, list):
+                    offered = [r for r in raw_offered if isinstance(r, dict)]
+                break
+        if not last_bot:
+            return None
+        match = re.match(
+            r"(?i)^\s*did you mean\s+(.+?)\s*\??\s*$",
+            last_bot.strip(),
+        )
+        if not match:
+            return None
+        guessed = match.group(1).strip().strip("\"'")
+        year = None
+        year_m = re.search(r"\((\s*(?:19|20)\d{2}\s*)\)\s*$", guessed)
+        if year_m:
+            try:
+                year = int(year_m.group(1).strip())
+            except (TypeError, ValueError):
+                year = None
+            guessed = guessed[: year_m.start()].strip().strip("\"'")
+        # Person confirms: no year and prior ask was filmography — leave alone.
+        if year is None and not offered:
+            prior_user = ""
+            for turn in reversed(history):
+                if turn.get("role") == "user":
+                    prior_user = str(turn.get("text") or "").strip()
+                    if prior_user:
+                        break
+            if prior_user and looks_like_person_ask(prior_user):
+                return None
+        if not guessed or len(guessed) > 120:
+            return None
+        if offered and len(offered) == 1:
+            option = dict(offered[0])
+            if not option.get("title"):
+                option["title"] = guessed
+            if year is not None and option.get("year") in (None, ""):
+                option["year"] = year
+        else:
+            option = {
+                "title": guessed,
+                "year": year,
+                "mediaType": "movie",
+            }
+        kind = str(option.get("mediaType") or "movie")
+        if kind not in {"movie", "tv"}:
+            kind = "movie"
+        markup = single_get_keyboard(option)
+        return PendingDisambiguation(
+            chat_id=int(chat_id),
+            options=[option],
+            media_kind=kind,
+            query=str(option.get("title") or guessed)[:200],
+            created_message_id=0,
+            last_bot_reply=last_bot[:400],
+            mode="confirm",
+            reply_markup=markup,
+            offer_kind="title",
+        )
+
+    async def _overseerr_title_hits(
+        self,
+        title: str,
+        *,
+        year: int | None = None,
+        media_kind: str = "",
+    ) -> list[dict[str, Any]]:
+        """Overseerr multi-search the same way the UI does — keep movie/TV hits.
+
+        One ``GET /api/v1/search?query=`` call. Short seeds stay exact
+        (Land ≠ La La Land). Multi-word titles like ``Rescued by Ruby`` /
+        ``The Man from Earth`` keep the TMDB/Overseerr rows the UI would show.
+        """
+        seed = catalog_search_title(title) or (title or "").strip()
+        if not seed:
+            return []
+        try:
+            found = await overseerr.search(seed)
+        except Exception as exc:  # noqa: BLE001
+            log.info("overseerr title hits failed: %s", redact(str(exc)))
+            return []
+        raw = [
+            r
+            for r in (found.get("results") or [])
+            if isinstance(r, dict)
+            and r.get("matched") != "fallback"
+            and str(r.get("mediaType") or "") in {"movie", "tv"}
+        ]
+        if media_kind in {"movie", "tv"}:
+            typed = [r for r in raw if str(r.get("mediaType") or "") == media_kind]
+            if typed:
+                raw = typed
+        grounded = [
+            r
+            for r in raw
+            if catalog_seed_matches_title(
+                seed, str(r.get("title") or r.get("name") or "")
+            )
+            or titles_match(seed, str(r.get("title") or r.get("name") or ""))
+        ]
+        if year is not None:
+            by_year = [r for r in grounded if self._row_year(r) == year]
+            if by_year:
+                grounded = by_year
+        # Normalize Overseerr/TMDB id → tmdbId/mediaId for Get / queue_request.
+        out: list[dict[str, Any]] = []
+        for row in grounded:
+            item = dict(row)
+            if not item.get("title") and item.get("name"):
+                item["title"] = item["name"]
+            tid = item.get("tmdbId") or item.get("mediaId") or item.get("id")
+            if tid not in (None, ""):
+                item["tmdbId"] = tid
+                item["mediaId"] = tid
+            out.append(item)
+        return filter_seed_rows(out, seed) if out else []
+
     def _remember_pending(
         self,
         view: MessageView,
@@ -2859,10 +3050,11 @@ class TelegramInbox:
                 year=year,
             )
 
-        # Guess-confirm rows may not yet have an id. Resolve exact/prefix title
-        # plus year so Land (2021) binds to TMDB 688271, never La La Land.
+        # Guess-confirm rows may not yet have an id. Resolve via Overseerr
+        # multi-search (same as the UI) so Land (2021) binds to TMDB 688271,
+        # Rescued by Ruby / The Man from Earth keep their hits — never La La Land.
         if tmdb_id in (None, "") and tvdb_id in (None, ""):
-            rows = await tool_lookup_title(
+            rows = await self._overseerr_title_hits(
                 title,
                 year=year,
                 media_kind=kind,
@@ -2875,13 +3067,6 @@ class TelegramInbox:
                 ]
                 if by_year:
                     rows = by_year
-            rows = [
-                candidate
-                for candidate in rows
-                if catalog_seed_matches_title(
-                    title, str(candidate.get("title") or "")
-                )
-            ]
             if len(rows) > 1 and not choices_are_indistinguishable(rows):
                 return self._offer_rows(
                     view, title, rows, media_kind=kind
@@ -2891,6 +3076,8 @@ class TelegramInbox:
                 title = str(current.get("title") or title)
                 year = self._row_year(current) or year
                 kind = self._row_kind(current, kind)
+                tmdb_id = current.get("tmdbId") or current.get("mediaId")
+                tvdb_id = current.get("tvdbId")
 
         parsed = row_to_parsed(
             current,
@@ -2906,6 +3093,15 @@ class TelegramInbox:
                 tmdb_id=parsed.tmdb_id,
                 tvdb_id=parsed.tvdb_id,
                 reason="confirmed_tool_row",
+            )
+        # Confirmed title still missing an id after search — honest miss only
+        # when Overseerr multi-search truly returned nothing for that title.
+        if parsed.tmdb_id is None and parsed.tvdb_id is None:
+            return InboxResult(
+                handled=True,
+                reply=format_not_found(title),
+                title=title,
+                year=year,
             )
 
         self.pending.pop(view.chat_id, None)
@@ -2951,34 +3147,20 @@ class TelegramInbox:
         exact: bool,
     ) -> InboxResult:
         """Ground one parsed row and request it through the patched client."""
+        del exact  # Confirmed and non-confirmed both resolve mediaId via search.
         kind = media_kind if media_kind in {"movie", "tv"} else "movie"
         title = parsed.title or parsed.display_label() or "Untitled"
         year = parsed.year
         media_id = parsed.tmdb_id
 
-        # A confirmed row without an id still requests that exact title. The
-        # Overseerr adapter performs its own lookup; Python never substitutes a
-        # neighboring substring result.
-        if media_id is None and parsed.tvdb_id is None and not exact:
+        # Resolve TMDB id via Overseerr multi-search when missing — same path
+        # as the UI. Never invent a catalog miss when Overseerr returns a
+        # matching movie/TV hit for the confirmed title.
+        if media_id is None and parsed.tvdb_id is None:
             query = catalog_search_title(title) or title
-            found = await overseerr.search(query)
-            rows = [
-                row
-                for row in (found.get("results") or [])
-                if row.get("matched") != "fallback"
-            ]
-            typed = [
-                row for row in rows if str(row.get("mediaType") or "") == kind
-            ]
-            if typed:
-                rows = typed
-            rows = filter_seed_rows(rows, query)
-            if year is not None:
-                by_year = [
-                    row for row in rows if self._row_year(row) == year
-                ]
-                if by_year:
-                    rows = by_year
+            rows = await self._overseerr_title_hits(
+                query, year=year, media_kind=kind
+            )
             if not rows:
                 return InboxResult(
                     handled=True,
@@ -3030,9 +3212,40 @@ class TelegramInbox:
             media_type=kind,
         )
         if response.get("ok") is False:
+            # Prefer honest library / already-queued copy over "not in catalog".
+            if response.get("already") or (
+                isinstance(response.get("requested"), dict)
+                and response["requested"].get("inLibrary")
+            ):
+                return InboxResult(
+                    handled=True,
+                    reply=format_already(title, library=True),
+                    title=title,
+                    service=service,
+                    year=year,
+                )
+            speak = str(response.get("speak") or "").strip()
+            if response.get("ambiguous") and speak:
+                return InboxResult(
+                    handled=True,
+                    reply=speak,
+                    title=title,
+                    service=service,
+                    year=year,
+                )
+            # Search returned a hit but request failed — never claim Overseerr
+            # "doesn't have" the title when we already resolved a mediaId.
+            if media_id not in (None, ""):
+                return InboxResult(
+                    handled=True,
+                    reply=f"Couldn't queue '{title}' through Overseerr.",
+                    title=title,
+                    service=service,
+                    year=year,
+                )
             return InboxResult(
                 handled=True,
-                reply=f"Couldn't queue '{title}' through Overseerr.",
+                reply=speak or format_not_found(title),
                 title=title,
                 service=service,
                 year=year,

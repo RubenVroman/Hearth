@@ -1920,6 +1920,9 @@ def test_title_seed_matches_rejects_clear_mismatch():
     assert not title_seed_matches("Land", "La La Land")
     assert title_seed_matches("Harry Potter", "Harry Potter and the Chamber of Secrets")
     assert title_seed_matches("Annihilation", "Annihilation")
+    assert title_seed_matches("The Man from Earth", "The Man from Earth")
+    assert title_seed_matches("Rescued by ruby", "Rescued by Ruby")
+    assert title_seed_matches("Rescued by Ruby", "Rescued by Ruby")
 
 
 def test_search_overseerr_unknown_title_no_discover_fallback():

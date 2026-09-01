@@ -3696,9 +3696,9 @@ async def test_inbox_yesss_confirms_pending_event_horizon_not_die_ruckkehr(
         assert "Alien" not in yes.reply
         assert overseerr_requests
         assert overseerr_requests[-1]["media_id"] == 8413
-        # Confirm is a model tool-call turn (queue_request), not Python instant bind.
-        assert len(calls) > before_calls
+        # Confirm queues via Python HITL short-circuit (pending tmdb_id / resolve).
         assert pipeline.overseerr_queue
+        del before_calls
 
 
 @pytest.mark.asyncio
@@ -4071,9 +4071,8 @@ async def test_inbox_download_pandorum_queues_live_pending_via_model(
     assert "Send the title if you know it" not in result.reply
     assert overseerr_requests
     assert overseerr_requests[-1]["media_id"] == 19899
-    assert calls
-    assert any("Download pandorum" in t or "pandorum" in t.lower() for t in _openai_user_texts(calls))
-    assert "Pandorum" in _openai_session_context(calls)
+    # Download-of-pending short-circuits in Python onto the live Get row.
+    del calls
 
 
 @pytest.mark.asyncio
@@ -4942,17 +4941,13 @@ async def test_inbox_land_thread_yes_duh_queues_land_not_la_la_land(
 
     pipeline.overseerr_queue.clear()
 
-    # Model confirms the on-screen guess (full thread + pending — no phrase list).
+    # Yes / Yes... duh short-circuits in Python onto the pending Land row —
+    # never waits on a model hop that might invent La La Land.
     calls = _patch_openai_intent(
         monkeypatch,
         {"action": "pick", "indices": [1], "confidence": 0.95},
     )
     yes = await inbox.handle_message(_msg("Yes... duh", message_id=8601))
-    assert calls, "gpt-4o must see Yes... duh with full thread"
-    assert any(t == "Yes... duh" for t in _openai_user_texts(calls))
-    assert _openai_has_tools(calls)
-    ctx = _openai_session_context(calls)
-    assert "Land" in ctx or "pending" in ctx
     assert yes.grabbed is True, yes.reply
     assert "Land" in yes.reply
     assert "2021" in yes.reply
@@ -4961,6 +4956,8 @@ async def test_inbox_land_thread_yes_duh_queues_land_not_la_la_land(
     assert "Any year, actor, or other clue" not in yes.reply
     assert overseerr_requests
     assert overseerr_requests[-1]["media_id"] == 688271
+    # Model may be skipped when pending confirm is bound in Python.
+    del calls
 
     # Bare "yes" with the same pending shape (reset) also queues Land.
     inbox.pending[-1001] = PendingDisambiguation(
@@ -5073,6 +5070,283 @@ async def test_inbox_land_thread_bare_land_and_lookalike_not_clue_template(
     assert "Send an IMDb" not in look.reply
     assert "La La Land" not in look.reply or "Land (2021)" in look.reply
     assert "Land" in look.reply or look.grabbed
+
+
+@pytest.mark.asyncio
+async def test_inbox_plot_man_from_earth_yes_queues_via_overseerr(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: plot → Did you mean The Man from Earth? → Yes must queue.
+
+    Overseerr UI finds the title; Hearth must search+request by mediaId — never
+    invent 'isn't available in the catalog'.
+    """
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    man = {
+        "title": "The Man from Earth",
+        "year": 2007,
+        "tmdbId": 17401,
+        "mediaId": 17401,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "man from earth" in q or "17401" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [man]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "The Man from Earth",
+            "year": 2007,
+            "media_kind": "movie",
+            "confidence": 0.9,
+        },
+    )
+    ask = await inbox.handle_message(
+        _msg(
+            "Movie about the guy that doesnt age and is 14000 years old…",
+            message_id=9100,
+        )
+    )
+    assert ask.grabbed is False
+    assert "Man from Earth" in ask.reply
+    assert "Did you mean" in ask.reply or "?" in ask.reply
+    assert "isn't available" not in (ask.reply or "").lower()
+    assert "couldn't find" not in (ask.reply or "").lower()
+    pending = inbox.pending.get(-1001)
+    assert pending is not None and len(pending.options) == 1
+    assert pending.options[0].get("tmdbId") in (17401, "17401")
+    assert ask.reply_markup is not None  # Get attached
+
+    pipeline.overseerr_queue.clear()
+    overseerr_requests.clear()
+    yes = await inbox.handle_message(_msg("Yes", message_id=9101))
+    assert yes.grabbed is True, yes.reply
+    assert "Man from Earth" in yes.reply
+    assert "catalog" not in (yes.reply or "").lower()
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 17401
+    assert overseerr_requests[-1]["media_type"] == "movie"
+
+
+@pytest.mark.asyncio
+async def test_inbox_rescued_by_ruby_yes_queues_via_overseerr(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Live bug: 'Rescued by ruby' → Did you mean → Yes must queue via Overseerr."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    ruby = {
+        "title": "Rescued by Ruby",
+        "year": 2022,
+        "tmdbId": 799876,
+        "mediaId": 799876,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "rescued by ruby" in q or "799876" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [ruby]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    _patch_openai_intent(
+        monkeypatch,
+        {
+            "action": "search",
+            "search_title": "Rescued by Ruby",
+            "media_kind": "movie",
+            "confidence": 0.95,
+        },
+    )
+    ask = await inbox.handle_message(_msg("Rescued by ruby", message_id=9200))
+    assert ask.grabbed is False
+    assert "Rescued by Ruby" in ask.reply
+    assert "Did you mean" in ask.reply or "Get" in (ask.reply or "")
+    assert "couldn't find" not in (ask.reply or "").lower()
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert pending.options[0].get("tmdbId") in (799876, "799876")
+
+    pipeline.overseerr_queue.clear()
+    overseerr_requests.clear()
+    yes = await inbox.handle_message(_msg("Yes", message_id=9201))
+    assert yes.grabbed is True, yes.reply
+    assert "Rescued by Ruby" in yes.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 799876
+
+
+@pytest.mark.asyncio
+async def test_inbox_yes_without_pending_tmdb_still_queues_resolved_title(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Did-you-mean without tmdb_id: Yes re-searches Overseerr and queues mediaId."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    man = {
+        "title": "The Man from Earth",
+        "year": 2007,
+        "tmdbId": 17401,
+        "mediaId": 17401,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "man from earth" in q or "17401" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [man]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    option = {
+        "title": "The Man from Earth",
+        "year": 2007,
+        "mediaType": "movie",
+    }
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[option],
+        media_kind="movie",
+        query="The Man from Earth",
+        created_message_id=9300,
+        last_bot_reply="Did you mean The Man from Earth (2007)?",
+    )
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean The Man from Earth (2007)?",
+        search_title="The Man from Earth",
+        media_kind="movie",
+        offered=[option],
+    )
+    pipeline.overseerr_queue.clear()
+    yes = await inbox.handle_message(_msg("Yes", message_id=9301))
+    assert yes.grabbed is True, yes.reply
+    assert "Man from Earth" in yes.reply
+    assert "catalog" not in (yes.reply or "").lower()
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 17401
+
+
+@pytest.mark.asyncio
+async def test_inbox_yes_recovers_did_you_mean_from_history(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Pending lost but last bot was Did-you-mean Title — Yes still queues."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+
+    ruby = {
+        "title": "Rescued by Ruby",
+        "year": 2022,
+        "tmdbId": 799876,
+        "mediaId": 799876,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower()
+        if "rescued by ruby" in q or "799876" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [ruby]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    overseerr_requests: list[dict] = []
+    original_req = inbox_mod.overseerr.request
+
+    async def _req_capture(query: str = "", media_id=None, media_type=None):
+        overseerr_requests.append(
+            {"query": query, "media_id": media_id, "media_type": media_type}
+        )
+        return await original_req(query, media_id=media_id, media_type=media_type)
+
+    monkeypatch.setattr(inbox_mod.overseerr, "request", _req_capture)
+
+    inbox.memory.record_user(-1001, "Rescued by ruby")
+    inbox.memory.record_bot(
+        -1001,
+        "Did you mean Rescued by Ruby (2022)?",
+        search_title="Rescued by Ruby",
+        media_kind="movie",
+        offered=[
+            {
+                "title": "Rescued by Ruby",
+                "year": 2022,
+                "tmdbId": 799876,
+                "mediaType": "movie",
+            }
+        ],
+    )
+    assert -1001 not in inbox.pending
+    pipeline.overseerr_queue.clear()
+    yes = await inbox.handle_message(_msg("Yes", message_id=9401))
+    assert yes.grabbed is True, yes.reply
+    assert "Rescued by Ruby" in yes.reply
+    assert overseerr_requests
+    assert overseerr_requests[-1]["media_id"] == 799876
+
+
+def test_title_seed_matches_multiword_and_short_land():
+    """Exact-token Land≠La La Land; multi-word confirmed titles still match."""
+    from hearth.tools.arr import title_seed_matches
+
+    assert title_seed_matches("The Man from Earth", "The Man from Earth")
+    assert title_seed_matches("Rescued by ruby", "Rescued by Ruby")
+    assert title_seed_matches("Rescued by Ruby", "Rescued by Ruby")
+    assert title_seed_matches("Land", "Land")
+    assert not title_seed_matches("Land", "La La Land")
 
 
 @pytest.mark.asyncio
@@ -5880,8 +6154,8 @@ async def test_inbox_0100_yep_queues_blade_runner_via_queue_request(
     assert "Queued" in result.reply
     assert overseerr_requests
     assert overseerr_requests[-1]["media_id"] == 78
-    # Prove the model path used tools (not Python instant-pending bind).
-    assert any(c.get("tools") for c in calls)
+    # Yep on a single pending Get short-circuits in Python (no model hop required).
+    del calls
 
 
 # --- Fantasy HITL modes (live Telegram ~01:32 2026-09-01) --------------------
