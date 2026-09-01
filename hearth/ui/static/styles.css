@@ -665,6 +665,13 @@ input,
   width: min(560px, calc(100vw - 32px));
   overflow-x: hidden;
   overflow-y: auto;
+  /* Stable scrollport — remounts must not feel like a new popup. */
+  overscroll-behavior: contain;
+}
+
+.info-media-stack.is-carousel {
+  /* One clear "page" of poster cards while the assistant narrates. */
+  min-height: min(42vh, 360px);
 }
 
 /* Never collapse to a hollow pill when content is missing — keep a readable shell. */
@@ -928,6 +935,14 @@ input,
   min-height: min(48vh, 400px);
   padding: 10px 0 28px;
   overflow: visible;
+}
+
+.info-media-stack.is-carousel .info-poster {
+  /* Poster-first cards — readable art while titles are spoken. */
+  width: 128px;
+  box-shadow:
+    0 16px 36px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(255, 206, 138, 0.08);
 }
 
 .info-media-stack.is-stacked .info-media-card {

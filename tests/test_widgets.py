@@ -49,7 +49,13 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v20" in sw.text
+    assert "hearth-shell-v21" in sw.text
+    assert "clientMediaFocusId" in js.text
+    assert "reconcileClientMediaFocus" in js.text
+    assert "rememberClientMediaFocus" in js.text
+    assert "live: true" in js.text
+    assert 'permission === "prompt") return false' in js.text
+    assert "glass.scrollTop" in js.text
     assert "info-infuse-btn" in js.text
     assert "playActiveInInfuse" in js.text
     assert "focusMediaById" in js.text

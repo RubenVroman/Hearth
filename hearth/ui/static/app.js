@@ -36,6 +36,11 @@ const state = {
   infoPinned: false,
   infoHideTimer: null,
   infoIdleTimer: null,
+  /**
+   * User-chosen carousel card. Survives /api/status polls + transcript sync so
+   * browsing does not jump back to "page 1" while the assistant narrates.
+   */
+  clientMediaFocusId: null,
   /** Live assistant transcript buffer for mid-utterance card focus. */
   liveAssistantTranscript: "",
   /** Status poll timer — faster while a voice call is live so overlays appear promptly. */
@@ -187,6 +192,8 @@ async function acquireMicStream() {
 function shouldShowMicGate(permission) {
   if (permission === "granted") return false;
   if (permission === "denied") return false;
+  /* Browser will show its own permission dialog — do not stack an in-app gate on top. */
+  if (permission === "prompt") return false;
   if (micStorageGet(MIC_STORAGE.denied) === "1" && permission !== "prompt") {
     /* Sticky denial from a prior NotAllowedError — show settings, not the gate. */
     return false;
@@ -606,9 +613,45 @@ function isAckUtterance(text) {
 }
 
 /**
+ * Remember a user-chosen carousel card across status polls / transcript sync.
+ */
+function rememberClientMediaFocus(mediaId) {
+  state.clientMediaFocusId = mediaId != null && mediaId !== "" ? String(mediaId) : null;
+}
+
+/**
+ * Re-apply the user's carousel selection onto a fresh server widget payload.
+ * Returns true when focus was restored.
+ */
+function reconcileClientMediaFocus(visual) {
+  if (!visual || visual.kind !== "media") return false;
+  const focusId = state.clientMediaFocusId;
+  if (!focusId) return false;
+  const items = mediaItemsOf(visual);
+  const hit = items.find((row) => String(row.id || mediaItemKey(row)) === String(focusId));
+  if (!hit) {
+    state.clientMediaFocusId = null;
+    return false;
+  }
+  const data = visual.data || {};
+  data.active_id = hit.id;
+  data.item = hit;
+  data.items = items;
+  visual.data = data;
+  visual.title = hit.title || visual.title;
+  const year = hit.year;
+  const type = hit.type || "movie";
+  visual.body = [type, year].filter(Boolean).join(" · ");
+  if (!visual.context) visual.context = {};
+  visual.context.active_id = hit.id;
+  visual.context.relevant = true;
+  return true;
+}
+
+/**
  * Focus a stacked media card by id (tap / keyboard / flick on recessed cards).
  */
-function focusMediaById(mediaId, { reveal = true } = {}) {
+function focusMediaById(mediaId, { reveal = true, fromUser = true } = {}) {
   const visual = pickVisualOverlay(state.widgets);
   if (!visual || visual.kind !== "media" || !mediaId) return false;
   const items = mediaItemsOf(visual);
@@ -616,6 +659,7 @@ function focusMediaById(mediaId, { reveal = true } = {}) {
   if (!hit) return false;
   const data = visual.data || {};
   const prev = String((visual.context && visual.context.active_id) || data.active_id || "");
+  if (fromUser) rememberClientMediaFocus(hit.id);
   if (prev === String(hit.id) && !state.infoSoftHidden) {
     if (reveal) scheduleOverlayIdleHide();
     return false;
@@ -801,6 +845,8 @@ function activeMediaItem(visual, mediaId) {
 async function browseGenreCategory(genre, { mediaType = "movie" } = {}) {
   const title = String(genre || "").trim();
   if (!title) return;
+  // New genre stack — drop prior browse selection so page 1 of this category shows.
+  state.clientMediaFocusId = null;
   flashLocalActivity("thinking", `${title}…`, 20000);
   try {
     const out = await invoke("plex_browse_genre", {
@@ -824,8 +870,10 @@ async function browseGenreCategory(genre, { mediaType = "movie" } = {}) {
 /**
  * Focus a stacked media card when live talk names its title.
  * Returns true when the active card changed.
+ * Does not steal a user-pinned browse selection.
  */
 function focusMediaFromText(text, { reveal = true } = {}) {
+  if (state.infoPinned && state.clientMediaFocusId) return false;
   const visual = pickVisualOverlay(state.widgets);
   if (!visual || visual.kind !== "media" || !text) return false;
   const items = mediaItemsOf(visual);
@@ -866,23 +914,33 @@ function focusMediaFromText(text, { reveal = true } = {}) {
 /**
  * New user/assistant utterance — hide quickly when talk leaves the panel; keep/reveal
  * when it still touches on-screen topics. Server context on the next payload confirms.
+ *
+ * @param {string} text
+ * @param {{ live?: boolean }} [opts] live streaming deltas skip card-focus thrash
  */
-function noteOverlayConversation(text) {
+function noteOverlayConversation(text, { live = false } = {}) {
   const visual = pickVisualOverlay(state.widgets);
   if (!visual) return;
   if (isAckUtterance(text)) {
     scheduleOverlayIdleHide();
     return;
   }
-  const focused = focusMediaFromText(text, { reveal: true });
-  if (focused) return;
+  // Streaming deltas only keep the panel policy warm — focusing mid-word remounts
+  // the carousel and yanks scroll back to card 1 / top of the glass.
+  if (!live) {
+    const focused = focusMediaFromText(text, { reveal: true });
+    if (focused) return;
+  } else if (state.infoPinned && state.clientMediaFocusId) {
+    scheduleOverlayIdleHide();
+    return;
+  }
   const related = textTouchesOverlay(text, visual);
   if (related) {
     if (state.infoHideTimer) {
       clearTimeout(state.infoHideTimer);
       state.infoHideTimer = null;
     }
-    state.infoPinned = false;
+    // Do not clear infoPinned — browsing must survive narration.
     if (state.infoSoftHidden || !$("info-overlay")?.classList.contains("is-open")) {
       openInfoOverlay(visual);
     } else {
@@ -924,10 +982,14 @@ function renderWidgets(widgets) {
   const visual = pickVisualOverlay(list);
   if (!visual) {
     state.localMediaExtras = [];
+    state.clientMediaFocusId = null;
     closeInfoOverlay({ animate: true });
     return;
   }
   pruneLocalMediaExtras(visual);
+  if (visual.kind === "media") {
+    reconcileClientMediaFocus(visual);
+  }
   if (overlayIsRelevant(visual)) {
     if (state.infoHideTimer) {
       clearTimeout(state.infoHideTimer);
@@ -940,8 +1002,13 @@ function renderWidgets(widgets) {
   if (!state.infoSoftHidden) {
     if (state.infoSignature !== overlaySignature(visual)) {
       const content = $("info-content");
+      const glass = $("info-glass");
+      const scrollTop = glass ? glass.scrollTop : 0;
       if (content) content.innerHTML = overlayInnerHtml(visual);
       state.infoSignature = overlaySignature(visual);
+      if (glass) {
+        glass.scrollTop = scrollTop;
+      }
     }
     softHideInfoOverlay();
   }
@@ -1401,8 +1468,12 @@ function overlayInnerHtml(widget) {
 function openInfoOverlay(widget) {
   const root = $("info-overlay");
   const content = $("info-content");
+  const glass = $("info-glass");
   if (!root || !content || !widget) return;
   clearInfoCloseTimer();
+  if (widget.kind === "media") {
+    reconcileClientMediaFocus(widget);
+  }
   const signature = overlaySignature(widget);
   const alreadyOpen =
     root.classList.contains("is-open") &&
@@ -1429,6 +1500,8 @@ function openInfoOverlay(widget) {
     closeInfoOverlay({ animate: false });
     return;
   }
+  // Preserve glass scroll across remounts (status polls / narration focus).
+  const scrollTop = glass ? glass.scrollTop : 0;
   content.innerHTML = html;
   state.infoSignature = signature;
   state.infoSoftHidden = false;
@@ -1445,6 +1518,9 @@ function openInfoOverlay(widget) {
     void root.offsetWidth;
   }
   root.classList.add("is-open");
+  if (glass && scrollTop > 0) {
+    glass.scrollTop = scrollTop;
+  }
   scheduleOverlayIdleHide();
 }
 
@@ -1453,6 +1529,7 @@ function closeInfoOverlay({ animate = true } = {}) {
   clearOverlayPolicyTimers();
   state.infoSoftHidden = false;
   state.infoPinned = false;
+  state.clientMediaFocusId = null;
   if (!root || root.hidden) {
     state.infoSignature = "";
     return;
@@ -1483,6 +1560,7 @@ function closeInfoOverlay({ animate = true } = {}) {
 async function dismissWidget(id, { silent = false } = {}) {
   const next = state.widgets.filter((w) => w.id !== id);
   state.localMediaExtras = [];
+  state.clientMediaFocusId = null;
   renderWidgets(next);
   try {
     await api(`/api/widgets/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -2071,14 +2149,14 @@ function onRealtimeEvent(event) {
     const delta = event.delta || "";
     if (delta) {
       state.liveAssistantTranscript = `${state.liveAssistantTranscript || ""}${delta}`;
-      noteOverlayConversation(state.liveAssistantTranscript);
+      noteOverlayConversation(state.liveAssistantTranscript, { live: true });
     }
   }
   if (type === "response.output_audio_transcript.done" || type === "response.audio_transcript.done") {
     const text = event.transcript || state.liveAssistantTranscript || "";
     state.liveAssistantTranscript = "";
     appendLog("hearth", text);
-    noteOverlayConversation(text);
+    noteOverlayConversation(text, { live: false });
   }
   if (type === "response.created") {
     state.liveAssistantTranscript = "";

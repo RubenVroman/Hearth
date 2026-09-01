@@ -52,7 +52,7 @@ def test_spoken_answer_shell_is_wired(client):
     assert "height: 0" in css.text
 
     sw = client.get("/sw.js")
-    assert "hearth-shell-v20" in sw.text
+    assert "hearth-shell-v21" in sw.text
     assert "/static/spoken-answer.js" in sw.text
 
 
@@ -163,4 +163,5 @@ def test_spoken_answer_failsoft_in_app_handler():
     assert "noteSpokenAnswer" in app_js
     assert "overlay must never break the voice path" in app_js
     # Still drives media overlay from the same transcript (one stream).
-    assert "noteOverlayConversation(state.liveAssistantTranscript)" in app_js
+    # Live deltas pass { live: true } so mid-utterance focus does not thrash the carousel.
+    assert "noteOverlayConversation(state.liveAssistantTranscript, { live: true })" in app_js
