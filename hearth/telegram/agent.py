@@ -126,13 +126,34 @@ _PERSON_ASK = re.compile(
     r"\b(?:with|met|starring|featuring|feat\.?|ft\.?)\s+"
     r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*(?:\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*){0,3}\s+"
     r"(?:movies?|films?|shows?|series|flicks?)\b"
-    r")",
+    r"|"
+    # "Tom Hanks? Movies starring that guy?" — name first, then filmography ask.
+    r"^\s*[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*(?:\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*){0,3}\s*\?\s*"
+    r".*\b(?:movies?|films?|shows?|series)\b"
+    r")"
+    ,
     re.I,
 )
 
 _PERSON_NAME_AFTER = re.compile(
     r"\b(?:with|met|starring|featuring|feat\.?|ft\.?)\s+"
     r"(?P<name>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*(?:\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*){0,4})",
+    re.I,
+)
+
+_PERSON_LEADING_NAME = re.compile(
+    r"^\s*(?P<name>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*(?:\s+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'\-]*){0,3})"
+    r"\s*[?!]",
+    re.I,
+)
+
+_PERSON_FOLLOWUP_NUDGE = re.compile(
+    r"(?:"
+    r"\b(?:starring|famous|actor|actrice|filmography)\b|"
+    r"\b(?:that guy|that actor|die gozer|die acteur)\b|"
+    r"\b(?:sort\s*of|kinda|like)\s+famous\b|"
+    r"\b(?:try again|not working|still broken|doesn'?t work|it'?s not working)\b"
+    r")",
     re.I,
 )
 
@@ -218,9 +239,10 @@ READ tools (auto-run):
   NEVER use search_title for "movies with Actor" / bare actor names.
 - search_person: actor/person filmography. REQUIRED for "movies with Leonardo
   DiCaprio", "films met …", typos like "leonardo dicaprot", or Yeah after a
-  person-name typo confirm. Resolves the person (TMDB), lists a few popular
-  RELEASED movie credits with Get buttons. Do not auto-queue. Do not dump
-  Wikipedia/RT. Never say you couldn't find them in the catalog when credits exist.
+  person-name typo confirm. Uses Overseerr multi-search (same as the UI) to
+  resolve the person, then lists a few popular RELEASED movie credits with Get
+  buttons. Do not auto-queue. Do not dump Wikipedia/RT. Never say you couldn't
+  find them in the catalog when credits exist. Never use search_title for actors.
 - web_search: house live web search. ALWAYS call this for "do a websearch" /
   "zoek op het web" / "search the web" — NEVER say you cannot search the web.
   Use web_search only to disambiguate identity (which film), never to write a
@@ -344,7 +366,26 @@ def extract_person_name(text: str) -> str:
     raw = (text or "").strip()
     if not raw:
         return ""
-    # Prefer the filmography-shaped clause (media noun + with/met).
+
+    def _clean(name: str) -> str:
+        name = re.sub(
+            r"(?i)\s+(?:movies?|films?|shows?|series|flicks?|titles?)\s*$",
+            "",
+            name,
+        ).strip(" .,!?;:")
+        return name[:80]
+
+    def _usable(name: str) -> bool:
+        if not name:
+            return False
+        first = name.split()[0].lower()
+        if first in _PERSON_NAME_STOP:
+            return False
+        if len(name.split()) > 4:
+            return False
+        return True
+
+    # Prefer the filmography-shaped clause (media noun + with/met/starring).
     filmography = re.search(
         r"(?i)\b(?:movies?|films?|shows?|series|flicks?|titles?)\s+"
         r"(?:with|met|starring|featuring|feat\.?|ft\.?)\s+"
@@ -352,19 +393,78 @@ def extract_person_name(text: str) -> str:
         raw,
     )
     if filmography:
-        name = filmography.group(1).strip(" .,!?;:")
-    else:
-        match = _PERSON_NAME_AFTER.search(raw)
-        if not match:
-            return ""
-        name = (match.group("name") or "").strip(" .,!?;:")
-    # Drop trailing media words accidentally captured.
-    name = re.sub(
-        r"(?i)\s+(?:movies?|films?|shows?|series|flicks?|titles?)\s*$",
-        "",
-        name,
-    ).strip(" .,!?;:")
-    return name[:80]
+        candidate = _clean(filmography.group(1))
+        if _usable(candidate):
+            return candidate
+
+    # "Tom Hanks? Movies starring that guy?" — leading proper name before ?.
+    leading = _PERSON_LEADING_NAME.match(raw)
+    if leading and re.search(
+        r"(?i)\b(?:movies?|films?|shows?|series|starring|famous|actor)\b",
+        raw,
+    ):
+        candidate = _clean(leading.group("name") or "")
+        if _usable(candidate):
+            return candidate
+
+    match = _PERSON_NAME_AFTER.search(raw)
+    if match:
+        candidate = _clean(match.group("name") or "")
+        if _usable(candidate):
+            return candidate
+    return ""
+
+
+def person_name_from_history(history: list[dict[str, Any]] | None) -> str:
+    """Last user filmography name from chat history (for follow-up retries)."""
+    if not history:
+        return ""
+    for turn in reversed(history):
+        if turn.get("role") != "user":
+            continue
+        name = extract_person_name(str(turn.get("text") or ""))
+        if name:
+            return name
+    return ""
+
+
+def looks_like_person_followup(
+    text: str,
+    history: list[dict[str, Any]] | None = None,
+) -> bool:
+    """True when a nudge after a person ask should retry search_person.
+
+    Covers ``Tom Hanks? Movies starring that guy?`` and shorter pushes like
+    ``He's like, sortof famous?`` after a person miss — never fall through to
+    title search or spelling lectures.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 240:
+        return False
+    if looks_like_person_ask(raw):
+        return True
+    prior = person_name_from_history(history)
+    if not prior:
+        return False
+    if not _PERSON_FOLLOWUP_NUDGE.search(raw):
+        return False
+    # Avoid treating a brand-new concrete title as a person retry.
+    if re.search(r"\(\s*(?:19|20)\d{2}\s*\)", raw):
+        return False
+    return True
+
+
+def resolve_person_query(
+    text: str,
+    history: list[dict[str, Any]] | None = None,
+) -> str:
+    """Best person name for this turn (message first, then prior ask)."""
+    name = extract_person_name(text)
+    if name:
+        return name
+    if looks_like_person_followup(text, history):
+        return person_name_from_history(history)
+    return ""
 
 
 def claims_overseerr_catalog(text: str) -> bool:
@@ -488,11 +588,11 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "search_person",
             "description": (
-                "Find released movies (or TV) with an actor/person via TMDB person "
-                "search + credits. Use for 'movies with Leonardo DiCaprio', "
-                "'films met …', actor typos, and Yeah after a person-name typo "
-                "confirm. Never use search_title for a bare actor name. Returns a "
-                "short list with Get buttons — never auto-queues."
+                "Find released movies (or TV) with an actor/person via Overseerr "
+                "multi-search person hits + combined credits. Use for "
+                "'movies with …', 'films met …', actor typos, and Yeah after a "
+                "person-name typo confirm. Never use search_title for a bare actor "
+                "name. Returns a short list with Get buttons — never auto-queues."
             ),
             "parameters": {
                 "type": "object",
