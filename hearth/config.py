@@ -171,37 +171,36 @@ class Settings(BaseSettings):
     thuisbezorgd_password: str = Field(default="", alias="THUISBEZORGD_PASSWORD")
     thuisbezorgd_session_token: str = Field(default="", alias="THUISBEZORGD_SESSION_TOKEN")
 
-    # Telegram drop-group inbox (movies/series/TV → *arr/Overseerr). Off unless
-    # TELEGRAM_BOT_TOKEN + at least one TELEGRAM_CHAT_IDS entry are set.
-    # Long-polling is the default; no public webhook / Funnel.
+    # Deterministic Telegram media bot. Overseerr is the sole search/request
+    # backend; Radarr/Sonarr are observed only for download progress. The bot is
+    # off unless its token and at least one allowlisted chat are configured.
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_ids: str = Field(default="", alias="TELEGRAM_CHAT_IDS")
     # Optional comma-separated Telegram user ids (house members). Empty = any
     # member of an allowlisted group may request (bot still ignored).
     telegram_user_ids: str = Field(default="", alias="TELEGRAM_USER_IDS")
+    # Operational kill switch. A configured bot otherwise runs one getUpdates
+    # long-poller; Hearth does not expose a Telegram webhook.
     telegram_poll: bool = Field(default=True, alias="TELEGRAM_POLL")
-    # Optional localhost-only webhook (not the default). Bind stays on 127.0.0.1.
-    telegram_webhook_local: bool = Field(default=False, alias="TELEGRAM_WEBHOOK_LOCAL")
-    telegram_webhook_path: str = Field(
-        default="/telegram/webhook",
-        alias="TELEGRAM_WEBHOOK_PATH",
-    )
     telegram_rate_limit_per_minute: int = Field(
         default=6,
         alias="TELEGRAM_RATE_LIMIT_PER_MINUTE",
-    )
-    telegram_dedup_window_seconds: float = Field(
-        default=120.0,
-        alias="TELEGRAM_DEDUP_WINDOW_SECONDS",
     )
     telegram_max_title_length: int = Field(default=200, alias="TELEGRAM_MAX_TITLE_LENGTH")
     telegram_progress_interval_seconds: float = Field(
         default=45.0,
         alias="TELEGRAM_PROGRESS_INTERVAL_SECONDS",
     )
-    # Telegram Movies inbox always uses Overseerr for search + request (movie and
-    # TV). Kept for backward-compatible env; no longer gates Radarr/Sonarr grabs.
-    telegram_prefer_overseerr: bool = Field(default=True, alias="TELEGRAM_PREFER_OVERSEERR")
+    telegram_concurrency: int = Field(default=4, ge=1, le=32, alias="TELEGRAM_CONCURRENCY")
+    telegram_callback_ttl_seconds: int = Field(
+        default=6 * 60 * 60,
+        ge=60,
+        alias="TELEGRAM_CALLBACK_TTL_SECONDS",
+    )
+    telegram_db_path: Path = Field(
+        default=Path("./data/hearth-telegram.db"),
+        alias="TELEGRAM_DB_PATH",
+    )
 
     @property
     def openai_configured(self) -> bool:
@@ -265,6 +264,19 @@ class Settings(BaseSettings):
                 continue
         return out
 
+    @staticmethod
+    def _id_list_valid(raw: str) -> bool:
+        parts = [part.strip() for part in (raw or "").replace(";", ",").split(",")]
+        values = [part for part in parts if part]
+        if not values:
+            return True
+        try:
+            for value in values:
+                int(value)
+        except ValueError:
+            return False
+        return True
+
     @property
     def telegram_chat_id_list(self) -> list[int]:
         return self._parse_id_list(self.telegram_chat_ids)
@@ -275,8 +287,21 @@ class Settings(BaseSettings):
         return self._parse_id_list(self.telegram_user_ids)
 
     @property
+    def telegram_chat_ids_valid(self) -> bool:
+        return self._id_list_valid(self.telegram_chat_ids)
+
+    @property
+    def telegram_user_ids_valid(self) -> bool:
+        return self._id_list_valid(self.telegram_user_ids)
+
+    @property
     def telegram_configured(self) -> bool:
-        return bool(self.telegram_bot_token.strip() and self.telegram_chat_id_list)
+        return bool(
+            self.telegram_bot_token.strip()
+            and self.telegram_chat_id_list
+            and self.telegram_chat_ids_valid
+            and self.telegram_user_ids_valid
+        )
 
 
 settings = Settings()

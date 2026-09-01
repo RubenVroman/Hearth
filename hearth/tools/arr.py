@@ -2,13 +2,253 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
+import time
 from typing import Any
 
 import httpx
 
 from hearth.config import settings
 from hearth.fixtures import pipeline
+
+log = logging.getLogger("hearth.arr")
+
+
+class OverseerrError(RuntimeError):
+    """Configured Overseerr/Seerr could not complete a live operation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str = "request",
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.status_code = status_code
+
+
+def _integer_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def _overseerr_base_url(value: str) -> str:
+    """Accept either the server root or a pasted ``/api/v1`` API URL."""
+    base = (value or "").strip().rstrip("/")
+    if base.lower().endswith("/api/v1"):
+        base = base[: -len("/api/v1")].rstrip("/")
+    return base
+
+
+def _overseerr_error(operation: str, exc: Exception) -> OverseerrError:
+    status = None
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+    suffix = f" (HTTP {status})" if status is not None else ""
+    log.warning("Overseerr %s failed%s: %s", operation, suffix, type(exc).__name__)
+    return OverseerrError(
+        f"Overseerr {operation} is unavailable{suffix}",
+        operation=operation,
+        status_code=status,
+    )
+
+
+def _json_object(response: Any) -> dict[str, Any]:
+    """Read an HTTP JSON object without turning an empty success into failure."""
+    try:
+        payload = response.json()
+    except (AttributeError, TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _required_json_object(response: Any, operation: str) -> dict[str, Any]:
+    """Require a JSON object from a real successful HTTP response.
+
+    A tiny number of legacy unit-test doubles only implement ``status_code``
+    and ``raise_for_status``. Keep those compatible, while never interpreting
+    an empty/malformed real httpx response as an empty catalog or accepted POST.
+    """
+    if not hasattr(response, "json"):
+        return {}
+    try:
+        payload = response.json()
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Overseerr {operation} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Overseerr {operation} returned a non-object JSON payload")
+    return payload
+
+
+def _validate_search_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = payload.get("results")
+    if not isinstance(rows, list):
+        raise ValueError("Overseerr search response has no results array")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _validate_request_payload(
+    payload: dict[str, Any],
+    *,
+    media_id: int,
+    media_type: str,
+) -> None:
+    if payload.get("id") is None or payload.get("status") is None:
+        raise ValueError("Overseerr request response has no request id/status")
+    media = payload.get("media")
+    if not isinstance(media, dict):
+        raise ValueError("Overseerr request response has no media object")
+    returned_id = media.get("tmdbId")
+    if isinstance(returned_id, bool):
+        raise ValueError("Overseerr request response has an invalid TMDB id")
+    if isinstance(returned_id, int):
+        normalized_id = returned_id
+    elif isinstance(returned_id, str) and returned_id.strip().isdigit():
+        normalized_id = int(returned_id.strip())
+    else:
+        raise ValueError("Overseerr request response has no TMDB id")
+    returned_type = str(media.get("mediaType") or "").strip().lower()
+    if normalized_id != media_id or returned_type != media_type:
+        raise ValueError("Overseerr request response identifies different media")
+
+
+def _media_info(item: dict[str, Any]) -> dict[str, Any]:
+    value = item.get("mediaInfo")
+    if not isinstance(value, dict):
+        value = item.get("media")
+    return value if isinstance(value, dict) else {}
+
+
+def _request_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = item.get("requests")
+    if not isinstance(rows, list):
+        rows = _media_info(item).get("requests")
+    return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def _latest_request(item: dict[str, Any]) -> dict[str, Any]:
+    explicit = item.get("request")
+    if not isinstance(explicit, dict):
+        explicit = _media_info(item).get("request")
+    if isinstance(explicit, dict):
+        return explicit
+    rows = _request_rows(item)
+    if not rows:
+        return {}
+
+    def _request_id(row: dict[str, Any]) -> int:
+        try:
+            return int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return max(rows, key=_request_id)
+
+
+def _request_status(item: dict[str, Any]) -> Any:
+    explicit = item.get("requestStatus")
+    if explicit is None:
+        explicit = _media_info(item).get("requestStatus")
+    if explicit is not None:
+        return explicit
+    latest = _latest_request(item)
+    if latest.get("status") is not None:
+        return latest.get("status")
+    # POST /request returns a MediaRequest object whose own status is the
+    # request status and whose ``media`` member holds the media status.
+    if isinstance(item.get("media"), dict):
+        return item.get("status")
+    return None
+
+
+def _media_status(item: dict[str, Any]) -> Any:
+    explicit = item.get("mediaStatus")
+    if explicit is not None:
+        return explicit
+    return _media_info(item).get("status")
+
+
+def _media_status_label(value: Any) -> str | None:
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return None
+    # Archived Overseerr uses 6=deleted. Current Seerr inserted
+    # 6=blocklisted and moved deleted to 7, so 6 cannot be named more narrowly
+    # without a server capability/version signal.
+    return {
+        1: "unknown",
+        2: "pending",
+        3: "processing",
+        4: "partially_available",
+        5: "available",
+        6: "blocklisted_or_deleted",
+        7: "deleted",
+    }.get(status)
+
+
+def _normalize_tv_seasons(value: list[int] | str | None) -> list[int] | str:
+    if value is None:
+        return "all"
+    if isinstance(value, str):
+        if value.strip().lower() == "all":
+            return "all"
+        raise ValueError("TV seasons must be 'all' or a list of season numbers")
+    if not isinstance(value, list) or not value:
+        raise ValueError("TV seasons must be 'all' or a non-empty list")
+    seasons: list[int] = []
+    for raw in value:
+        if isinstance(raw, bool):
+            raise ValueError("TV season numbers must be integers")
+        if isinstance(raw, int):
+            season = raw
+        elif isinstance(raw, str) and re.fullmatch(r"\d+", raw.strip()):
+            season = int(raw.strip())
+        else:
+            # Exact request coordinates must never truncate floats such as 2.9.
+            raise ValueError("TV season numbers must be integers")
+        if season < 0:
+            raise ValueError("TV season numbers cannot be negative")
+        if season not in seasons:
+            seasons.append(season)
+    return seasons
+
+
+def _request_result_fields(
+    payload: dict[str, Any],
+    pick: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize a MediaRequest response while retaining the selected title."""
+    media = _media_info(payload)
+    request_status = payload.get("status")
+    media_status = media.get("status")
+    request_id = payload.get("id")
+    summary_source: dict[str, Any] = dict(pick)
+    if media:
+        summary_source["mediaInfo"] = media
+    if request_status is not None:
+        summary_source["requestStatus"] = request_status
+    if media_status is not None:
+        summary_source["mediaStatus"] = media_status
+    if request_id is not None:
+        summary_source["requestId"] = request_id
+    fields: dict[str, Any] = {
+        "requested": _summarize_overseerr(summary_source),
+        "request": payload,
+        "requestId": request_id,
+        "requestStatus": request_status,
+        "mediaStatus": media_status,
+    }
+    return fields
 
 # Spoken / tool statuses for active *arr downloads.
 DOWNLOAD_STATUSES = (
@@ -87,11 +327,15 @@ def _confident_overseerr_hits(
         if media_type in {"movie", "tv"} and mt and mt != media_type:
             continue
         title = _row_title(row)
-        if not title_seed_matches(seed, title):
+        original = str(row.get("originalTitle") or row.get("originalName") or "")
+        if not (
+            title_seed_matches(seed, title)
+            or title_seed_matches(seed, original)
+        ):
             continue
         out.append(row)
     if year is not None:
-        year_hits = []
+        year_hits: list[dict[str, Any]] = []
         for row in out:
             try:
                 row_year = int(row.get("year")) if row.get("year") not in (None, "") else None
@@ -99,8 +343,9 @@ def _confident_overseerr_hits(
                 row_year = None
             if row_year == year:
                 year_hits.append(row)
-        if year_hits:
-            return year_hits
+        # An explicit year is a safety boundary, not merely a ranking hint.
+        # Never auto-request the only same-title hit when it is the wrong year.
+        return year_hits
     return out
 
 
@@ -112,6 +357,7 @@ def _indistinguishable_overseerr_hits(hits: list[dict[str, Any]]) -> bool:
             " ".join(_normalize_title_tokens(_row_title(h))),
             str(h.get("year") or ""),
             str(h.get("mediaType") or ""),
+            str(h.get("mediaId") or h.get("tmdbId") or h.get("id") or ""),
         )
         for h in hits
     }
@@ -172,13 +418,13 @@ def _in_library(item: dict[str, Any]) -> bool:
         return True
     if item.get("path") and _library_id(item) is not None:
         return True
-    if item.get("queued") is True or item.get("requested") is True:
-        return True
-    media = item.get("media") if isinstance(item.get("media"), dict) else {}
-    # Overseerr mediaInfo status: 3=available, 4=partial, 5=processing, …
+    media = _media_info(item)
+    # Overseerr/Seerr MediaStatus: 5 is fully available. Processing (3),
+    # partial (4), blocklisted (6), and deleted (6 on old Overseerr, 7 on
+    # current Seerr) must not be presented as already in the library.
     status = media.get("status")
     try:
-        if status is not None and int(status) >= 3:
+        if status is not None and int(status) == 5:
             return True
     except (TypeError, ValueError):
         pass
@@ -263,14 +509,25 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
     if not year:
         date = item.get("releaseDate") or item.get("firstAirDate") or ""
         year = str(date)[:4] or None
-    media_id = item.get("id") or item.get("mediaId")
-    media_type = _row_media_type(item)
+    media = _media_info(item)
+    # On a search/detail response ``id`` is the TMDB id. On a MediaRequest
+    # response ``id`` is the request id and the TMDB id lives under ``media``.
+    media_id = (
+        item.get("mediaId")
+        or item.get("tmdbId")
+        or media.get("tmdbId")
+        or media.get("mediaId")
+        or item.get("id")
+    )
+    media_type = _row_media_type(item) or _row_media_type(media)
     if not media_type and _is_person_result(item):
         media_type = "person"
     name = item.get("name")
     title = item.get("title") or name
+    media_status = _media_status(item)
     out = {
         "title": title,
+        "originalTitle": item.get("originalTitle") or item.get("originalName"),
         "name": name or (title if media_type == "person" else None),
         "year": year,
         "mediaType": media_type or item.get("mediaType"),
@@ -281,7 +538,18 @@ def _summarize_overseerr(item: dict[str, Any]) -> dict[str, Any]:
         "overview": (item.get("overview") or item.get("summary") or "")[:180],
         "posterPath": _poster_path(item),
         "popularity": item.get("popularity"),
+        "mediaStatus": media_status,
+        "mediaStatusLabel": _media_status_label(media_status),
+        "requestStatus": _request_status(item),
     }
+    latest_request = _latest_request(item)
+    request_id = item.get("requestId")
+    if request_id is None and latest_request:
+        request_id = latest_request.get("id")
+    if request_id is None and isinstance(item.get("media"), dict):
+        request_id = item.get("id")
+    if request_id is not None:
+        out["requestId"] = request_id
     known = item.get("knownFor")
     if known is None:
         known = item.get("known_for")
@@ -473,7 +741,31 @@ def _queue_media_ids(item: dict[str, Any], *, service: str) -> dict[str, Any]:
                 out["episodeId"] = int(episode_id)
             except (TypeError, ValueError):
                 pass
+        tvdb = series.get("tvdbId") or item.get("tvdbId")
+        if tvdb is not None:
+            try:
+                out["tvdbId"] = int(tvdb)
+            except (TypeError, ValueError):
+                pass
+        season = episode.get("seasonNumber")
+        if season is None:
+            season = item.get("seasonNumber")
+        if season is not None:
+            try:
+                out["seasonNumber"] = int(season)
+            except (TypeError, ValueError):
+                pass
     return out
+
+
+def _queue_media_title(item: dict[str, Any]) -> str:
+    """Movie/series title, separate from the download release name."""
+    movie = item.get("movie") if isinstance(item.get("movie"), dict) else {}
+    series = item.get("series") if isinstance(item.get("series"), dict) else {}
+    for candidate in (movie.get("title"), series.get("title")):
+        if candidate:
+            return str(candidate)
+    return _download_title(item)
 
 
 def summarize_queue_item(item: dict[str, Any], *, service: str) -> dict[str, Any]:
@@ -489,6 +781,7 @@ def summarize_queue_item(item: dict[str, Any], *, service: str) -> dict[str, Any
         queue_id_i = None
     out = {
         "title": title or None,
+        "mediaTitle": _queue_media_title(item) or None,
         "status": status,
         "percent": percent,
         "size": size,
@@ -538,7 +831,9 @@ def retry_media_key(item: dict[str, Any], *, service: str) -> str:
         if ids.get("episodeId") is not None:
             return f"sonarr:episode:{ids['episodeId']}"
         if ids.get("seriesId") is not None:
-            return f"sonarr:series:{ids['seriesId']}"
+            season = ids.get("seasonNumber")
+            season_bit = f":season:{season}" if season is not None else ""
+            return f"sonarr:series:{ids['seriesId']}{season_bit}"
     title = _download_title(item).strip().lower() or "unknown"
     return f"{service}:title:{title}"
 
@@ -1473,6 +1768,7 @@ class StarrClient:
         force: bool = False,
         reason: str = "",
         keep_existing: bool | None = None,
+        queue_id: int | None = None,
     ) -> dict[str, Any]:
         """Blocklist the bad release and grab an alternate for the SAME title.
 
@@ -1482,8 +1778,34 @@ class StarrClient:
         title = (title or "").strip()
         max_attempts = self.max_retries
         mock = not self.live
-        raw = await self.queue_raw(title)
+        # Automatic callers can bind the mutation to the queue row they just
+        # inspected. Re-resolving only by title can target a remake or another
+        # season when several downloads share a name.
+        raw = await self.queue_raw("" if queue_id is not None else title)
+        if self.live and (
+            str(raw.get("mode") or "").lower() != "live" or raw.get("error")
+        ):
+            return {
+                "ok": False,
+                "mode": "live",
+                "service": self.kind,
+                "query": title or None,
+                "reason": "unavailable",
+                "title": title or self.kind.title(),
+                "error": "live queue lookup failed",
+                "speak": f"{self.kind.title()} is unavailable; I did not retry anything.",
+            }
         records = list(raw.get("records") or [])
+        if queue_id is not None:
+            try:
+                expected_queue_id = int(queue_id)
+            except (TypeError, ValueError):
+                expected_queue_id = -1
+            records = [
+                row
+                for row in records
+                if isinstance(row, dict) and _integer_value(row.get("id")) == expected_queue_id
+            ]
         target = self._select_retry_target(records, title=title, force=force)
         display = (
             _download_title(target)
@@ -1510,7 +1832,7 @@ class StarrClient:
                 }
             # Not in the active queue — offer library alternate releases when the
             # title is monitored (missing file, too big, or keep-both extra copy).
-            if title and self.kind == "radarr":
+            if title and self.kind == "radarr" and queue_id is None:
                 switch = await self.list_alternate_releases(
                     title,
                     prefer_smaller=keep_existing is not True,
@@ -1643,70 +1965,8 @@ class StarrClient:
                 ),
             }
         except Exception as exc:  # noqa: BLE001
-            if settings.mock_if_unconfigured and self.live:
-                # Fall through to fixture path when live *arr is unreachable.
-                try:
-                    pipeline.blocklist_queue_item(self.kind, queue_id_i)
-                    releases = pipeline.list_releases(self.kind, target)
-                    pick = self._pick_alternate_release(releases, blocked=blocked)
-                    if pick is None:
-                        attempt = self._bump_retry(key)
-                        return {
-                            "ok": False,
-                            "mode": "mock",
-                            "service": self.kind,
-                            "query": title or None,
-                            "reason": "no_alternate",
-                            "title": display,
-                            "attempt": attempt,
-                            "max_attempts": max_attempts,
-                            "error": str(exc),
-                            "speak": speak_retry(
-                                title=display,
-                                ok=False,
-                                reason="no_alternate",
-                                mock=True,
-                            ),
-                        }
-                    pipeline.grab_release(self.kind, pick)
-                    attempt = self._bump_retry(key)
-                    new_indexer = str(pick.get("indexer") or "")
-                    refreshed = await self.queue(display if not title else title)
-                    return {
-                        "ok": True,
-                        "mode": "mock",
-                        "service": self.kind,
-                        "query": title or None,
-                        "reason": "retried",
-                        "title": display,
-                        "attempt": attempt,
-                        "max_attempts": max_attempts,
-                        "indexer": new_indexer or None,
-                        "error": str(exc),
-                        "downloads": refreshed.get("downloads") or [],
-                        "speak": speak_retry(
-                            title=display,
-                            ok=True,
-                            reason="retried",
-                            indexer=new_indexer,
-                            attempt=attempt,
-                            max_attempts=max_attempts,
-                            mock=True,
-                        ),
-                    }
-                except Exception as mock_exc:  # noqa: BLE001
-                    return {
-                        "ok": False,
-                        "mode": "mock",
-                        "service": self.kind,
-                        "query": title or None,
-                        "reason": "error",
-                        "title": display,
-                        "error": str(mock_exc),
-                        "speak": speak_retry(
-                            title=display, ok=False, reason="error", mock=True
-                        ),
-                    }
+            # A live mutation may already have removed/blocklisted the old row.
+            # Never turn that ambiguous outcome into a fixture "success".
             return {
                 "ok": False,
                 "mode": "live",
@@ -2259,96 +2519,391 @@ class StarrClient:
 
 
 class Overseerr:
+    _PROVIDER_PROBE_TTL_SECONDS = 60.0
+    _PROVIDER_PROBE_MOVIE_ID = 550  # Fight Club: stable TMDB fixture/probe.
+
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._client_signature: tuple[str, str] | None = None
+        self._provider_probe_cache: dict[str, Any] | None = None
+        self._provider_probe_cached_at = 0.0
+        self._provider_probe_signature: tuple[str, str] | None = None
+        self._provider_probe_lock = asyncio.Lock()
 
     @property
     def live(self) -> bool:
         return settings.overseerr_configured
 
     async def _http(self) -> httpx.AsyncClient:
+        signature = (
+            _overseerr_base_url(settings.overseerr_url),
+            settings.overseerr_api_key.strip(),
+        )
+        if self._client is not None and self._client_signature != signature:
+            await self._client.aclose()
+            self._client = None
+            self._clear_provider_probe()
         if self._client is None:
             self._client = httpx.AsyncClient(
-                base_url=settings.overseerr_url.rstrip("/"),
-                headers={"X-Api-Key": settings.overseerr_api_key, "Accept": "application/json"},
-                timeout=12.0,
+                base_url=signature[0],
+                headers={"X-Api-Key": signature[1], "Accept": "application/json"},
+                timeout=httpx.Timeout(12.0, connect=5.0),
             )
+            self._client_signature = signature
         return self._client
 
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        self._client_signature = None
+        self._clear_provider_probe()
 
-    async def search(self, query: str) -> dict[str, Any]:
-        query = (query or "").strip()
+    def _clear_provider_probe(self) -> None:
+        self._provider_probe_cache = None
+        self._provider_probe_cached_at = 0.0
+        self._provider_probe_signature = None
+
+    async def media_details(
+        self,
+        media_id: int,
+        media_type: str,
+    ) -> dict[str, Any]:
+        """Return normalized Overseerr details and request state for a TMDB id."""
+        try:
+            mid = int(media_id)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "mode": "live" if self.live else "mock",
+                "service": "overseerr",
+                "reason": "invalid_media_id",
+                "mediaType": media_type,
+                "mediaId": media_id,
+                "mediaInfo": {},
+                "requests": [],
+            }
+        kind = str(media_type or "").strip().lower()
+        if kind not in {"movie", "tv"}:
+            return {
+                "ok": False,
+                "mode": "live" if self.live else "mock",
+                "service": "overseerr",
+                "reason": "invalid_media_type",
+                "mediaType": kind,
+                "mediaId": mid,
+                "mediaInfo": {},
+                "requests": [],
+            }
+
+        if not self.live:
+            rows = pipeline.search_overseerr(f"tmdb:{mid}")
+            row = next(
+                (
+                    candidate
+                    for candidate in rows
+                    if str(candidate.get("mediaType") or "").lower() == kind
+                ),
+                None,
+            )
+            if not isinstance(row, dict):
+                return {
+                    "ok": False,
+                    "mode": "mock",
+                    "service": "overseerr",
+                    "reason": "not_found",
+                    "mediaType": kind,
+                    "mediaId": mid,
+                    "mediaInfo": {},
+                    "requests": [],
+                }
+            normalized_row = {
+                **row,
+                "mediaType": kind,
+                "mediaId": mid,
+                "tmdbId": mid,
+            }
+            info = _media_info(normalized_row)
+            requests = _request_rows(normalized_row)
+            return {
+                "ok": True,
+                "mode": "mock",
+                "service": "overseerr",
+                "mediaType": kind,
+                "mediaId": mid,
+                "mediaInfo": info,
+                "requests": requests,
+                "mediaStatus": _media_status(normalized_row),
+                "requestStatus": _request_status(normalized_row),
+                "media": _summarize_overseerr(normalized_row),
+            }
+
+        client = await self._http()
+        try:
+            response = await client.get(f"/api/v1/{kind}/{mid}")
+            if response.status_code == 404:
+                return {
+                    "ok": False,
+                    "mode": "live",
+                    "service": "overseerr",
+                    "reason": "not_found",
+                    "status_code": 404,
+                    "mediaType": kind,
+                    "mediaId": mid,
+                    "mediaInfo": {},
+                    "requests": [],
+                }
+            response.raise_for_status()
+            payload = _required_json_object(response, "media details")
+            try:
+                returned_id = int(payload.get("id"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Overseerr media details response has no TMDB id") from exc
+            if returned_id != mid:
+                raise ValueError("Overseerr media details response has the wrong TMDB id")
+            normalized_payload = {
+                **payload,
+                "mediaType": kind,
+                "mediaId": mid,
+                "tmdbId": mid,
+            }
+            info = _media_info(normalized_payload)
+            requests = _request_rows(normalized_payload)
+            return {
+                "ok": True,
+                "mode": "live",
+                "service": "overseerr",
+                "mediaType": kind,
+                "mediaId": mid,
+                "mediaInfo": info,
+                "requests": requests,
+                "mediaStatus": _media_status(normalized_payload),
+                "requestStatus": _request_status(normalized_payload),
+                "media": _summarize_overseerr(normalized_payload),
+            }
+        except Exception as exc:  # noqa: BLE001
+            raise _overseerr_error("media details", exc) from exc
+
+    async def provider_probe(self, *, force: bool = False) -> dict[str, Any]:
+        """Check Seerr's TMDB provider, caching the known-title probe briefly.
+
+        Seerr can turn upstream TMDB/DNS failures into HTTP 200 searches with
+        no rows. Fetching the stable Fight Club (TMDB 550) detail distinguishes
+        a genuine catalog miss from that degraded-provider state.
+        """
+        mode = "live" if self.live else "mock"
         if not self.live:
             return {
+                "ok": True,
+                "mode": mode,
+                "service": "overseerr",
+                "provider": "tmdb",
+                "status": "available",
+                "probeMediaId": self._PROVIDER_PROBE_MOVIE_ID,
+            }
+
+        signature = (
+            _overseerr_base_url(settings.overseerr_url),
+            settings.overseerr_api_key.strip(),
+        )
+        now = time.monotonic()
+        if (
+            not force
+            and self._provider_probe_cache is not None
+            and self._provider_probe_signature == signature
+            and now - self._provider_probe_cached_at < self._PROVIDER_PROBE_TTL_SECONDS
+        ):
+            return dict(self._provider_probe_cache)
+
+        async with self._provider_probe_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self._provider_probe_cache is not None
+                and self._provider_probe_signature == signature
+                and now - self._provider_probe_cached_at < self._PROVIDER_PROBE_TTL_SECONDS
+            ):
+                return dict(self._provider_probe_cache)
+
+            client = await self._http()
+            result: dict[str, Any]
+            try:
+                response = await client.get(
+                    f"/api/v1/movie/{self._PROVIDER_PROBE_MOVIE_ID}"
+                )
+                response.raise_for_status()
+                payload = _json_object(response)
+                try:
+                    returned_id = int(payload.get("id") or payload.get("tmdbId") or 0)
+                except (TypeError, ValueError):
+                    returned_id = 0
+                title = str(payload.get("title") or "").strip()
+                healthy = (
+                    returned_id == self._PROVIDER_PROBE_MOVIE_ID
+                    or title.lower() == "fight club"
+                )
+                result = {
+                    "ok": healthy,
+                    "mode": "live",
+                    "service": "overseerr",
+                    "provider": "tmdb",
+                    "status": "available" if healthy else "invalid_response",
+                    "probeMediaId": self._PROVIDER_PROBE_MOVIE_ID,
+                }
+            except Exception as exc:  # noqa: BLE001
+                status_code = None
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status_code = exc.response.status_code
+                result = {
+                    "ok": False,
+                    "mode": "live",
+                    "service": "overseerr",
+                    "provider": "tmdb",
+                    "status": (
+                        "authentication_failed"
+                        if status_code in {401, 403}
+                        else "unavailable"
+                    ),
+                    "probeMediaId": self._PROVIDER_PROBE_MOVIE_ID,
+                    "status_code": status_code,
+                }
+                log.warning("Overseerr TMDB provider probe failed: %s", type(exc).__name__)
+
+            self._provider_probe_cache = dict(result)
+            self._provider_probe_cached_at = time.monotonic()
+            self._provider_probe_signature = signature
+            return result
+
+    async def search(self, query: str, *, page: int = 1) -> dict[str, Any]:
+        query = (query or "").strip()
+        try:
+            page_i = max(1, int(page))
+        except (TypeError, ValueError):
+            page_i = 1
+        if not self.live:
+            rows = pipeline.search_overseerr(query)
+            return {
+                "ok": True,
                 "mode": "mock",
                 "service": "overseerr",
                 "query": query,
-                "results": [_summarize_overseerr(h) for h in pipeline.search_overseerr(query)],
+                "page": page_i,
+                "totalPages": 1,
+                "totalResults": len(rows),
+                "providerOk": True,
+                "results": [_summarize_overseerr(h) for h in rows],
             }
         client = await self._http()
         try:
-            response = await client.get("/api/v1/search", params={"query": query})
+            # Explicit page=1 is compatible with both archived Overseerr and
+            # current Seerr and avoids relying on OpenAPI default injection.
+            response = await client.get(
+                "/api/v1/search",
+                params={"query": query, "page": page_i},
+            )
             response.raise_for_status()
-            payload = response.json() or {}
-            rows = payload.get("results") or []
-            return {
+            payload = _required_json_object(response, "search")
+            rows = _validate_search_payload(payload)
+            result = {
+                "ok": True,
                 "mode": "live",
                 "service": "overseerr",
                 "query": query,
-                "results": [_summarize_overseerr(h) for h in rows[:8]],
+                "page": payload.get("page") or page_i,
+                "totalPages": payload.get("totalPages") or 1,
+                "totalResults": payload.get("totalResults") or len(rows),
+                "providerOk": True,
+                # Seerr's page size is currently 20. Preserve the whole page so
+                # downstream ranking can find an exact hit after broad results.
+                "results": [_summarize_overseerr(h) for h in rows[:20]],
             }
+            if not rows:
+                probe = await self.provider_probe()
+                result["providerOk"] = bool(probe.get("ok"))
+                result["provider"] = probe
+                if not probe.get("ok"):
+                    result["ok"] = False
+                    result["reason"] = (
+                        "authentication_failed"
+                        if probe.get("status") == "authentication_failed"
+                        else "provider_unavailable"
+                    )
+            return result
         except Exception as exc:  # noqa: BLE001
-            if settings.mock_if_unconfigured:
-                return {
-                    "mode": "mock",
-                    "service": "overseerr",
-                    "query": query,
-                    "error": str(exc),
-                    "results": [_summarize_overseerr(h) for h in pipeline.search_overseerr(query)],
-                }
-            raise
+            # A configured live backend must never degrade to fixtures: that
+            # made auth/network failures look like empty catalog searches.
+            raise _overseerr_error("search", exc) from exc
 
     async def request(
         self,
         query: str = "",
         media_id: int | None = None,
         media_type: str | None = None,
+        seasons: list[int] | str | None = None,
     ) -> dict[str, Any]:
         query = (query or "").strip()
-        mt = media_type if media_type in {"movie", "tv"} else None
-
-        # Explicit TMDB id — never fuzzy-pick a mismatched search/fallback hit.
-        if media_id and not mt:
-            # Resolve media type from an id search when the caller omitted it.
-            id_found = await self.search(str(int(media_id)))
-            for row in id_found.get("results") or []:
-                rid = row.get("mediaId") or row.get("tmdbId") or row.get("id")
-                try:
-                    if int(rid) != int(media_id):
-                        continue
-                except (TypeError, ValueError):
-                    continue
-                if row.get("matched") == "fallback":
-                    continue
-                row_mt = str(row.get("mediaType") or "")
-                if row_mt in {"movie", "tv"}:
-                    mt = row_mt
-                    if not query:
-                        query = _row_title(row)
-                    break
-            if not mt:
+        raw_media_type = str(media_type or "").strip().lower()
+        mt = raw_media_type if raw_media_type in {"movie", "tv"} else None
+        if media_id is not None:
+            if isinstance(media_id, bool):
+                media_id = 0
+            elif isinstance(media_id, int):
+                pass
+            elif isinstance(media_id, str) and re.fullmatch(
+                r"[1-9]\d*", media_id.strip()
+            ):
+                media_id = int(media_id.strip())
+            else:
+                # Exact request coordinates must never truncate 550.9 to 550.
+                media_id = 0
+            if media_id <= 0:
                 return {
                     "ok": False,
+                    "mode": "live" if self.live else "mock",
                     "service": "overseerr",
-                    "error": f"mediaType required for Overseerr id {media_id}",
-                    "speak": f"I need to know if TMDB {media_id} is a movie or a show before requesting it.",
+                    "reason": "invalid_media_id",
+                    "error": "mediaId must be a positive TMDB id",
+                    "speak": "That TMDB id is invalid.",
                 }
+            if not mt:
+                # TMDB movie and TV ids occupy separate namespaces and can
+                # collide. Numeric free-text search is not an id lookup.
+                return {
+                    "ok": False,
+                    "mode": "live" if self.live else "mock",
+                    "service": "overseerr",
+                    "reason": "media_type_required",
+                    "error": f"mediaType required for TMDB id {media_id}",
+                    "speak": (
+                        f"I need to know if TMDB {media_id} is a movie or a show "
+                        "before requesting it."
+                    ),
+                }
+        normalized_seasons: list[int] | str | None = None
+        if mt == "tv":
+            try:
+                normalized_seasons = _normalize_tv_seasons(seasons)
+            except ValueError as exc:
+                return {
+                    "ok": False,
+                    "mode": "live" if self.live else "mock",
+                    "service": "overseerr",
+                    "reason": "invalid_seasons",
+                    "error": str(exc),
+                    "speak": "Choose one or more valid season numbers, or request all seasons.",
+                }
+        elif seasons is not None:
+            return {
+                "ok": False,
+                "mode": "live" if self.live else "mock",
+                "service": "overseerr",
+                "reason": "invalid_seasons",
+                "error": "Seasons can only be supplied for TV requests",
+                "speak": "Season selection is only available for TV shows.",
+            }
 
-        if media_id and mt:
+        # Explicit TMDB id — never fuzzy-pick a mismatched search/fallback hit.
+        if media_id is not None and mt:
             pick: dict[str, Any] = {
                 "mediaId": media_id,
                 "id": media_id,
@@ -2364,16 +2919,40 @@ class Overseerr:
                 ]
                 if enriched:
                     pick = {**enriched[0], "mediaType": mt}
+                if normalized_seasons is not None:
+                    pick["seasons"] = normalized_seasons
                 item = pipeline.request_overseerr(pick)
                 return {
+                    "ok": True,
                     "mode": "mock",
                     "service": "overseerr",
                     "requested": _summarize_overseerr(item),
                 }
-            return await self._post_request(pick, media_id=int(media_id), media_type=mt, query=query)
+            return await self._post_request(
+                pick,
+                media_id=int(media_id),
+                media_type=mt,
+                query=query,
+                seasons=normalized_seasons,
+            )
 
         # Title-only path: require a confident title match (never results[0] fallback).
         found = await self.search(query) if query else {"results": []}
+        if found.get("ok") is False:
+            reason = str(found.get("reason") or "search_failed")
+            speak = (
+                "Overseerr is reachable, but its TMDB provider is unavailable."
+                if reason == "provider_unavailable"
+                else "Overseerr search failed, so I did not submit a media request."
+            )
+            return {
+                **found,
+                "ok": False,
+                "service": "overseerr",
+                "query": query,
+                "reason": reason,
+                "speak": speak,
+            }
         results = list(found.get("results") or [])
         confident = _confident_overseerr_hits(results, query=query, media_type=mt)
         if not confident:
@@ -2438,8 +3017,13 @@ class Overseerr:
             }
 
         if not self.live:
+            if pick_type == "tv":
+                if normalized_seasons is None:
+                    normalized_seasons = _normalize_tv_seasons(seasons)
+                pick = {**pick, "seasons": normalized_seasons}
             item = pipeline.request_overseerr({**pick, "mediaType": pick_type, "id": pick_id_i})
             return {
+                "ok": True,
                 "mode": "mock",
                 "service": "overseerr",
                 "requested": _summarize_overseerr(item),
@@ -2449,6 +3033,7 @@ class Overseerr:
             media_id=pick_id_i,
             media_type=pick_type,
             query=query,
+            seasons=normalized_seasons if pick_type == "tv" else None,
         )
 
     async def _post_request(
@@ -2458,32 +3043,87 @@ class Overseerr:
         media_id: int,
         media_type: str,
         query: str = "",
+        seasons: list[int] | str | None = None,
     ) -> dict[str, Any]:
         client = await self._http()
         # Official Overseerr contract: mediaType + mediaId; TV uses seasons "all".
         body: dict[str, Any] = {"mediaId": media_id, "mediaType": media_type}
         if media_type == "tv":
-            body["seasons"] = "all"
+            body["seasons"] = _normalize_tv_seasons(seasons)
         body["is4k"] = False
         try:
             response = await client.post("/api/v1/request", json=body)
+            if response.status_code == 202:
+                payload = _json_object(response)
+                fields = _request_result_fields(payload, pick)
+                return {
+                    "ok": False,
+                    "mode": "live",
+                    "service": "overseerr",
+                    "reason": "no_seasons",
+                    "status_code": 202,
+                    **fields,
+                    "speak": (
+                        "Overseerr has no requestable seasons for "
+                        f"{query or pick.get('title') or 'that show'}."
+                    ),
+                }
+            if response.status_code == 409:
+                payload = _json_object(response)
+                fields = _request_result_fields(payload, pick)
+                return {
+                    "ok": False,
+                    "mode": "live",
+                    "service": "overseerr",
+                    "reason": "already_requested",
+                    "already": True,
+                    "already_queued": True,
+                    "status_code": 409,
+                    **fields,
+                    "speak": f"{query or pick.get('title') or 'That title'} is already requested.",
+                }
+            if response.status_code in {400, 403, 422}:
+                payload = _json_object(response)
+                fields = _request_result_fields(payload, pick)
+                forbidden = response.status_code == 403
+                return {
+                    "ok": False,
+                    "mode": "live",
+                    "service": "overseerr",
+                    "reason": "forbidden" if forbidden else "invalid_request",
+                    "status_code": response.status_code,
+                    **fields,
+                    "speak": (
+                        "Overseerr rejected this request. Check the API key, user permissions, "
+                        "quota, and blocklist."
+                        if forbidden
+                        else "Overseerr could not accept that media request."
+                    ),
+                }
             response.raise_for_status()
+            if response.status_code != 201:
+                raise ValueError(
+                    f"Overseerr request returned unexpected HTTP {response.status_code}"
+                )
+            payload = _required_json_object(response, "request")
+            if hasattr(response, "json"):
+                _validate_request_payload(
+                    payload,
+                    media_id=media_id,
+                    media_type=media_type,
+                )
+            fields = _request_result_fields(payload, pick)
             return {
+                "ok": True,
                 "mode": "live",
                 "service": "overseerr",
-                "requested": pick,
                 "status_code": response.status_code,
+                **fields,
             }
         except Exception as exc:  # noqa: BLE001
-            if settings.mock_if_unconfigured:
-                item = pipeline.request_overseerr(pick if isinstance(pick, dict) else {"title": query})
-                return {
-                    "mode": "mock",
-                    "service": "overseerr",
-                    "error": str(exc),
-                    "requested": _summarize_overseerr(item),
-                }
-            raise
+            # Never claim a live request was queued after a transport/5xx
+            # failure. POST is not retried because its outcome may be ambiguous.
+            raise _overseerr_error("request", exc) from exc
 
     async def discover(
         self,
@@ -2541,6 +3181,7 @@ class Overseerr:
                 exclude_tmdb_ids=sorted(ban_ids),
             )
             return {
+                "ok": True,
                 "mode": "mock",
                 "service": "overseerr",
                 "media_type": kind,
@@ -2605,6 +3246,7 @@ class Overseerr:
                 if len(filtered) >= cap:
                     break
             return {
+                "ok": True,
                 "mode": "live",
                 "service": "overseerr",
                 "media_type": kind,
@@ -2616,30 +3258,7 @@ class Overseerr:
                 "results": [_summarize_overseerr(h) for h in filtered[:cap]],
             }
         except Exception as exc:  # noqa: BLE001
-            if settings.mock_if_unconfigured:
-                rows = pipeline.discover_overseerr(
-                    genre_ids=include,
-                    exclude_genre_ids=exclude,
-                    media_type=kind,
-                    limit=fetch_cap,
-                    page=page_i,
-                    primary_release_date_lte=date_lte,
-                    vote_count_gte=vote_floor,
-                    exclude_tmdb_ids=sorted(ban_ids),
-                )
-                return {
-                    "mode": "mock",
-                    "service": "overseerr",
-                    "media_type": kind,
-                    "genre_ids": include,
-                    "exclude_genre_ids": exclude,
-                    "page": page_i,
-                    "primary_release_date_lte": date_lte,
-                    "vote_count_gte": vote_floor,
-                    "error": str(exc),
-                    "results": [_summarize_overseerr(h) for h in rows[:cap]],
-                }
-            raise
+            raise _overseerr_error("discover", exc) from exc
 
     def _people_from_search_rows(self, rows: list[Any]) -> list[dict[str, Any]]:
         """Keep Overseerr multi-search person hits (never title-only movie/tv filter)."""
@@ -2685,6 +3304,7 @@ class Overseerr:
         query = (query or "").strip()
         if not query:
             return {
+                "ok": True,
                 "mode": "mock" if not self.live else "live",
                 "service": "overseerr",
                 "query": query,
@@ -2692,6 +3312,7 @@ class Overseerr:
             }
         if not self.live:
             return {
+                "ok": True,
                 "mode": "mock",
                 "service": "overseerr",
                 "query": query,
@@ -2727,31 +3348,31 @@ class Overseerr:
                     list(payload2.get("results") or [])
                 )
             return {
+                "ok": True,
                 "mode": "live",
                 "service": "overseerr",
                 "query": query,
                 "results": people[:8],
             }
         except Exception as exc:  # noqa: BLE001
-            if settings.mock_if_unconfigured:
-                return {
-                    "mode": "mock",
-                    "service": "overseerr",
-                    "query": query,
-                    "error": str(exc),
-                    "results": pipeline.search_person(query),
-                }
-            raise
+            raise _overseerr_error("person search", exc) from exc
 
     async def person_combined_credits(self, person_id: int) -> dict[str, Any]:
         """Combined credits via Overseerr ``GET /api/v1/person/{id}/combined_credits``."""
         try:
             pid = int(person_id)
         except (TypeError, ValueError):
-            return {"mode": "error", "service": "overseerr", "cast": [], "crew": [], "id": person_id}
+            return {
+                "mode": "error",
+                "service": "overseerr",
+                "cast": [],
+                "crew": [],
+                "id": person_id,
+            }
         if not self.live:
             payload = pipeline.person_combined_credits(pid)
             return {
+                "ok": True,
                 "mode": "mock",
                 "service": "overseerr",
                 "id": pid,
@@ -2764,6 +3385,7 @@ class Overseerr:
             response.raise_for_status()
             payload = response.json() or {}
             return {
+                "ok": True,
                 "mode": "live",
                 "service": "overseerr",
                 "id": pid,
@@ -2771,17 +3393,7 @@ class Overseerr:
                 "crew": list(payload.get("crew") or []),
             }
         except Exception as exc:  # noqa: BLE001
-            if settings.mock_if_unconfigured:
-                payload = pipeline.person_combined_credits(pid)
-                return {
-                    "mode": "mock",
-                    "service": "overseerr",
-                    "id": pid,
-                    "error": str(exc),
-                    "cast": list(payload.get("cast") or []),
-                    "crew": list(payload.get("crew") or []),
-                }
-            raise
+            raise _overseerr_error("person credits", exc) from exc
 
 
 radarr = StarrClient("radarr")

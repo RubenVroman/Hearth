@@ -1,11 +1,8 @@
-"""Progress status posts for titles queued by the Telegram inbox.
+"""Verified progress notifications for Telegram media requests.
 
-Quiet policy: one early "started and healthy" ping once a download reaches
-a trustworthy mid-start percent, then silence until done / failed (or a manual
-status ask via radarr_queue / sonarr_queue elsewhere).
-
-When a watched grab stalls or fails, automatically blocklist the bad release
-and grab an alternate *arr source (capped) — with clear user feedback.
+Overseerr/Seerr is the source of truth for completion. A title leaving an
+*arr queue is ambiguous (it may have imported, failed, or simply disappeared),
+so queue absence never becomes a success notification here.
 """
 
 from __future__ import annotations
@@ -13,55 +10,104 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
+from dataclasses import asdict, dataclass, field
+from typing import Any, Awaitable, Callable
 
-from hearth.config import settings
-from hearth.tools.arr import download_is_unhealthy, radarr, sonarr
+from hearth.tools.arr import download_is_unhealthy, overseerr, radarr, sonarr
 
 log = logging.getLogger("hearth.telegram")
 
-# Early healthy-start signal. Small threshold so we know the grab is moving
-# without spamming later percent ticks (10%, 25%, …). Skip near-complete
-# first sightings so we never announce "downloading, ~100%".
 START_THRESHOLD = 5.0
 START_PERCENT_MAX = 95.0
-
 _RAW_TMDB_LABEL = re.compile(r"^tmdb:\d+$", re.I)
+_FAILED_MEDIA_TEXT = frozenset({"blocked", "blocklisted", "deleted", "failed"})
+_FAILED_REQUEST_TEXT = frozenset({"declined", "denied", "failed", "rejected"})
+
+
+def _integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _display_title(title: str, year: int | None = None) -> str:
+    raw = (title or "").strip()
+    if not raw or _RAW_TMDB_LABEL.fullmatch(raw):
+        return "that title"
+    return f"{raw} ({year})" if year else raw
 
 
 @dataclass
 class TrackedGrab:
+    """Primitive-only state for one accepted Overseerr request."""
+
     chat_id: int
     title: str
     service: str  # radarr | sonarr
     year: int | None = None
-    started_at: float = field(default_factory=time.monotonic)
+    season: int | None = None
+    tmdb_id: int | None = None
+    tvdb_id: int | None = None
+    arr_media_id: int | None = None
+    media_type: str = ""  # movie | tv
+    request_id: int | None = None
+    request_key: str = ""
+    request_status: int | str | None = None
+    started_at: float = field(default_factory=time.time)
     last_status: str = ""
     last_percent: float | None = None
-    last_progress_at: float = field(default_factory=time.monotonic)
+    last_progress_at: float = field(default_factory=time.time)
     announce_started: bool = False
     announce_retrying: bool = False
     retry_attempts: int = 0
+    retried_queue_keys: list[str] = field(default_factory=list)
+    resolved_retry_keys: list[str] = field(default_factory=list)
+    pending_terminal_text: str = ""
+    pending_terminal_state: str = ""
+    terminal_state: str = ""
     done: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def notification_title(self) -> str:
+        return (
+            f"{self.title} season {self.season}"
+            if self.season is not None
+            else self.title
+        )
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> TrackedGrab:
+        allowed = cls.__dataclass_fields__
+        return cls(**{key: item for key, item in value.items() if key in allowed})
+
+
+def format_requested(
+    title: str,
+    year: int | None,
+    via: str = "Overseerr",
+    *,
+    pending_approval: bool = False,
+) -> str:
+    """Acknowledge an API request without claiming it entered a queue."""
+    label = _display_title(title, year)
+    if pending_approval:
+        return f"Requested {label} via {via}; waiting for approval."
+    return f"Requested {label} via {via}."
 
 
 def format_queued(title: str, year: int | None, via: str) -> str:
-    """Queue ack — never emit raw ``tmdb:123`` as the human-facing label."""
-    raw = (title or "").strip()
-    if not raw or _RAW_TMDB_LABEL.match(raw):
-        label = "that title"
-    else:
-        label = f"{raw} ({year})" if year else raw
-    return f"Queued {label} via {via}."
+    """Describe a verified queue insertion, not an accepted pending request."""
+    return f"Queued {_display_title(title, year)} via {via}."
 
 
 def format_downloading(title: str, percent: float | None) -> str:
-    """Announce an in-flight grab. Never formats a fake near-100% figure."""
-    if percent is None or percent < 0:
-        return f"{title} is downloading."
-    # Guard: never say "~100%" (or ~95%+) while still "downloading".
-    if percent >= START_PERCENT_MAX:
+    if percent is None or percent < 0 or percent >= START_PERCENT_MAX:
         return f"{title} is downloading."
     return f"{title} is downloading, ~{percent:g}%."
 
@@ -71,8 +117,11 @@ def format_done(title: str) -> str:
 
 
 def format_failed(title: str, detail: str = "") -> str:
-    bit = f" ({detail})" if detail else ""
-    return f"{title} failed{bit}."
+    return f"{title} failed{f' ({detail})' if detail else ''}."
+
+
+def format_expired(title: str) -> str:
+    return f"{title} is still unresolved after seven days; I stopped tracking it."
 
 
 def format_retrying(
@@ -89,65 +138,49 @@ def format_retrying(
 
 def format_retry_exhausted(title: str, *, max_attempts: int = 0) -> str:
     if max_attempts:
-        return (
-            f"{title} failed — ran out of alternate sources "
-            f"after {max_attempts} tries."
-        )
+        return f"{title} failed — ran out of alternate sources after {max_attempts} tries."
     return f"{title} failed — ran out of alternate sources."
 
 
-def format_not_found(query: str) -> str:
-    """Catalog miss for an instant Title (YYYY) / id path.
+def format_retry_uncertain(title: str) -> str:
+    return (
+        f"{title} needs attention — an automatic retry had an uncertain outcome. "
+        "Check the media queue before retrying it manually."
+    )
 
-    Never ask for an IMDb/TMDB link — the conversation hop confirms
-    model-named titles instead of calling this.
-    """
+
+def format_not_found(query: str) -> str:
     return f"Couldn't find a match for '{query}'."
 
 
 def format_guess_confirm(title: str, year: int | None = None) -> str:
-    """Single best-guess confirmation — never a list-less 1–N range."""
-    label = f"{title} ({year})" if year not in (None, "") else str(title or "that")
-    return f"Did you mean {label}?"
+    return f"Did you mean {_display_title(title, year)}?"
 
 
 def format_ambiguous(query: str, options: list[dict[str, Any]]) -> str:
-    # n==1 must name/confirm the title — never "Reply 1–1" without a real menu.
     if len(options) == 1:
         row = options[0]
-        title = str(row.get("title") or query or "Untitled")
-        year = row.get("year")
-        try:
-            year_i = int(year) if year not in (None, "") else None
-        except (TypeError, ValueError):
-            year_i = None
-        return format_guess_confirm(title, year_i)
-    show = min(4, len(options))
+        return format_guess_confirm(
+            str(row.get("title") or query or "Untitled"), _integer(row.get("year"))
+        )
+    rows = options[:4]
+    kinds = {str(row.get("mediaType") or "").lower() for row in rows}
     lines = [f"Which one for '{query}'? Tap Get, or None of these:"]
-    for idx, row in enumerate(options[:show], start=1):
-        title = row.get("title") or "Untitled"
-        year = row.get("year")
-        kind = str(row.get("mediaType") or "").strip().lower()
-        label = f"{title} ({year})" if year else str(title)
-        if kind in {"movie", "tv"}:
-            type_bit = "TV" if kind == "tv" else "movie"
-            kinds = {
-                str(o.get("mediaType") or "").strip().lower()
-                for o in options[:show]
-            }
-            if len(kinds) > 1:
-                label = f"{label} [{type_bit}]"
-        lines.append(f"{idx}. {label}")
+    for index, row in enumerate(rows, start=1):
+        label = _display_title(
+            str(row.get("title") or "Untitled"), _integer(row.get("year"))
+        )
+        kind = str(row.get("mediaType") or "").lower()
+        if len(kinds) > 1 and kind in {"movie", "tv"}:
+            label += f" [{'TV' if kind == 'tv' else 'movie'}]"
+        lines.append(f"{index}. {label}")
     return "\n".join(lines)
 
 
 def format_queued_many(titles: list[str], via: str) -> str:
-    """Deprecated multi-queue copy — never emit 'Queued N'. One title at a time."""
     if not titles:
         return f"Nothing new to queue via {via}."
-    # HITL queues one id per tap; if called with many, report the first only.
-    first = titles[0]
-    return format_queued(first, None, via)
+    return format_queued(titles[0], None, via)
 
 
 def format_already(title: str, *, queued: bool = False, library: bool = False) -> str:
@@ -160,8 +193,8 @@ def format_already(title: str, *, queued: bool = False, library: bool = False) -
 
 def format_reject_download() -> str:
     return (
-        "This inbox only queues movies/series/TV through *arr/Overseerr — "
-        "not a general downloader. Drop an IMDb/TMDB link or a title."
+        "This bot requests movies and TV through Overseerr — it does not accept "
+        "torrent files, magnets, or arbitrary downloads."
     )
 
 
@@ -170,61 +203,400 @@ def format_rate_limited() -> str:
 
 
 def _as_percent(value: Any) -> float | None:
-    """Coerce a queue percent already on 0–100 (from summarize_queue_item)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    n = float(value)
-    if n < 0:
+    number = float(value)
+    return number if number >= 0 else None
+
+
+def _details_body(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    body = payload.get("details")
+    return body if isinstance(body, dict) else payload
+
+
+def _media_status(payload: Any) -> int | str | None:
+    body = _details_body(payload)
+    media = body.get("mediaInfo")
+    if not isinstance(media, dict):
+        media = body.get("media") if isinstance(body.get("media"), dict) else {}
+    status = media.get("status")
+    return body.get("mediaStatus") if status is None else status
+
+
+def _request_rows(payload: Any) -> list[dict[str, Any]]:
+    body = _details_body(payload)
+    media = body.get("mediaInfo")
+    rows: Any = body.get("requests")
+    if not isinstance(rows, list) and isinstance(media, dict):
+        rows = media.get("requests")
+    if not isinstance(rows, list):
+        one = body.get("request")
+        rows = [one] if isinstance(one, dict) else []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _request_row(payload: Any, request_id: int | None) -> dict[str, Any] | None:
+    rows = _request_rows(payload)
+    if request_id is None:
+        # Aggregate/latest request state can belong to another TV season.
         return None
-    # summarize_queue_item already scales 0–1 API fractions; do not ×100 again.
-    return n
+    for row in rows:
+        if _integer(row.get("id")) == request_id:
+            return row
+    return None
 
 
-def _trustworthy_start_percent(percent: float | None, *, threshold: float) -> bool:
-    """True when percent is a real early-progress signal (not missing / not ~done)."""
-    if percent is None:
+def matching_request_row(
+    payload: Any,
+    request_id: int | None,
+    *,
+    media_type: str,
+    season: int | None,
+) -> dict[str, Any] | None:
+    """Resolve one exact Overseerr request without using latest/aggregate state.
+
+    A known request id is authoritative.  Crash recovery may not have saved the
+    id yet, so it can infer one only when the media/season coordinates leave a
+    single candidate.  Ambiguity deliberately remains pending.
+    """
+    rows = _request_rows(payload)
+    if request_id is not None:
+        for row in rows:
+            if _integer(row.get("id")) == request_id:
+                return row
+        return None
+
+    candidates = rows
+    if media_type == "tv" and season is not None:
+        candidates = []
+        for row in rows:
+            raw_seasons = row.get("seasons")
+            if not isinstance(raw_seasons, list):
+                continue
+            numbers: set[int] = set()
+            for value in raw_seasons:
+                if isinstance(value, dict):
+                    number = _integer(value.get("seasonNumber"))
+                else:
+                    number = _integer(value)
+                if number is not None:
+                    numbers.add(number)
+            if season in numbers:
+                candidates.append(row)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _status_text(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", " ")
+
+
+def _media_failure(status: Any) -> str:
+    number = _integer(status)
+    if number in {6, 7}:
+        return "blocked or deleted in Overseerr"
+    text = _status_text(status)
+    return text if text in _FAILED_MEDIA_TEXT else ""
+
+
+def _request_failure(status: Any) -> str:
+    if _integer(status) == 3:
+        return "request declined in Overseerr"
+    if _integer(status) == 4:
+        return "request failed in Overseerr"
+    text = _status_text(status)
+    return f"request {text} in Overseerr" if text in _FAILED_REQUEST_TEXT else ""
+
+
+def _queue_key(row: dict[str, Any]) -> str:
+    for key in ("queueId", "downloadId", "id"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return f"{key}:{value}"
+    return "|".join(
+        str(row.get(key) or "").strip().lower()
+        for key in ("title", "indexer", "status", "quality")
+    )
+
+
+async def _send_succeeded(
+    send: Callable[[int, str], Awaitable[Any]],
+    chat_id: int,
+    text: str,
+) -> bool:
+    result = await send(chat_id, text)
+    if isinstance(result, dict):
+        # A lost Telegram response is at-most-once: retrying could duplicate a
+        # message that the API already accepted.
+        return result.get("ok") is True or result.get("outcome_unknown") is True
+    return True
+
+
+def _normalized_title(value: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+
+def _verified_live_payload(client: Any, payload: Any) -> bool:
+    """Reject fixture/error payloads from real *arr clients.
+
+    Minimal injected test doubles without a ``live`` contract remain usable;
+    production Starr clients always expose ``live`` and return an explicit mode.
+    """
+    if not isinstance(payload, dict) or payload.get("error"):
         return False
-    return threshold <= percent < START_PERCENT_MAX
+    if hasattr(client, "live") and not bool(getattr(client, "live")):
+        return False
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode == "live":
+        return True
+    if mode:
+        return False
+    return not hasattr(client, "live")
 
 
-def _stall_idle_seconds() -> float:
-    try:
-        return max(30.0, float(settings.download_stall_idle_seconds))
-    except (TypeError, ValueError):
-        return 20 * 60
+def _verified_live_result(client: Any, payload: Any) -> bool:
+    """Verify live mutation provenance without requiring operation success."""
+    if not isinstance(payload, dict):
+        return False
+    if hasattr(client, "live") and not bool(getattr(client, "live")):
+        return False
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode:
+        return mode == "live"
+    return not hasattr(client, "live")
+
+
+def _verified_overseerr_details(client: Any, payload: Any) -> bool:
+    """Fixture data must never become Plex/request terminal truth."""
+    if not isinstance(payload, dict) or payload.get("ok") is False:
+        return False
+    mode = str(payload.get("mode") or "").strip().lower()
+    if hasattr(client, "live") and not bool(getattr(client, "live")):
+        return False
+    if client is overseerr:
+        return payload.get("ok") is True and mode == "live"
+    return not mode or mode == "live"
+
+
+def _matching_queue_row(item: TrackedGrab, rows: Any) -> dict[str, Any] | None:
+    """Select one unambiguous queue row; never trust substring ordering."""
+    candidates = [row for row in (rows or []) if isinstance(row, dict)]
+    stable_identity = False
+    arr_key = "movieId" if item.media_type == "movie" else "seriesId"
+    if item.arr_media_id is not None:
+        identified = [
+            row for row in candidates if _integer(row.get(arr_key)) is not None
+        ]
+        candidates = [
+            row
+            for row in identified
+            if _integer(row.get(arr_key)) == item.arr_media_id
+        ]
+        if not candidates:
+            return None
+        stable_identity = True
+    if item.media_type == "movie" and item.tmdb_id is not None:
+        identified = [row for row in candidates if _integer(row.get("tmdbId")) is not None]
+        stable = [row for row in identified if _integer(row.get("tmdbId")) == item.tmdb_id]
+        if identified:
+            if not stable:
+                return None
+            candidates = stable
+            stable_identity = True
+
+    if item.media_type == "tv":
+        identified = [
+            row for row in candidates if _integer(row.get("tvdbId")) is not None
+        ]
+        if item.tvdb_id is not None:
+            candidates = [
+                row
+                for row in identified
+                if _integer(row.get("tvdbId")) == item.tvdb_id
+            ]
+            if not candidates:
+                return None
+            stable_identity = True
+        elif identified:
+            # The queue exposes a stable namespace, but this request has no
+            # corresponding identifier. A title match is not safe enough.
+            return None
+
+    if item.media_type == "tv" and item.season is not None:
+        identified = [
+            row for row in candidates if _integer(row.get("seasonNumber")) is not None
+        ]
+        if not identified:
+            return None
+        candidates = [
+            row for row in identified if _integer(row.get("seasonNumber")) == item.season
+        ]
+        if not candidates:
+            return None
+
+    if stable_identity:
+        exact = candidates
+    else:
+        title = _normalized_title(item.title)
+        if not title:
+            return None
+        exact = [
+            row
+            for row in candidates
+            if title
+            in {
+                _normalized_title(row.get("mediaTitle")),
+                _normalized_title(row.get("title")),
+            }
+        ]
+        # A title is a compatibility fallback for old *arr payloads, never a
+        # tie-breaker. Multiple exact-title rows could be different releases.
+        if len(exact) != 1:
+            return None
+    # A TV season normally has several episode queue rows. Once stable
+    # series/season identity is established, selecting one deterministic row
+    # is safe; prefer an unhandled unhealthy row so each failed episode can be
+    # retried without ever falling back to a different title.
+    unhealthy = [
+        row
+        for row in exact
+        if download_is_unhealthy(row)
+        and _queue_key(row) not in item.retried_queue_keys
+    ]
+    if unhealthy:
+        return min(unhealthy, key=_queue_key)
+    active = [
+        row
+        for row in exact
+        if _status_text(row.get("status")) in {"downloading", "queued", "paused"}
+    ]
+    if active:
+        return min(
+            active,
+            key=lambda row: (
+                _as_percent(row.get("percent")) is None,
+                _as_percent(row.get("percent")) or 0.0,
+                _queue_key(row),
+            ),
+        )
+    return min(exact, key=_queue_key)
 
 
 class ProgressTracker:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        overseerr_client: Any | None = None,
+        radarr_client: Any | None = None,
+        sonarr_client: Any | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._items: list[TrackedGrab] = []
+        self._overseerr = overseerr_client or overseerr
+        self._radarr = radarr_client or radarr
+        self._sonarr = sonarr_client or sonarr
+        self._clock = clock
 
     def reset(self) -> None:
         self._items.clear()
 
-    def track(self, chat_id: int, title: str, service: str, year: int | None = None) -> None:
+    def track(
+        self,
+        chat_id: int,
+        title: str,
+        service: str,
+        year: int | None = None,
+        *,
+        season: int | None = None,
+        tmdb_id: int | None = None,
+        media_type: str = "",
+        request_id: int | None = None,
+        request_key: str = "",
+        request_status: int | str | None = None,
+    ) -> TrackedGrab | None:
         title = (title or "").strip()
         if not title:
-            return
-        for item in self._items:
-            if item.chat_id == chat_id and item.title.lower() == title.lower() and not item.done:
-                return
-        self._items.append(
-            TrackedGrab(chat_id=chat_id, title=title, service=service, year=year)
+            return None
+        kind = media_type.strip().lower()
+        if kind not in {"movie", "tv"}:
+            kind = "movie" if service == "radarr" else "tv" if service == "sonarr" else ""
+        arr_service = service.strip().lower()
+        if arr_service not in {"radarr", "sonarr"}:
+            arr_service = "radarr" if kind == "movie" else "sonarr" if kind == "tv" else ""
+        media_id = _integer(tmdb_id)
+        external_request_id = _integer(request_id)
+        incoming_key = str(request_key or "")
+        for item in self.active:
+            if incoming_key:
+                same_request = item.request_key == incoming_key
+            elif external_request_id is not None:
+                same_request = item.request_id == external_request_id
+            elif media_id is not None:
+                same_request = (
+                    item.request_id is None
+                    and item.tmdb_id == media_id
+                    and item.media_type == kind
+                    and item.season == season
+                )
+            else:
+                same_request = (
+                    item.request_id is None
+                    and item.tmdb_id is None
+                    and item.title.casefold() == title.casefold()
+                    and item.media_type == kind
+                    and item.service == arr_service
+                    and item.season == season
+                )
+            if item.chat_id == chat_id and same_request:
+                item.tmdb_id = media_id or item.tmdb_id
+                item.media_type = kind or item.media_type
+                item.service = arr_service or item.service
+                item.season = season if season is not None else item.season
+                item.request_id = external_request_id or item.request_id
+                item.request_key = incoming_key or item.request_key
+                item.request_status = (
+                    request_status if request_status is not None else item.request_status
+                )
+                return item
+        now = self._clock()
+        item = TrackedGrab(
+            chat_id=chat_id,
+            title=title,
+            service=arr_service,
+            year=year,
+            season=season,
+            tmdb_id=media_id,
+            media_type=kind,
+            request_id=external_request_id,
+            request_key=str(request_key or ""),
+            request_status=request_status,
+            started_at=now,
+            last_progress_at=now,
         )
+        self._items.append(item)
+        return item
+
+    def restore(self, rows: list[dict[str, Any]]) -> None:
+        self._items = [
+            TrackedGrab.from_dict(row) for row in rows if isinstance(row, dict)
+        ]
+
+    def dump(self) -> list[dict[str, Any]]:
+        return [item.to_dict() for item in self.active]
 
     def active_title_for(self, chat_id: int) -> str:
-        """Most recent unfinished tracked title for this chat (retry subject)."""
         for item in reversed(self._items):
             if item.chat_id == chat_id and not item.done:
                 return item.title
         return ""
 
     def active_service_for(self, chat_id: int, title: str = "") -> str:
-        needle = (title or "").strip().lower()
+        needle = (title or "").strip().casefold()
         for item in reversed(self._items):
             if item.chat_id != chat_id or item.done:
                 continue
-            if not needle or item.title.lower() == needle or needle in item.title.lower():
+            if not needle or item.title.casefold() == needle or needle in item.title.casefold():
                 return item.service
         return ""
 
@@ -232,157 +604,319 @@ class ProgressTracker:
     def active(self) -> list[TrackedGrab]:
         return [item for item in self._items if not item.done]
 
-    def _note_progress(self, item: TrackedGrab, percent: float | None, now: float) -> None:
-        prev = item.last_percent
-        if percent is None:
-            return
-        if prev is None or abs(percent - prev) >= 0.5:
-            item.last_percent = percent
-            item.last_progress_at = now
-        else:
-            item.last_percent = percent
+    @property
+    def completed(self) -> list[TrackedGrab]:
+        return [item for item in self._items if item.done]
 
-    def _idle_stalled(self, item: TrackedGrab, *, now: float, stall_idle_s: float) -> bool:
-        """Zero/flat progress for long enough while still 'downloading'."""
-        if item.last_status not in {"downloading", "queued", "paused", "warning", "unknown"}:
+    def prune_completed(self) -> list[TrackedGrab]:
+        completed = self.completed
+        self._items[:] = [item for item in self._items if not item.done]
+        return completed
+
+    async def _media_details(self, item: TrackedGrab) -> dict[str, Any] | None:
+        if item.tmdb_id is None or item.media_type not in {"movie", "tv"}:
+            return None
+        method = getattr(self._overseerr, "media_details", None)
+        if method is None:
+            log.warning("Overseerr client has no media_details method")
+            return None
+        try:
+            payload = await method(item.tmdb_id, item.media_type)
+        except Exception:  # noqa: BLE001 - polling must not stop the bot
+            log.exception("telegram Overseerr progress poll failed for %s", item.title)
+            return None
+        if not _verified_overseerr_details(self._overseerr, payload):
+            log.warning("ignored unverified Overseerr progress result for %s", item.title)
+            return None
+        return payload
+
+    def _apply_request_state(self, item: TrackedGrab, payload: dict[str, Any]) -> str:
+        body = _details_body(payload)
+        media = body.get("mediaInfo")
+        if isinstance(media, dict):
+            item.arr_media_id = (
+                _integer(media.get("externalServiceId")) or item.arr_media_id
+            )
+            if item.media_type == "tv":
+                item.tvdb_id = _integer(media.get("tvdbId")) or item.tvdb_id
+        row = _request_row(payload, item.request_id)
+        if row:
+            item.request_id = _integer(row.get("id")) or item.request_id
+            if row.get("status") is not None:
+                item.request_status = row["status"]
+        failure = _media_failure(_media_status(payload))
+        return failure or _request_failure(item.request_status)
+
+    @staticmethod
+    async def _finish_after_send(
+        item: TrackedGrab,
+        send: Callable[[int, str], Awaitable[Any]],
+        *,
+        state: str,
+        text: str,
+        checkpoint: Callable[[TrackedGrab], Awaitable[Any]] | None = None,
+    ) -> bool:
+        item.pending_terminal_text = text
+        item.pending_terminal_state = state
+        if checkpoint is not None:
+            await checkpoint(item)
+        if not await _send_succeeded(send, item.chat_id, text):
             return False
-        # Need at least one observation before declaring idle stall.
-        if not item.last_status:
-            return False
-        return (now - item.last_progress_at) >= stall_idle_s
+        item.pending_terminal_text = ""
+        item.pending_terminal_state = ""
+        item.terminal_state = state
+        item.done = True
+        if checkpoint is not None:
+            await checkpoint(item)
+        return True
 
     async def _auto_retry(
         self,
         item: TrackedGrab,
+        row: dict[str, Any],
         send: Callable[[int, str], Awaitable[Any]],
-        *,
-        why: str,
-    ) -> bool:
-        """Try alternate source. Returns True when the grab is finished (exhausted/failed)."""
-        client = radarr if item.service == "radarr" else sonarr
+        checkpoint: Callable[[TrackedGrab], Awaitable[Any]] | None = None,
+    ) -> None:
+        failure_key = _queue_key(row)
+        if failure_key in item.retried_queue_keys:
+            if failure_key in item.resolved_retry_keys:
+                return
+            if item.pending_terminal_text:
+                await self._finish_after_send(
+                    item,
+                    send,
+                    state=item.pending_terminal_state or "uncertain",
+                    text=item.pending_terminal_text,
+                    checkpoint=checkpoint,
+                )
+            else:
+                await self._finish_after_send(
+                    item,
+                    send,
+                    state="uncertain",
+                    text=format_retry_uncertain(item.notification_title),
+                    checkpoint=checkpoint,
+                )
+            return
+        client = self._radarr if item.service == "radarr" else self._sonarr
+        try:
+            max_attempts = max(0, int(getattr(client, "max_retries", 3)))
+        except (TypeError, ValueError):
+            max_attempts = 3
+        used_attempts = max(item.retry_attempts, len(item.retried_queue_keys))
+        if used_attempts >= max_attempts:
+            await self._finish_after_send(
+                item,
+                send,
+                state="failed",
+                text=format_retry_exhausted(
+                    item.notification_title,
+                    max_attempts=max_attempts,
+                ),
+                checkpoint=checkpoint,
+            )
+            return
+        item.retried_queue_keys.append(failure_key)
+        # Persist the one-shot guard before mutating *arr. If the process dies
+        # after the grab, restart recovery must not submit the retry again.
+        if checkpoint is not None:
+            try:
+                await checkpoint(item)
+            except BaseException:
+                item.retried_queue_keys.remove(failure_key)
+                raise
+        status = _status_text(row.get("status")) or "failed"
         try:
             result = await client.retry_download(
-                item.title, force=False, reason=f"auto:{why}"
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("telegram auto-retry failed for %s", item.title)
-            await send(item.chat_id, format_failed(item.title, why))
-            item.done = True
-            return True
-
-        reason = str(result.get("reason") or "")
-        if result.get("ok") and reason == "retried":
-            item.retry_attempts = int(result.get("attempt") or item.retry_attempts + 1)
-            item.announce_retrying = True
-            item.announce_started = False
-            item.last_status = "downloading"
-            item.last_percent = None
-            item.last_progress_at = time.monotonic()
-            spoken = str(result.get("speak") or "").strip()
-            if spoken:
-                await send(item.chat_id, spoken)
-            else:
-                await send(
-                    item.chat_id,
-                    format_retrying(
-                        item.title,
-                        indexer=str(result.get("indexer") or ""),
-                        attempt=int(result.get("attempt") or 0),
-                        max_attempts=int(result.get("max_attempts") or 0),
-                    ),
-                )
-            return False
-
-        if reason == "exhausted":
-            await send(
-                item.chat_id,
-                str(result.get("speak") or "").strip()
-                or format_retry_exhausted(
-                    item.title, max_attempts=int(result.get("max_attempts") or 0)
+                item.title,
+                force=False,
+                reason=f"auto:{status}",
+                queue_id=_integer(
+                    row.get("queueId")
+                    if row.get("queueId") is not None
+                    else row.get("id")
                 ),
             )
-            item.done = True
-            return True
+        except Exception:  # noqa: BLE001
+            log.exception("telegram alternate-source retry failed for %s", item.title)
+            await self._finish_after_send(
+                item,
+                send,
+                state="uncertain",
+                text=format_retry_uncertain(item.notification_title),
+                checkpoint=checkpoint,
+            )
+            return
 
-        if reason in {"no_alternate", "not_found", "error"}:
+        if not _verified_live_result(client, result):
+            log.warning("ignored unverified *arr retry result for %s", item.title)
+            return
+        reason = _status_text(result.get("reason"))
+        if result.get("ok") and reason == "retried":
+            item.retry_attempts = (
+                _integer(result.get("attempt")) or item.retry_attempts + 1
+            )
+            item.announce_retrying = True
+            item.announce_started = False
+            item.last_percent = None
+            if failure_key not in item.resolved_retry_keys:
+                item.resolved_retry_keys.append(failure_key)
+            if checkpoint is not None:
+                await checkpoint(item)
             await send(
                 item.chat_id,
                 str(result.get("speak") or "").strip()
-                or format_failed(item.title, reason.replace("_", " ")),
+                or format_retrying(
+                    item.notification_title,
+                    indexer=str(result.get("indexer") or ""),
+                    attempt=_integer(result.get("attempt")) or 0,
+                    max_attempts=_integer(result.get("max_attempts")) or 0,
+                ),
             )
-            item.done = True
-            return True
+            return
 
-        # Healthy / unexpected — fall back to a plain failure notice for failed/stalled.
-        await send(item.chat_id, format_failed(item.title, why))
-        item.done = True
-        return True
+        if reason in {"healthy", "not found", "not_found"}:
+            # The queue changed between observation and retry lookup. Its final
+            # outcome is ambiguous; keep watching Overseerr instead of lying.
+            if failure_key not in item.resolved_retry_keys:
+                item.resolved_retry_keys.append(failure_key)
+            if checkpoint is not None:
+                await checkpoint(item)
+            return
+        if reason in {"error", "unavailable"}:
+            await self._finish_after_send(
+                item,
+                send,
+                state="uncertain",
+                text=format_retry_uncertain(item.notification_title),
+                checkpoint=checkpoint,
+            )
+            return
+        if reason == "exhausted":
+            text = format_retry_exhausted(
+                item.notification_title,
+                max_attempts=_integer(result.get("max_attempts")) or 0,
+            )
+        else:
+            text = format_failed(item.notification_title, reason or status)
+        await self._finish_after_send(
+            item,
+            send,
+            state="failed",
+            text=str(result.get("speak") or "").strip() or text,
+            checkpoint=checkpoint,
+        )
 
     async def poll_once(
         self,
         send: Callable[[int, str], Awaitable[Any]],
         *,
-        max_age_s: float = 6 * 3600,
+        max_age_s: float = 7 * 24 * 3600,
         start_threshold: float = START_THRESHOLD,
         stall_idle_s: float | None = None,
+        checkpoint: Callable[[TrackedGrab], Awaitable[Any]] | None = None,
     ) -> None:
-        now = time.monotonic()
-        idle_limit = float(stall_idle_s) if stall_idle_s is not None else _stall_idle_seconds()
+        """Poll verified state once; queue absence is deliberately a no-op."""
+        del stall_idle_s  # compatibility: flat progress is not proof of failure
+        now = self._clock()
         for item in list(self.active):
+            if item.pending_terminal_text:
+                await self._finish_after_send(
+                    item,
+                    send,
+                    state=item.pending_terminal_state or "uncertain",
+                    text=item.pending_terminal_text,
+                    checkpoint=checkpoint,
+                )
+                continue
             if now - item.started_at > max_age_s:
-                item.done = True
+                await self._finish_after_send(
+                    item,
+                    send,
+                    state="expired",
+                    text=format_expired(item.notification_title),
+                    checkpoint=checkpoint,
+                )
                 continue
-            client = radarr if item.service == "radarr" else sonarr
+
+            details = await self._media_details(item)
+            if details is not None:
+                if _integer(_media_status(details)) == 5:
+                    await self._finish_after_send(
+                        item,
+                        send,
+                        state="available",
+                        text=format_done(item.notification_title),
+                        checkpoint=checkpoint,
+                    )
+                    continue
+                failure = self._apply_request_state(item, details)
+                if failure:
+                    await self._finish_after_send(
+                        item,
+                        send,
+                        state="failed",
+                        text=format_failed(item.notification_title, failure),
+                        checkpoint=checkpoint,
+                    )
+                    continue
+                if _integer(item.request_status) == 5:
+                    await self._finish_after_send(
+                        item,
+                        send,
+                        state="available",
+                        text=format_done(item.notification_title),
+                        checkpoint=checkpoint,
+                    )
+                    continue
+
+            if item.service not in {"radarr", "sonarr"}:
+                continue
+            client = self._radarr if item.service == "radarr" else self._sonarr
             try:
-                payload = await client.queue(item.title)
+                # Fetch the whole bounded queue, then apply stable ids locally.
+                # Server-side substring filtering can discard localized or
+                # alternate-title rows before exact TMDB/TVDB matching.
+                payload = await client.queue("")
             except Exception:  # noqa: BLE001
-                log.exception("telegram progress poll failed for %s", item.title)
+                log.exception("telegram *arr progress poll failed for %s", item.title)
                 continue
-            downloads = payload.get("downloads") or []
-            if not downloads:
-                # Not in queue anymore — treat as imported / done after we had progress.
-                if item.announce_started or item.last_status or item.announce_retrying:
-                    await send(item.chat_id, format_done(item.title))
-                    item.done = True
+            if not _verified_live_payload(client, payload):
+                log.warning("ignored unverified *arr queue result for %s", item.title)
                 continue
-            row = downloads[0]
-            status = str(row.get("status") or "unknown").strip().lower()
+            row = _matching_queue_row(item, payload.get("downloads"))
+            if row is None:
+                # Missing from *arr is not evidence of import or availability.
+                continue
+
+            status = _status_text(row.get("status")) or "unknown"
             percent = _as_percent(row.get("percent"))
-            prev_status = item.last_status
             item.last_status = status
-            self._note_progress(item, percent, now)
+            if percent is not None:
+                if item.last_percent is None or abs(item.last_percent - percent) >= 0.5:
+                    item.last_progress_at = now
+                item.last_percent = percent
 
-            unhealthy = download_is_unhealthy(row) or status in {"failed", "stalled"}
-            idle_stalled = (not unhealthy) and self._idle_stalled(
-                item, now=now, stall_idle_s=idle_limit
+            if download_is_unhealthy(row) or status in {"failed", "stalled"}:
+                await self._auto_retry(item, row, send, checkpoint)
+                continue
+
+            # Completed/importing still require Overseerr status 5 later.
+            if status != "downloading" or item.announce_started:
+                continue
+            trustworthy = (
+                percent is None or start_threshold <= percent < START_PERCENT_MAX
             )
-            if unhealthy or idle_stalled:
-                why = status if unhealthy else "stalled"
-                await self._auto_retry(item, send, why=why)
-                continue
-
-            if status == "completed":
-                # Imported (or *arr says completed) — announce done, never
-                # "downloading ~100%" even on first sighting.
-                await send(item.chat_id, format_done(item.title))
-                item.done = True
-                continue
-            if status == "importing":
-                # Still processing — stay quiet; do not claim Plex or ~100%.
-                continue
-            # One early healthy-start ping at a trustworthy mid-start percent;
-            # no later percent spam. Skip bogus near-100 / missing-byte first polls.
-            # After an auto-retry, allow one fresh start ping for the new source.
-            if not item.announce_started and _trustworthy_start_percent(
-                percent, threshold=start_threshold
-            ):
-                await send(item.chat_id, format_downloading(item.title, percent))
-                item.announce_started = True
-            elif (
-                item.announce_retrying
-                and prev_status in {"failed", "stalled", ""}
-                and status == "downloading"
-                and not item.announce_started
-            ):
-                # Retry just landed; stay quiet until real mid-start percent.
-                pass
+            if trustworthy:
+                shown = (
+                    percent
+                    if percent is not None and percent >= start_threshold
+                    else None
+                )
+                if await _send_succeeded(
+                    send,
+                    item.chat_id,
+                    format_downloading(item.notification_title, shown),
+                ):
+                    item.announce_started = True
+                    item.announce_retrying = False

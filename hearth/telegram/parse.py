@@ -1,703 +1,469 @@
-"""Parse Telegram group messages into movie/series/TV grab requests.
+"""Deterministically parse Telegram messages into Overseerr searches.
 
-Treat as a request:
-- Catalog links (IMDb, TMDB, TVDB, Trakt, JustWatch) — extract id/title/year.
-- Plain IMDb tt IDs and TMDB/TVDB ids.
-- Plain titles: "Movie Title", "Movie Title (2024)", "Show S02E03", "Show season 2".
-- Optional quality hints (1080p, 4K) are recorded but not required to grab.
-
-Do NOT treat as a request:
-- Greetings, reactions, chatter ("ok", "thanks").
-- Hearth's own status messages / bot outbound.
-- Non-catalog http(s) links, shorteners, magnets, torrents, raw media files.
+This module deliberately performs no network calls and never asks a language
+model to interpret a request. The only accepted catalog links are TMDB links,
+whose type and id can be extracted locally.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import unquote, urlparse
 
-MediaKind = Literal["movie", "tv", "unknown"]
-ParseKind = Literal[
-    "request",
-    "ignore",
-    "reject_download",
-    "disambiguation_pick",
-]
+from hearth.telegram.models import MediaQuery, MediaType, MessageView
 
-
-# Hosts we trust for title/id extraction. Never fetch arbitrary URLs (SSRF).
-CATALOG_HOSTS = frozenset(
-    {
-        "imdb.com",
-        "www.imdb.com",
-        "m.imdb.com",
-        "themoviedb.org",
-        "www.themoviedb.org",
-        "thetvdb.com",
-        "www.thetvdb.com",
-        "trakt.tv",
-        "www.trakt.tv",
-        "justwatch.com",
-        "www.justwatch.com",
-    }
+_MAX_TITLE_LENGTH = 200
+_URL = re.compile(r"https?://[^\s<>\[\]\"']+", re.IGNORECASE)
+_MAGNET = re.compile(r"(?:^|\s)magnet:\?\S+", re.IGNORECASE)
+_TORRENT = re.compile(
+    r"(?:^|[/\\\s])[^\s/\\]+\.torrent(?=$|[\s.,;:!?()\[\]{}])",
+    re.IGNORECASE,
+)
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_SPACE = re.compile(r"\s+")
+_COMMAND = re.compile(
+    r"^/(?P<command>[a-z]+)(?:@[a-z0-9_]+)?(?:\s+(?P<argument>.*))?$",
+    re.IGNORECASE,
+)
+_REQUEST_PREFIX = re.compile(
+    r"^(?:(?P<polite>please|pls|alstublieft|aub)\s+)?"
+    r"(?P<verb>request|download|get|grab|find|search|zoek|haal|vraag)"
+    r"(?:\s+(?P<filler>me|mij|for(?:\s+me)?|naar|voor(?:\s+mij)?))?"
+    r"\s+(?P<title>.+)$",
+    re.IGNORECASE,
+)
+_MODAL_REQUEST_PREFIX = re.compile(
+    r"^(?:can|could|would|kan|kun)\s+(?:you|je|jij)\s+"
+    r"(?:(?:please|even)\s+)?"
+    r"(?:request|download|get|grab|find|search|zoek|haal|vraag)"
+    r"(?:\s+(?:me|mij|for(?:\s+me)?|naar|voor(?:\s+mij)?))?"
+    r"\s+(?P<title>.+)$",
+    re.IGNORECASE,
+)
+_TYPE_PREFIX = re.compile(
+    r"^(?P<type>movie|film|tv|show|series|serie)\s*[:\-–—]\s*(?P<title>.+)$",
+    re.IGNORECASE,
+)
+_TYPE_SUFFIX = re.compile(
+    r"^(?P<title>.+?)\s+\((?P<type>movie|film|tv|show|series|serie)\)$",
+    re.IGNORECASE,
+)
+_SEASON = re.compile(
+    r"^(?P<title>.+?)(?:\s+|[._-])(?:"
+    r"[sS](?P<s_short>\d{1,3})(?:[._-]?[eE](?P<episode>\d{1,3}))?"
+    r"|(?:season|seizoen)\s*(?P<s_word>\d{1,3})"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_SEASON_ONLY = re.compile(
+    r"^(?:"
+    r"[sS](?P<s_short>\d{1,3})(?:[._-]?[eE](?P<episode>\d{1,3}))?"
+    r"|(?:season|seizoen)\s*(?P<s_word>\d{1,3})"
+    r")$",
+    re.IGNORECASE,
+)
+_EPISODE_TOKEN = re.compile(
+    r"[sS]\d{1,3}(?:[._-]?[eE])\d{1,3}(?!\d)"
+)
+_MOVIE_HINT_PREFIX = re.compile(r"^(?:movie|film)(?:\s*[:\-–—]\s*|\s+)", re.IGNORECASE)
+_MOVIE_HINT_SUFFIX = re.compile(r"\s+(?:movie|film)\s*$", re.IGNORECASE)
+_MOVIE_SEASON_CONTRADICTION = re.compile(
+    r"(?:"
+    r"^(?:movie|film)(?:\s*[:\-–—]\s*|\s+).+\s+"
+    r"(?:[sS]\d{1,3}|(?:season|seizoen)\s*\d{1,3})\s*$"
+    r"|(?:^|\s)(?:[sS]\d{1,3}|(?:season|seizoen)\s*\d{1,3})"
+    r"\s+(?:movie|film)\s*$"
+    r")",
+    re.IGNORECASE,
+)
+_TITLE_YEAR = re.compile(
+    r"^(?P<title>.+?)\s*\(\s*(?P<year>(?:18|19|20|21)\d{2})\s*\)\s*$"
+)
+_TMDB_TYPED_ID = re.compile(
+    r"\btmdb\s*:\s*(?P<type>movie|film|tv|show|series|serie)\s*:\s*(?P<id>\d{1,10})\b",
+    re.IGNORECASE,
+)
+_TYPE_TMDB_ID = re.compile(
+    r"\b(?P<type>movie|film|tv|show|series|serie)\s+tmdb\s*:\s*(?P<id>\d{1,10})\b",
+    re.IGNORECASE,
+)
+_TMDB_ID_TYPE = re.compile(
+    r"\btmdb\s*:\s*(?P<id>\d{1,10})\s+(?P<type>movie|film|tv|show|series|serie)\b",
+    re.IGNORECASE,
+)
+_UNTYPED_TMDB = re.compile(r"\btmdb\s*:\s*\d{1,10}\b", re.IGNORECASE)
+_TMDB_MARKER = re.compile(r"\btmdb\s*:", re.IGNORECASE)
+_TMDB_PATH = re.compile(
+    r"/(?:[a-z]{2}(?:-[a-z]{2})?/)?(?P<type>movie|tv)/(?P<id>\d{1,10})(?!\d)"
+    r"(?:[-/](?P<slug>[^/?#]+))?",
+    re.IGNORECASE,
 )
 
-_GREETINGS = frozenset(
+_GREETINGS_AND_CHATTER = frozenset(
     {
-        "ok",
-        "okay",
-        "k",
-        "kk",
-        "thanks",
-        "thank you",
-        "thx",
-        "ty",
         "hi",
         "hey",
         "hello",
+        "hoi",
+        "hallo",
         "yo",
-        "sup",
-        "cool",
+        "ok",
+        "okay",
+        "thanks",
+        "thank you",
+        "dank je",
+        "dankjewel",
+        "thx",
+        "ty",
+        "k",
+        "kk",
         "nice",
         "great",
+        "top",
+        "cool",
         "yes",
-        "yep",
         "yeah",
+        "yep",
         "no",
         "nope",
         "lol",
         "haha",
+        "sup",
+        "how are you",
+        "how are you?",
+        "what's up",
+        "whats up",
+        "good morning",
+        "good night",
+        "goedemorgen",
+        "goedenavond",
+        "welterusten",
+        "status",
         "👍",
         "🙏",
+        "❤️",
+        "+1",
         "+",
         "++",
     }
 )
 
-_STATUS_PREFIXES = (
-    "queued ",
-    "couldn't find",
-    "could not find",
-    "already in ",
-    "already queued",
-    "failed to ",
-    "which one",
-    "pick one",
-    "this inbox only queues",
-    "too many requests",
-    "rate limited",
-    "ignored: ",
-)
 
-_STATUS_CONTAINS = (
-    " is downloading",
-    " is done —",
-    " is done -",
-    " failed.",
-    " failed (",
-    " via radarr.",
-    " via sonarr.",
-    " via overseerr.",
-    " is already in the library",
-    " is already queued",
-)
-
-_IMDB_TT = re.compile(r"\b(tt\d{5,10})\b", re.I)
-_TMDB_ID = re.compile(r"\b(?:tmdb[:\s#]*)(\d{1,10})\b", re.I)
-_TVDB_ID = re.compile(r"\b(?:tvdb[:\s#]*)(\d{1,10})\b", re.I)
-_YEAR = re.compile(r"\((19|20)\d{2}\)")
-_SEASON_EP = re.compile(
-    r"^(?P<title>.+?)\s+[Ss](?P<season>\d{1,2})(?:[Ee](?P<episode>\d{1,3}))?\s*$"
-)
-_SEASON_WORD = re.compile(
-    r"^(?P<title>.+?)\s+(?:season|seizoen)\s+(?P<season>\d{1,2})\s*$",
-    re.I,
-)
-_QUALITY = re.compile(
-    r"\b(?P<q>2160p|1080p|720p|480p|4k|uhd|hdr|dv|dolby\s*vision)\b",
-    re.I,
-)
-# "Miss you love you 2026 film" → title + year; keep "Blade Runner 2049".
-_TRAILING_MEDIA_KIND = re.compile(
-    r"(?i)(?:\s+the)?\s+(?:films?|movies?|flicks?|series|shows?|tv)\s*$"
-)
-_MEDIA_KIND_WORD = re.compile(
-    r"(?i)\b(?:films?|movies?|flicks?|series|shows?|tv)\b"
-)
-_PAREN_YEAR_TAIL = re.compile(r"\s*\(\s*((?:19|20)\d{2})\s*\)\s*$")
-_BARE_YEAR_TAIL = re.compile(r"\s+((?:19|20)\d{2})\s*$")
-_LEADING_YEAR_FILM = re.compile(
-    r"(?i)^(?:the\s+)?((?:19|20)\d{2})\s+(?:films?|movies?|flicks?)\s+(.+)$"
-)
+def _normalize(value: str) -> str:
+    return _SPACE.sub(" ", value.strip())
 
 
-def strip_title_year_media(title: str) -> tuple[str, int | None]:
-    """Return (catalog title, year) stripping film/movie words + year disambiguators.
-
-    Parenthetical ``(YYYY)`` is always a release year. Bare trailing ``YYYY``
-    is only stripped when a film/movie/tv word is also present so titles like
-    ``Blade Runner 2049`` stay intact.
-    """
-    raw = (title or "").strip()
-    if not raw:
-        return "", None
-    cleaned = raw
-    year: int | None = None
-    had_media = bool(_MEDIA_KIND_WORD.search(cleaned))
-    cleaned = _TRAILING_MEDIA_KIND.sub("", cleaned).strip(" -–—|,.")
-
-    paren = _PAREN_YEAR_TAIL.search(cleaned)
-    if paren:
-        try:
-            year = int(paren.group(1))
-        except (TypeError, ValueError):
-            year = None
-        cleaned = cleaned[: paren.start()].strip(" -–—|,.")
-    elif had_media:
-        bare = _BARE_YEAR_TAIL.search(cleaned)
-        if bare:
-            try:
-                year = int(bare.group(1))
-            except (TypeError, ValueError):
-                year = None
-            cleaned = cleaned[: bare.start()].strip(" -–—|,.")
-        cleaned = _TRAILING_MEDIA_KIND.sub("", cleaned).strip(" -–—|,.")
-
-    leading = _LEADING_YEAR_FILM.match(cleaned)
-    if leading:
-        try:
-            year = year or int(leading.group(1))
-        except (TypeError, ValueError):
-            pass
-        cleaned = leading.group(2).strip(" -–—|,.")
-
-    return (cleaned or raw), year
-_URL = re.compile(r"https?://[^\s<>\[\]()\"']+", re.I)
-_MAGNET = re.compile(r"magnet:\?[^\s]+", re.I)
-_BINARYISH = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-_PICK = re.compile(r"^\s*(?:#?\s*)?([1-3])\s*$")
-_WHITESPACE = re.compile(r"\s+")
+def _media_type(value: str) -> MediaType:
+    return "movie" if value.casefold() in {"movie", "film"} else "tv"
 
 
-@dataclass(frozen=True)
-class ParsedRequest:
-    kind: ParseKind
-    media_kind: MediaKind = "unknown"
-    title: str = ""
-    year: int | None = None
-    imdb_id: str | None = None
-    tmdb_id: int | None = None
-    tvdb_id: int | None = None
+def _clean_title(value: str) -> str:
+    return _normalize(value).strip(" \"'`.,;:!?-–—|")
+
+
+def _title_from_slug(value: str) -> str:
+    slug = unquote(value or "").replace("_", " ").replace("-", " ")
+    return _normalize(slug).title()
+
+
+def _parse_tmdb_url(value: str) -> tuple[MediaType, int, str, str] | None:
+    """Extract a typed TMDB id locally. This function never fetches a URL."""
+    cleaned = value.rstrip('.,;!?)]}"')
+    try:
+        parsed = urlparse(cleaned)
+    except ValueError:
+        return None
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return None
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if host not in {"themoviedb.org", "www.themoviedb.org"}:
+        return None
+    match = _TMDB_PATH.search(unquote(parsed.path or ""))
+    if not match:
+        return None
+    tmdb_id = int(match.group("id"))
+    if tmdb_id <= 0:
+        return None
+    return (
+        _media_type(match.group("type")),
+        tmdb_id,
+        _title_from_slug(match.group("slug") or ""),
+        host,
+    )
+
+
+def _extract_title_parts(
+    text: str,
+    *,
+    media_type: MediaType | None = None,
+) -> tuple[str, int | None, int | None, int | None, MediaType | None]:
+    title = _clean_title(text)
     season: int | None = None
     episode: int | None = None
-    quality: str | None = None
-    pick_index: int | None = None
-    reason: str = ""
-    catalog_host: str | None = None
-    raw_text: str = ""
+    season_match = _SEASON.match(title)
+    if season_match:
+        title = _clean_title(season_match.group("title"))
+        season = int(season_match.group("s_short") or season_match.group("s_word"))
+        episode_text = season_match.group("episode")
+        episode = int(episode_text) if episode_text is not None else None
+        media_type = "tv"
 
-    def search_query(self) -> str:
-        """Human/search term for *arr — never a raw ``tt…`` id string."""
-        if self.title:
-            bits = [self.title.strip()]
-            if self.year:
-                bits.append(f"({self.year})")
-            return " ".join(bit for bit in bits if bit).strip()
-        if self.tmdb_id and self.media_kind != "tv":
-            return f"tmdb:{self.tmdb_id}"
-        if self.tvdb_id:
-            return f"tvdb:{self.tvdb_id}"
-        # Unresolved IMDb id: empty — callers must resolve via catalog first.
-        return ""
-
-    def display_label(self) -> str:
-        """Label for user-facing not-found / status — never a raw ``tt…`` id."""
-        if self.title and self.year:
-            return f"{self.title} ({self.year})"
-        if self.title:
-            return self.title
-        return "that title"
-
-    def dedup_key(self) -> str:
-        if self.imdb_id:
-            return f"imdb:{self.imdb_id.lower()}"
-        if self.tmdb_id:
-            return f"tmdb:{self.tmdb_id}:{self.media_kind}"
-        if self.tvdb_id:
-            return f"tvdb:{self.tvdb_id}"
-        title = normalize_title(self.title)
-        year = self.year or ""
-        return f"title:{title}:{year}:{self.media_kind}"
-
-    def needs_catalog_resolve(self) -> bool:
-        """True when an external id or title/year must be verified on TMDB."""
-        if self.kind != "request":
-            return False
-        if self.imdb_id or self.tmdb_id or self.tvdb_id:
-            return True
-        return bool(self.title)
-
-
-@dataclass
-class MessageView:
-    """Minimal redacted view of an inbound Telegram message (no full payload kept)."""
-
-    chat_id: int
-    message_id: int
-    user_id: int | None
-    text: str
-    is_bot: bool = False
-    has_media_file: bool = False
-    media_kind_hint: str = ""
-    reply_to_message_id: int | None = None
-    reply_to_text: str = ""
-
-    @classmethod
-    def from_telegram(cls, message: dict[str, Any]) -> MessageView | None:
-        if not isinstance(message, dict):
-            return None
-        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
-        sender = message.get("from") if isinstance(message.get("from"), dict) else {}
-        try:
-            chat_id = int(chat.get("id"))
-            message_id = int(message.get("message_id"))
-        except (TypeError, ValueError):
-            return None
-        user_id = None
-        if sender.get("id") is not None:
-            try:
-                user_id = int(sender["id"])
-            except (TypeError, ValueError):
-                user_id = None
-        text = (
-            message.get("text")
-            or message.get("caption")
-            or ""
-        )
-        if not isinstance(text, str):
-            text = str(text)
-        reply = message.get("reply_to_message") if isinstance(message.get("reply_to_message"), dict) else {}
-        reply_id = None
-        if reply.get("message_id") is not None:
-            try:
-                reply_id = int(reply["message_id"])
-            except (TypeError, ValueError):
-                reply_id = None
-        reply_text = ""
-        if isinstance(reply.get("text"), str):
-            reply_text = reply["text"]
-        elif isinstance(reply.get("caption"), str):
-            reply_text = reply["caption"]
-        has_file = any(
-            message.get(key)
-            for key in (
-                "document",
-                "video",
-                "audio",
-                "voice",
-                "video_note",
-                "animation",
-                "sticker",
-                "photo",
-            )
-        )
-        # Stickers / voice with no caption are chatter, not requests.
-        media_hint = ""
-        for key in ("document", "video", "audio", "voice", "sticker", "photo"):
-            if message.get(key):
-                media_hint = key
-                break
-        return cls(
-            chat_id=chat_id,
-            message_id=message_id,
-            user_id=user_id,
-            text=text.strip(),
-            is_bot=bool(sender.get("is_bot")),
-            has_media_file=has_file,
-            media_kind_hint=media_hint,
-            reply_to_message_id=reply_id,
-            reply_to_text=reply_text[:400],
-        )
-
-
-def normalize_title(value: str) -> str:
-    return _WHITESPACE.sub(" ", (value or "").strip().lower())
-
-
-def is_status_echo(text: str) -> bool:
-    lowered = (text or "").strip().lower()
-    if not lowered:
-        return False
-    if any(lowered.startswith(prefix) for prefix in _STATUS_PREFIXES):
-        return True
-    return any(bit in lowered for bit in _STATUS_CONTAINS)
-
-
-def _host_allowed(hostname: str) -> bool:
-    host = (hostname or "").lower().rstrip(".")
-    if host in CATALOG_HOSTS:
-        return True
-    # Allow one subdomain level under known catalog apexes (e.g. www).
-    parts = host.split(".")
-    if len(parts) >= 2:
-        apex = ".".join(parts[-2:])
-        return apex in {h for h in CATALOG_HOSTS if h.count(".") == 1} or host in CATALOG_HOSTS
-    return False
-
-
-def _strip_quality(text: str) -> tuple[str, str | None]:
-    match = _QUALITY.search(text)
-    quality = match.group("q").upper().replace(" ", "") if match else None
-    cleaned = _QUALITY.sub(" ", text)
-    cleaned = _WHITESPACE.sub(" ", cleaned).strip(" -–—|,")
-    return cleaned, quality
-
-
-def _parse_catalog_url(url: str) -> ParsedRequest | None:
-    try:
-        parsed = urlparse(url)
-    except Exception:  # noqa: BLE001
-        return None
-    host = (parsed.hostname or "").lower()
-    if not host or not _host_allowed(host):
-        return None
-    path = unquote(parsed.path or "")
-    query = parsed.query or ""
-
-    imdb = _IMDB_TT.search(path) or _IMDB_TT.search(query)
-    if "imdb.com" in host and imdb:
-        return ParsedRequest(
-            kind="request",
-            media_kind="unknown",
-            imdb_id=imdb.group(1).lower(),
-            catalog_host=host,
-            reason="imdb_url",
-        )
-
-    tmdb_movie = re.search(r"/movie/(\d+)", path, re.I)
-    tmdb_tv = re.search(r"/(?:tv|tv-show|show)/(\d+)", path, re.I)
-    if "themoviedb.org" in host:
-        if tmdb_movie:
-            slug_title = _slug_title(path, after=tmdb_movie.end())
-            return ParsedRequest(
-                kind="request",
-                media_kind="movie",
-                tmdb_id=int(tmdb_movie.group(1)),
-                title=slug_title,
-                catalog_host=host,
-                reason="tmdb_movie_url",
-            )
-        if tmdb_tv:
-            slug_title = _slug_title(path, after=tmdb_tv.end())
-            return ParsedRequest(
-                kind="request",
-                media_kind="tv",
-                tmdb_id=int(tmdb_tv.group(1)),
-                title=slug_title,
-                catalog_host=host,
-                reason="tmdb_tv_url",
-            )
-
-    tvdb = re.search(r"/(?:series|movie|dereferrer/(?:series|movie))/(\d+)", path, re.I)
-    if "thetvdb.com" in host and tvdb:
-        return ParsedRequest(
-            kind="request",
-            media_kind="tv" if "series" in path.lower() else "unknown",
-            tvdb_id=int(tvdb.group(1)),
-            catalog_host=host,
-            reason="tvdb_url",
-        )
-
-    trakt_movie = re.search(r"/movies/([^/?#]+)", path, re.I)
-    trakt_show = re.search(r"/shows/([^/?#]+)", path, re.I)
-    if "trakt.tv" in host:
-        if trakt_movie:
-            title, year = _title_year_from_slug(trakt_movie.group(1))
-            return ParsedRequest(
-                kind="request",
-                media_kind="movie",
-                title=title,
-                year=year,
-                catalog_host=host,
-                reason="trakt_movie_url",
-            )
-        if trakt_show:
-            title, year = _title_year_from_slug(trakt_show.group(1))
-            return ParsedRequest(
-                kind="request",
-                media_kind="tv",
-                title=title,
-                year=year,
-                catalog_host=host,
-                reason="trakt_show_url",
-            )
-
-    justwatch = re.search(r"/(?:movie|tv-show|show)/([^/?#]+)", path, re.I)
-    if "justwatch.com" in host and justwatch:
-        media = "tv" if "/tv-show" in path.lower() or "/show/" in path.lower() else "movie"
-        title, year = _title_year_from_slug(justwatch.group(1))
-        return ParsedRequest(
-            kind="request",
-            media_kind=media,  # type: ignore[arg-type]
-            title=title,
-            year=year,
-            catalog_host=host,
-            reason="justwatch_url",
-        )
-    return None
-
-
-def _slug_title(path: str, *, after: int) -> str:
-    rest = path[after:].lstrip("/-")
-    if not rest:
-        return ""
-    slug = rest.split("/")[0]
-    return _title_year_from_slug(slug)[0]
-
-
-def _title_year_from_slug(slug: str) -> tuple[str, int | None]:
-    raw = unquote(slug or "").replace("_", " ").replace("-", " ")
-    raw = _WHITESPACE.sub(" ", raw).strip()
-    year = None
-    m = re.search(r"(19|20)\d{2}$", raw)
-    if m:
-        year = int(m.group(0))
-        raw = raw[: m.start()].strip()
-    title = raw.title() if raw else ""
-    return title, year
-
-
-def _parse_plain_title(text: str) -> ParsedRequest | None:
-    cleaned, quality = _strip_quality(text)
-    if not cleaned:
-        return None
-
-    season_ep = _SEASON_EP.match(cleaned)
-    if season_ep:
-        title = season_ep.group("title").strip(" -–—|")
-        year = None
-        y = _YEAR.search(title)
-        if y:
-            year = int(y.group(0)[1:-1])
-            title = _YEAR.sub("", title).strip()
-        return ParsedRequest(
-            kind="request",
-            media_kind="tv",
-            title=title,
-            year=year,
-            season=int(season_ep.group("season")),
-            episode=int(season_ep.group("episode")) if season_ep.group("episode") else None,
-            quality=quality,
-            reason="season_episode",
-        )
-
-    season_word = _SEASON_WORD.match(cleaned)
-    if season_word:
-        title = season_word.group("title").strip(" -–—|")
-        year = None
-        y = _YEAR.search(title)
-        if y:
-            year = int(y.group(0)[1:-1])
-            title = _YEAR.sub("", title).strip()
-        return ParsedRequest(
-            kind="request",
-            media_kind="tv",
-            title=title,
-            year=year,
-            season=int(season_word.group("season")),
-            quality=quality,
-            reason="season_word",
-        )
-
-    year = None
-    y = _YEAR.search(cleaned)
-    title = cleaned
-    media_kind: MediaKind = "unknown"
-    if y:
-        year = int(y.group(0)[1:-1])
-        title = _YEAR.sub("", cleaned).strip(" -–—|")
+    type_match = _TYPE_PREFIX.match(title)
+    if type_match:
+        media_type = _media_type(type_match.group("type"))
+        title = _clean_title(type_match.group("title"))
     else:
-        # "Miss you love you 2026 film" / "the 2026 film Title" — bare year
-        # with a film/movie word is a release-year disambiguator, not part of
-        # the catalog title (unlike Blade Runner 2049 with no media word).
-        stripped, bare_year = strip_title_year_media(cleaned)
-        if bare_year is not None and stripped and stripped != cleaned:
-            title = stripped
-            year = bare_year
-            if re.search(r"(?i)\b(?:films?|movies?|flicks?)\b", cleaned):
-                media_kind = "movie"
-            elif re.search(r"(?i)\b(?:series|shows?|tv)\b", cleaned):
-                media_kind = "tv"
-    title = title.strip(" \"'`")
-    if len(title) < 2:
-        return None
-    # Reject pure numbers / punctuation.
-    if not re.search(r"[A-Za-zÀ-ÿ]", title):
-        return None
-    return ParsedRequest(
-        kind="request",
-        media_kind=media_kind,
-        title=title,
-        year=year,
-        quality=quality,
-        reason="plain_title",
-    )
+        type_match = _TYPE_SUFFIX.match(title)
+        if type_match:
+            media_type = _media_type(type_match.group("type"))
+            title = _clean_title(type_match.group("title"))
+
+    year: int | None = None
+    year_match = _TITLE_YEAR.match(title)
+    if year_match:
+        title = _clean_title(year_match.group("title"))
+        year = int(year_match.group("year"))
+
+    return title, year, season, episode, media_type
+
+
+def _parse_season_residual(
+    text: str,
+) -> tuple[int | None, int | None, bool]:
+    """Parse an optional season token and require full residual consumption."""
+    residual = _clean_title(text)
+    if not residual:
+        return None, None, True
+    match = _SEASON_ONLY.fullmatch(residual)
+    if not match:
+        return None, None, False
+    season = int(match.group("s_short") or match.group("s_word"))
+    episode_text = match.group("episode")
+    episode = int(episode_text) if episode_text is not None else None
+    return season, episode, True
 
 
 def parse_message_text(
     text: str,
     *,
-    max_length: int = 200,
+    max_length: int = _MAX_TITLE_LENGTH,
     is_bot: bool = False,
-    has_media_file: bool = False,
-    media_kind_hint: str = "",
-) -> ParsedRequest:
-    """Classify a message body. Never executes text as code or a shell command."""
+    has_media: bool = False,
+    media_kind: str = "",
+    # Transitional keyword names used by the former inbox implementation.
+    has_media_file: bool | None = None,
+    media_kind_hint: str | None = None,
+) -> MediaQuery:
+    """Classify a Telegram message without executing or fetching anything."""
+    if has_media_file is not None:
+        has_media = has_media_file
+    if media_kind_hint is not None:
+        media_kind = media_kind_hint
     raw = (text or "").strip()
-    if is_bot or is_status_echo(raw):
-        return ParsedRequest(kind="ignore", reason="bot_or_status", raw_text=raw[:max_length])
+    clipped = raw[: max(0, max_length * 2)]
 
-    if _BINARYISH.search(raw) or len(raw) > max(max_length * 4, 800):
-        return ParsedRequest(kind="ignore", reason="oversized_or_binary", raw_text="")
-
-    if _MAGNET.search(raw) or re.search(r"\.(torrent)\b", raw, re.I):
-        return ParsedRequest(
-            kind="reject_download",
-            reason="magnet_or_torrent",
-            raw_text=raw[:max_length],
+    if is_bot:
+        return MediaQuery(action="ignore", reason="bot_sender", raw_text=clipped)
+    if has_media:
+        return MediaQuery(
+            action="reject",
+            reason=f"media_attachment:{media_kind or 'unknown'}",
+            raw_text=clipped,
         )
-
-    # Raw media attachments without a catalog caption are not a general downloader.
-    if has_media_file and media_kind_hint in {"document", "video", "audio", "voice", "sticker"} and not raw:
-        if media_kind_hint == "sticker":
-            return ParsedRequest(kind="ignore", reason="sticker", raw_text="")
-        if media_kind_hint in {"voice", "audio"}:
-            return ParsedRequest(kind="ignore", reason="voice", raw_text="")
-        return ParsedRequest(
-            kind="reject_download",
-            reason="media_attachment",
-            raw_text="",
-        )
-
+    if _MAGNET.search(raw) or _TORRENT.search(raw):
+        return MediaQuery(action="reject", reason="torrent_download", raw_text=clipped)
     if not raw:
-        return ParsedRequest(kind="ignore", reason="empty", raw_text="")
+        return MediaQuery(action="ignore", reason="empty")
+    if _CONTROL.search(raw) or len(raw) > max(max_length * 4, 800):
+        return MediaQuery(action="reject", reason="invalid_text")
 
-    pick = _PICK.match(raw)
-    if pick:
-        return ParsedRequest(
-            kind="disambiguation_pick",
-            pick_index=int(pick.group(1)),
-            reason="pick_index",
-            raw_text=raw,
+    normalized = _normalize(raw)
+    lowered = normalized.casefold()
+    if lowered in _GREETINGS_AND_CHATTER or len(normalized) == 1:
+        return MediaQuery(action="ignore", reason="chatter", raw_text=clipped)
+
+    explicit_command = False
+    command = _COMMAND.match(normalized)
+    if command:
+        name = command.group("command").casefold()
+        argument = _normalize(command.group("argument") or "")
+        if name in {"start", "help"}:
+            return MediaQuery(action="help", reason=f"command:{name}", raw_text=clipped)
+        if name == "status":
+            return MediaQuery(action="status", reason="command:status", raw_text=clipped)
+        if name not in {"search", "request"}:
+            return MediaQuery(action="ignore", reason="unknown_command", raw_text=clipped)
+        if not argument:
+            return MediaQuery(action="help", reason="missing_query", raw_text=clipped)
+        normalized = argument
+        explicit_command = True
+
+    prefix = None if explicit_command else _MODAL_REQUEST_PREFIX.match(normalized)
+    if prefix is None and not explicit_command:
+        candidate = _REQUEST_PREFIX.match(normalized)
+        if candidate is not None:
+            # Keep title-cased ambiguous titles such as "Get Out" and
+            # "Search Party". Lower-case verbs and any polite/filler form are
+            # explicit request language.
+            verb = candidate.group("verb")
+            ambiguous = verb.casefold() in {"get", "find", "search"}
+            explicit = bool(candidate.group("polite") or candidate.group("filler"))
+            if not ambiguous or verb.islower() or explicit:
+                prefix = candidate
+    if prefix is not None:
+        normalized = _normalize(prefix.group("title"))
+    elif not explicit_command and normalized.casefold() in {
+        "request",
+        "download",
+        "get",
+        "grab",
+        "find",
+        "search",
+        "zoek",
+        "haal",
+        "vraag",
+    }:
+        return MediaQuery(action="help", reason="missing_query", raw_text=clipped)
+
+    if _EPISODE_TOKEN.search(normalized):
+        return MediaQuery(
+            action="reject",
+            reason="episode_not_supported",
+            raw_text=clipped,
         )
+    if _MOVIE_SEASON_CONTRADICTION.search(normalized):
+        return MediaQuery(action="reject", reason="movie_has_season", raw_text=clipped)
 
-    lowered = normalize_title(raw)
-    if lowered in _GREETINGS or len(lowered) <= 1:
-        return ParsedRequest(kind="ignore", reason="greeting", raw_text=raw)
-
-    # Catalog / id extraction first.
-    urls = _URL.findall(raw)
-    non_catalog = False
+    urls = _URL.findall(normalized)
+    if len(urls) > 1:
+        return MediaQuery(action="reject", reason="ambiguous_catalog_id", raw_text=clipped)
     for url in urls:
-        catalog = _parse_catalog_url(url)
-        if catalog:
-            return ParsedRequest(
-                kind=catalog.kind,
-                media_kind=catalog.media_kind,
-                title=catalog.title[:max_length],
-                year=catalog.year,
-                imdb_id=catalog.imdb_id,
-                tmdb_id=catalog.tmdb_id,
-                tvdb_id=catalog.tvdb_id,
-                quality=catalog.quality,
-                catalog_host=catalog.catalog_host,
-                reason=catalog.reason,
-                raw_text=raw[: max_length * 2],
+        parsed_url = _parse_tmdb_url(url)
+        if parsed_url is None:
+            continue
+        media_type, tmdb_id, title, host = parsed_url
+        season, episode, residual_ok = _parse_season_residual(
+            _URL.sub(" ", normalized)
+        )
+        if not residual_ok:
+            return MediaQuery(action="reject", reason="invalid_season", raw_text=clipped)
+        if episode is not None:
+            return MediaQuery(
+                action="reject",
+                reason="episode_not_supported",
+                raw_text=clipped,
             )
-        try:
-            host = (urlparse(url).hostname or "").lower()
-        except Exception:  # noqa: BLE001
-            host = ""
-        if host and not _host_allowed(host):
-            non_catalog = True
-
-    if non_catalog and not (_IMDB_TT.search(raw) or _TMDB_ID.search(raw) or _TVDB_ID.search(raw)):
-        # Only URLs, none catalog → ignore (not a grab).
-        remainder = _URL.sub(" ", raw).strip()
-        if not remainder or normalize_title(remainder) in _GREETINGS:
-            return ParsedRequest(kind="ignore", reason="non_catalog_url", raw_text=raw[:max_length])
-
-    imdb = _IMDB_TT.search(raw)
-    if imdb:
-        return ParsedRequest(
-            kind="request",
-            media_kind="unknown",
-            imdb_id=imdb.group(1).lower(),
-            reason="imdb_id",
-            raw_text=raw[:max_length],
+        if season is not None and media_type == "movie":
+            return MediaQuery(action="reject", reason="movie_has_season", raw_text=clipped)
+        return MediaQuery(
+            action="search",
+            media_type=media_type,
+            title=title[:max_length],
+            tmdb_id=tmdb_id,
+            season=season,
+            episode=episode,
+            reason="tmdb_url",
+            raw_text=clipped,
+            catalog_host=host,
         )
-    tmdb = _TMDB_ID.search(raw)
-    if tmdb:
-        return ParsedRequest(
-            kind="request",
-            media_kind="unknown",
-            tmdb_id=int(tmdb.group(1)),
+    if urls:
+        # Never turn arbitrary URLs into title searches or fetch them.
+        return MediaQuery(action="ignore", reason="unsupported_url", raw_text=clipped)
+
+    typed_id = (
+        _TMDB_TYPED_ID.search(normalized)
+        or _TYPE_TMDB_ID.search(normalized)
+        or _TMDB_ID_TYPE.search(normalized)
+    )
+    if typed_id:
+        tmdb_id = int(typed_id.group("id"))
+        if tmdb_id <= 0:
+            return MediaQuery(action="reject", reason="invalid_tmdb_id", raw_text=clipped)
+        media_type = _media_type(typed_id.group("type"))
+        # A season may be written on either side of the exact id. Inspect the
+        # full residual text so ``S02 tmdb:tv:95396`` cannot widen to ``all``.
+        residual = _normalize(
+            f"{normalized[: typed_id.start()]} {normalized[typed_id.end() :]}"
+        )
+        season, episode, residual_ok = _parse_season_residual(residual)
+        if not residual_ok:
+            return MediaQuery(action="reject", reason="invalid_season", raw_text=clipped)
+        if episode is not None:
+            return MediaQuery(
+                action="reject",
+                reason="episode_not_supported",
+                raw_text=clipped,
+            )
+        if season is not None and media_type != "tv":
+            return MediaQuery(action="reject", reason="movie_has_season", raw_text=clipped)
+        return MediaQuery(
+            action="search",
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            season=season,
+            episode=episode,
             reason="tmdb_id",
-            raw_text=raw[:max_length],
+            raw_text=clipped,
         )
-    tvdb = _TVDB_ID.search(raw)
-    if tvdb:
-        return ParsedRequest(
-            kind="request",
-            media_kind="tv",
-            tvdb_id=int(tvdb.group(1)),
-            reason="tvdb_id",
-            raw_text=raw[:max_length],
-        )
+    if _UNTYPED_TMDB.search(normalized):
+        return MediaQuery(action="reject", reason="tmdb_type_required", raw_text=clipped)
+    if _TMDB_MARKER.search(normalized):
+        return MediaQuery(action="reject", reason="invalid_tmdb_id", raw_text=clipped)
 
-    # Strip URLs before plain-title parse.
-    without_urls = _URL.sub(" ", raw)
-    without_urls = _WHITESPACE.sub(" ", without_urls).strip()
-    if len(without_urls) > max_length:
-        return ParsedRequest(kind="ignore", reason="title_too_long", raw_text=without_urls[:80])
-
-    plain = _parse_plain_title(without_urls)
-    if plain:
-        return ParsedRequest(
-            kind=plain.kind,
-            media_kind=plain.media_kind,
-            title=plain.title[:max_length],
-            year=plain.year,
-            season=plain.season,
-            episode=plain.episode,
-            quality=plain.quality,
-            reason=plain.reason,
-            raw_text=raw[: max_length * 2],
+    title, year, season, episode, media_type = _extract_title_parts(normalized)
+    if episode is not None:
+        return MediaQuery(
+            action="reject",
+            reason="episode_not_supported",
+            raw_text=clipped,
         )
-    return ParsedRequest(kind="ignore", reason="unrecognized", raw_text=raw[:max_length])
+    movie_contradiction = bool(
+        season is not None
+        and (
+            media_type == "movie"
+            or _MOVIE_HINT_PREFIX.search(normalized)
+            or _MOVIE_HINT_SUFFIX.search(normalized)
+        )
+    )
+    if movie_contradiction:
+        return MediaQuery(action="reject", reason="movie_has_season", raw_text=clipped)
+    if len(title) > max_length:
+        return MediaQuery(action="reject", reason="title_too_long", raw_text=title[:80])
+    if len(title) < 2 or not any(character.isalnum() for character in title):
+        return MediaQuery(action="ignore", reason="not_a_title", raw_text=clipped)
+
+    return MediaQuery(
+        action="search",
+        media_type=media_type,
+        title=title,
+        year=year,
+        season=season,
+        episode=episode,
+        reason="title",
+        raw_text=clipped,
+    )
 
 
 def parse_message(
     message: dict[str, Any] | MessageView,
     *,
-    max_length: int = 200,
+    max_length: int = _MAX_TITLE_LENGTH,
     bot_user_id: int | None = None,
-) -> tuple[MessageView | None, ParsedRequest]:
+) -> tuple[MessageView | None, MediaQuery]:
     view = message if isinstance(message, MessageView) else MessageView.from_telegram(message)
     if view is None:
-        return None, ParsedRequest(kind="ignore", reason="invalid_message")
-    if bot_user_id is not None and view.user_id == bot_user_id:
-        return view, ParsedRequest(kind="ignore", reason="own_bot", raw_text="")
-    if view.is_bot:
-        return view, ParsedRequest(kind="ignore", reason="bot_sender", raw_text=view.text[:max_length])
-    parsed = parse_message_text(
+        return None, MediaQuery(action="ignore", reason="invalid_message")
+    if view.is_bot or (bot_user_id is not None and view.user_id == bot_user_id):
+        return view, MediaQuery(action="ignore", reason="bot_sender")
+    return view, parse_message_text(
         view.text,
         max_length=max_length,
-        is_bot=False,
-        has_media_file=view.has_media_file,
-        media_kind_hint=view.media_kind_hint,
+        has_media=view.has_media,
+        media_kind=view.media_kind,
     )
-    return view, parsed
+
+
+# One release-cycle import alias for small downstream extensions. New code
+# should use MediaQuery directly.
+ParsedRequest = MediaQuery

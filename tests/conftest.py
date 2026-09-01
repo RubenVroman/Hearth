@@ -44,7 +44,7 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "telegram_chat_ids", "")
     monkeypatch.setattr(settings, "telegram_user_ids", "")
     monkeypatch.setattr(settings, "telegram_poll", True)
-    monkeypatch.setattr(settings, "telegram_webhook_local", False)
+    monkeypatch.setattr(settings, "telegram_db_path", tmp_path / "hearth-telegram.db")
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
     monkeypatch.setattr(settings, "memory_db_path", tmp_path / "hearth-memory.db")
     monkeypatch.setattr(settings, "memory_enabled", True)
@@ -102,8 +102,7 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     sonarr.reset_retry_counts()
     from hearth.telegram import telegram_inbox
 
-    telegram_inbox.inbox.reset()
-    telegram_inbox.running = False
+    telegram_inbox.reset()
     from hearth.memory.store import init_memory_db, reset_memory
 
     reset_memory()

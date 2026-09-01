@@ -521,27 +521,6 @@ async def realtime_hangup(call_id: str) -> dict[str, Any]:
     return {"ok": True, "path": "webrtc-ga", "call_id": call_id}
 
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request) -> JSONResponse:
-    """Optional localhost webhook — long-polling is the default. Funnel stays off."""
-    if not settings.telegram_webhook_local or not settings.telegram_configured:
-        raise HTTPException(status_code=404, detail="not found")
-    client_host = request.client.host if request.client else ""
-    if client_host not in {"127.0.0.1", "::1"}:
-        raise HTTPException(status_code=403, detail="loopback only")
-    expected = (settings.telegram_webhook_path or "/telegram/webhook").rstrip("/") or "/telegram/webhook"
-    if request.url.path.rstrip("/") != expected:
-        raise HTTPException(status_code=404, detail="not found")
-    try:
-        payload = await request.json()
-    except Exception:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail="invalid json") from None
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="invalid update")
-    result = await telegram_inbox.handle_webhook_update(payload)
-    return JSONResponse(result)
-
-
 class RealtimeToolBody(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)

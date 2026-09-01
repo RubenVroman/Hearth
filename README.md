@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, Infuse play on ATV, *arr/Overseerr grab/request, Telegram drop-group inbox, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, Infuse play on ATV, *arr/Overseerr grab/request, deterministic Telegram media bot, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -197,7 +197,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
-- **Telegram drop-group** → same *arr/Overseerr grab path; status posts back into the group (see below)
+- **Telegram media bot** → deterministic Overseerr search, signed exact-id requests, and quiet *arr progress in the group (see below)
 - Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
 - Weather outside → `get_weather` (Open-Meteo; no API key)
 - Live web (news, current events, where-to-watch / streaming) → `web_search` (OpenAI hosted web search by default; optional Brave; DuckDuckGo HTML lite last resort). Search results only — Hearth does not fetch arbitrary pages. Follow with `suggest_titles` when movie/TV ideas should appear as overlay cards.
@@ -447,9 +447,9 @@ For LAN discovery (Cast, some TVs), you may want host networking on the HA servi
 
 Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve → the app). Do not document or use `:8443` / `:8787` in the UI. Do **not** enable Tailscale Funnel. Hearth stays Tailscale-only; bind the app to LAN/Tailscale (or localhost behind Serve), never a WAN port-forward.
 
-## Telegram drop-group inbox
+## Telegram media bot
 
-A dedicated house Telegram group can act as a movie/series/TV **request inbox**. Titles and catalog links are searched and requested through **Overseerr** (movie and TV via `mediaType`). Radarr/Sonarr are used only for download progress / queue status on titles this inbox queued. Status (queued, progress, done, failed) is posted back into the **same** group. There is no WhatsApp / WAHA / Baileys path — Telegram Bot API only.
+A dedicated house Telegram group can search and request movies and series through **Overseerr**. Hearth sends the query directly to Overseerr, shows up to five ranked movie/TV matches with their current status, and adds a signed **Get** button to each requestable result. Pressing a button requests that exact TMDB id and media type; Hearth never queues a fuzzy or unrelated fallback. Radarr/Sonarr are observed only for progress on requests made by this bot. There is no LLM, conversational guessing, direct torrent client, or Radarr/Sonarr request fallback in this path.
 
 ### Setup (Ruben)
 
@@ -457,7 +457,7 @@ A dedicated house Telegram group can act as a movie/series/TV **request inbox**.
 2. Add the bot to the house group. Prefer making it an admin (or at least able to read messages).
 3. Disable privacy mode so the bot sees all group messages: BotFather → `/setprivacy` → **Disable**.
 4. Get the group chat id (negative number for groups/supergroups). Easiest: temporarily add a “get ids” bot, or inspect `getUpdates` once after posting in the group.
-5. On VAULT, put secrets in host `.env` only (never commit):
+5. On VAULT, configure the live `OVERSEERR_URL` / `OVERSEERR_API_KEY`, then put the Telegram secrets in the host `.env` only (never commit):
 
    ```bash
    TELEGRAM_BOT_TOKEN=123456:ABC…
@@ -466,17 +466,20 @@ A dedicated house Telegram group can act as a movie/series/TV **request inbox**.
    # TELEGRAM_USER_IDS=111,222
    ```
 
-6. Recreate the hearth container. Feature stays **off** until both token and chat id are set.
-7. Long-polling (`getUpdates`) runs inside Hearth — no public webhook, no Funnel, no extra NAS docker sidecar. An optional localhost-only webhook (`TELEGRAM_WEBHOOK_LOCAL=true`, loopback clients only) exists for advanced setups; it is **not** the default.
+6. Recreate the Hearth container. The bot stays **off** until both token and chat id are set. `TELEGRAM_POLL=false` is an operational kill switch.
+7. Hearth runs one `getUpdates` long-poller for the token. Do not run a second replica with the same bot token: Telegram permits only one active poller. There is no webhook, Funnel, or extra NAS sidecar.
 
 ### Behavior
 
-- Only allowlisted `TELEGRAM_CHAT_IDS` are inboxes. Messages from other chats are ignored.
-- Catalog links (IMDb / TMDB / TVDB / Trakt / JustWatch), plain `tt…` / `tmdb:` / `tvdb:` ids, and titles like `Annihilation (2018)` or `Severance S02E03` are requests. The group itself is the confirmation — no extra Hearth UI confirm.
-- Magnets, `.torrent` files, and raw media attachments get a short in-group refusal (this is not a general downloader).
-- Ambiguous titles get a top-3 disambiguation; reply `1` / `2` / `3`, or `all of them` / `de eerste` while that list is on screen (instant, no model). Bare titles without a year, season asks, plot descriptions in any language, corrections (“nee niet die…”, actor clues, misspellings), and short follow-ups always go through a conversation hop with gpt-4o: Overseerr catalog hits for that message are passed as `candidates` on the same turn, plus the last ~8 turns of that chat (or `OPENAI_MODEL` when it is already set to a named model other than mini). House chat keeps the existing `OPENAI_MODEL` default. The hop must not invent a search title that is not in the user text or the candidate list, and a new title/plot ask clears leftover `subject_title` / `offered` candidates from a prior grab. Rejected titles are remembered so a wrong first guess cannot trap the group in a 1–2 loop. Plot/vibe asks get one best gpt-4o guess and a confirm (“Did you mean Alien (1979)?”) before Overseerr queues — never a list-less “reply 1–1”. Unsure with 2+ real catalog hits → clarify with a numbered `1. Title (year)` list; never invent a grab. Exact catalog ids and `Title (YYYY)` grab immediately after TMDB/Overseerr resolve (IMDb `tt…` is never searched as a title string). Duplicate catalog rows are collapsed. Chit-chat / emoji / meta talk is ignored (no “which movie”). Magnets / torrents are rejected.
-- Dedup (message id + title/year window), per-group rate limit, max title length, bot loop-prevention, and log redaction for `TELEGRAM_BOT_TOKEN` ship by default.
-- Progress polls Radarr/Sonarr queue tools only for titles this inbox queued. One early “started and healthy” ping around ~5%, then silence until done / failed (manual status asks still use `radarr_queue` / `sonarr_queue`).
+- `/search <title>`, a plain title, or a typed TMDB movie/TV link performs one live Overseerr search. A year or season marker narrows the results. Overseerr requests whole seasons, so `S02E03` is rejected instead of silently widening to all of season 2. `/help` explains the compact command set; `/status` reports whether the bot and Overseerr are ready.
+- Search returns at most five deduplicated movie/TV results, filters person rows, and ranks exact title/year matches first with Overseerr order as the tie-breaker. Available, requested, processing, and partially available media are labeled clearly; only requestable rows get a **Get** button.
+- A text message never downloads by itself. **Get** is the confirmation. Its compact callback contains the exact media type, TMDB id, and optional TV season, is HMAC-signed, bound to the originating chat, and expires after `TELEGRAM_CALLBACK_TTL_SECONDS` (six hours by default).
+- Overseerr authentication, provider, timeout, no-match, duplicate, quota, and request errors are reported distinctly. A configured live failure never becomes fixture data or a false “queued” response.
+- Only `TELEGRAM_CHAT_IDS` are served. `TELEGRAM_USER_IDS` can restrict requests further; an empty user list allows any human member of an allowlisted chat. Bot-authored messages are ignored.
+- Magnets, `.torrent` files, and raw media attachments are refused. Rate limits, maximum title length, durable SQLite deduplication, secret redaction, immediate callback acknowledgement, ordered handling within each chat, and bounded concurrency across chats are enabled by default.
+- Progress checks Radarr/Sonarr only for titles this bot queued. It posts one early healthy-progress update, then only completion or failure, avoiding group spam.
+
+The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, and `TELEGRAM_DB_PATH`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.
 
 ## What is stubbed vs live in v0.1
 
@@ -491,7 +494,7 @@ A dedicated house Telegram group can act as a movie/series/TV **request inbox**.
 | `/ws/voice` text fallback | Live protocol; not the disabled beta websocket |
 | Whisper/TTS on fallback | Live when a key is set but Realtime is down |
 | HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
-| Telegram drop-group inbox | Live when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` are set; long-poll inside Hearth. Otherwise off. |
+| Telegram media bot | Live when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` are set; one long-poller inside Hearth, Overseerr-only search/request. Otherwise off. |
 | Thuisbezorgd / Just Eat Takeaway NL | Fixtures + confirm/dry-run always. Live paid submit needs partner `THUISBEZORGD_API_KEY` + session (no public consumer OAuth; no scrape). |
 | Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |
 | HA onboarding, TV/AVR pairing | Yours — service is included unconfigured |

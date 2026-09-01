@@ -1,89 +1,101 @@
-"""Allowlist, dedup, and rate-limit safeguards for the Telegram inbox."""
+"""Authorization and keyed rate-limit safeguards."""
 
 from __future__ import annotations
 
+import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass, field
+
+
+def _monotonic() -> float:
+    return time.monotonic()
 
 
 @dataclass
 class RateLimiter:
+    """Keyed sliding-window limiter.
+
+    A key should normally be ``(chat_id, user_id)``. ``allow()`` without a key
+    remains useful for callers that intentionally want a single global bucket.
+    """
+
     max_calls: int = 6
     window_s: float = 60.0
-    _hits: deque[float] = field(default_factory=deque)
+    clock: Callable[[], float] = _monotonic
+    _hits: dict[Hashable | None, deque[float]] = field(
+        default_factory=lambda: defaultdict(deque),
+    )
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def reset(self) -> None:
-        self._hits.clear()
+    def reset(self, key: Hashable | None = None, *, all_keys: bool = True) -> None:
+        with self._lock:
+            if all_keys:
+                self._hits.clear()
+            else:
+                self._hits.pop(key, None)
 
-    def allow(self) -> bool:
-        now = time.monotonic()
-        while self._hits and now - self._hits[0] > self.window_s:
-            self._hits.popleft()
-        if len(self._hits) >= self.max_calls:
+    def _prune_bucket(self, key: Hashable | None, now: float) -> deque[float]:
+        bucket = self._hits[key]
+        while bucket and now - bucket[0] >= self.window_s:
+            bucket.popleft()
+        return bucket
+
+    def allow(self, key: Hashable | None = None) -> bool:
+        if self.max_calls <= 0:
             return False
-        self._hits.append(now)
-        return True
-
-
-@dataclass
-class Deduper:
-    """Dedup by Telegram message id, title+year, and (chat_id, tmdb_id)."""
-
-    window_s: float = 120.0
-    _message_keys: dict[str, float] = field(default_factory=dict)
-    _title_keys: dict[str, float] = field(default_factory=dict)
-    _tmdb_keys: dict[str, float] = field(default_factory=dict)
-
-    def reset(self) -> None:
-        self._message_keys.clear()
-        self._title_keys.clear()
-        self._tmdb_keys.clear()
-
-    def _prune(self, now: float) -> None:
-        for store in (self._message_keys, self._title_keys, self._tmdb_keys):
-            expired = [key for key, ts in store.items() if now - ts > self.window_s]
-            for key in expired:
-                del store[key]
-
-    def seen_message(self, chat_id: int, message_id: int) -> bool:
-        now = time.monotonic()
-        self._prune(now)
-        key = f"{chat_id}:{message_id}"
-        if key in self._message_keys:
+        now = self.clock()
+        with self._lock:
+            bucket = self._prune_bucket(key, now)
+            if len(bucket) >= self.max_calls:
+                return False
+            bucket.append(now)
             return True
-        self._message_keys[key] = now
-        return False
 
-    def seen_title(self, chat_id: int, dedup_key: str) -> bool:
-        now = time.monotonic()
-        self._prune(now)
-        key = f"{chat_id}:{dedup_key}"
-        if key in self._title_keys:
-            return True
-        self._title_keys[key] = now
-        return False
-
-    def seen_tmdb(self, chat_id: int, tmdb_id: int) -> bool:
-        """True when this chat already queued/handled this TMDB id recently."""
-        now = time.monotonic()
-        self._prune(now)
-        key = f"{chat_id}:tmdb:{int(tmdb_id)}"
-        if key in self._tmdb_keys:
-            return True
-        self._tmdb_keys[key] = now
-        return False
+    def retry_after(self, key: Hashable | None = None) -> float:
+        """Seconds until the keyed bucket may accept another request."""
+        now = self.clock()
+        with self._lock:
+            bucket = self._prune_bucket(key, now)
+            if len(bucket) < self.max_calls or not bucket:
+                return 0.0
+            return max(0.0, self.window_s - (now - bucket[0]))
 
 
-def chat_allowed(chat_id: int, allowlist: list[int]) -> bool:
-    return bool(allowlist) and int(chat_id) in allowlist
+def chat_allowed(chat_id: int, allowlist: Iterable[int]) -> bool:
+    """Chats are fail-closed: at least one explicitly allowed chat is required."""
+    allowed = {int(value) for value in allowlist}
+    return bool(allowed) and int(chat_id) in allowed
 
 
-def user_allowed(user_id: int | None, allowlist: list[int], *, bot_user_id: int | None) -> bool:
+def user_allowed(
+    user_id: int | None,
+    allowlist: Iterable[int],
+    *,
+    bot_user_id: int | None,
+) -> bool:
+    """Reject bots/missing users, then apply the optional household user list."""
     if user_id is None:
         return False
-    if bot_user_id is not None and int(user_id) == int(bot_user_id):
+    user = int(user_id)
+    if bot_user_id is not None and user == int(bot_user_id):
         return False
-    if not allowlist:
-        return True
-    return int(user_id) in allowlist
+    allowed = {int(value) for value in allowlist}
+    return not allowed or user in allowed
+
+
+def authorized(
+    *,
+    chat_id: int,
+    user_id: int | None,
+    chat_allowlist: Iterable[int],
+    user_allowlist: Iterable[int],
+    bot_user_id: int | None,
+) -> bool:
+    """Return whether this actor may make media requests in this chat."""
+    return chat_allowed(chat_id, chat_allowlist) and user_allowed(
+        user_id,
+        user_allowlist,
+        bot_user_id=bot_user_id,
+    )
