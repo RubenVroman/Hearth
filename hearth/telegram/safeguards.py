@@ -28,18 +28,20 @@ class RateLimiter:
 
 @dataclass
 class Deduper:
-    """Dedup by Telegram message id and by title+year within a short window."""
+    """Dedup by Telegram message id, title+year, and (chat_id, tmdb_id)."""
 
     window_s: float = 120.0
     _message_keys: dict[str, float] = field(default_factory=dict)
     _title_keys: dict[str, float] = field(default_factory=dict)
+    _tmdb_keys: dict[str, float] = field(default_factory=dict)
 
     def reset(self) -> None:
         self._message_keys.clear()
         self._title_keys.clear()
+        self._tmdb_keys.clear()
 
     def _prune(self, now: float) -> None:
-        for store in (self._message_keys, self._title_keys):
+        for store in (self._message_keys, self._title_keys, self._tmdb_keys):
             expired = [key for key, ts in store.items() if now - ts > self.window_s]
             for key in expired:
                 del store[key]
@@ -60,6 +62,16 @@ class Deduper:
         if key in self._title_keys:
             return True
         self._title_keys[key] = now
+        return False
+
+    def seen_tmdb(self, chat_id: int, tmdb_id: int) -> bool:
+        """True when this chat already queued/handled this TMDB id recently."""
+        now = time.monotonic()
+        self._prune(now)
+        key = f"{chat_id}:tmdb:{int(tmdb_id)}"
+        if key in self._tmdb_keys:
+            return True
+        self._tmdb_keys[key] = now
         return False
 
 

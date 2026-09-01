@@ -3464,6 +3464,7 @@ async def test_inbox_yesss_confirms_pending_event_horizon_not_die_ruckkehr(
     for i, text in enumerate(("Yesss", "yess", "yes!", "jaaa")):
         pipeline.overseerr_queue.clear()
         overseerr_requests.clear()
+        inbox.deduper.reset()
         inbox.pending[-1001] = PendingDisambiguation(
             chat_id=-1001,
             options=[dict(option)],
@@ -5258,6 +5259,7 @@ def test_telegram_tool_schemas_include_required_tools():
     names = {t["function"]["name"] for t in TELEGRAM_CHAT_TOOLS}
     assert "search_title" in names
     assert "discover_by_genre" in names
+    assert "web_search" in names
     assert "queue_request" in names
     assert "library_status" in names
     assert "download_progress" in names
@@ -6326,3 +6328,367 @@ def test_amsterdam_today_helper():
 
     day = TelegramInbox._amsterdam_today()
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)
+
+
+# --- Spider-Man triple-queue + Land web_search (live 2026-09-01 ~02:26–02:28) ---
+
+
+def test_format_queued_never_emits_raw_tmdb_label():
+    from hearth.telegram.progress import format_queued
+
+    assert "tmdb:" not in format_queued("tmdb:429617", 2019, "Overseerr").lower()
+    assert "tmdb:" not in format_queued("tmdb:1930", None, "Overseerr").lower()
+    assert "Amazing" in format_queued("The Amazing Spider-Man", 2012, "Overseerr")
+
+
+def test_dedup_seen_tmdb_window():
+    deduper = Deduper(window_s=60)
+    assert deduper.seen_tmdb(-1001, 429617) is False
+    assert deduper.seen_tmdb(-1001, 429617) is True
+    assert deduper.seen_tmdb(-1001, 1930) is False
+
+
+@pytest.mark.asyncio
+async def test_inbox_0227_get_matrix_does_not_queue_spiderman(inbox: TelegramInbox):
+    """Live bug: 90s sci-fi Get buttons on screen; stale Spider-Man callbacks must not queue."""
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    matrix = {
+        "title": "The Matrix",
+        "year": 1999,
+        "tmdbId": 603,
+        "mediaId": 603,
+        "mediaType": "movie",
+    }
+    recall = {
+        "title": "Total Recall",
+        "year": 1990,
+        "tmdbId": 861,
+        "mediaId": 861,
+        "mediaType": "movie",
+    }
+    troopers = {
+        "title": "Starship Troopers",
+        "year": 1997,
+        "tmdbId": 563,
+        "mediaId": 563,
+        "mediaType": "movie",
+    }
+    fifth = {
+        "title": "The Fifth Element",
+        "year": 1997,
+        "tmdbId": 18,
+        "mediaId": 18,
+        "mediaType": "movie",
+    }
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[matrix, recall, troopers, fifth],
+        media_kind="movie",
+        query="90s sci-fi",
+        created_message_id=22701,
+        last_bot_reply=(
+            "1. The Matrix (1999)\n2. Total Recall (1990)\n"
+            "3. Starship Troopers (1997)\n4. The Fifth Element (1997)"
+        ),
+    )
+    pipeline.overseerr_queue.clear()
+
+    # Stale Amazing Spider-Man + Far From Home callbacks while sci-fi list is live.
+    stale_asm = await inbox.handle_callback(
+        {
+            "id": "cb-asm",
+            "data": "q:movie:1930",
+            "from": {"id": 42},
+            "message": {"message_id": 22699, "chat": {"id": -1001}},
+        }
+    )
+    assert stale_asm.grabbed is False
+    assert "Queued" not in (stale_asm.reply or "")
+    assert "Spider" not in (stale_asm.reply or "")
+
+    stale_ffh = await inbox.handle_callback(
+        {
+            "id": "cb-ffh",
+            "data": "q:movie:429617",
+            "from": {"id": 42},
+            "message": {"message_id": 22699, "chat": {"id": -1001}},
+        }
+    )
+    assert stale_ffh.grabbed is False
+    assert "tmdb:" not in (stale_ffh.reply or "").lower()
+    assert len(pipeline.overseerr_queue) == 0
+
+    # Real Get 1 on Matrix queues Matrix only.
+    ok = await inbox.handle_callback(
+        {
+            "id": "cb-matrix",
+            "data": "q:movie:603",
+            "from": {"id": 42},
+            "message": {"message_id": 22701, "chat": {"id": -1001}},
+        }
+    )
+    assert ok.grabbed is True
+    assert "Matrix" in ok.reply
+    assert "Spider" not in ok.reply
+    assert "tmdb:" not in ok.reply.lower()
+    assert len(pipeline.overseerr_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbox_0227_duplicate_callback_does_not_triple_queue(
+    inbox: TelegramInbox,
+):
+    """Duplicate Get deliveries must not queue the same tmdb id three times."""
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    option = {
+        "title": "The Amazing Spider-Man",
+        "year": 2012,
+        "tmdbId": 1930,
+        "mediaId": 1930,
+        "mediaType": "movie",
+    }
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[option],
+        media_kind="movie",
+        query="Spider-Man",
+        created_message_id=22710,
+    )
+    pipeline.overseerr_queue.clear()
+
+    cb = {
+        "id": "cb-dup-1",
+        "data": "q:movie:1930",
+        "from": {"id": 42},
+        "message": {"message_id": 22710, "chat": {"id": -1001}},
+    }
+    first = await inbox.handle_callback(cb)
+    assert first.grabbed is True
+    assert "Amazing Spider-Man" in first.reply
+    assert "tmdb:" not in first.reply.lower()
+
+    # Same id again (Telegram redelivery / double-tap) — suppressed.
+    second = await inbox.handle_callback({**cb, "id": "cb-dup-2"})
+    third = await inbox.handle_callback(
+        {
+            "id": "cb-dup-3",
+            "data": "q:movie:429617",
+            "from": {"id": 42},
+            "message": {"message_id": 22710, "chat": {"id": -1001}},
+        }
+    )
+    assert second.grabbed is False
+    assert third.grabbed is False
+    assert "tmdb:" not in (second.reply or "").lower()
+    assert "tmdb:" not in (third.reply or "").lower()
+    assert len(pipeline.overseerr_queue) == 1
+
+
+@pytest.mark.asyncio
+async def test_inbox_0227_queue_reply_never_contains_tmdb_label(
+    inbox: TelegramInbox,
+):
+    """Even a title-less pending row must not post 'Queued tmdb:N'."""
+    from hearth.telegram.inbox import PendingDisambiguation
+
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[
+            {
+                "title": "tmdb:429617",
+                "year": 2019,
+                "tmdbId": 429617,
+                "mediaId": 429617,
+                "mediaType": "movie",
+            }
+        ],
+        media_kind="movie",
+        query="Spider-Man",
+        created_message_id=22720,
+    )
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_callback(
+        {
+            "id": "cb-ffh-title",
+            "data": "q:movie:429617",
+            "from": {"id": 42},
+            "message": {"message_id": 22720, "chat": {"id": -1001}},
+        }
+    )
+    assert result.grabbed is True
+    assert "tmdb:" not in (result.reply or "").lower()
+    assert "Spider-Man" in result.reply or "that title" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_inbox_0227_land_catalog_miss_web_search_offers_land_2021(
+    inbox: TelegramInbox, monkeypatch
+):
+    """Land miss → web_search → Land (2021) Get offer; no auto-queue; not La La Land."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.tools import websearch as websearch_mod
+
+    land = {
+        "title": "Land",
+        "year": 2021,
+        "tmdbId": 688271,
+        "mediaId": 688271,
+        "mediaType": "movie",
+    }
+    la_la = {
+        "title": "La La Land",
+        "year": 2016,
+        "tmdbId": 313369,
+        "mediaId": 313369,
+        "mediaType": "movie",
+    }
+
+    land_lookups = {"n": 0}
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower().strip()
+        if "688271" in q or q.startswith("tmdb:688271"):
+            return {"mode": "mock", "service": "overseerr", "results": [land]}
+        if "la la" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [la_la]}
+        if q == "land" or (q.startswith("land") and "la la" not in q):
+            land_lookups["n"] += 1
+            # First Overseerr hit is a hard miss; later lookups (after web) resolve.
+            if land_lookups["n"] == 1:
+                return {"mode": "mock", "service": "overseerr", "results": []}
+            return {"mode": "mock", "service": "overseerr", "results": [land, la_la]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    web_calls: list[str] = []
+    original = websearch_mod.web_search
+
+    async def _cap(args):
+        web_calls.append(str(args.get("query") or ""))
+        return await original(args)
+
+    monkeypatch.setattr(websearch_mod, "web_search", _cap)
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "search_title",
+                            "arguments": {"title": "Land", "media_type": "movie"},
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(_msg("Land", message_id=22730))
+    assert web_calls, "catalog miss must trigger web_search"
+    assert result.grabbed is False
+    assert "couldn't find" not in (result.reply or "").lower()
+    assert "La La Land" not in (result.reply or "")
+    body = (result.reply or "").lower()
+    assert "land" in body
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    assert any(int(o.get("tmdbId") or 0) == 688271 for o in pending.options)
+    assert all(int(o.get("tmdbId") or 0) != 313369 for o in pending.options)
+    assert result.reply_markup is not None
+    assert len(pipeline.overseerr_queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_inbox_0227_do_a_websearch_uses_tool(
+    inbox: TelegramInbox, monkeypatch
+):
+    """'Do a websearch' must call web_search — never 'I cannot search the web'."""
+    from hearth.telegram import catalog as catalog_mod
+    from hearth.telegram import inbox as inbox_mod
+    from hearth.telegram.inbox import PendingDisambiguation
+    from hearth.tools import websearch as websearch_mod
+
+    land = {
+        "title": "Land",
+        "year": 2021,
+        "tmdbId": 688271,
+        "mediaId": 688271,
+        "mediaType": "movie",
+    }
+
+    async def _search(query: str, *args, **kwargs):
+        q = (query or "").lower().strip()
+        if "la la" in q:
+            return {"mode": "mock", "service": "overseerr", "results": []}
+        if "land" in q or "688271" in q:
+            return {"mode": "mock", "service": "overseerr", "results": [land]}
+        return {"mode": "mock", "service": "overseerr", "results": []}
+
+    monkeypatch.setattr(inbox_mod.overseerr, "search", _search)
+    monkeypatch.setattr(catalog_mod.overseerr, "search", _search)
+
+    web_calls: list[str] = []
+    original = websearch_mod.web_search
+
+    async def _cap(args):
+        web_calls.append(str(args.get("query") or ""))
+        return await original(args)
+
+    monkeypatch.setattr(websearch_mod, "web_search", _cap)
+
+    # Prior miss context: subject is Land.
+    inbox.memory.set_subject(-1001, "Land", media_kind="movie")
+    inbox.memory.record_user(-1001, "Land")
+    inbox.memory.record_bot(
+        -1001,
+        "I couldn't find a movie titled 'Land' in the catalog.",
+        search_title="Land",
+        media_kind="movie",
+    )
+    inbox.pending[-1001] = PendingDisambiguation(
+        chat_id=-1001,
+        options=[{"title": "Land", "year": None, "mediaType": "movie"}],
+        media_kind="movie",
+        query="Land",
+        created_message_id=22740,
+        last_bot_reply="I couldn't find a movie titled 'Land' in the catalog.",
+    )
+
+    _patch_openai_tools(
+        monkeypatch,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "web_search",
+                            "arguments": {
+                                "query": "Land 2021 Robin Wright movie",
+                                "media_type": "movie",
+                            },
+                        }
+                    }
+                ]
+            }
+        ],
+    )
+    pipeline.overseerr_queue.clear()
+    result = await inbox.handle_message(_msg("Do a websearch", message_id=22741))
+    assert web_calls, "expected explicit web_search tool call"
+    assert "cannot" not in (result.reply or "").lower()
+    assert "unable" not in (result.reply or "").lower()
+    assert "i can't search" not in (result.reply or "").lower()
+    assert result.grabbed is False
+    assert len(pipeline.overseerr_queue) == 0
+    pending = inbox.pending.get(-1001)
+    assert pending is not None
+    titles = " ".join(str(o.get("title") or "") for o in pending.options)
+    assert "Land" in titles
+    assert "La La Land" not in titles

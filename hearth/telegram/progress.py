@@ -11,6 +11,7 @@ and grab an alternate *arr source (capped) — with clear user feedback.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
@@ -25,6 +26,8 @@ log = logging.getLogger("hearth.telegram")
 # first sightings so we never announce "downloading, ~100%".
 START_THRESHOLD = 5.0
 START_PERCENT_MAX = 95.0
+
+_RAW_TMDB_LABEL = re.compile(r"^tmdb:\d+$", re.I)
 
 
 @dataclass
@@ -44,7 +47,12 @@ class TrackedGrab:
 
 
 def format_queued(title: str, year: int | None, via: str) -> str:
-    label = f"{title} ({year})" if year else title
+    """Queue ack — never emit raw ``tmdb:123`` as the human-facing label."""
+    raw = (title or "").strip()
+    if not raw or _RAW_TMDB_LABEL.match(raw):
+        label = "that title"
+    else:
+        label = f"{raw} ({year})" if year else raw
     return f"Queued {label} via {via}."
 
 

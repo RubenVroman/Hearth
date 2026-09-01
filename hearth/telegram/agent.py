@@ -132,6 +132,11 @@ You have tools. Use them — do not invent catalog ids.
 READ tools (auto-run):
 - search_title: exact/prefix title lookup. Single-token seeds are exact
   (Land ≠ La La Land, Wild ≠ The Wild Robot). Use for named titles.
+  On a catalog miss for an exact-ish title, the tool itself runs web_search
+  then search_title on the resolved name (e.g. Land → Land (2021)).
+- web_search: house live web search. ALWAYS call this for "do a websearch" /
+  "zoek op het web" / "search the web" — NEVER say you cannot search the web.
+  After web results, resolve a catalog title and offer Get (do not auto-queue).
 - discover_by_genre: TMDB discover via Overseerr. Pass genre_ids and optional
   exclude_genre_ids. Fantasy = 14 (ALWAYS exclude 878 Sci-Fi). Sci-Fi = 878.
   Horror = 27. "cool fantasy" MUST call discover_by_genre([14], exclude=[878]).
@@ -157,10 +162,12 @@ Conversation rules:
 - If you cannot refresh the list, say so WITHOUT Get buttons — never attach
   Get 1/2/3 for titles you just said you could not replace.
 - Exact Title (YYYY) / IMDb-TMDB URL: search_title then offer Get — do not assume queued.
+- "Do a websearch" / "zoek op het web": call web_search (never claim you cannot).
 - Ignore pure group chatter/emoji (empty reply).
 - Prefer short Telegram replies. Numbered lists as "1. Title (year)\\n2. …".
 - After a wrong genre: "You're right — those were sci-fi. Fantasy instead: …"
 - Never say "Queued 3" / "Queued N via".
+- Never say "Queued tmdb:123" — always use the human title.
 """
 
 
@@ -286,6 +293,31 @@ TELEGRAM_CHAT_TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["genre_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the live web (house web_search tool). REQUIRED for "
+                "'do a websearch' / 'zoek op het web' / 'search the web'. "
+                "Also used when search_title misses an exact film name. "
+                "Resolves a catalog title and offers Get — never auto-queues. "
+                "Never claim you cannot search the web."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query, e.g. 'Land 2021 Robin Wright movie'",
+                    },
+                    "year": {"type": "integer"},
+                    "media_type": {"type": "string"},
+                },
+                "required": ["query"],
             },
         },
     },
@@ -696,11 +728,12 @@ def _absorb_tool_side_effects(
         "search_catalog",
         "discover_by_genre",
         "suggest_titles",
+        "web_search",
         "retry_download",
         "download_progress",
         "library_status",
     }:
-        st = payload.get("query") or payload.get("title") or ""
+        st = payload.get("query") or payload.get("title") or payload.get("resolved_title") or ""
         if st:
             result.search_title = str(st)[:200]
         kind = payload.get("media_type") or payload.get("media_kind") or ""
@@ -711,14 +744,17 @@ def _absorb_tool_side_effects(
                 "retry_download",
                 "suggest_titles",
                 "discover_by_genre",
+                "web_search",
             }:
                 result.reply = str(payload["reply"])
-        if name in {"discover_by_genre", "suggest_titles"}:
+        if name in {"discover_by_genre", "suggest_titles", "web_search"}:
             if payload.get("ok") and payload.get("reply_markup") and isinstance(
                 payload["reply_markup"], dict
             ):
                 result.reply_markup = payload["reply_markup"]
-                result.mode = "offer"
+                result.mode = "offer" if name != "web_search" else (
+                    "confirm" if payload.get("count") == 1 else "offer"
+                )
             elif not payload.get("ok"):
                 # Failed refresh must not keep prior Get buttons.
                 result.reply_markup = None
@@ -728,3 +764,5 @@ def _absorb_tool_side_effects(
             result.mode = "confirm"
         elif name in {"search_title", "search_catalog"} and (payload.get("count") or 0) > 1:
             result.mode = "offer"
+        if name == "web_search" and payload.get("count") == 1:
+            result.mode = "confirm"
