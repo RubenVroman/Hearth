@@ -253,7 +253,9 @@ class TelegramInbox:
             return InboxResult(handled=True)
         media_type, tmdb_id = parsed
 
-        # Prefer the live offer row so title/year stay accurate.
+        # Prefer the live offer row so title/year stay accurate. A Get tap for
+        # an id that is NOT on the current offer is a stale button (e.g. old
+        # Spider-Man Get while a 90s sci-fi list is live) — never queue it.
         pending = self._pending_for(chat_id)
         row: dict[str, Any] | None = None
         if pending is not None:
@@ -265,13 +267,37 @@ class TelegramInbox:
                         break
                 except (TypeError, ValueError):
                     continue
-        if row is None:
-            row = {
-                "title": f"tmdb:{tmdb_id}",
-                "tmdbId": tmdb_id,
-                "mediaId": tmdb_id,
-                "mediaType": media_type,
-            }
+            if row is None:
+                return InboxResult(
+                    handled=True,
+                    reply=(
+                        "That Get button is from an older list — "
+                        "tap one on the current offer."
+                    ),
+                    reply_markup=pending.reply_markup
+                    or offer_inline_keyboard(pending.options),
+                    mode="offer",
+                )
+        else:
+            # No live offer: ignore redeliveries / expired buttons. Never invent
+            # a queue from a raw tmdb id outside the current Get row.
+            if self.deduper.seen_tmdb(chat_id, tmdb_id):
+                return InboxResult(handled=True, reply="", mode=self._mode(chat_id))
+            return InboxResult(
+                handled=True,
+                reply="That offer expired — send the title again if you still want it.",
+                mode="idle",
+            )
+
+        # Duplicate Telegram deliveries / double-taps of the same Get.
+        if self.deduper.seen_tmdb(chat_id, tmdb_id):
+            return InboxResult(
+                handled=True,
+                reply="",
+                mode=self._mode(chat_id),
+            )
+
+        row = await self._ensure_human_title(row, tmdb_id, media_type)
 
         # Synthetic view for grab helpers.
         view = MessageView(
@@ -291,6 +317,15 @@ class TelegramInbox:
             media_kind_hint=media_type,
             skip_rate=True,
         )
+        # Belt-and-suspenders: never post "Queued tmdb:123".
+        if result.reply and "tmdb:" in result.reply.lower():
+            human = str(row.get("title") or result.title or "").strip()
+            if human and not re.match(r"^tmdb:\d+$", human, re.I):
+                result.reply = format_queued(
+                    human, result.year or self._row_year(row), "Overseerr"
+                )
+            else:
+                result.reply = format_queued("that title", result.year, "Overseerr")
         result.mode = "queued" if result.grabbed else self._mode(chat_id)
         if result.grabbed:
             self._set_mode(chat_id, "queued")
@@ -637,6 +672,9 @@ class TelegramInbox:
         async def retry_download(args: dict[str, Any]) -> dict[str, Any]:
             return await self._tool_retry_download(view, args)
 
+        async def web_search(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._tool_web_search(view, args)
+
         return {
             "search_title": search_title,
             "search_catalog": search_title,  # back-compat alias
@@ -647,6 +685,7 @@ class TelegramInbox:
             "already_queued": library_status,
             "download_progress": download_progress,
             "retry_download": retry_download,
+            "web_search": web_search,
         }
 
     async def _tool_search_catalog(
@@ -705,6 +744,24 @@ class TelegramInbox:
             if not self._title_is_rejected(view.chat_id, str(r.get("title") or ""))
         ]
 
+        # Exact-ish catalog miss → house web_search then search_title on the
+        # resolved name (Land → Land (2021) Robin Wright). Never invent La La Land.
+        from_web = False
+        if not rows and (
+            looks_like_concrete_title(title)
+            or looks_like_concrete_title(view.text)
+            or len(title.split()) <= 6
+        ):
+            web_rows = await self._title_web_search_resolve(
+                view,
+                title,
+                year=year_i,
+                media_kind=kind,
+            )
+            if web_rows:
+                rows = web_rows
+                from_web = True
+
         # Pivoting to a new search clears the prior on-screen offer.
         live = self._pending_for(view.chat_id)
         if live is not None and not titles_match(live.query, title):
@@ -751,6 +808,7 @@ class TelegramInbox:
                 "reply": offered.reply,
                 "reply_markup": offered.reply_markup,
                 "hint": "Ask the user to confirm or tap Get before queue_request.",
+                "source": "web_search" if from_web else "catalog",
             }
 
         if len(compact) > 1:
@@ -1106,6 +1164,259 @@ class TelegramInbox:
                 names.append(title)
         return names[:8]
 
+    async def _resolve_tmdb_row(
+        self, tmdb_id: int, media_type: str
+    ) -> dict[str, Any] | None:
+        """Look up a human title for a TMDB id — never display ``tmdb:N``."""
+        for query in (f"tmdb:{int(tmdb_id)}", str(int(tmdb_id))):
+            try:
+                found = await overseerr.search(query)
+            except Exception as exc:  # noqa: BLE001
+                log.info("tmdb resolve failed: %s", redact(str(exc)))
+                continue
+            for hit in found.get("results") or []:
+                if not isinstance(hit, dict):
+                    continue
+                raw = hit.get("tmdbId") or hit.get("mediaId") or hit.get("id")
+                try:
+                    if raw is not None and int(raw) == int(tmdb_id):
+                        row = dict(hit)
+                        row["tmdbId"] = int(tmdb_id)
+                        row["mediaId"] = int(tmdb_id)
+                        kind = str(
+                            row.get("mediaType") or media_type or "movie"
+                        ).strip()
+                        if kind not in {"movie", "tv"}:
+                            kind = media_type if media_type in {"movie", "tv"} else "movie"
+                        row["mediaType"] = kind
+                        title = str(row.get("title") or "").strip()
+                        if title and not re.match(r"^tmdb:\d+$", title, re.I):
+                            return row
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    async def _ensure_human_title(
+        self,
+        row: dict[str, Any],
+        tmdb_id: int,
+        media_type: str,
+    ) -> dict[str, Any]:
+        title = str(row.get("title") or "").strip()
+        if title and not re.match(r"^tmdb:\d+$", title, re.I):
+            out = dict(row)
+            out.setdefault("tmdbId", tmdb_id)
+            out.setdefault("mediaId", tmdb_id)
+            out.setdefault("mediaType", media_type)
+            return out
+        resolved = await self._resolve_tmdb_row(tmdb_id, media_type)
+        if resolved is not None:
+            return resolved
+        out = dict(row)
+        out["title"] = "that title"
+        out["tmdbId"] = tmdb_id
+        out["mediaId"] = tmdb_id
+        out["mediaType"] = media_type if media_type in {"movie", "tv"} else "movie"
+        return out
+
+    async def _title_web_search_resolve(
+        self,
+        view: MessageView,
+        title: str,
+        *,
+        year: int | None = None,
+        media_kind: str = "",
+    ) -> list[dict[str, Any]]:
+        """Catalog miss → web_search → search_title on the resolved film name."""
+        from hearth.tools.websearch import web_search
+
+        seed = (title or "").strip()
+        if not seed:
+            return []
+        year_bit = f" {year}" if year else ""
+        search_q = f"{seed}{year_bit} movie film"
+        try:
+            payload = await web_search({"query": search_q, "limit": 5})
+        except Exception as exc:  # noqa: BLE001
+            log.info("title web_search resolve failed: %s", redact(str(exc)))
+            return []
+        if not payload.get("ok"):
+            return []
+
+        names = self._titles_from_web_search(payload)
+        # Also accept bare seed from speak/snippets when year is known.
+        if year and seed:
+            names.insert(0, f"{seed} ({year})")
+        if seed and seed not in names:
+            names.append(seed)
+
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for name in names:
+            bare = re.sub(r"\s*\(\d{4}\)\s*$", "", name).strip() or name
+            year_m = re.search(r"\((\d{4})\)\s*$", name)
+            year_i = int(year_m.group(1)) if year_m else year
+            # Exact-ish seed: Land ≠ La La Land / Cop Land.
+            if not (
+                catalog_seed_matches_title(seed, bare)
+                or titles_match(seed, bare)
+            ):
+                continue
+            found = await tool_lookup_title(
+                bare, year=year_i, media_kind=media_kind
+            )
+            found = filter_seed_rows(found, seed) if found else []
+            found = [
+                r
+                for r in found
+                if catalog_seed_matches_title(seed, str(r.get("title") or ""))
+                or titles_match(seed, str(r.get("title") or ""))
+            ]
+            if not found:
+                continue
+            row = dict(found[0])
+            label = str(row.get("title") or bare).strip()
+            key = normalize_title(label)
+            if not key or key in seen:
+                continue
+            if self._title_is_rejected(view.chat_id, label):
+                continue
+            seen.add(key)
+            rows.append(row)
+            if len(rows) >= MAX_CANDIDATES:
+                break
+        return rows
+
+    async def _tool_web_search(
+        self, view: MessageView, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Explicit 'do a websearch' / 'zoek op het web' — never refuse web search."""
+        from hearth.tools.websearch import web_search
+
+        query = str(args.get("query") or args.get("q") or "").strip()
+        if not query:
+            try:
+                subject, _kind = self.memory.subject(view.chat_id)
+            except Exception:  # noqa: BLE001
+                subject = ""
+            query = subject or view.text or ""
+        query = query.strip()
+        if not query:
+            return {
+                "ok": False,
+                "error": "query required",
+                "hint": "Pass a film/TV title or question to search the web.",
+            }
+
+        try:
+            payload = await web_search({"query": query, "limit": 5})
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+        seed = catalog_search_title(query) or query
+        seed = re.sub(
+            r"(?i)\b(?:do\s+a\s+)?web\s*search\b|\bzoek\s+op\s+(?:het\s+)?web\b|"
+            r"\bsearch\s+(?:the\s+)?web\b|\bgoogle\b",
+            " ",
+            seed,
+        ).strip(" -–—|,.")
+        if not seed or len(seed) < 2:
+            try:
+                subject, _kind = self.memory.subject(view.chat_id)
+            except Exception:  # noqa: BLE001
+                subject = ""
+            seed = (subject or "").strip() or query
+
+        media_kind = str(args.get("media_type") or args.get("mediaType") or "").strip()
+        kind = media_kind if media_kind in {"movie", "tv"} else ""
+        year = args.get("year")
+        try:
+            year_i = int(year) if year not in (None, "") else None
+        except (TypeError, ValueError):
+            year_i = None
+
+        names = self._titles_from_web_search(payload if isinstance(payload, dict) else {})
+        if year_i and seed:
+            names.insert(0, f"{seed} ({year_i})")
+        if seed and seed not in names:
+            names.append(seed)
+
+        resolved: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for name in names:
+            bare = re.sub(r"\s*\(\d{4}\)\s*$", "", name).strip() or name
+            year_m = re.search(r"\((\d{4})\)\s*$", name)
+            y = int(year_m.group(1)) if year_m else year_i
+            concrete_seed = looks_like_concrete_title(seed)
+            if concrete_seed and not (
+                catalog_seed_matches_title(seed, bare) or titles_match(seed, bare)
+            ):
+                continue
+            found = await tool_lookup_title(bare, year=y, media_kind=kind)
+            if concrete_seed:
+                found = filter_seed_rows(found, seed) if found else []
+                found = [
+                    r
+                    for r in found
+                    if catalog_seed_matches_title(seed, str(r.get("title") or ""))
+                    or titles_match(seed, str(r.get("title") or ""))
+                ]
+            if not found:
+                continue
+            row = dict(found[0])
+            label = str(row.get("title") or bare).strip()
+            key = normalize_title(label)
+            if not key or key in seen:
+                continue
+            if self._title_is_rejected(view.chat_id, label):
+                continue
+            seen.add(key)
+            resolved.append(row)
+            if len(resolved) >= 1:
+                break
+
+        if resolved:
+            row = resolved[0]
+            offered = self._ask_guess_confirm(view, row, query=seed)
+            compact = [
+                {
+                    "title": str(row.get("title") or ""),
+                    "year": self._row_year(row),
+                    "tmdbId": row.get("tmdbId") or row.get("mediaId"),
+                    "mediaType": self._row_kind(row, kind),
+                }
+            ]
+            return {
+                "ok": True,
+                "query": query,
+                "resolved_title": compact[0]["title"],
+                "results": compact,
+                "count": 1,
+                "reply": offered.reply,
+                "reply_markup": offered.reply_markup,
+                "web": {
+                    "speak": str(payload.get("speak") or "")[:400],
+                    "results": (payload.get("results") or [])[:3],
+                },
+                "hint": (
+                    "Offer Get for the resolved title. Do not auto-queue. "
+                    "Never say you cannot search the web."
+                ),
+                "source": "web_search",
+            }
+
+        speak = str(payload.get("speak") or "").strip()
+        return {
+            "ok": bool(payload.get("ok")),
+            "query": query,
+            "results": payload.get("results") or [],
+            "speak": speak,
+            "reply": speak
+            or "I searched the web but couldn't pin a catalog title. Any other clue?",
+            "hint": "Summarize web findings; never claim you cannot search the web.",
+            "source": "web_search",
+        }
+
     async def _tool_suggest_titles(
         self, view: MessageView, args: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1309,11 +1620,31 @@ class TelegramInbox:
                 ),
             }
 
+        # Dedup (chat_id, tmdb_id) — model + callback must not triple-queue.
+        oid = row.get("tmdbId") or row.get("mediaId") or tmdb_id
+        try:
+            oid_i = int(oid) if oid not in (None, "") else None
+        except (TypeError, ValueError):
+            oid_i = None
+        if oid_i is not None and self.deduper.seen_tmdb(view.chat_id, oid_i):
+            return {
+                "ok": True,
+                "grabbed": False,
+                "already": True,
+                "title": str(row.get("title") or title),
+                "reply": format_already(str(row.get("title") or title), queued=True),
+                "media_type": str(row.get("mediaType") or kind),
+            }
+
         if year_i is not None and row.get("year") in (None, ""):
             row["year"] = year_i
         if tmdb_id is not None and not (row.get("tmdbId") or row.get("mediaId")):
             row["tmdbId"] = tmdb_id
             row["mediaId"] = tmdb_id
+        if oid_i is not None:
+            row = await self._ensure_human_title(
+                row, oid_i, str(row.get("mediaType") or kind)
+            )
 
         result = await self._grab_catalog_row(
             view,
@@ -1322,6 +1653,14 @@ class TelegramInbox:
             media_kind_hint=str(row.get("mediaType") or kind),
             skip_rate=True,
         )
+        if result.reply and "tmdb:" in result.reply.lower():
+            human = str(row.get("title") or result.title or "").strip()
+            if human and not re.match(r"^tmdb:\d+$", human, re.I):
+                result.reply = format_queued(
+                    human, result.year or self._row_year(row), "Overseerr"
+                )
+            else:
+                result.reply = format_queued("that title", result.year, "Overseerr")
         if result.grabbed:
             self._set_mode(view.chat_id, "queued")
         return {
@@ -1905,11 +2244,14 @@ class TelegramInbox:
             )
 
         self.progress.track(view.chat_id, title, service, year)
+        display = title
+        if not display or re.match(r"^tmdb:\d+$", display.strip(), re.I):
+            display = "that title"
         return InboxResult(
             handled=True,
-            reply=format_queued(title, year, "Overseerr"),
+            reply=format_queued(display, year, "Overseerr"),
             grabbed=True,
-            title=title,
+            title=display if display != "that title" else title,
             service=service,
             year=year,
         )

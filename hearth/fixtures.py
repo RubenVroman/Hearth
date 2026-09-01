@@ -353,6 +353,24 @@ MOCK_WEB_SEARCH_FANTASY: list[dict[str, Any]] = [
     },
 ]
 
+MOCK_WEB_SEARCH_LAND: list[dict[str, Any]] = [
+    {
+        "title": "Land (2021 film) — Wikipedia",
+        "url": "https://en.wikipedia.org/wiki/Land_(2021_film)",
+        "snippet": (
+            "Land (2021) is a drama film directed by and starring Robin Wright "
+            "as Edee, who retreats to the wilderness after a tragedy."
+        ),
+        "source": "wikipedia.org",
+    },
+    {
+        "title": "Land (2021) — Robin Wright",
+        "url": "https://www.imdb.com/title/tt10320310/",
+        "snippet": "Land (2021) movie starring Robin Wright.",
+        "source": "imdb.com",
+    },
+]
+
 
 def mock_web_search_results(query: str, limit: int = 4) -> list[dict[str, Any]]:
     """Pick mock web rows; fantasy movie queries return classic released titles."""
@@ -361,6 +379,10 @@ def mock_web_search_results(query: str, limit: int = 4) -> list[dict[str, Any]]:
         r"\b(movie|film|cinema|released|classic)\b", q
     ):
         return [dict(row) for row in MOCK_WEB_SEARCH_FANTASY[:limit]]
+    if re.search(r"\bland\b", q) and re.search(r"\b(movie|film|cinema|robin|wright)\b", q):
+        return [dict(row) for row in MOCK_WEB_SEARCH_LAND[:limit]]
+    if re.search(r"\bland\b", q) and not re.search(r"\bla\s*la\b", q):
+        return [dict(row) for row in MOCK_WEB_SEARCH_LAND[:limit]]
     return [dict(row) for row in MOCK_WEB_SEARCH_RESULTS[:limit]]
 
 
@@ -946,6 +968,20 @@ MOCK_OVERSEERR_RESULTS: list[dict[str, Any]] = [
         "title": "Land",
         "year": 2021,
         "imdbId": "tt10320310",
+    },
+    {
+        "id": 1930,
+        "mediaType": "movie",
+        "title": "The Amazing Spider-Man",
+        "year": 2012,
+        "imdbId": "tt0948470",
+    },
+    {
+        "id": 429617,
+        "mediaType": "movie",
+        "title": "Spider-Man: Far From Home",
+        "year": 2019,
+        "imdbId": "tt6320628",
     },
     {
         "id": 228150,
