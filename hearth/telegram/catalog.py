@@ -321,33 +321,9 @@ def catalog_seed_matches_title(seed: str, title: str) -> bool:
     Single-token seeds must be exact — ``Land`` must not match ``La La Land``,
     ``Wild`` must not match ``The Wild Robot``.
     """
-    def _tokens(value: str) -> list[str]:
-        text = re.sub(r"[^a-z0-9à-ÿ]+", " ", normalize_title(value)).strip()
-        return [t for t in text.split() if t]
+    from hearth.tools.arr import title_seed_matches
 
-    seed_tokens = _tokens(seed)
-    title_tokens = _tokens(title)
-    if not seed_tokens or not title_tokens:
-        return False
-    if seed_tokens == title_tokens:
-        return True
-
-    # Drop leading articles for equality / prefix checks.
-    def _strip_articles(tokens: list[str]) -> list[str]:
-        while tokens and tokens[0] in {"the", "a", "an", "de", "het", "een"}:
-            tokens = tokens[1:]
-        return tokens
-
-    seed_tokens = _strip_articles(seed_tokens)
-    title_tokens = _strip_articles(title_tokens)
-    if not seed_tokens or not title_tokens:
-        return False
-    if seed_tokens == title_tokens:
-        return True
-    # Multi-word seed as leading phrase (franchise / longer official title).
-    if len(seed_tokens) >= 2 and title_tokens[: len(seed_tokens)] == seed_tokens:
-        return True
-    return False
+    return title_seed_matches(seed, title)
 
 
 async def resolve_title(

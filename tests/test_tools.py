@@ -1634,3 +1634,165 @@ def test_match_videoland_source_from_list():
 
     assert match_videoland_source(["HDMI 1", "Videoland", "Netflix"]) == "Videoland"
     assert match_videoland_source(["HDMI 1", "videoland app"]) == "videoland app"
+
+
+# --- Overseerr title-similarity gate (She Came for Me ≠ The Odyssey) ----------
+
+
+def test_title_seed_matches_rejects_clear_mismatch():
+    from hearth.tools.arr import title_seed_matches
+
+    assert title_seed_matches("She Came for Me", "She Came for Me")
+    assert not title_seed_matches("She Came for Me", "The Odyssey")
+    assert not title_seed_matches("Land", "La La Land")
+    assert title_seed_matches("Harry Potter", "Harry Potter and the Chamber of Secrets")
+    assert title_seed_matches("Annihilation", "Annihilation")
+
+
+def test_search_overseerr_unknown_title_no_discover_fallback():
+    """Mock catalog must not surface The Odyssey (discover[0]) for unrelated asks."""
+    from hearth.fixtures import pipeline
+
+    hits = pipeline.search_overseerr("She Came for Me")
+    assert hits == []
+    titles = {str(h.get("title") or "") for h in hits}
+    assert "The Odyssey" not in titles
+
+
+async def test_overseerr_request_refuses_mismatched_fallback(monkeypatch):
+    """Live bug: She Came for Me → fallback The Odyssey must never auto-request."""
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import overseerr
+
+    pipeline.overseerr_queue.clear()
+
+    async def _bad_search(query: str):
+        return {
+            "mode": "mock",
+            "service": "overseerr",
+            "query": query,
+            "results": [
+                {
+                    "title": "The Odyssey",
+                    "year": 2026,
+                    "mediaType": "movie",
+                    "mediaId": 1110001,
+                    "tmdbId": 1110001,
+                    "matched": "fallback",
+                },
+                {
+                    "title": "The Odyssey",
+                    "year": 2026,
+                    "mediaType": "movie",
+                    "mediaId": 1110001,
+                    "tmdbId": 1110001,
+                },
+            ],
+        }
+
+    monkeypatch.setattr(overseerr, "search", _bad_search)
+    result = await overseerr.request("She Came for Me")
+    assert result.get("ok") is False
+    assert result.get("mismatch") or result.get("not_found")
+    assert not pipeline.overseerr_queue
+    assert "confident" in (result.get("error") or "").lower() or "match" in (
+        result.get("speak") or ""
+    ).lower()
+
+
+async def test_overseerr_request_exact_title_still_queues():
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import overseerr
+
+    pipeline.overseerr_queue.clear()
+    result = await overseerr.request("Annihilation")
+    assert result.get("ok") is not False
+    assert (result.get("requested") or {}).get("title") == "Annihilation"
+    assert pipeline.overseerr_queue
+    assert pipeline.overseerr_queue[-1].get("title") == "Annihilation"
+
+
+async def test_overseerr_request_ambiguous_years_ask_which(monkeypatch):
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import overseerr
+
+    pipeline.overseerr_queue.clear()
+
+    async def _heat_search(query: str):
+        return {
+            "mode": "mock",
+            "service": "overseerr",
+            "query": query,
+            "results": [
+                {
+                    "title": "Heat",
+                    "year": 1995,
+                    "mediaType": "movie",
+                    "mediaId": 949,
+                    "tmdbId": 949,
+                },
+                {
+                    "title": "Heat",
+                    "year": 1986,
+                    "mediaType": "movie",
+                    "mediaId": 10784,
+                    "tmdbId": 10784,
+                },
+            ],
+        }
+
+    monkeypatch.setattr(overseerr, "search", _heat_search)
+    result = await overseerr.request("Heat")
+    assert result.get("ok") is False
+    assert result.get("ambiguous") is True
+    assert len(result.get("choices") or []) >= 2
+    assert not pipeline.overseerr_queue
+    assert "Which" in (result.get("speak") or "")
+
+
+async def test_overseerr_request_by_media_id_still_works():
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import overseerr
+
+    pipeline.overseerr_queue.clear()
+    result = await overseerr.request(
+        "whatever wrong title",
+        media_id=300668,
+        media_type="movie",
+    )
+    assert result.get("ok") is not False
+    assert pipeline.overseerr_queue
+    queued = pipeline.overseerr_queue[-1]
+    assert queued.get("id") == 300668 or queued.get("mediaId") == 300668
+
+
+async def test_overseerr_request_tool_speaks_mismatch(monkeypatch):
+    from hearth.agent.loop import _pretty_tool
+    from hearth.fixtures import pipeline
+    from hearth.tools.arr import overseerr
+
+    pipeline.overseerr_queue.clear()
+
+    async def _bad_search(query: str):
+        return {
+            "mode": "mock",
+            "results": [
+                {
+                    "title": "The Odyssey",
+                    "year": 2026,
+                    "mediaType": "movie",
+                    "mediaId": 1110001,
+                    "tmdbId": 1110001,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(overseerr, "search", _bad_search)
+    tool = await registry.call("overseerr_request", {"query": "She Came for Me"})
+    assert not tool.ok
+    assert tool.data.get("ok") is False
+    assert not pipeline.overseerr_queue
+    spoken = _pretty_tool("overseerr_request", tool.data) or ""
+    assert "Odyssey" not in spoken or "Which" in spoken
+    assert "She Came for Me" in spoken or "confident" in spoken.lower()
+    assert "I'll request" not in spoken
