@@ -323,6 +323,95 @@ async def test_search_filters_people_deduplicates_ranks_and_signs_exact_results(
     assert (decoded.media_type, decoded.tmdb_id) == ("movie", 438631)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "exact_title", "exact_id", "distractors"),
+    [
+        (
+            "Talk to Me",
+            "Talk to Me",
+            1009811,
+            [
+                {
+                    "mediaType": "movie",
+                    "id": 550,
+                    "title": "Talk Radio",
+                    "releaseDate": "1988-12-21",
+                },
+                {
+                    "mediaType": "movie",
+                    "id": 13,
+                    "title": "Can We Talk?",
+                    "releaseDate": "2010-01-01",
+                },
+                {
+                    "mediaType": "person",
+                    "id": 99,
+                    "name": "Talk Host",
+                },
+            ],
+        ),
+        (
+            "Late Night with the Devil",
+            "Late Night with the Devil",
+            1020006,
+            [
+                {
+                    "mediaType": "movie",
+                    "id": 4248,
+                    "title": "Late Night",
+                    "releaseDate": "2019-06-07",
+                },
+                {
+                    "mediaType": "tv",
+                    "id": 1408,
+                    "name": "Late Night with Conan O'Brien",
+                    "firstAirDate": "1993-09-13",
+                },
+                {
+                    "mediaType": "movie",
+                    "id": 77,
+                    "title": "The Devil Wears Prada",
+                    "releaseDate": "2006-06-30",
+                },
+            ],
+        ),
+    ],
+)
+async def test_horror_title_search_payloads_still_rank_exact_hit_first(
+    bot_factory: Callable[..., tuple[TelegramMediaBot, TelegramStore, RecordingProgress]],
+    query: str,
+    exact_title: str,
+    exact_id: int,
+    distractors: list[dict[str, Any]],
+) -> None:
+    fake = FakeOverseerr(
+        results=[
+            *distractors,
+            {
+                "mediaType": "movie",
+                "id": exact_id,
+                "title": exact_title,
+                "releaseDate": "2023-07-28" if exact_id == 1009811 else "2024-03-22",
+            },
+        ]
+    )
+    bot, _, _ = bot_factory(fake)
+
+    reply = await bot.handle_message(_message(query))
+
+    assert reply is not None
+    assert fake.search_calls == [(query, 1)]
+    ranked = [line for line in reply.text.splitlines() if line[:1].isdigit()]
+    assert ranked and ranked[0].startswith(f"1. {exact_title}")
+    callback_data = _first_button(reply)
+    decoded = bot._callback_codec().decode(callback_data, CHAT_ID)
+    assert (decoded.media_type, decoded.tmdb_id) == ("movie", exact_id)
+    assert reply.reply_markup is not None
+    assert reply.reply_markup["inline_keyboard"][0][0]["text"].startswith("Get 1")
+    assert "Wikipedia" not in reply.text
+
+
 async def _button_for(
     bot: TelegramMediaBot,
     text: str,

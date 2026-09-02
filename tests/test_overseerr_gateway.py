@@ -8,7 +8,38 @@ import httpx
 import pytest
 
 from hearth.config import settings
-from hearth.tools.arr import Overseerr, OverseerrError
+from hearth.tools.arr import (
+    Overseerr,
+    OverseerrError,
+    StarrClient,
+    _overseerr_base_url,
+    _rewrite_host_docker_internal,
+)
+
+
+def test_overseerr_base_url_rewrites_host_docker_internal_to_loopback() -> None:
+    assert (
+        _overseerr_base_url("http://host.docker.internal:5055")
+        == "http://127.0.0.1:5055"
+    )
+    assert (
+        _overseerr_base_url("http://host.docker.internal:5055/api/v1/")
+        == "http://127.0.0.1:5055"
+    )
+    assert _overseerr_base_url("http://100.67.187.109:5055") == "http://100.67.187.109:5055"
+    assert (
+        _rewrite_host_docker_internal("http://host.docker.internal:7878")
+        == "http://127.0.0.1:7878"
+    )
+
+
+def test_starr_base_url_rewrites_host_docker_internal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "radarr_url", "http://host.docker.internal:7878")
+    monkeypatch.setattr(settings, "sonarr_url", "http://host.docker.internal:8989")
+    assert StarrClient("radarr").base_url == "http://127.0.0.1:7878"
+    assert StarrClient("sonarr").base_url == "http://127.0.0.1:8989"
 
 
 def _live_gateway(
@@ -27,6 +58,127 @@ def _live_gateway(
     gateway._client = http
     gateway._client_signature = ("http://overseerr.test", "configured-live-key")
     return gateway, http
+
+
+@pytest.mark.asyncio
+async def test_http_client_rewrites_host_docker_internal_before_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "overseerr_url", "http://host.docker.internal:5055")
+    monkeypatch.setattr(settings, "overseerr_api_key", "configured-live-key")
+    monkeypatch.setattr(settings, "mock_if_unconfigured", True)
+
+    created: dict[str, Any] = {}
+    real_client = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        created["base_url"] = kwargs.get("base_url")
+        kwargs = {
+            **kwargs,
+            "transport": httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        }
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    gateway = Overseerr()
+    try:
+        await gateway._http()
+    finally:
+        await gateway.aclose()
+
+    assert created["base_url"] == "http://127.0.0.1:5055"
+    assert gateway._client_signature == ("http://127.0.0.1:5055", "configured-live-key")
+
+
+@pytest.mark.asyncio
+async def test_search_connect_error_is_overseerr_error_after_host_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "overseerr_url", "http://host.docker.internal:5055")
+    monkeypatch.setattr(settings, "overseerr_api_key", "configured-live-key")
+    monkeypatch.setattr(settings, "mock_if_unconfigured", True)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.host == "127.0.0.1"
+        raise httpx.ConnectError("overseerr unavailable", request=request)
+
+    real_client = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs = {**kwargs, "transport": httpx.MockTransport(handler)}
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    gateway = Overseerr()
+    try:
+        with pytest.raises(OverseerrError) as raised:
+            await gateway.search("Talk to Me")
+    finally:
+        await gateway.aclose()
+
+    assert raised.value.operation == "search"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_search_after_host_rewrite_returns_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "overseerr_url", "http://host.docker.internal:5055/api/v1")
+    monkeypatch.setattr(settings, "overseerr_api_key", "configured-live-key")
+    monkeypatch.setattr(settings, "mock_if_unconfigured", True)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.url.host == "127.0.0.1"
+        assert request.url.port == 5055
+        assert request.url.path == "/api/v1/search"
+        assert request.headers["X-Api-Key"] == "configured-live-key"
+        return httpx.Response(
+            200,
+            json={
+                "page": 1,
+                "totalPages": 1,
+                "totalResults": 2,
+                "results": [
+                    {
+                        "id": 1009811,
+                        "mediaType": "movie",
+                        "title": "Talk to Me",
+                        "releaseDate": "2023-07-28",
+                    },
+                    {
+                        "id": 1020006,
+                        "mediaType": "movie",
+                        "title": "Late Night with the Devil",
+                        "releaseDate": "2024-03-22",
+                    },
+                ],
+            },
+        )
+
+    real_client = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs = {**kwargs, "transport": httpx.MockTransport(handler)}
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    gateway = Overseerr()
+    try:
+        result = await gateway.search("Talk to Me")
+    finally:
+        await gateway.aclose()
+
+    assert result["ok"] is True
+    assert result["mode"] == "live"
+    titles = [row["title"] for row in result["results"]]
+    assert titles == ["Talk to Me", "Late Night with the Devil"]
+    assert seen and dict(seen[0].url.params) == {"query": "Talk to Me", "page": "1"}
 
 
 @pytest.mark.asyncio
