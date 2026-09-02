@@ -83,11 +83,13 @@ async def test_http_client_rewrites_host_docker_internal_before_connect(
     gateway = Overseerr()
     try:
         await gateway._http()
+        assert created["base_url"] == "http://127.0.0.1:5055"
+        assert gateway._client_signature == (
+            "http://127.0.0.1:5055",
+            "configured-live-key",
+        )
     finally:
         await gateway.aclose()
-
-    assert created["base_url"] == "http://127.0.0.1:5055"
-    assert gateway._client_signature == ("http://127.0.0.1:5055", "configured-live-key")
 
 
 @pytest.mark.asyncio
