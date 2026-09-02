@@ -608,6 +608,14 @@ class TelegramStore:
                 return None
             return _json_load(row["payload"])
 
+    def clear_callback_media(self, callback_key: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM telegram_callback_media WHERE callback_key = ?",
+                (str(callback_key),),
+            )
+            self._after_write_locked()
+
     def upsert_request(
         self,
         request_key: str,

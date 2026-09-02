@@ -751,3 +751,280 @@ async def test_service_preserves_same_chat_order_bounds_cross_chat_work_and_offs
     assert store.get_offset() == 24
     assert service.last_update_id == 23
     store.close()
+
+
+# --- plot/vibe guess + button labels (VAULT Movies & Series) -----------------
+
+
+@pytest.mark.asyncio
+async def test_scar_wizard_plot_guesses_then_confirms_without_literal_search(
+    bot_factory: Callable[..., tuple[TelegramMediaBot, TelegramStore, RecordingProgress]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live bug: plot English was sent as a literal Overseerr title search."""
+    from hearth.telegram import bot as bot_mod
+    from hearth.telegram.intent import CatalogGuess
+
+    fake = FakeOverseerr(
+        results=[
+            {
+                "mediaType": "movie",
+                "id": 671,
+                "title": "Harry Potter and the Philosopher's Stone",
+                "releaseDate": "2001-11-16",
+            },
+            {
+                "mediaType": "movie",
+                "id": 672,
+                "title": "Harry Potter and the Chamber of Secrets",
+                "releaseDate": "2002-11-15",
+            },
+        ]
+    )
+    bot, _, _ = bot_factory(fake)
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test-not-used")
+
+    async def _fake_guess(text: str) -> CatalogGuess:
+        assert "wizard" in text.lower() or "scar" in text.lower()
+        return CatalogGuess(
+            search_title="Harry Potter",
+            year=2001,
+            media_kind="movie",
+            confidence=0.95,
+        )
+
+    monkeypatch.setattr(bot_mod, "guess_catalog_title", _fake_guess)
+
+    plot = "That movie with the wizard with a scar on his face"
+    reply = await bot.handle_message(_message(plot))
+
+    assert reply is not None
+    assert fake.search_calls == [("Harry Potter", 1)]
+    assert plot not in {q for q, _ in fake.search_calls}
+    assert "No Overseerr matches" not in reply.text
+    assert "Wikipedia" not in reply.text
+    assert "Harry Potter" in reply.text
+    assert reply.reply_markup is not None
+    assert fake.request_calls == []  # never auto-queue
+    assert "Wikipedia" not in reply.text
+    # Multi-hit guesses require Get (no sticky yes) — bare nah must not invent a queue.
+    nah = await bot.handle_message(_message("nah", message_id=2))
+    assert nah is None
+    assert fake.request_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dutch_plot_guess_path_searches_resolved_title_not_plot(
+    bot_factory: Callable[..., tuple[TelegramMediaBot, TelegramStore, RecordingProgress]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hearth.telegram import bot as bot_mod
+    from hearth.telegram.intent import CatalogGuess
+
+    dutch = "Die film met de tovenaar met een litteken in zijn gezicht"
+    fake = FakeOverseerr(
+        results=[
+            {
+                "mediaType": "movie",
+                "id": 671,
+                "title": "Harry Potter and the Philosopher's Stone",
+                "releaseDate": "2001-11-16",
+            }
+        ]
+    )
+    bot, _, _ = bot_factory(fake)
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
+
+    async def _fake_guess(text: str) -> CatalogGuess:
+        assert "tovenaar" in text.lower() or "litteken" in text.lower()
+        return CatalogGuess(search_title="Harry Potter", year=2001, media_kind="movie")
+
+    monkeypatch.setattr(bot_mod, "guess_catalog_title", _fake_guess)
+
+    reply = await bot.handle_message(_message(dutch))
+
+    assert reply is not None
+    assert fake.search_calls == [("Harry Potter", 1)]
+    assert all("tovenaar" not in q.lower() for q, _ in fake.search_calls)
+    assert "Did you mean" in reply.text
+    assert fake.request_calls == []
+
+
+@pytest.mark.asyncio
+async def test_plot_guess_yes_queues_by_tmdb_media_id_nah_does_not(
+    bot_factory: Callable[..., tuple[TelegramMediaBot, TelegramStore, RecordingProgress]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hearth.telegram import bot as bot_mod
+    from hearth.telegram.intent import CatalogGuess
+
+    fake = FakeOverseerr(
+        results=[
+            {
+                "mediaType": "movie",
+                "id": 671,
+                "title": "Harry Potter and the Philosopher's Stone",
+                "releaseDate": "2001-11-16",
+            }
+        ],
+        request_result={
+            "ok": True,
+            "requestStatus": 2,
+            "mediaStatus": 3,
+            "requestId": 88,
+        },
+    )
+    bot, _, progress = bot_factory(fake)
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
+
+    async def _fake_guess(text: str) -> CatalogGuess:
+        return CatalogGuess(search_title="Harry Potter", year=2001, media_kind="movie")
+
+    monkeypatch.setattr(bot_mod, "guess_catalog_title", _fake_guess)
+
+    ask = await bot.handle_message(
+        _message("That movie with the wizard with a scar on his face")
+    )
+    assert ask is not None
+    assert fake.request_calls == []
+
+    # Reject must clear the sticky guess without posting a request.
+    nah = await bot.handle_message(_message("nah", message_id=2))
+    assert nah is not None
+    assert "not queueing" in nah.text.lower()
+    assert fake.request_calls == []
+
+    # Re-ask and confirm with yes → Overseerr request by mediaId.
+    ask2 = await bot.handle_message(
+        _message("That movie with the wizard with a scar on his face", message_id=3)
+    )
+    assert ask2 is not None
+    yes = await bot.handle_message(_message("yes", message_id=4))
+    assert yes is not None
+    assert fake.request_calls == [
+        {
+            "query": "Harry Potter and the Philosopher's Stone",
+            "media_id": 671,
+            "media_type": "movie",
+            "seasons": None,
+        }
+    ]
+    assert progress.track_calls
+
+
+@pytest.mark.asyncio
+async def test_talk_to_me_buttons_include_year_and_kind_and_keep_distinct_rows(
+    bot_factory: Callable[..., tuple[TelegramMediaBot, TelegramStore, RecordingProgress]],
+) -> None:
+    fake = FakeOverseerr(
+        results=[
+            {
+                "mediaType": "movie",
+                "id": 1009811,
+                "title": "Talk to Me",
+                "releaseDate": "2023-07-28",
+            },
+            {
+                "mediaType": "tv",
+                "id": 1405,
+                "name": "Talk to Me",
+                "firstAirDate": "2007-01-01",
+            },
+            {
+                "mediaType": "movie",
+                "id": 33339,
+                "title": "Talk to Me",
+                "releaseDate": "1984-01-01",
+            },
+            {
+                "mediaType": "movie",
+                "id": 14442,
+                "title": "Talk to Me",
+                "releaseDate": "2007-07-13",
+            },
+            {
+                "mediaType": "movie",
+                "id": 55555,
+                "title": "Talk to Me",
+                "releaseDate": "1996-01-01",
+            },
+            # True duplicate of 2023 movie — must collapse.
+            {
+                "mediaType": "movie",
+                "id": 1009811,
+                "title": "Talk to Me",
+                "releaseDate": "2023-07-28",
+            },
+        ]
+    )
+    bot, _, _ = bot_factory(fake)
+
+    reply = await bot.handle_message(_message("Talk to Me"))
+
+    assert reply is not None
+    assert fake.search_calls == [("Talk to Me", 1)]
+    keyboard = reply.reply_markup["inline_keyboard"] if reply.reply_markup else []
+    labels = [row[0]["text"] for row in keyboard]
+    assert len(labels) == 5
+    assert labels[0] == "Get 1 · Talk to Me (2023) movie"
+    assert any("(2007) TV" in label for label in labels)
+    assert any("(1984) movie" in label for label in labels)
+    assert any("(1996) movie" in label for label in labels)
+    # Every button must carry year + kind — never bare "Get N · Talk to Me".
+    for label in labels:
+        assert "(" in label and (" movie" in label or " TV" in label)
+
+
+@pytest.mark.asyncio
+async def test_land_exact_title_does_not_list_la_la_land(
+    bot_factory: Callable[..., tuple[TelegramMediaBot, TelegramStore, RecordingProgress]],
+) -> None:
+    fake = FakeOverseerr(
+        results=[
+            {
+                "mediaType": "movie",
+                "id": 313369,
+                "title": "La La Land",
+                "releaseDate": "2016-12-09",
+            },
+            {
+                "mediaType": "movie",
+                "id": 688271,
+                "title": "Land",
+                "releaseDate": "2021-02-12",
+            },
+            {
+                "mediaType": "movie",
+                "id": 9470,
+                "title": "Cop Land",
+                "releaseDate": "1997-08-15",
+            },
+        ]
+    )
+    bot, _, _ = bot_factory(fake)
+
+    reply = await bot.handle_message(_message("Land"))
+
+    assert reply is not None
+    assert "La La Land" not in reply.text
+    assert "Cop Land" not in reply.text
+    assert "Land (2021)" in reply.text
+    keyboard = reply.reply_markup["inline_keyboard"] if reply.reply_markup else []
+    assert len(keyboard) == 1
+    assert "Land (2021) movie" in keyboard[0][0]["text"]
+
+
+def test_looks_like_concrete_title_keeps_named_titles_and_rejects_plots() -> None:
+    from hearth.telegram.intent import looks_like_concrete_title
+
+    assert looks_like_concrete_title("Talk to Me")
+    assert looks_like_concrete_title("Land")
+    assert looks_like_concrete_title("Dune (2021)")
+    assert looks_like_concrete_title("Late Night with the Devil")
+    assert not looks_like_concrete_title(
+        "That movie with the wizard with a scar on his face"
+    )
+    assert not looks_like_concrete_title(
+        "Die film met de tovenaar met een litteken in zijn gezicht"
+    )
+    assert not looks_like_concrete_title("Land with robin wright")
