@@ -324,6 +324,40 @@ async def test_search_filters_people_deduplicates_ranks_and_signs_exact_results(
 
 
 @pytest.mark.asyncio
+async def test_spoken_the_movie_suffix_is_stripped_before_overseerr_search(
+    bot_factory: Callable[..., tuple[TelegramMediaBot, TelegramStore, RecordingProgress]],
+) -> None:
+    """NAS: encoded \"Talk to me, the movie\" is 200/empty; search \"Talk to me\" instead."""
+    fake = FakeOverseerr(
+        results=[
+            {
+                "mediaType": "movie",
+                "id": 1009811,
+                "title": "Talk to Me",
+                "releaseDate": "2023-07-28",
+            },
+            {
+                "mediaType": "movie",
+                "id": 550,
+                "title": "Talk Radio",
+                "releaseDate": "1988-12-21",
+            },
+        ]
+    )
+    bot, _, _ = bot_factory(fake)
+
+    reply = await bot.handle_message(_message("Talk to me, the movie"))
+
+    assert reply is not None
+    assert fake.search_calls == [("Talk to me", 1)]
+    assert "1. Talk to Me" in reply.text
+    assert reply.reply_markup is not None
+    assert reply.reply_markup["inline_keyboard"][0][0]["text"].startswith("Get 1")
+    decoded = bot._callback_codec().decode(_first_button(reply), CHAT_ID)
+    assert (decoded.media_type, decoded.tmdb_id) == ("movie", 1009811)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("query", "exact_title", "exact_id", "distractors"),
     [
