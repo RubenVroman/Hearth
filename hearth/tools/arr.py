@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -41,12 +42,38 @@ def _integer_value(value: Any) -> int | None:
     return None
 
 
+def _rewrite_host_docker_internal(url: str) -> str:
+    """Rewrite ``host.docker.internal`` to loopback for host-network containers.
+
+    Synology/Docker ``network_mode: host`` often cannot resolve
+    ``host.docker.internal`` even when compose extras_hosts would map it in
+    bridge mode. Services bound on the host are reachable at ``127.0.0.1``.
+    """
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() != "host.docker.internal":
+        return url
+    userinfo = ""
+    if parts.username is not None:
+        userinfo = parts.username
+        if parts.password is not None:
+            userinfo += f":{parts.password}"
+        userinfo += "@"
+    port = f":{parts.port}" if parts.port is not None else ""
+    return urlunsplit(
+        (parts.scheme, f"{userinfo}127.0.0.1{port}", parts.path, parts.query, parts.fragment)
+    )
+
+
 def _overseerr_base_url(value: str) -> str:
-    """Accept either the server root or a pasted ``/api/v1`` API URL."""
+    """Accept either the server root or a pasted ``/api/v1`` API URL.
+
+    Also rewrites ``host.docker.internal`` → ``127.0.0.1`` so VAULT host-network
+    containers can reach Overseerr without a .env/compose change.
+    """
     base = (value or "").strip().rstrip("/")
     if base.lower().endswith("/api/v1"):
         base = base[: -len("/api/v1")].rstrip("/")
-    return base
+    return _rewrite_host_docker_internal(base)
 
 
 def _overseerr_error(operation: str, exc: Exception) -> OverseerrError:
@@ -1317,9 +1344,10 @@ class StarrClient:
 
     @property
     def base_url(self) -> str:
+        # Same host-network trap as Overseerr: rewrite docker DNS to loopback.
         if self.kind == "radarr":
-            return settings.radarr_url.rstrip("/")
-        return settings.sonarr_url.rstrip("/")
+            return _rewrite_host_docker_internal(settings.radarr_url.rstrip("/"))
+        return _rewrite_host_docker_internal(settings.sonarr_url.rstrip("/"))
 
     @property
     def api_key(self) -> str:
