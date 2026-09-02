@@ -1,7 +1,9 @@
-"""Deterministic Overseerr-first Telegram media bot.
+"""Overseerr-first Telegram media bot.
 
-Messages only search. A signed inline button is the explicit mutation boundary,
-and every request uses the exact TMDB id and media type shown to the user.
+Obvious titles search deterministically. Plot/vibe/actor-ish asks go through a
+gpt-4o guess, then confirm via Get / yes before any Overseerr request. A signed
+inline button is the explicit mutation boundary, and every request uses the
+exact TMDB id and media type shown to the user.
 """
 
 from __future__ import annotations
@@ -16,25 +18,34 @@ from rapidfuzz import fuzz
 
 from hearth.config import settings
 from hearth.telegram.callbacks import CallbackCodec, CallbackError
+from hearth.telegram.intent import (
+    guess_catalog_title,
+    looks_like_concrete_title,
+    looks_like_confirm_no,
+    looks_like_confirm_yes,
+)
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
 from hearth.telegram.parse import parse_message
 from hearth.telegram.progress import (
     ProgressTracker,
+    format_guess_confirm,
     format_reject_download,
     matching_request_row,
 )
 from hearth.telegram.safeguards import RateLimiter, authorized
 from hearth.telegram.store import TelegramStore
-from hearth.tools.arr import OverseerrError, overseerr
+from hearth.tools.arr import OverseerrError, overseerr, title_seed_matches
 
 log = logging.getLogger("hearth.telegram")
 
 MAX_RESULTS = 5
 HELP_TEXT = (
-    "Send a movie or series title and I’ll search Overseerr. Add a year or season "
-    "to narrow it, for example Dune (2021) or Severance S02. Tap Get on the exact "
+    "Send a movie or series title and I’ll search Overseerr. Describe a plot or "
+    "vibe and I’ll guess, then ask before requesting. Add a year or season to "
+    "narrow it, for example Dune (2021) or Severance S02. Tap Get on the exact "
     "match to request it. Commands: /search <title>, /status, /help."
 )
+_PENDING_GUESS_PREFIX = "guess:"
 
 _STATUS_MARKS = {
     1: "○ Not requested",
@@ -48,6 +59,8 @@ _STATUS_MARKS = {
     6: "◇ Blocklisted or deleted",
     7: "○ Removed",
 }
+
+
 def _integer(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -64,6 +77,22 @@ def _normalized(value: str) -> str:
 def _display_title(title: str, year: int | None = None) -> str:
     clean = (title or "").strip() or "that title"
     return f"{clean} ({year})" if year else clean
+
+
+def _kind_label(media_type: str) -> str:
+    return "movie" if media_type == "movie" else "TV"
+
+
+def _button_label(
+    index: int,
+    hit: MediaHit,
+    *,
+    season: int | None = None,
+) -> str:
+    year_bit = f" ({hit.year})" if hit.year is not None else ""
+    season_bit = f" S{season:02d}" if season is not None else ""
+    # Telegram shows ~64 visible chars; keep index + title + year + kind.
+    return f"Get {index} · {hit.title}{year_bit} {_kind_label(hit.media_type)}{season_bit}"
 
 
 class TelegramMediaBot:
@@ -117,14 +146,62 @@ class TelegramMediaBot:
             bot_user_id=self.bot_user_id,
         )
 
+    @staticmethod
+    def _pending_key(chat_id: int) -> str:
+        return f"{_PENDING_GUESS_PREFIX}{int(chat_id)}"
+
+    def _get_pending_guess(self, chat_id: int) -> dict[str, Any] | None:
+        payload = self.store.get_callback_media(self._pending_key(chat_id))
+        if not payload:
+            return None
+        media_type = str(payload.get("media_type") or "").lower()
+        tmdb_id = _integer(payload.get("tmdb_id"))
+        title = str(payload.get("title") or "").strip()
+        if media_type not in {"movie", "tv"} or tmdb_id is None or not title:
+            self._clear_pending_guess(chat_id)
+            return None
+        return payload
+
+    def _set_pending_guess(self, chat_id: int, hit: MediaHit, *, season: int | None) -> None:
+        ttl = max(60, int(settings.telegram_callback_ttl_seconds))
+        self.store.put_callback_media(
+            self._pending_key(chat_id),
+            {
+                "chat_id": chat_id,
+                "media_type": hit.media_type,
+                "tmdb_id": hit.tmdb_id,
+                "title": hit.title,
+                "year": hit.year,
+                "season": season,
+            },
+            ttl_s=ttl,
+        )
+
+    def _clear_pending_guess(self, chat_id: int) -> None:
+        self.store.clear_callback_media(self._pending_key(chat_id))
+
     async def handle_message(self, message: dict[str, Any]) -> BotReply | None:
-        view, query = parse_message(
+        view = MessageView.from_telegram(message)
+        if view is None or not self._authorized(view.chat_id, view.user_id):
+            return None
+
+        pending = self._get_pending_guess(view.chat_id)
+        if pending is not None and looks_like_confirm_yes(view.text):
+            return await self._queue_pending_guess(view, pending)
+        if pending is not None and looks_like_confirm_no(view.text):
+            self._clear_pending_guess(view.chat_id)
+            return BotReply("Okay — not queueing that. Send another title or description.")
+        if pending is None and (
+            looks_like_confirm_yes(view.text) or looks_like_confirm_no(view.text)
+        ):
+            # Bare yes/nah/no without an on-screen guess must never invent a queue.
+            return None
+
+        _, query = parse_message(
             message,
             max_length=max(20, int(settings.telegram_max_title_length)),
             bot_user_id=self.bot_user_id,
         )
-        if view is None or not self._authorized(view.chat_id, view.user_id):
-            return None
         # Durable update ids in TelegramStore own transport deduplication. Do
         # not mark a message seen before its reply has actually been delivered:
         # a transient send failure must be able to replay the search.
@@ -143,6 +220,18 @@ class TelegramMediaBot:
         if not self.rate.allow(rate_key):
             wait = max(1, math.ceil(self.rate.retry_after(rate_key)))
             return BotReply(f"Too many searches. Try again in about {wait} seconds.")
+
+        # New search/guess replaces any sticky yes/no offer.
+        self._clear_pending_guess(view.chat_id)
+
+        # Plot/vibe/actor-ish natural language → gpt-4o guess, never literal
+        # Overseerr search of the description. Exact titles keep the Codex path.
+        if (
+            query.tmdb_id is None
+            and query.reason == "title"
+            and not looks_like_concrete_title(query.raw_text or query.title)
+        ):
+            return await self._guess_reply(view, query)
         return await self._search_reply(view, query)
 
     async def _status_reply(self) -> BotReply:
@@ -191,6 +280,168 @@ class TelegramMediaBot:
                 "with an optional numeric season such as S02."
             )
         return format_reject_download()
+
+    async def _guess_reply(self, view: MessageView, query: MediaQuery) -> BotReply:
+        """Resolve a descriptive ask via gpt-4o, then confirm — never auto-queue."""
+        if not self.backend_configured:
+            return BotReply(
+                "Overseerr is not configured, so I cannot run a real catalog search."
+            )
+        if not settings.openai_configured:
+            return BotReply(
+                "That sounds like a description. Send the movie or series title "
+                "(or configure OpenAI so I can guess)."
+            )
+
+        guess = await guess_catalog_title(query.raw_text or query.title)
+        if guess is None or not guess.search_title.strip():
+            return BotReply(
+                "I’m not sure which title you mean. Send the movie or series name."
+            )
+
+        guessed = MediaQuery(
+            action="search",
+            media_type=guess.media_kind if guess.media_kind in {"movie", "tv"} else None,
+            title=guess.search_title,
+            year=guess.year,
+            reason="guess",
+            raw_text=query.raw_text,
+        )
+        try:
+            rows = await self._search_rows(guessed)
+        except OverseerrError as exc:
+            if exc.operation == "authentication" or exc.status_code in {401, 403}:
+                return BotReply(
+                    "Overseerr rejected its configured API key. Fix the key or its "
+                    "request permissions before searching again."
+                )
+            return BotReply(
+                "Overseerr search is unavailable right now. This is a backend error, "
+                "not a catalog miss."
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("telegram guess search failed")
+            return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
+
+        hits = self._rank_hits(rows, guessed)
+        if not hits:
+            label = _display_title(guess.search_title, guess.year)
+            return BotReply(
+                f"Did you mean {label}? I couldn’t find it in Overseerr yet. "
+                "Send the exact title or a TMDB link."
+            )
+        return self._results_reply(
+            view.chat_id,
+            guessed,
+            hits,
+            header=(
+                format_guess_confirm(hits[0].title, hits[0].year)
+                if len(hits) == 1
+                else f"Which one for “{guess.search_title}”?"
+            ),
+            remember_single_guess=True,
+        )
+
+    async def _queue_pending_guess(
+        self,
+        view: MessageView,
+        pending: Mapping[str, Any],
+    ) -> BotReply:
+        """Queue the single on-screen guess after an explicit yes — never on nah/no."""
+        media_type = str(pending.get("media_type") or "").lower()
+        tmdb_id = _integer(pending.get("tmdb_id"))
+        title = str(pending.get("title") or "").strip()
+        year = _integer(pending.get("year"))
+        season = _integer(pending.get("season"))
+        if media_type not in {"movie", "tv"} or tmdb_id is None or not title:
+            self._clear_pending_guess(view.chat_id)
+            return BotReply("That guess expired. Search again.")
+
+        label = _display_title(title, year)
+        if season is not None:
+            label = f"{label} · Season {season}"
+        seasons: list[int] | str | None = None
+        if media_type == "tv":
+            seasons = [season] if season is not None else "all"
+
+        try:
+            result = await self.overseerr.request(
+                query=title,
+                media_id=tmdb_id,
+                media_type=media_type,
+                seasons=seasons,
+            )
+        except OverseerrError:
+            return BotReply(
+                f"The request outcome for {label} is uncertain because Overseerr did "
+                "not answer. Check Overseerr before trying again."
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("telegram pending-guess request failed")
+            return BotReply(
+                f"The request outcome for {label} is uncertain. Check Overseerr before "
+                "trying again."
+            )
+
+        self._clear_pending_guess(view.chat_id)
+        if not result.get("ok"):
+            return BotReply(self._request_error_text(label, result))
+
+        request_status = _integer(result.get("requestStatus"))
+        media_status = _integer(result.get("mediaStatus"))
+        request_id = _integer(result.get("requestId"))
+        state, text = self._accepted_text(
+            label,
+            request_status=request_status,
+            media_status=media_status,
+        )
+        season_key = "all" if season is None else str(season)
+        media_key = f"{media_type}:{tmdb_id}:{season_key}"
+        request_key = f"{view.chat_id}:{media_key}"
+        durable_state = (
+            "pending" if request_status == 2 and media_status != 5 else state
+        )
+        try:
+            self.store.upsert_request(
+                request_key,
+                media_type=media_type,
+                tmdb_id=tmdb_id,
+                title=title,
+                season=season,
+                external_request_id=request_id,
+                state=durable_state,
+                metadata={
+                    "chat_id": view.chat_id,
+                    "year": year,
+                    "request_status": request_status,
+                    "media_status": media_status,
+                    "tracked": None,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("failed to journal yes-confirmed Overseerr request")
+            return BotReply(
+                f"Overseerr accepted {label}, but Hearth could not save its local "
+                "tracking state. Check Overseerr before trying again."
+            )
+
+        if durable_state == "pending" and request_status == 2:
+            try:
+                self.progress.track(
+                    view.chat_id,
+                    title,
+                    "radarr" if media_type == "movie" else "sonarr",
+                    year,
+                    season=season,
+                    tmdb_id=tmdb_id,
+                    media_type=media_type,
+                    request_id=request_id,
+                    request_key=request_key,
+                    request_status=request_status,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("failed to attach tracker after yes-confirm")
+        return BotReply(text)
 
     async def _search_reply(self, view: MessageView, query: MediaQuery) -> BotReply:
         if not self.backend_configured:
@@ -280,6 +531,16 @@ class TelegramMediaBot:
             hits.append(hit)
 
         asked = _normalized(query.title)
+        # Short exact titles must not become substring menus (Land→La La Land).
+        if asked and looks_like_concrete_title(query.title):
+            seeded = [
+                hit
+                for hit in hits
+                if title_seed_matches(query.title, hit.title)
+                or title_seed_matches(query.title, hit.original_title)
+            ]
+            if seeded:
+                hits = seeded
 
         def score(hit: MediaHit) -> float:
             title = _normalized(hit.title)
@@ -306,11 +567,15 @@ class TelegramMediaBot:
         chat_id: int,
         query: MediaQuery,
         hits: list[MediaHit],
+        *,
+        header: str | None = None,
+        remember_single_guess: bool = False,
     ) -> BotReply:
-        lines = [f"Overseerr results for “{query.display_label()}”:"]
+        lines = [header or f"Overseerr results for “{query.display_label()}”:"]
         buttons: list[list[dict[str, str]]] = []
         codec = self._callback_codec()
         ttl = max(60, int(settings.telegram_callback_ttl_seconds))
+        requestable: list[tuple[MediaHit, int | None]] = []
         for index, hit in enumerate(hits, start=1):
             status = _STATUS_MARKS.get(hit.media_status, "○ Not requested")
             lines.append(f"{index}. {hit.display_label()} — {status}")
@@ -341,13 +606,17 @@ class TelegramMediaBot:
                 },
                 ttl_s=ttl,
             )
-            season_bit = f" S{season:02d}" if season is not None else ""
-            label = f"Get {index} · {hit.title}{season_bit}"
+            label = _button_label(index, hit, season=season)
             buttons.append(
-                [{"text": label[:60], "callback_data": callback_data}]
+                [{"text": label[:64], "callback_data": callback_data}]
             )
-        if buttons:
-            lines.append("Tap the exact title to request it.")
+            requestable.append((hit, season))
+        if remember_single_guess and len(requestable) == 1:
+            hit, season = requestable[0]
+            self._set_pending_guess(chat_id, hit, season=season)
+            lines.append("Tap Get to request it, or reply yes / nah.")
+        elif buttons:
+            lines.append("Tap Get on the exact title to request it.")
         else:
             lines.append("Everything shown is already handled or unavailable.")
         return BotReply(
@@ -370,6 +639,9 @@ class TelegramMediaBot:
         user_id = _integer(sender.get("id"))
         if not self._authorized(chat_id, user_id):
             return None
+
+        # A Get tap is the confirm — drop any sticky yes/nah offer for this chat.
+        self._clear_pending_guess(chat_id)
 
         data = str(callback.get("data") or "")
         try:
