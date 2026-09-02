@@ -175,3 +175,23 @@ def test_invalid_or_overlong_tmdb_ids_are_rejected(text: str) -> None:
 
     assert parsed.action == "reject"
     assert parsed.reason == "invalid_tmdb_id"
+
+
+@pytest.mark.parametrize(
+    ("text", "title", "media_type"),
+    [
+        ("Talk to me, the movie", "Talk to me", "movie"),
+        ("Late night with the devil", "Late night with the devil", None),
+        ("Back to the future", "Back to the future", None),
+    ],
+)
+def test_vault_horror_and_classic_titles_parse_cleanly(
+    text: str,
+    title: str,
+    media_type: str | None,
+) -> None:
+    parsed = parse_message_text(text)
+
+    assert parsed.action == "search"
+    assert parsed.title == title
+    assert parsed.media_type == media_type

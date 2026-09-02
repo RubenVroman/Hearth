@@ -242,7 +242,11 @@ class TelegramMediaBot:
                 media["tmdbId"] = query.tmdb_id
             return [media]
 
-        payload = await self.overseerr.search(query.title, page=1)
+        title = (query.title or "").strip()
+        if len(title) < 2 or not any(character.isalnum() for character in title):
+            return []
+
+        payload = await self.overseerr.search(title, page=1)
         if not payload.get("ok"):
             if payload.get("reason") == "authentication_failed":
                 raise OverseerrError(

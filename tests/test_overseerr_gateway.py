@@ -13,6 +13,7 @@ from hearth.tools.arr import (
     OverseerrError,
     StarrClient,
     _overseerr_base_url,
+    _overseerr_search_path,
     _rewrite_host_docker_internal,
 )
 
@@ -181,6 +182,9 @@ async def test_search_after_host_rewrite_returns_rows(
     titles = [row["title"] for row in result["results"]]
     assert titles == ["Talk to Me", "Late Night with the Devil"]
     assert seen and dict(seen[0].url.params) == {"query": "Talk to Me", "page": "1"}
+    assert "Talk%20to%20Me" in str(seen[0].url)
+    assert "Talk+to" not in str(seen[0].url)
+    assert "%2520" not in str(seen[0].url)
 
 
 @pytest.mark.asyncio
@@ -248,7 +252,7 @@ async def test_search_normalizes_official_payload_and_sends_page_one(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [401, 500])
+@pytest.mark.parametrize("status_code", [400, 401, 500])
 async def test_configured_search_failure_never_falls_back_to_mock(
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
@@ -511,3 +515,174 @@ async def test_person_search_keeps_late_person_rows_and_uses_combined_credits(
     assert credits["cast"][0]["title"] == "Forrest Gump"
     search = next(request for request in seen if request.url.path == "/api/v1/search")
     assert dict(search.url.params) == {"query": "tom hanks", "page": "1"}
+    assert "tom%20hanks" in str(search.url)
+    assert "tom+hanks" not in str(search.url)
+    assert "%2520" not in str(search.url)
+
+
+def test_overseerr_search_path_quotes_reserved_chars_without_double_encoding() -> None:
+    path = _overseerr_search_path("Talk to me, the movie", page=1)
+    assert path.startswith("/api/v1/search?")
+    assert "query=Talk%20to%20me%2C%20the%20movie" in path
+    assert "page=1" in path
+    assert "+" not in path
+    assert "%2520" not in path
+    assert "%252C" not in path
+    # Space-only titles use %20, never +.
+    spaced = _overseerr_search_path("Back to the future", page=1)
+    assert "query=Back%20to%20the%20future" in spaced
+    assert "Back+to" not in spaced
+    assert "%2520" not in spaced
+
+
+@pytest.mark.asyncio
+async def test_search_comma_title_sends_percent2c_on_the_wire_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seerr 3.4.1 400s on raw reserved chars; quoted commas must reach the wire."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raw = request.url.raw_path.decode("ascii")
+        # Fail the test early if we accidentally form-encoded or double-encoded.
+        assert "," not in raw.split("?", 1)[-1].replace("%2C", "")
+        assert "+" not in raw
+        assert "%2520" not in raw
+        assert "%2C" in raw
+        assert "Talk%20to%20me%2C%20the%20movie" in raw
+        return httpx.Response(
+            200,
+            json={
+                "page": 1,
+                "totalPages": 1,
+                "totalResults": 1,
+                "results": [
+                    {
+                        "id": 1009811,
+                        "mediaType": "movie",
+                        "title": "Talk to Me",
+                        "releaseDate": "2023-07-28",
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(settings, "overseerr_url", "http://overseerr.test")
+    monkeypatch.setattr(settings, "overseerr_api_key", "configured-live-key")
+    monkeypatch.setattr(settings, "mock_if_unconfigured", True)
+    real_client = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs = {**kwargs, "transport": httpx.MockTransport(handler)}
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    gateway = Overseerr()
+    try:
+        result = await gateway.search("Talk to me, the movie")
+    finally:
+        await gateway.aclose()
+
+    assert result["ok"] is True
+    assert result["results"][0]["title"] == "Talk to Me"
+    assert dict(seen[0].url.params) == {
+        "query": "Talk to me, the movie",
+        "page": "1",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "title",
+    ["Talk to Me", "Late night with the devil", "Back to the future"],
+)
+async def test_search_space_titles_use_percent20_not_plus(
+    monkeypatch: pytest.MonkeyPatch,
+    title: str,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raw = request.url.raw_path.decode("ascii")
+        assert "+" not in raw
+        assert "%20" in raw
+        assert "%2520" not in raw
+        return httpx.Response(
+            200,
+            json={"page": 1, "totalPages": 1, "totalResults": 0, "results": []},
+        )
+
+    monkeypatch.setattr(settings, "overseerr_url", "http://overseerr.test")
+    monkeypatch.setattr(settings, "overseerr_api_key", "configured-live-key")
+    monkeypatch.setattr(settings, "mock_if_unconfigured", True)
+
+    async def _probe(*, force: bool = False) -> dict[str, Any]:
+        return {"ok": True, "status": "available"}
+
+    real_client = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs = {**kwargs, "transport": httpx.MockTransport(handler)}
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    gateway = Overseerr()
+    gateway.provider_probe = _probe  # type: ignore[method-assign]
+    try:
+        result = await gateway.search(title)
+    finally:
+        await gateway.aclose()
+
+    assert result["ok"] is True
+    assert seen and dict(seen[0].url.params)["query"] == title
+
+
+@pytest.mark.asyncio
+async def test_empty_search_query_does_not_hit_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    gateway, http = _live_gateway(monkeypatch, handler)
+    try:
+        result = await gateway.search("  ")
+    finally:
+        await gateway.aclose()
+
+    assert result["ok"] is True
+    assert result["results"] == []
+    assert result.get("reason") == "empty_query"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_http_400_is_overseerr_error_not_catalog_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "message": (
+                    "Parameter 'query' must be url encoded. "
+                    "Its value may not contain reserved characters."
+                )
+            },
+        )
+
+    gateway, http = _live_gateway(monkeypatch, handler)
+    try:
+        with pytest.raises(OverseerrError) as raised:
+            await gateway.search("Talk to Me")
+    finally:
+        await gateway.aclose()
+
+    assert raised.value.operation == "search"
+    assert raised.value.status_code == 400

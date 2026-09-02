@@ -68,6 +68,12 @@ _EPISODE_TOKEN = re.compile(
 )
 _MOVIE_HINT_PREFIX = re.compile(r"^(?:movie|film)(?:\s*[:\-–—]\s*|\s+)", re.IGNORECASE)
 _MOVIE_HINT_SUFFIX = re.compile(r"\s+(?:movie|film)\s*$", re.IGNORECASE)
+# Only clear trailing disambiguators ("Talk to me, the movie" / "Dune the film").
+# Do not strip bare "movie"/"Movie 43"/"The Movie" — those are real titles.
+_MOVIE_DISAMBIG_SUFFIX = re.compile(
+    r"(?:,\s*(?:the\s+)?(?:movie|film)|\s+the\s+(?:movie|film))\s*$",
+    re.IGNORECASE,
+)
 _MOVIE_SEASON_CONTRADICTION = re.compile(
     r"(?:"
     r"^(?:movie|film)(?:\s*[:\-–—]\s*|\s+).+\s+"
@@ -224,6 +230,14 @@ def _extract_title_parts(
     if year_match:
         title = _clean_title(year_match.group("title"))
         year = int(year_match.group("year"))
+
+    # Trailing ", the movie" / " the film" after year/type handling.
+    disambig = _MOVIE_DISAMBIG_SUFFIX.search(title)
+    if disambig:
+        stripped = _clean_title(_MOVIE_DISAMBIG_SUFFIX.sub("", title))
+        title = stripped
+        if stripped:
+            media_type = media_type or "movie"
 
     return title, year, season, episode, media_type
 

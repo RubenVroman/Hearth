@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -15,6 +15,29 @@ from hearth.config import settings
 from hearth.fixtures import pipeline
 
 log = logging.getLogger("hearth.arr")
+
+
+def _overseerr_search_path(query: str, *, page: int = 1) -> str:
+    """Build ``GET /api/v1/search`` with RFC3986 quoting — never httpx ``params=``.
+
+    Jellyseerr/Seerr 3.4.1 OpenAPI validation inspects the *raw* query string and
+    returns HTTP 400 ("Parameter 'query' must be url encoded. Its value may not
+    contain reserved characters.") when spaces are ``+`` or commas/other
+    reserved chars appear unencoded (seerr#523). httpx ``params=`` form-encodes
+    spaces as ``+``. Quote with ``safe=''`` and embed in the path so the wire
+    has ``%20`` / ``%2C`` only — never quote *and* pass ``params=`` (that
+    double-encodes to ``%2520``).
+    """
+    try:
+        page_i = max(1, int(page))
+    except (TypeError, ValueError):
+        page_i = 1
+    return f"/api/v1/search?query={quote(query, safe='')}&page={page_i}"
+
+
+def _usable_overseerr_query(query: str) -> bool:
+    text = (query or "").strip()
+    return len(text) >= 2 and any(character.isalnum() for character in text)
 
 
 class OverseerrError(RuntimeError):
@@ -2808,6 +2831,21 @@ class Overseerr:
             page_i = max(1, int(page))
         except (TypeError, ValueError):
             page_i = 1
+        if not _usable_overseerr_query(query):
+            # Empty/garbage after parse must never hit /search (required query
+            # + OpenAPI 400s). Treat as a quiet catalog miss, not a backend error.
+            return {
+                "ok": True,
+                "mode": "live" if self.live else "mock",
+                "service": "overseerr",
+                "query": query,
+                "page": page_i,
+                "totalPages": 1,
+                "totalResults": 0,
+                "providerOk": True,
+                "results": [],
+                "reason": "empty_query",
+            }
         if not self.live:
             rows = pipeline.search_overseerr(query)
             return {
@@ -2823,12 +2861,8 @@ class Overseerr:
             }
         client = await self._http()
         try:
-            # Explicit page=1 is compatible with both archived Overseerr and
-            # current Seerr and avoids relying on OpenAPI default injection.
-            response = await client.get(
-                "/api/v1/search",
-                params={"query": query, "page": page_i},
-            )
+            # Never use httpx params= here — Seerr 3.4.1 rejects '+' / raw reserved.
+            response = await client.get(_overseerr_search_path(query, page=page_i))
             response.raise_for_status()
             payload = _required_json_object(response, "search")
             rows = _validate_search_payload(payload)
@@ -3346,15 +3380,21 @@ class Overseerr:
                 "query": query,
                 "results": pipeline.search_person(query),
             }
+        if not _usable_overseerr_query(query):
+            return {
+                "ok": True,
+                "mode": "live",
+                "service": "overseerr",
+                "query": query,
+                "results": [],
+                "reason": "empty_query",
+            }
         client = await self._http()
         try:
-            # Same endpoint as Overseerr.search / the UI — query only.
+            # Same endpoint as Overseerr.search — quoted path, never params=.
             # Scan the full first page (typically 20) before truncating so a
             # person ranked after several title hits is not dropped.
-            response = await client.get(
-                "/api/v1/search",
-                params={"query": query, "page": 1},
-            )
+            response = await client.get(_overseerr_search_path(query, page=1))
             response.raise_for_status()
             payload = response.json() or {}
             raw_rows = list(payload.get("results") or [])
@@ -3366,10 +3406,7 @@ class Overseerr:
             except (TypeError, ValueError):
                 total_pages = 1
             if not people and total_pages > 1:
-                response2 = await client.get(
-                    "/api/v1/search",
-                    params={"query": query, "page": 2},
-                )
+                response2 = await client.get(_overseerr_search_path(query, page=2))
                 response2.raise_for_status()
                 payload2 = response2.json() or {}
                 people = self._people_from_search_rows(
