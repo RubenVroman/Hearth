@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 from typing import Any, AsyncIterator
 
@@ -13,8 +12,6 @@ from hearth.memory import store as memory_store
 from hearth.memory.summarize import maybe_summarize
 from hearth.runtime import runtime
 from hearth import widgets as widget_bus
-
-log = logging.getLogger("hearth.agent")
 
 MAX_TURNS = 8
 
