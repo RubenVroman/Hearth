@@ -17,6 +17,7 @@ from typing import Any
 from rapidfuzz import fuzz
 
 from hearth.config import settings
+from hearth.jev import evaluate_message, log_shadow_outcome, noul_high
 from hearth.telegram.callbacks import CallbackCodec, CallbackError
 from hearth.telegram.intent import (
     guess_catalog_title,
@@ -186,14 +187,49 @@ class TelegramMediaBot:
             return None
 
         pending = self._get_pending_guess(view.chat_id)
-        if pending is not None and looks_like_confirm_yes(view.text):
+        regex_yes = looks_like_confirm_yes(view.text)
+        regex_no = looks_like_confirm_no(view.text)
+
+        # Optional Jev gate: help detect confirm/cancel when a guess is pending.
+        # Never invent a queue without a pending guess (Overseerr confirm product rule).
+        jev_verdict = None
+        if pending is not None and settings.jev_enabled:
+            jev_verdict = await evaluate_message(view.text)
+            log_shadow_outcome(
+                jev_verdict,
+                channel="telegram",
+                tools=[],
+                outcome=(
+                    "regex_yes"
+                    if regex_yes
+                    else "regex_no"
+                    if regex_no
+                    else "pending_guess"
+                ),
+            )
+            if jev_verdict.enforcing and jev_verdict.ok:
+                if noul_high(
+                    jev_verdict.answers,
+                    "is_cancel",
+                    settings.jev_cancel_threshold,
+                ):
+                    self._clear_pending_guess(view.chat_id)
+                    return BotReply(
+                        "Okay — not queueing that. Send another title or description."
+                    )
+                if noul_high(
+                    jev_verdict.answers,
+                    "is_confirm",
+                    settings.jev_confirm_threshold,
+                ):
+                    return await self._queue_pending_guess(view, pending)
+
+        if pending is not None and regex_yes:
             return await self._queue_pending_guess(view, pending)
-        if pending is not None and looks_like_confirm_no(view.text):
+        if pending is not None and regex_no:
             self._clear_pending_guess(view.chat_id)
             return BotReply("Okay — not queueing that. Send another title or description.")
-        if pending is None and (
-            looks_like_confirm_yes(view.text) or looks_like_confirm_no(view.text)
-        ):
+        if pending is None and (regex_yes or regex_no):
             # Bare yes/nah/no without an on-screen guess must never invent a queue.
             return None
 

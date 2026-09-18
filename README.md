@@ -109,6 +109,10 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HEARTH_COS_WEBHOOK` | **Live** Chief of Staff POST. Empty → tool returns “not configured” (not fake success). |
 | `HEARTH_COS_WEBHOOK_KEY` | Optional. Sent as `Authorization: Bearer <key>`. |
 | `HEARTH_COS_REPO` | Default `RubenVroman/Hearth`. |
+| `TYPESAFE_API_KEY` | Optional. TypeSafe Jev (System One) decision gate. Host `.env` only — never log. See [docs/jev.md](docs/jev.md). |
+| `HEARTH_JEV_ENABLED` | Default `false`. When true, run one System One call before the agent tool loop. |
+| `HEARTH_JEV_SHADOW` | Default `true`. Log Jev answers without enforcing. Set `false` only after reviewing shadow logs. |
+| `HEARTH_JEV_MODEL` | Default `jev-latest` (pin a versioned id once thresholds are tuned). |
 | `DOCKER_SOCKET` | Read-only socket is mounted. If missing → mocked container list (plex/sonarr/…/gluetun). |
 | `WORKSPACE_PATH` | Inside the container, `/app/workspace`. |
 | `HEARTH_MOCK_IF_UNCONFIGURED` | Default `true`. Fixtures are used only when a backend is unconfigured. A configured live HA failure is never turned into fake success. |
@@ -403,9 +407,11 @@ confirmation for those UI paths. Auth / house-token gating is unchanged.
 
 ```
 hearth/          FastAPI runtime, agent loop, tools, voice gateway, house memory
+hearth/jev/      TypeSafe Jev (System One) decision gate — see docs/jev.md
 hearth/ui/       Static command center (no Node build)
 workspace/       Sandboxed files + skills
 ha/              Home Assistant config (onboarding still required)
+docs/            Operator notes (Jev sandbox, …)
 data/            Auth + memory SQLite (compose bind-mount; gitignores *.db)
 docker-compose.yml
 Dockerfile
