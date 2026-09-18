@@ -45,6 +45,13 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "telegram_user_ids", "")
     monkeypatch.setattr(settings, "telegram_poll", True)
     monkeypatch.setattr(settings, "telegram_db_path", tmp_path / "hearth-telegram.db")
+    monkeypatch.setattr(settings, "typesafe_api_key", "")
+    monkeypatch.setattr(settings, "jev_enabled", False)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "jev_model", "jev-latest")
+    monkeypatch.setattr(settings, "jev_domain_confidence", 0.72)
+    monkeypatch.setattr(settings, "jev_cancel_threshold", 0.78)
+    monkeypatch.setattr(settings, "jev_confirm_threshold", 0.78)
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
     monkeypatch.setattr(settings, "memory_db_path", tmp_path / "hearth-memory.db")
     monkeypatch.setattr(settings, "memory_enabled", True)
@@ -103,6 +110,9 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from hearth.telegram import telegram_inbox
 
     telegram_inbox.reset()
+    from hearth.jev import reset_client
+
+    reset_client()
     from hearth.memory.store import init_memory_db, reset_memory
 
     reset_memory()

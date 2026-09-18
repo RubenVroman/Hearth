@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator
 from hearth.agent.prompts import SYSTEM_PROMPT, compose_system_prompt_async
 from hearth.agent.registry import ToolRegistry, registry
 from hearth.config import settings
+from hearth.jev import evaluate_message, log_shadow_outcome
 from hearth.memory import store as memory_store
 from hearth.memory.summarize import maybe_summarize
 from hearth.runtime import runtime
@@ -28,6 +29,7 @@ class AgentLoop:
         runtime.note("user", user_text)
         widget_bus.start_turn(user_text)
         text = user_text.strip()
+        jev_verdict = None
         try:
             if confirm and runtime.pending is not None:
                 pending = runtime.pending
@@ -48,9 +50,77 @@ class AgentLoop:
                 out["widgets"] = runtime.list_widgets()
                 return out
 
+            # Cheap typed gate before OpenAI / local tool routing (shadow by default).
+            recent = [
+                line.text
+                for line in list(runtime.transcript)[-4:]
+                if getattr(line, "role", "") in {"user", "assistant"} and line.text
+            ]
+            jev_verdict = await evaluate_message(text, recent=recent)
+            if jev_verdict.action == "block_cancel":
+                reply = (
+                    "Okay — I won't queue or run that. Say what you'd like instead, "
+                    "or confirm explicitly if you meant to proceed."
+                )
+                runtime.note("assistant", reply)
+                out = {
+                    "reply": reply,
+                    "mode": "jev_cancel",
+                    "tools": [],
+                    "jev": jev_verdict.as_log_dict(),
+                }
+                await _after_turn(text, out, channel="chat")
+                log_shadow_outcome(
+                    jev_verdict,
+                    channel="chat",
+                    tools=[],
+                    outcome="blocked_cancel",
+                )
+                runtime.set_status("idle")
+                widget_bus.finish_turn(ok=True, detail="Cancelled (Jev).")
+                out["widgets"] = runtime.list_widgets()
+                return out
+            if jev_verdict.action == "escalate_cos":
+                result = await self.tools.call(
+                    "chief_of_staff",
+                    {"task": text, "said": text, "repo": settings.cos_repo},
+                )
+                used = [result.as_dict()]
+                reply = _format_tool_reply(used)
+                runtime.note("assistant", reply)
+                out = {
+                    "reply": reply,
+                    "mode": "jev_cos",
+                    "tools": used,
+                    "jev": jev_verdict.as_log_dict(),
+                }
+                await _after_turn(text, out, channel="chat")
+                log_shadow_outcome(
+                    jev_verdict,
+                    channel="chat",
+                    tools=["chief_of_staff"],
+                    outcome="escalated_cos",
+                )
+                runtime.set_status("idle")
+                widget_bus.finish_turn(ok=True, detail="Escalated (Jev).")
+                out["widgets"] = runtime.list_widgets()
+                return out
+
             if settings.openai_configured:
                 try:
                     out = await self._run_openai(text)
+                    if jev_verdict is not None:
+                        out["jev"] = jev_verdict.as_log_dict()
+                        log_shadow_outcome(
+                            jev_verdict,
+                            channel="chat",
+                            tools=[
+                                str(t.get("name") or "")
+                                for t in (out.get("tools") or [])
+                                if isinstance(t, dict)
+                            ],
+                            outcome=str(out.get("mode") or "openai"),
+                        )
                     await _after_turn(text, out, channel="chat")
                     runtime.set_status("idle")
                     widget_bus.finish_turn(ok=True, detail="Done.")
@@ -61,6 +131,18 @@ class AgentLoop:
                     runtime.flash_error("Model call failed")
 
             out = await self._run_local(text)
+            if jev_verdict is not None:
+                out["jev"] = jev_verdict.as_log_dict()
+                log_shadow_outcome(
+                    jev_verdict,
+                    channel="chat",
+                    tools=[
+                        str(t.get("name") or "")
+                        for t in (out.get("tools") or [])
+                        if isinstance(t, dict)
+                    ],
+                    outcome=str(out.get("mode") or "local"),
+                )
             await _after_turn(text, out, channel="chat")
             runtime.set_status("idle")
             widget_bus.finish_turn(ok=True, detail="Done.")

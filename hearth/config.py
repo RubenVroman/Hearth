@@ -202,9 +202,40 @@ class Settings(BaseSettings):
         alias="TELEGRAM_DB_PATH",
     )
 
+    # TypeSafe Jev (System One) — cheap typed decision gate before gpt/tools.
+    # Off by default. When enabled, shadow mode logs only (does not enforce).
+    # API key stays on the VAULT host .env; never log it.
+    typesafe_api_key: str = Field(default="", alias="TYPESAFE_API_KEY")
+    jev_enabled: bool = Field(default=False, alias="HEARTH_JEV_ENABLED")
+    jev_shadow: bool = Field(default=True, alias="HEARTH_JEV_SHADOW")
+    # Pin with e.g. jev-1.13.0 once thresholds are tuned; alias moves with releases.
+    jev_model: str = Field(default="jev-latest", alias="HEARTH_JEV_MODEL")
+    jev_domain_confidence: float = Field(
+        default=0.72,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_DOMAIN_CONFIDENCE",
+    )
+    jev_cancel_threshold: float = Field(
+        default=0.78,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_CANCEL_THRESHOLD",
+    )
+    jev_confirm_threshold: float = Field(
+        default=0.78,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_CONFIRM_THRESHOLD",
+    )
+
     @property
     def openai_configured(self) -> bool:
         return bool(self.openai_api_key.strip())
+
+    @property
+    def typesafe_configured(self) -> bool:
+        return bool(self.typesafe_api_key.strip())
 
     @property
     def openai_admin_configured(self) -> bool:

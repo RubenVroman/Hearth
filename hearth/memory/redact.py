@@ -27,6 +27,7 @@ _ASSIGN_KEYS = (
     "THUISBEZORGD_API_KEY",
     "THUISBEZORGD_PASSWORD",
     "THUISBEZORGD_SESSION_TOKEN",
+    "TYPESAFE_API_KEY",
 )
 
 _LIVE_ATTRS = (
@@ -47,6 +48,7 @@ _LIVE_ATTRS = (
     "thuisbezorgd_api_key",
     "thuisbezorgd_password",
     "thuisbezorgd_session_token",
+    "typesafe_api_key",
 )
 
 Replacement = str | Callable[[Match[str]], str]
