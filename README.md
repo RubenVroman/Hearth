@@ -455,7 +455,7 @@ Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve →
 
 ## Telegram media bot
 
-A dedicated house Telegram group can search and request movies and series through **Overseerr**. Hearth sends the query directly to Overseerr, shows up to five ranked movie/TV matches with their current status, and adds a signed **Get** button to each requestable result. Pressing a button requests that exact TMDB id and media type; Hearth never queues a fuzzy or unrelated fallback. Radarr/Sonarr are observed only for progress on requests made by this bot. There is no LLM, conversational guessing, direct torrent client, or Radarr/Sonarr request fallback in this path.
+A dedicated house Telegram group can search and request movies and series through **Overseerr**. Every media-ish turn is classified first by **Jev** (TypeSafe System One Choice/Noul/Score): exact title, known franchise, series-all, edition-aware, descriptive riddle, or chat-about. Exact / franchise / series / edition paths hit Overseerr/TMDB immediately with little or no LLM prose. Descriptive riddles and title Q&A use gpt-4o only when Jev says so (or on fail-open). Hearth shows ranked movie/TV matches with signed **Get** buttons; pressing a button (or explicit yes on a single pending guess) requests that exact TMDB id. Chat alone never queues. Radarr/Sonarr are observed only for progress on requests made by this bot.
 
 ### Setup (Ruben)
 
@@ -470,6 +470,11 @@ A dedicated house Telegram group can search and request movies and series throug
    TELEGRAM_CHAT_IDS=-1001234567890
    # optional house-member allowlist:
    # TELEGRAM_USER_IDS=111,222
+   # Jev-first media router (recommended on VAULT):
+   # HEARTH_JEV_ENABLED=true
+   # HEARTH_JEV_SHADOW=true   # cancel/confirm still advisory; media_ask routes
+   # TYPESAFE_API_KEY=…
+   # OPENAI_API_KEY=…         # only for descriptive riddles / title Q&A
    ```
 
 6. Recreate the Hearth container. The bot stays **off** until both token and chat id are set. `TELEGRAM_POLL=false` is an operational kill switch.
@@ -477,15 +482,16 @@ A dedicated house Telegram group can search and request movies and series throug
 
 ### Behavior
 
-- `/search <title>`, a plain title, or a typed TMDB movie/TV link performs one live Overseerr search. A year or season marker narrows the results. Overseerr requests whole seasons, so `S02E03` is rejected instead of silently widening to all of season 2. `/help` explains the compact command set; `/status` reports whether the bot and Overseerr are ready.
-- Search returns at most five deduplicated movie/TV results, filters person rows, and ranks exact title/year matches first with Overseerr order as the tie-breaker. Available, requested, processing, and partially available media are labeled clearly; only requestable rows get a **Get** button.
-- A text message never downloads by itself. **Get** is the confirmation. Its compact callback contains the exact media type, TMDB id, and optional TV season, is HMAC-signed, bound to the originating chat, and expires after `TELEGRAM_CALLBACK_TTL_SECONDS` (six hours by default).
-- Overseerr authentication, provider, timeout, no-match, duplicate, quota, and request errors are reported distinctly. A configured live failure never becomes fixture data or a false “queued” response.
-- Only `TELEGRAM_CHAT_IDS` are served. `TELEGRAM_USER_IDS` can restrict requests further; an empty user list allows any human member of an allowlisted chat. Bot-authored messages are ignored.
-- Magnets, `.torrent` files, and raw media attachments are refused. Rate limits, maximum title length, durable SQLite deduplication, secret redaction, immediate callback acknowledgement, ordered handling within each chat, and bounded concurrency across chats are enabled by default.
-- Progress checks Radarr/Sonarr only for titles this bot queued. It posts one early healthy-progress update, then only completion or failure, avoiding group spam.
+- **Jev media router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics. See `docs/jev.md`.
+- `/search <title>`, a plain title, franchise seed (`Harry Potter`), series-all (`Harry Potter, all movies`), edition (`Lord of the Rings extended edition`), plot/riddle, or typed TMDB movie/TV link. A year or season marker narrows results. Overseerr requests whole seasons, so `S02E03` is rejected. `/help` and `/status` as before.
+- Search returns ranked movie/TV results with year/kind on each **Get** button. Franchise / series-all show multiple Get cards — tap each; Hearth never silent-queues the whole list.
+- Title info questions (`what's X about?`) get a short answer with **no** Get / queue.
+- A text message never downloads by itself. **Get** is the confirmation (or yes on a single sticky guess). Callbacks are HMAC-signed, chat-bound, and expire after `TELEGRAM_CALLBACK_TTL_SECONDS`.
+- Nah/No without a pending guess, and vague list asks, never invent a queue.
+- Magnets, `.torrent` files, and raw media attachments are refused. Rate limits, maximum title length, durable SQLite deduplication, secret redaction, ordered handling within each chat, and bounded concurrency across chats are enabled by default.
+- Progress checks Radarr/Sonarr only for titles this bot queued.
 
-The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, and `TELEGRAM_DB_PATH`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.
+The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, `TELEGRAM_DB_PATH`, plus the Jev variables in `docs/jev.md`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.
 
 ## What is stubbed vs live in v0.1
 

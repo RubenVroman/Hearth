@@ -1,9 +1,10 @@
 """Overseerr-first Telegram media bot.
 
-Obvious titles search deterministically. Plot/vibe/actor-ish asks go through a
-gpt-4o guess, then confirm via Get / yes before any Overseerr request. A signed
-inline button is the explicit mutation boundary, and every request uses the
-exact TMDB id and media type shown to the user.
+**Jev-first media router:** every media-ish turn hits TypeSafe System One
+(Choice/Noul/Score) to classify exact title / franchise / series-all / edition /
+descriptive riddle / chat-about. OpenAI (gpt-4o) runs only when Jev says a
+descriptive riddle or needs_llm (or fail-open). Get / yes confirm remains the
+only queue boundary — never invent a grab from chat alone.
 """
 
 from __future__ import annotations
@@ -17,13 +18,18 @@ from typing import Any
 from rapidfuzz import fuzz
 
 from hearth.config import settings
-from hearth.jev import evaluate_message, log_shadow_outcome, noul_high
+from hearth.jev import evaluate_telegram_media, log_shadow_outcome, noul_high
 from hearth.telegram.callbacks import CallbackCodec, CallbackError
-from hearth.telegram.intent import (
-    guess_catalog_title,
+from hearth.telegram.heuristics import (
     looks_like_concrete_title,
     looks_like_confirm_no,
     looks_like_confirm_yes,
+)
+from hearth.telegram.media import (
+    MediaIntent,
+    answer_catalog_question,
+    classify_media_ask,
+    guess_catalog_titles,
 )
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
 from hearth.telegram.parse import parse_message
@@ -40,11 +46,13 @@ from hearth.tools.arr import OverseerrError, overseerr, title_seed_matches
 log = logging.getLogger("hearth.telegram")
 
 MAX_RESULTS = 5
+SERIES_MAX_RESULTS = 8
 HELP_TEXT = (
     "Send a movie or series title and I’ll search Overseerr. Describe a plot or "
-    "vibe and I’ll guess, then ask before requesting. Add a year or season to "
-    "narrow it, for example Dune (2021) or Severance S02. Tap Get on the exact "
-    "match to request it. Commands: /search <title>, /status, /help."
+    "vibe and I’ll guess, then ask before requesting. Ask for a whole franchise "
+    "(e.g. Harry Potter, all movies) or an edition (extended, director’s cut). "
+    "Tap Get on the exact match to request it — I never queue from chat alone. "
+    "Commands: /search <title>, /status, /help."
 )
 _PENDING_GUESS_PREFIX = "guess:"
 
@@ -190,14 +198,13 @@ class TelegramMediaBot:
         regex_yes = looks_like_confirm_yes(view.text)
         regex_no = looks_like_confirm_no(view.text)
 
-        # Optional Jev gate: help detect confirm/cancel when a guess is pending.
-        # Never invent a queue without a pending guess (Overseerr confirm product rule).
-        jev_verdict = None
+        # Pending-guess confirm/cancel: Jev may sharpen yes/nah in enforce mode.
+        # Never invent a queue without a pending guess (Overseerr confirm rule).
         if pending is not None and settings.jev_enabled:
-            jev_verdict = await evaluate_message(view.text)
+            jev_verdict = await evaluate_telegram_media(view.text)
             log_shadow_outcome(
                 jev_verdict,
-                channel="telegram",
+                channel="telegram_pending_guess",
                 tools=[],
                 outcome=(
                     "regex_yes"
@@ -260,15 +267,72 @@ class TelegramMediaBot:
         # New search/guess replaces any sticky yes/no offer.
         self._clear_pending_guess(view.chat_id)
 
-        # Plot/vibe/actor-ish natural language → gpt-4o guess, never literal
-        # Overseerr search of the description. Exact titles keep the Codex path.
-        if (
-            query.tmdb_id is None
-            and query.reason == "title"
-            and not looks_like_concrete_title(query.raw_text or query.title)
-        ):
-            return await self._guess_reply(view, query)
-        return await self._search_reply(view, query)
+        # Typed TMDB ids stay on the exact Overseerr detail path.
+        if query.tmdb_id is not None:
+            return await self._search_reply(view, query)
+
+        # Jev-first media router (fail-open to local heuristics).
+        intent = await classify_media_ask(
+            query.raw_text or query.title or view.text,
+            parsed=query,
+        )
+        return await self._route_media_intent(view, query, intent)
+
+    async def _route_media_intent(
+        self,
+        view: MessageView,
+        query: MediaQuery,
+        intent: MediaIntent,
+    ) -> BotReply:
+        if intent.note == "list_ask" or intent.kind == "other":
+            # List / chatter / not_media — never invent a queue from a vague ask.
+            if intent.note == "list_ask":
+                return BotReply(
+                    "I don’t queue from a list ask. Send a title, franchise, "
+                    "edition, or short description — then tap Get."
+                )
+            # Fall through: treat leftover "other" as a normal title search when
+            # the parser already extracted something searchable.
+            if query.title and looks_like_concrete_title(query.title):
+                return await self._search_reply(view, query)
+            return None
+
+        if intent.kind == "chat_about":
+            return await self._chat_about_reply(view, query, intent)
+
+        if intent.kind == "describe" or intent.needs_llm:
+            return await self._guess_reply(view, query, intent=intent)
+
+        if intent.kind == "series_all":
+            return await self._series_all_reply(view, query, intent)
+
+        if intent.kind == "edition":
+            return await self._edition_reply(view, query, intent)
+
+        if intent.kind == "known_franchise":
+            return await self._franchise_reply(view, query, intent)
+
+        # exact_title — instant Overseerr path, no LLM.
+        search_query = self._intent_search_query(query, intent)
+        return await self._search_reply(view, search_query)
+
+    @staticmethod
+    def _intent_search_query(query: MediaQuery, intent: MediaIntent) -> MediaQuery:
+        title = (intent.search_title or query.title or "").strip()
+        year = intent.year if intent.year is not None else query.year
+        media_type = intent.media_type if intent.media_type in {"movie", "tv"} else query.media_type
+        return MediaQuery(
+            action="search",
+            media_type=media_type if media_type in {"movie", "tv"} else None,
+            title=title,
+            year=year,
+            season=query.season,
+            episode=query.episode,
+            tmdb_id=query.tmdb_id,
+            reason=query.reason or "title",
+            raw_text=query.raw_text,
+            catalog_host=query.catalog_host,
+        )
 
     async def _status_reply(self) -> BotReply:
         if not self.backend_configured:
@@ -317,8 +381,14 @@ class TelegramMediaBot:
             )
         return format_reject_download()
 
-    async def _guess_reply(self, view: MessageView, query: MediaQuery) -> BotReply:
-        """Resolve a descriptive ask via gpt-4o, then confirm — never auto-queue."""
+    async def _guess_reply(
+        self,
+        view: MessageView,
+        query: MediaQuery,
+        *,
+        intent: MediaIntent | None = None,
+    ) -> BotReply:
+        """LLM catalog resolve for descriptive riddles — never auto-queue."""
         if not self.backend_configured:
             return BotReply(
                 "Overseerr is not configured, so I cannot run a real catalog search."
@@ -329,22 +399,132 @@ class TelegramMediaBot:
                 "(or configure OpenAI so I can guess)."
             )
 
-        guess = await guess_catalog_title(query.raw_text or query.title)
-        if guess is None or not guess.search_title.strip():
+        guesses = await guess_catalog_titles(query.raw_text or query.title)
+        if not guesses:
             return BotReply(
                 "I’m not sure which title you mean. Send the movie or series name."
             )
 
-        guessed = MediaQuery(
-            action="search",
-            media_type=guess.media_kind if guess.media_kind in {"movie", "tv"} else None,
-            title=guess.search_title,
-            year=guess.year,
-            reason="guess",
-            raw_text=query.raw_text,
+        # Search the primary guess; if empty, try the next candidate once.
+        hits: list[MediaHit] = []
+        guessed = MediaQuery(action="search", reason="guess", raw_text=query.raw_text)
+        for guess in guesses:
+            guessed = MediaQuery(
+                action="search",
+                media_type=guess.media_kind if guess.media_kind in {"movie", "tv"} else None,
+                title=guess.search_title,
+                year=guess.year,
+                reason="guess",
+                raw_text=query.raw_text,
+            )
+            try:
+                rows = await self._search_rows(guessed)
+            except OverseerrError as exc:
+                if exc.operation == "authentication" or exc.status_code in {401, 403}:
+                    return BotReply(
+                        "Overseerr rejected its configured API key. Fix the key or its "
+                        "request permissions before searching again."
+                    )
+                return BotReply(
+                    "Overseerr search is unavailable right now. This is a backend error, "
+                    "not a catalog miss."
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("telegram guess search failed")
+                return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
+            hits = self._rank_hits(rows, guessed)
+            if hits:
+                break
+
+        if not hits:
+            label = _display_title(guesses[0].search_title, guesses[0].year)
+            return BotReply(
+                f"Did you mean {label}? I couldn’t find it in Overseerr yet. "
+                "Send the exact title or a TMDB link."
+            )
+        header = (
+            format_guess_confirm(hits[0].title, hits[0].year)
+            if len(hits) == 1
+            else f"Which one for “{guessed.title}”?"
         )
+        if intent and intent.source == "jev":
+            header = f"{header}"
+        return self._results_reply(
+            view.chat_id,
+            guessed,
+            hits,
+            header=header,
+            remember_single_guess=True,
+        )
+
+    async def _chat_about_reply(
+        self,
+        view: MessageView,
+        query: MediaQuery,
+        intent: MediaIntent,
+    ) -> BotReply:
+        """Answer plot/year/cast questions — no Get buttons, never queue."""
+        del view  # chat_id unused; info-only replies have no callbacks
+        catalog_context = ""
+        search_title = (intent.search_title or query.title or "").strip()
+        if self.backend_configured and search_title and looks_like_concrete_title(search_title):
+            try:
+                probe = MediaQuery(
+                    action="search",
+                    title=search_title,
+                    year=intent.year or query.year,
+                    media_type=(
+                        intent.media_type
+                        if intent.media_type in {"movie", "tv"}
+                        else query.media_type
+                    ),
+                    reason="chat_about",
+                    raw_text=query.raw_text,
+                )
+                rows = await self._search_rows(probe)
+                hits = self._rank_hits(rows, probe)
+                if hits:
+                    top = hits[0]
+                    bits = [top.display_label()]
+                    if top.overview:
+                        bits.append(top.overview[:220])
+                    catalog_context = " — ".join(bits)
+            except Exception:  # noqa: BLE001 — Q&A can proceed without catalog
+                log.exception("telegram chat_about catalog lookup failed")
+
+        if not settings.openai_configured:
+            if catalog_context:
+                return BotReply(catalog_context)
+            return BotReply(
+                "Ask with a clear title, or configure OpenAI so I can answer plot questions."
+            )
+
+        answered = await answer_catalog_question(
+            query.raw_text or query.title,
+            catalog_context=catalog_context,
+        )
+        if answered and answered.get("answer"):
+            return BotReply(str(answered["answer"]))
+        if catalog_context:
+            return BotReply(catalog_context)
+        return BotReply("I’m not sure. Send the title more clearly, or ask to get it.")
+
+    async def _series_all_reply(
+        self,
+        view: MessageView,
+        query: MediaQuery,
+        intent: MediaIntent,
+    ) -> BotReply:
+        """Whole franchise/series — multi Get cards, never silent bulk queue."""
+        search_query = self._intent_search_query(query, intent)
+        if not search_query.title:
+            return BotReply("Which franchise should I expand? Send the series name.")
+        if not self.backend_configured:
+            return BotReply(
+                "Overseerr is not configured, so I cannot run a real catalog search."
+            )
         try:
-            rows = await self._search_rows(guessed)
+            rows = await self._search_rows(search_query)
         except OverseerrError as exc:
             if exc.operation == "authentication" or exc.status_code in {401, 403}:
                 return BotReply(
@@ -356,26 +536,129 @@ class TelegramMediaBot:
                 "not a catalog miss."
             )
         except Exception:  # noqa: BLE001
-            log.exception("telegram guess search failed")
+            log.exception("telegram series_all search failed")
             return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
 
-        hits = self._rank_hits(rows, guessed)
+        hits = self._rank_hits(
+            rows,
+            search_query,
+            franchise_seed=search_query.title,
+            limit=SERIES_MAX_RESULTS,
+        )
         if not hits:
-            label = _display_title(guess.search_title, guess.year)
-            return BotReply(
-                f"Did you mean {label}? I couldn’t find it in Overseerr yet. "
-                "Send the exact title or a TMDB link."
-            )
+            return BotReply(f"No Overseerr matches for “{search_query.display_label()}”.")
         return self._results_reply(
             view.chat_id,
-            guessed,
+            search_query,
             hits,
             header=(
-                format_guess_confirm(hits[0].title, hits[0].year)
-                if len(hits) == 1
-                else f"Which one for “{guess.search_title}”?"
+                f"Whole series for “{search_query.title}” — tap Get on each title "
+                "you want (I won’t queue them all at once):"
             ),
-            remember_single_guess=True,
+            remember_single_guess=False,
+        )
+
+    async def _franchise_reply(
+        self,
+        view: MessageView,
+        query: MediaQuery,
+        intent: MediaIntent,
+    ) -> BotReply:
+        """Known franchise seed (e.g. Harry Potter) → franchise-aware Get cards."""
+        search_query = self._intent_search_query(query, intent)
+        if not self.backend_configured:
+            return BotReply(
+                "Overseerr is not configured, so I cannot run a real catalog search."
+            )
+        try:
+            rows = await self._search_rows(search_query)
+        except OverseerrError as exc:
+            if exc.operation == "authentication" or exc.status_code in {401, 403}:
+                return BotReply(
+                    "Overseerr rejected its configured API key. Fix the key or its "
+                    "request permissions before searching again."
+                )
+            return BotReply(
+                "Overseerr search is unavailable right now. This is a backend error, "
+                "not a catalog miss."
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("telegram franchise search failed")
+            return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
+
+        hits = self._rank_hits(
+            rows,
+            search_query,
+            franchise_seed=search_query.title,
+            limit=SERIES_MAX_RESULTS,
+        )
+        if not hits:
+            return BotReply(f"No Overseerr matches for “{search_query.display_label()}”.")
+        header = (
+            f"“{search_query.title}” franchise — pick a title:"
+            if len(hits) > 1
+            else None
+        )
+        return self._results_reply(
+            view.chat_id,
+            search_query,
+            hits,
+            header=header,
+            remember_single_guess=len(hits) == 1,
+        )
+
+    async def _edition_reply(
+        self,
+        view: MessageView,
+        query: MediaQuery,
+        intent: MediaIntent,
+    ) -> BotReply:
+        """Edition/cut preference — search clean title, never literal edition string."""
+        search_query = self._intent_search_query(query, intent)
+        if not search_query.title:
+            return BotReply("Which title should I look up with that edition preference?")
+        if not self.backend_configured:
+            return BotReply(
+                "Overseerr is not configured, so I cannot run a real catalog search."
+            )
+        try:
+            rows = await self._search_rows(search_query)
+        except OverseerrError as exc:
+            if exc.operation == "authentication" or exc.status_code in {401, 403}:
+                return BotReply(
+                    "Overseerr rejected its configured API key. Fix the key or its "
+                    "request permissions before searching again."
+                )
+            return BotReply(
+                "Overseerr search is unavailable right now. This is a backend error, "
+                "not a catalog miss."
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("telegram edition search failed")
+            return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
+
+        seed = search_query.title
+        hits = self._rank_hits(
+            rows,
+            search_query,
+            franchise_seed=seed if len(seed.split()) >= 2 else None,
+            limit=SERIES_MAX_RESULTS if len(seed.split()) >= 2 else MAX_RESULTS,
+        )
+        if not hits:
+            return BotReply(f"No Overseerr matches for “{search_query.display_label()}”.")
+        label = intent.edition_label or "preferred edition"
+        header = (
+            f"Resolved “{search_query.title}” for {label} — tap Get on the film(s). "
+            f"I’ll note {label} when grabbing."
+        )
+        return self._results_reply(
+            view.chat_id,
+            search_query,
+            hits,
+            header=header,
+            remember_single_guess=len(hits) == 1,
+            edition_key=intent.edition_key,
+            edition_label=intent.edition_label,
         )
 
     async def _queue_pending_guess(
@@ -550,7 +833,13 @@ class TelegramMediaBot:
         return [row for row in (payload.get("results") or []) if isinstance(row, dict)]
 
     @staticmethod
-    def _rank_hits(rows: list[dict[str, Any]], query: MediaQuery) -> list[MediaHit]:
+    def _rank_hits(
+        rows: list[dict[str, Any]],
+        query: MediaQuery,
+        *,
+        franchise_seed: str | None = None,
+        limit: int = MAX_RESULTS,
+    ) -> list[MediaHit]:
         hits: list[MediaHit] = []
         seen: set[tuple[str, int]] = set()
         for row in rows:
@@ -567,8 +856,19 @@ class TelegramMediaBot:
             hits.append(hit)
 
         asked = _normalized(query.title)
+        seed = _normalized(franchise_seed or "")
+        # Franchise / series-all: keep prefix matches for the seed.
+        if seed:
+            seeded = [
+                hit
+                for hit in hits
+                if title_seed_matches(franchise_seed or "", hit.title)
+                or title_seed_matches(franchise_seed or "", hit.original_title)
+            ]
+            if seeded:
+                hits = seeded
         # Short exact titles must not become substring menus (Land→La La Land).
-        if asked and looks_like_concrete_title(query.title):
+        elif asked and looks_like_concrete_title(query.title):
             seeded = [
                 hit
                 for hit in hits
@@ -583,8 +883,8 @@ class TelegramMediaBot:
             original = _normalized(hit.original_title)
             candidates = [candidate for candidate in (title, original) if candidate]
             relevance = (
-                max(float(fuzz.WRatio(asked, candidate)) for candidate in candidates)
-                if asked and candidates
+                max(float(fuzz.WRatio(asked or seed, candidate)) for candidate in candidates)
+                if (asked or seed) and candidates
                 else 100.0
             )
             if asked and asked in candidates:
@@ -593,10 +893,13 @@ class TelegramMediaBot:
                 relevance += 300
             if query.year is not None and hit.year == query.year:
                 relevance += 500
+            # Prefer earlier release years for franchise lists (stable order).
+            if seed and hit.year is not None:
+                relevance += max(0, 2100 - hit.year) / 100.0
             return relevance
 
         hits.sort(key=score, reverse=True)
-        return hits[:MAX_RESULTS]
+        return hits[: max(1, int(limit))]
 
     def _results_reply(
         self,
@@ -606,6 +909,8 @@ class TelegramMediaBot:
         *,
         header: str | None = None,
         remember_single_guess: bool = False,
+        edition_key: str = "",
+        edition_label: str = "",
     ) -> BotReply:
         lines = [header or f"Overseerr results for “{query.display_label()}”:"]
         buttons: list[list[dict[str, str]]] = []
@@ -630,16 +935,20 @@ class TelegramMediaBot:
                 chat_id,
                 season=season,
             )
+            payload: dict[str, Any] = {
+                "chat_id": chat_id,
+                "media_type": hit.media_type,
+                "tmdb_id": hit.tmdb_id,
+                "title": hit.title,
+                "year": hit.year,
+                "season": season,
+            }
+            if edition_key:
+                payload["edition_key"] = edition_key
+                payload["edition_label"] = edition_label
             self.store.put_callback_media(
                 callback_data,
-                {
-                    "chat_id": chat_id,
-                    "media_type": hit.media_type,
-                    "tmdb_id": hit.tmdb_id,
-                    "title": hit.title,
-                    "year": hit.year,
-                    "season": season,
-                },
+                payload,
                 ttl_s=ttl,
             )
             label = _button_label(index, hit, season=season)

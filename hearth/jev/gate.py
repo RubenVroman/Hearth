@@ -18,6 +18,7 @@ from hearth.jev.schema import (
     JevVerdict,
     QUEUE_TOOLS,
     hearth_system_one_questions,
+    telegram_media_system_one_questions,
 )
 from hearth.memory.redact import redact
 
@@ -94,6 +95,7 @@ async def evaluate_message(
     *,
     recent: list[str] | None = None,
     client: SystemOneClient | None = None,
+    questions: dict[str, dict[str, Any]] | None = None,
 ) -> JevVerdict:
     """Run one parallel System One call (all questions in one request).
 
@@ -137,7 +139,7 @@ async def evaluate_message(
         active = client or get_client()
         answers = await active.system_one(
             state=build_state(text, recent=recent),
-            questions=hearth_system_one_questions(),
+            questions=questions or hearth_system_one_questions(),
             model=settings.jev_model,
         )
         suggested, reason = suggest_action(answers)
@@ -164,6 +166,66 @@ async def evaluate_message(
             reason="api_error",
             error=type(exc).__name__,
         )
+
+
+async def evaluate_telegram_media(
+    user_text: str,
+    *,
+    recent: list[str] | None = None,
+    client: SystemOneClient | None = None,
+) -> JevVerdict:
+    """Jev-first Telegram media router (media_ask + needs_llm + confirm/cancel).
+
+    Same fail-open contract as ``evaluate_message``. Callers use ``media_ask``
+    for routing whenever the verdict is ok and confidence clears the media
+    threshold — this is first-class product routing, not shadow-only logging.
+    Cancel/confirm enforcement still respects ``jev_shadow``.
+    """
+    return await evaluate_message(
+        user_text,
+        recent=recent,
+        client=client,
+        questions=telegram_media_system_one_questions(),
+    )
+
+
+def media_ask_choice(
+    answers: JevAnswers | None,
+    *,
+    confidence_min: float | None = None,
+) -> tuple[str, float] | None:
+    """Return ``(media_ask choice, confidence)`` when above threshold."""
+    if answers is None or answers.media_ask is None:
+        return None
+    floor = (
+        settings.jev_media_ask_confidence
+        if confidence_min is None
+        else float(confidence_min)
+    )
+    choice = str(answers.media_ask.choice or "").strip()
+    conf = float(answers.media_ask.confidence)
+    if not choice or conf < floor:
+        return None
+    return choice, conf
+
+
+def needs_llm_resolve(
+    answers: JevAnswers | None,
+    *,
+    media_choice: str | None = None,
+    threshold: float | None = None,
+) -> bool:
+    """True when Jev says an LLM hop is required (or media_ask is a riddle/Q&A)."""
+    if media_choice in {"descriptive_riddle", "chat_about_title"}:
+        return True
+    if answers is None:
+        return False
+    floor = (
+        settings.jev_needs_llm_threshold if threshold is None else float(threshold)
+    )
+    if answers.needs_llm is not None and float(answers.needs_llm.noul) >= floor:
+        return True
+    return False
 
 
 def log_shadow_outcome(
@@ -208,8 +270,11 @@ __all__ = [
     "QUEUE_TOOLS",
     "build_state",
     "evaluate_message",
+    "evaluate_telegram_media",
     "get_client",
     "log_shadow_outcome",
+    "media_ask_choice",
+    "needs_llm_resolve",
     "noul_high",
     "reset_client",
     "set_client",

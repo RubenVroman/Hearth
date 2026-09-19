@@ -29,6 +29,40 @@ DOMAIN_CRITERIA: dict[str, str] = {
     "refuse": "Unsafe, off-limits, or something Hearth should decline.",
 }
 
+# Telegram media router (first-class). Parallel Choice on every media-ish turn.
+MEDIA_ASK_CRITERIA: dict[str, str] = {
+    "exact_title": (
+        "User named one clear movie/show title to find or download "
+        "(e.g. 'Dune', 'Talk to Me', 'Severance S02') — not a plot riddle."
+    ),
+    "known_franchise": (
+        "User named a well-known franchise seed without asking for every entry "
+        "(e.g. bare 'Harry Potter' or 'Lord of the Rings') — show franchise titles."
+    ),
+    "series_all": (
+        "User wants the whole series/franchise/collection "
+        "(e.g. 'Harry Potter, all movies', 'all Harry Potters', 'whole LOTR trilogy')."
+    ),
+    "edition_aware": (
+        "User asked for a specific cut or quality of a known title "
+        "(extended edition, director's cut, theatrical, 4K/UHD, remastered, etc.)."
+    ),
+    "descriptive_riddle": (
+        "Plot, vibe, actor, appearance, Dutch/English description, or riddle — "
+        "needs an LLM to guess the catalog title before search."
+    ),
+    "chat_about_title": (
+        "Question about a title (plot, year, cast, 'what's that about?') "
+        "without clear download/get intent."
+    ),
+    "not_media": (
+        "Not a movie/TV catalog ask — lights, food, chatter, list/status, "
+        "or unrelated house talk."
+    ),
+}
+
+MEDIA_ASK_KINDS = tuple(MEDIA_ASK_CRITERIA.keys())
+
 RISK_LEVELS = (
     "harmless",  # routine read / chat
     "needs_confirm",  # paid, destructive, or queue-ish — confirm gate
@@ -60,17 +94,8 @@ QUEUE_TOOLS = frozenset(
 )
 
 
-def hearth_system_one_questions() -> dict[str, dict[str, Any]]:
-    """Raw question map for POST /v1/systemone (also used to build SDK objects)."""
+def _confirm_cancel_risk_questions() -> dict[str, dict[str, Any]]:
     return {
-        "domain": {
-            "type": "choice",
-            "instructions": (
-                "Which Hearth house domain best matches the latest user message? "
-                "Prefer escalate_cos for repo/PR/agent work Hearth cannot do."
-            ),
-            "criteria": dict(DOMAIN_CRITERIA),
-        },
         "wants_queue": {
             "type": "noul",
             "instructions": (
@@ -115,6 +140,70 @@ def hearth_system_one_questions() -> dict[str, dict[str, Any]]:
     }
 
 
+def _media_router_questions() -> dict[str, dict[str, Any]]:
+    """First-class Telegram media intent router (Choice + needs_llm Noul)."""
+    return {
+        "media_ask": {
+            "type": "choice",
+            "instructions": (
+                "Classify this Telegram house message for the Overseerr movie/TV bot. "
+                "Prefer exact_title or known_franchise when the user named a real title. "
+                "Use series_all only when they want every entry. "
+                "Use edition_aware when a cut/quality preference is attached to a title. "
+                "Use descriptive_riddle for plots/vibes/riddles that need an LLM. "
+                "Use chat_about_title for info questions without download intent. "
+                "Use not_media for lights, food, chatter, or non-catalog asks."
+            ),
+            "criteria": dict(MEDIA_ASK_CRITERIA),
+        },
+        "needs_llm": {
+            "type": "noul",
+            "instructions": (
+                "Does resolving this message into catalog title(s) require a generative "
+                "LLM (gpt) hop, rather than a direct TMDB/Overseerr title search?"
+            ),
+            "criteria": {
+                "true": (
+                    "Plot/riddle/description/actor guess, or the media_ask is "
+                    "descriptive_riddle / chat_about_title with unclear title."
+                ),
+                "false": (
+                    "Exact title, franchise seed, series-all, or edition-aware ask "
+                    "that can search Overseerr/TMDB directly."
+                ),
+            },
+        },
+    }
+
+
+def hearth_system_one_questions() -> dict[str, dict[str, Any]]:
+    """Raw question map for POST /v1/systemone (also used to build SDK objects)."""
+    return {
+        "domain": {
+            "type": "choice",
+            "instructions": (
+                "Which Hearth house domain best matches the latest user message? "
+                "Prefer escalate_cos for repo/PR/agent work Hearth cannot do."
+            ),
+            "criteria": dict(DOMAIN_CRITERIA),
+        },
+        **_media_router_questions(),
+        **_confirm_cancel_risk_questions(),
+    }
+
+
+def telegram_media_system_one_questions() -> dict[str, dict[str, Any]]:
+    """Telegram-first System One map: media router + confirm/cancel (no house domain).
+
+    Used on every media-ish Telegram turn so Jev classifies intent in one parallel
+    call before any OpenAI prose or Overseerr search strategy is chosen.
+    """
+    return {
+        **_media_router_questions(),
+        **_confirm_cancel_risk_questions(),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class ChoiceAnswer:
     choice: str
@@ -153,6 +242,8 @@ class ScoreAnswer:
 @dataclass(frozen=True, slots=True)
 class JevAnswers:
     domain: ChoiceAnswer | None = None
+    media_ask: ChoiceAnswer | None = None
+    needs_llm: NoulAnswer | None = None
     wants_queue: NoulAnswer | None = None
     is_confirm: NoulAnswer | None = None
     is_cancel: NoulAnswer | None = None
@@ -170,6 +261,16 @@ class JevAnswers:
                     k: round(v, 4) for k, v in self.domain.probabilities.items()
                 },
             }
+        if self.media_ask is not None:
+            out["media_ask"] = {
+                "choice": self.media_ask.choice,
+                "confidence": round(self.media_ask.confidence, 4),
+                "probabilities": {
+                    k: round(v, 4) for k, v in self.media_ask.probabilities.items()
+                },
+            }
+        if self.needs_llm is not None:
+            out["needs_llm"] = round(self.needs_llm.noul, 4)
         if self.wants_queue is not None:
             out["wants_queue"] = round(self.wants_queue.noul, 4)
         if self.is_confirm is not None:
@@ -235,12 +336,16 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
                     answers[name] = _answer_from_object(value, default_type=bucket)
 
     domain = _parse_choice(answers.get("domain"))
+    media_ask = _parse_choice(answers.get("media_ask"))
+    needs_llm = _parse_noul(answers.get("needs_llm"))
     wants_queue = _parse_noul(answers.get("wants_queue"))
     is_confirm = _parse_noul(answers.get("is_confirm"))
     is_cancel = _parse_noul(answers.get("is_cancel"))
     risk = _parse_score(answers.get("risk"))
     return JevAnswers(
         domain=domain,
+        media_ask=media_ask,
+        needs_llm=needs_llm,
         wants_queue=wants_queue,
         is_confirm=is_confirm,
         is_cancel=is_cancel,
@@ -329,6 +434,8 @@ def _parse_score(raw: Any) -> ScoreAnswer | None:
 
 __all__ = [
     "DOMAIN_CRITERIA",
+    "MEDIA_ASK_CRITERIA",
+    "MEDIA_ASK_KINDS",
     "Domain",
     "EnforceAction",
     "JevAnswers",
@@ -340,4 +447,5 @@ __all__ = [
     "ScoreAnswer",
     "hearth_system_one_questions",
     "parse_answers",
+    "telegram_media_system_one_questions",
 ]
