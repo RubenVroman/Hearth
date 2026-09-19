@@ -11,15 +11,16 @@ from dataclasses import dataclass
 
 from hearth.telegram.media.types import FollowUpKind
 
+# "the second one" / "the first one" are ordinals against the cards on screen,
+# so they are deliberately absent here and handled by ``_ORDINAL`` below.
 _SEQUEL = re.compile(
     r"\b(?:the\s+)?(?:sequel|next\s+one|next\s+part|part\s+(?:two|2)|"
-    r"second\s+(?:one|movie|film)|follow[-\s]?up|"
-    r"het\s+vervolg|vervolg|deel\s+(?:twee|2))\b",
+    r"follow[-\s]?up|het\s+vervolg|vervolg|deel\s+(?:twee|2))\b",
     re.I,
 )
 _PREQUEL = re.compile(
-    r"\b(?:the\s+)?(?:prequel|first\s+one|original|earlier\s+one|"
-    r"het\s+origineel|eerste\s+(?:deel|film))\b",
+    r"\b(?:the\s+)?(?:prequel|the\s+original|earlier\s+one|"
+    r"het\s+origineel|eerste\s+deel)\b",
     re.I,
 )
 _ALL_OF_THEM = re.compile(

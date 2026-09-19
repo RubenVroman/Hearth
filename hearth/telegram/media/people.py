@@ -37,7 +37,8 @@ _BY_PERSON = re.compile(
     re.I,
 )
 _PERSON_POSSESSIVE = re.compile(
-    r"^(?P<who>.+?)'?s?\s+(?:filmography|movies?|films?|shows?|catalog(?:ue)?|"
+    # The apostrophe must be explicit: a bare "s?" would eat the s of "Hanks".
+    r"^(?P<who>.+?)(?:'s|’s|'|’)\s+(?:filmography|movies?|films?|shows?|catalog(?:ue)?|"
     r"back\s+catalog(?:ue)?|oeuvre|work)\s*$",
     re.I,
 )

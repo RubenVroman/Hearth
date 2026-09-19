@@ -1577,7 +1577,7 @@ class MockPipeline:
 
     def list_radarr_library(self, title: str = "") -> list[dict[str, Any]]:
         """Monitored Radarr library rows (may lack a usable file)."""
-        from hearth.tools.arr import _normalize_title_tokens
+        from hearth.tools.arr import normalize_title_tokens
 
         source = (
             self.radarr_library
@@ -1594,12 +1594,12 @@ class MockPipeline:
         needle = (title or "").strip().lower()
         if not needle:
             return rows
-        needle_tokens = " ".join(_normalize_title_tokens(title))
+        needle_tokens = " ".join(normalize_title_tokens(title))
         out: list[dict[str, Any]] = []
         for row in rows:
             row_title = str(row.get("title") or "")
             row_l = row_title.lower()
-            row_tokens = " ".join(_normalize_title_tokens(row_title))
+            row_tokens = " ".join(normalize_title_tokens(row_title))
             if needle_tokens and row_tokens == needle_tokens:
                 out.append(row)
             elif needle in row_l or row_l in needle:

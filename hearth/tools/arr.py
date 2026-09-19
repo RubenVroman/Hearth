@@ -325,7 +325,8 @@ _TITLE_YEAR_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>(?:19|20)\d{2})\)\s*$
 _ARTICLES = frozenset({"the", "a", "an", "de", "het", "een"})
 
 
-def _normalize_title_tokens(value: str) -> list[str]:
+def normalize_title_tokens(value: str) -> list[str]:
+    """Lower-case alphanumeric tokens with a leading article removed."""
     text = re.sub(r"[^a-z0-9à-ÿ]+", " ", (value or "").lower()).strip()
     tokens = [t for t in text.split() if t]
     while tokens and tokens[0] in _ARTICLES:
@@ -339,8 +340,8 @@ def title_seed_matches(seed: str, title: str) -> bool:
     Shared gate for Overseerr auto-request: mismatched search/fallback hits
     must not be queued.
     """
-    seed_tokens = _normalize_title_tokens(seed)
-    title_tokens = _normalize_title_tokens(title)
+    seed_tokens = normalize_title_tokens(seed)
+    title_tokens = normalize_title_tokens(title)
     if not seed_tokens or not title_tokens:
         return False
     if seed_tokens == title_tokens:
@@ -413,7 +414,7 @@ def _indistinguishable_overseerr_hits(hits: list[dict[str, Any]]) -> bool:
         return True
     labels = {
         (
-            " ".join(_normalize_title_tokens(_row_title(h))),
+            " ".join(normalize_title_tokens(_row_title(h))),
             str(h.get("year") or ""),
             str(h.get("mediaType") or ""),
             str(h.get("mediaId") or h.get("tmdbId") or h.get("id") or ""),
@@ -2088,7 +2089,7 @@ class StarrClient:
             payload = response.json()
             rows = payload if isinstance(payload, list) else []
             needle = query.lower()
-            query_tokens = " ".join(_normalize_title_tokens(query))
+            query_tokens = " ".join(normalize_title_tokens(query))
             matches: list[dict[str, Any]] = []
             exact: list[dict[str, Any]] = []
             for row in rows:
@@ -2096,7 +2097,7 @@ class StarrClient:
                     continue
                 title = str(row.get("title") or "")
                 title_l = title.lower()
-                title_tokens = " ".join(_normalize_title_tokens(title))
+                title_tokens = " ".join(normalize_title_tokens(title))
                 if query_tokens and title_tokens == query_tokens:
                     exact.append(row)
                     matches.append(row)

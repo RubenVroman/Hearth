@@ -52,6 +52,7 @@ from hearth.telegram.media import (
     guess_catalog_titles,
     house_pick_spec,
     in_release_order,
+    plausible_match,
     rank_hits,
     voice,
     without_ids,
@@ -628,10 +629,17 @@ class TelegramMediaBot:
             drop_last=intent.drop_last,
             drop_first=intent.drop_first,
         )
+        # Say what was skipped by position, not by title: naming a film that has
+        # no button invites "did you queue it?".
         dropped = ""
-        if len(kept) != len(ordered):
-            missing = [hit for hit in ordered if hit not in kept]
-            dropped = ", ".join(hit.title for hit in missing[:2])
+        skipped = len(ordered) - len(kept)
+        if skipped > 0:
+            if intent.drop_last:
+                dropped = "the last" if intent.drop_last == 1 else f"the last {intent.drop_last}"
+            elif intent.drop_first:
+                dropped = (
+                    "the first" if intent.drop_first == 1 else f"the first {intent.drop_first}"
+                )
         return self._present(
             view.chat_id,
             kept[:SERIES_MAX_RESULTS],
@@ -957,11 +965,13 @@ class TelegramMediaBot:
                     drop_last=part.drop_last,
                     drop_first=part.drop_first,
                 )[:SERIES_MAX_RESULTS]
-            hits = await self.catalog.hits(query, limit=2)
+            hits = await self.catalog.hits(query, limit=3)
         except CatalogUnavailable:
             # One unavailable item must not sink the whole plan.
             return []
-        return hits[:1]
+        # Silently swapping in a loosely related film would be worse than
+        # reporting the item as a miss.
+        return [hit for hit in hits if plausible_match(part.title, hit)][:1]
 
     # --- follow-ups --------------------------------------------------------
 
@@ -1084,15 +1094,26 @@ class TelegramMediaBot:
         if top is None:
             return BotReply(voice.lost_context())
         seed = context.franchise_seed or best_franchise_seed(top.title)
-        query = MediaQuery(
-            action="search",
-            title=seed,
-            media_type=top.media_type if top.media_type in {"movie", "tv"} else None,
-            reason="follow_up",
+        # The TMDB collection is authoritative about what "the sequel" is; a
+        # seeded title search is only the fallback.
+        _, entries = await self.catalog.collection_hits(
+            top.media_type,
+            top.tmdb_id,
+            limit=SERIES_MAX_RESULTS + 4,
         )
-        hits = in_release_order(
-            await self.catalog.hits(query, franchise_seed=seed, limit=SERIES_MAX_RESULTS)
-        )
+        if not entries:
+            query = MediaQuery(
+                action="search",
+                title=seed,
+                media_type=top.media_type if top.media_type in {"movie", "tv"} else None,
+                reason="follow_up",
+            )
+            entries = await self.catalog.hits(
+                query,
+                franchise_seed=seed,
+                limit=SERIES_MAX_RESULTS,
+            )
+        hits = in_release_order(entries)
         if not hits:
             return self._miss(seed)
 

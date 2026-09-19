@@ -6,13 +6,14 @@ and gets back the order a human would expect to read.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from rapidfuzz import fuzz
 
 from hearth.telegram.heuristics import looks_like_concrete_title
 from hearth.telegram.models import MediaHit, MediaQuery
-from hearth.tools.arr import title_seed_matches
+from hearth.tools.arr import normalize_title_tokens, title_seed_matches
 
 MAX_RESULTS = 5
 SERIES_MAX_RESULTS = 8
@@ -63,8 +64,8 @@ def rank_hits(
         seeded = [
             hit
             for hit in hits
-            if title_seed_matches(franchise_seed or "", hit.title)
-            or title_seed_matches(franchise_seed or "", hit.original_title)
+            if franchise_seed_matches(franchise_seed or "", hit.title)
+            or franchise_seed_matches(franchise_seed or "", hit.original_title)
         ]
         if seeded:
             hits = seeded
@@ -101,6 +102,68 @@ def rank_hits(
 
     hits.sort(key=score, reverse=True)
     return hits[: max(1, int(limit))]
+
+
+_FRANCHISE_SEPARATOR = re.compile(r"^\s*[:\-–—]|\s+[-–—]\s+")
+_SEQUEL_WORD = re.compile(
+    r"^(?:part|chapter|episode|vol\.?|volume|deel|[ivx]+|\d+)\b",
+    re.I,
+)
+_CONNECTIVE = frozenset(
+    {"of", "in", "on", "at", "to", "for", "from", "with", "and", "or", "van", "met", "der", "des"}
+)
+
+
+def franchise_seed_matches(seed: str, title: str) -> bool:
+    """Franchise membership, which is looser than an exact-title match.
+
+    ``title_seed_matches`` intentionally refuses single-word prefixes so that
+    "Land" cannot pull in "La La Land". That guard is right for the exact lane
+    but it also hides "Dune: Part Two" from the *Dune* franchise, so a one-word
+    seed is accepted here only when the rest of the title reads like a franchise
+    entry: a separator ("Dune: Part Two"), a part word ("Rocky II"), or a single
+    trailing word ("Matrix Reloaded") — never a prepositional phrase
+    ("Land of the Dead").
+    """
+    if title_seed_matches(seed, title):
+        return True
+    seed_tokens = normalize_title_tokens(seed)
+    title_tokens = normalize_title_tokens(title)
+    if len(seed_tokens) != 1 or len(title_tokens) < 2:
+        return False
+    if title_tokens[0] != seed_tokens[0] or len(seed_tokens[0]) < 3:
+        return False
+    remainder = " ".join(title_tokens[1:])
+    head = normalize_title_tokens(title)[0]
+    raw_tail = (title or "").strip()
+    index = raw_tail.casefold().find(head)
+    if index >= 0:
+        raw_tail = raw_tail[index + len(head) :]
+    if _FRANCHISE_SEPARATOR.match(raw_tail):
+        return True
+    if _SEQUEL_WORD.match(remainder):
+        return True
+    return len(title_tokens) == 2 and title_tokens[1] not in _CONNECTIVE
+
+
+def plausible_match(asked: str, hit: MediaHit, *, floor: int = 80) -> bool:
+    """True when a hit could honestly be the asked title.
+
+    Overseerr search happily returns loosely related rows. In a multi-item plan
+    that would silently swap one requested film for another, so each item is
+    checked before it earns a Get button.
+    """
+    needle = normalized(asked)
+    if not needle:
+        return True
+    if title_seed_matches(asked, hit.title) or title_seed_matches(asked, hit.original_title):
+        return True
+    candidates = [normalized(hit.title), normalized(hit.original_title)]
+    return any(
+        float(fuzz.WRatio(needle, candidate)) >= float(floor)
+        for candidate in candidates
+        if candidate
+    )
 
 
 def in_release_order(hits: list[MediaHit]) -> list[MediaHit]:
@@ -149,8 +212,10 @@ __all__ = [
     "SERIES_MAX_RESULTS",
     "apply_exclusions",
     "best_franchise_seed",
+    "franchise_seed_matches",
     "in_release_order",
     "normalized",
+    "plausible_match",
     "rank_hits",
     "to_hits",
     "without_ids",
