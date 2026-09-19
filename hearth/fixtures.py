@@ -1741,6 +1741,47 @@ class MockPipeline:
             return {"id": pid, "cast": [], "crew": []}
         return deepcopy(payload)
 
+    def neighbours_overseerr(
+        self,
+        media_id: int,
+        media_type: str,
+        *,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Mock "similar to" rows: same media type, overlapping genre ids.
+
+        Derived from the existing discover catalog rather than a hand-written
+        similarity table, so offline results stay consistent with mock search.
+        """
+        try:
+            anchor_id = int(media_id)
+        except (TypeError, ValueError):
+            return []
+        kind = media_type if media_type in {"movie", "tv"} else "movie"
+        pool = [
+            row
+            for row in MOCK_TMDB_DISCOVER
+            if str(row.get("mediaType") or "movie") == kind
+        ]
+        anchor = next(
+            (row for row in pool if int(row.get("id") or 0) == anchor_id),
+            None,
+        )
+        anchor_genres = {int(g) for g in ((anchor or {}).get("genreIds") or [])}
+        matched: list[dict[str, Any]] = []
+        for row in pool:
+            try:
+                row_id = int(row.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if row_id == anchor_id or row.get("discover") is False:
+                continue
+            genres = {int(g) for g in (row.get("genreIds") or [])}
+            if anchor_genres and not genres.intersection(anchor_genres):
+                continue
+            matched.append(dict(row))
+        return matched[: max(1, min(int(limit or 8), 20))]
+
     def discover_overseerr(
         self,
         *,

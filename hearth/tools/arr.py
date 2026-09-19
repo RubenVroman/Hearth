@@ -171,6 +171,15 @@ def _validate_request_payload(
         raise ValueError("Overseerr request response identifies different media")
 
 
+def _collection_id(item: dict[str, Any]) -> int | None:
+    """TMDB collection id from an Overseerr MovieDetails payload."""
+    collection = item.get("collection")
+    if not isinstance(collection, dict):
+        return None
+    value = _integer_value(collection.get("id"))
+    return value if value and value > 0 else None
+
+
 def _media_info(item: dict[str, Any]) -> dict[str, Any]:
     value = item.get("mediaInfo")
     if not isinstance(value, dict):
@@ -2720,7 +2729,7 @@ class Overseerr:
             }
             info = _media_info(normalized_payload)
             requests = _request_rows(normalized_payload)
-            return {
+            result = {
                 "ok": True,
                 "mode": "live",
                 "service": "overseerr",
@@ -2732,6 +2741,18 @@ class Overseerr:
                 "requestStatus": _request_status(normalized_payload),
                 "media": _summarize_overseerr(normalized_payload),
             }
+            # MovieDetails carries the TMDB collection, which is the only exact
+            # way to expand a franchise without fuzzy title matching.
+            collection_id = _collection_id(payload)
+            if collection_id is not None:
+                result["collectionId"] = collection_id
+                result["collectionName"] = str(
+                    (payload.get("collection") or {}).get("name") or ""
+                )
+            runtime = _integer_value(payload.get("runtime"))
+            if runtime is not None:
+                result["runtime"] = runtime
+            return result
         except Exception as exc:  # noqa: BLE001
             raise _overseerr_error("media details", exc) from exc
 
@@ -3196,7 +3217,12 @@ class Overseerr:
         limit: int = 4,
         page: int = 1,
         primary_release_date_lte: str | None = None,
+        primary_release_date_gte: str | None = None,
         vote_count_gte: int | None = None,
+        vote_average_gte: float | None = None,
+        with_runtime_lte: int | None = None,
+        with_runtime_gte: int | None = None,
+        sort_by: str | None = None,
         exclude_tmdb_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         """TMDB discover via Overseerr (genre include / exclude).
@@ -3207,6 +3233,11 @@ class Overseerr:
         Released-only defaults: pass ``primary_release_date_lte`` (YYYY-MM-DD)
         and ``vote_count_gte`` so upcoming vaporware does not dominate.
         ``exclude_tmdb_ids`` drops titles already shown this chat session.
+
+        Runtime, rating and era bounds map onto the documented Overseerr
+        ``withRuntimeLte`` / ``voteAverageGte`` / ``primaryReleaseDateGte``
+        (``firstAirDateGte`` for TV) query params — a mood such as "scary under
+        two hours" is answered by the API, not by guessing.
         """
         kind = media_type if media_type in {"movie", "tv"} else "movie"
         include = [int(g) for g in (genre_ids or []) if str(g).isdigit() or isinstance(g, int)]
@@ -3221,7 +3252,21 @@ class Overseerr:
             vote_floor = int(vote_count_gte) if vote_count_gte is not None else None
         except (TypeError, ValueError):
             vote_floor = None
+        try:
+            rating_floor = float(vote_average_gte) if vote_average_gte is not None else None
+        except (TypeError, ValueError):
+            rating_floor = None
+        try:
+            runtime_max = int(with_runtime_lte) if with_runtime_lte is not None else None
+        except (TypeError, ValueError):
+            runtime_max = None
+        try:
+            runtime_min = int(with_runtime_gte) if with_runtime_gte is not None else None
+        except (TypeError, ValueError):
+            runtime_min = None
         date_lte = str(primary_release_date_lte or "").strip() or None
+        date_gte = str(primary_release_date_gte or "").strip() or None
+        order = str(sort_by or "").strip() or None
         ban_ids = {
             int(x)
             for x in (exclude_tmdb_ids or [])
@@ -3266,8 +3311,21 @@ class Overseerr:
                 params["primaryReleaseDateLte"] = date_lte
             else:
                 params["firstAirDateLte"] = date_lte
+        if date_gte:
+            if kind == "movie":
+                params["primaryReleaseDateGte"] = date_gte
+            else:
+                params["firstAirDateGte"] = date_gte
         if vote_floor is not None and vote_floor > 0:
             params["voteCountGte"] = str(vote_floor)
+        if rating_floor is not None and rating_floor > 0:
+            params["voteAverageGte"] = str(rating_floor)
+        if runtime_max is not None and runtime_max > 0:
+            params["withRuntimeLte"] = str(runtime_max)
+        if runtime_min is not None and runtime_min > 0:
+            params["withRuntimeGte"] = str(runtime_min)
+        if order:
+            params["sortBy"] = order
         try:
             response = await client.get(path, params=params)
             response.raise_for_status()
@@ -3459,6 +3517,145 @@ class Overseerr:
             }
         except Exception as exc:  # noqa: BLE001
             raise _overseerr_error("person credits", exc) from exc
+
+    async def neighbours(
+        self,
+        media_id: int,
+        media_type: str,
+        *,
+        limit: int = 8,
+        include_recommendations: bool = True,
+    ) -> dict[str, Any]:
+        """Titles adjacent to one media id ("something like X").
+
+        Uses the documented ``GET /{movie|tv}/{id}/similar`` route and merges
+        ``/recommendations`` when asked, because TMDB's two neighbour lists
+        disagree often enough that either alone reads thin. The anchor itself is
+        always removed.
+        """
+        try:
+            mid = int(media_id)
+        except (TypeError, ValueError):
+            mid = 0
+        kind = str(media_type or "").strip().lower()
+        cap = max(1, min(int(limit or 8), 20))
+        if mid <= 0 or kind not in {"movie", "tv"}:
+            return {
+                "ok": False,
+                "mode": "live" if self.live else "mock",
+                "service": "overseerr",
+                "reason": "invalid_media_id" if mid <= 0 else "invalid_media_type",
+                "results": [],
+            }
+        if not self.live:
+            rows = pipeline.neighbours_overseerr(mid, kind, limit=cap)
+            return {
+                "ok": True,
+                "mode": "mock",
+                "service": "overseerr",
+                "mediaId": mid,
+                "mediaType": kind,
+                "results": [_summarize_overseerr(row) for row in rows[:cap]],
+            }
+
+        client = await self._http()
+        paths = [f"/api/v1/{kind}/{mid}/similar"]
+        if include_recommendations:
+            paths.append(f"/api/v1/{kind}/{mid}/recommendations")
+        merged: list[dict[str, Any]] = []
+        seen: set[int] = {mid}
+        errors = 0
+        for path in paths:
+            try:
+                response = await client.get(path, params={"page": 1})
+                response.raise_for_status()
+                payload = _json_object(response)
+            except Exception as exc:  # noqa: BLE001
+                # One thin list must not sink the lane; both failing is an error.
+                errors += 1
+                log.warning(
+                    "Overseerr neighbours lookup failed for %s: %s", path, type(exc).__name__
+                )
+                continue
+            for row in payload.get("results") or []:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    tid = int(row.get("id") or row.get("tmdbId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if tid <= 0 or tid in seen:
+                    continue
+                seen.add(tid)
+                merged.append({**row, "mediaType": _row_media_type(row) or kind})
+        if errors == len(paths):
+            raise OverseerrError(
+                "Overseerr neighbours lookup failed",
+                operation="neighbours",
+            )
+        return {
+            "ok": True,
+            "mode": "live",
+            "service": "overseerr",
+            "mediaId": mid,
+            "mediaType": kind,
+            "results": [_summarize_overseerr(row) for row in merged[:cap]],
+        }
+
+    async def collection(self, collection_id: int, *, limit: int = 12) -> dict[str, Any]:
+        """A TMDB collection (franchise pack) via ``GET /collection/{id}``."""
+        try:
+            cid = int(collection_id)
+        except (TypeError, ValueError):
+            cid = 0
+        cap = max(1, min(int(limit or 12), 30))
+        if cid <= 0:
+            return {
+                "ok": False,
+                "mode": "live" if self.live else "mock",
+                "service": "overseerr",
+                "reason": "invalid_collection_id",
+                "results": [],
+            }
+        if not self.live:
+            return {
+                "ok": True,
+                "mode": "mock",
+                "service": "overseerr",
+                "collectionId": cid,
+                "name": "",
+                "results": [],
+            }
+        client = await self._http()
+        try:
+            response = await client.get(f"/api/v1/collection/{cid}")
+            if response.status_code == 404:
+                return {
+                    "ok": False,
+                    "mode": "live",
+                    "service": "overseerr",
+                    "reason": "not_found",
+                    "status_code": 404,
+                    "collectionId": cid,
+                    "results": [],
+                }
+            response.raise_for_status()
+            payload = _required_json_object(response, "collection")
+            parts = [
+                {**row, "mediaType": _row_media_type(row) or "movie"}
+                for row in (payload.get("parts") or [])
+                if isinstance(row, dict)
+            ]
+            return {
+                "ok": True,
+                "mode": "live",
+                "service": "overseerr",
+                "collectionId": cid,
+                "name": str(payload.get("name") or ""),
+                "results": [_summarize_overseerr(row) for row in parts[:cap]],
+            }
+        except Exception as exc:  # noqa: BLE001
+            raise _overseerr_error("collection", exc) from exc
 
 
 radarr = StarrClient("radarr")

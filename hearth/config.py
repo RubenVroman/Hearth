@@ -201,6 +201,27 @@ class Settings(BaseSettings):
         default=Path("./data/hearth-telegram.db"),
         alias="TELEGRAM_DB_PATH",
     )
+    # Magic lanes on top of the Jev router. Each one degrades to the plain title
+    # search when disabled or when its Overseerr route is unavailable.
+    telegram_mood_lane: bool = Field(default=True, alias="HEARTH_TELEGRAM_MOOD_LANE")
+    telegram_person_lane: bool = Field(default=True, alias="HEARTH_TELEGRAM_PERSON_LANE")
+    telegram_similar_lane: bool = Field(default=True, alias="HEARTH_TELEGRAM_SIMILAR_LANE")
+    telegram_batch_lane: bool = Field(default=True, alias="HEARTH_TELEGRAM_BATCH_LANE")
+    telegram_batch_max_items: int = Field(
+        default=4,
+        ge=2,
+        le=8,
+        alias="HEARTH_TELEGRAM_BATCH_MAX_ITEMS",
+    )
+    # In-thread follow-up memory ("the sequel", "all of them", "more like that").
+    telegram_context_ttl_seconds: int = Field(
+        default=30 * 60,
+        ge=60,
+        le=24 * 60 * 60,
+        alias="HEARTH_TELEGRAM_CONTEXT_TTL_SECONDS",
+    )
+    # House-butler phrasing. Off keeps the plain operational sentences.
+    telegram_butler_voice: bool = Field(default=True, alias="HEARTH_TELEGRAM_BUTLER_VOICE")
 
     # TypeSafe Jev (System One) — cheap typed decision gate before gpt/tools.
     # Off by default. When enabled, shadow mode logs only (does not enforce).
@@ -239,6 +260,12 @@ class Settings(BaseSettings):
         ge=0.0,
         le=1.0,
         alias="HEARTH_JEV_NEEDS_LLM_THRESHOLD",
+    )
+    jev_multi_item_threshold: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_MULTI_ITEM_THRESHOLD",
     )
 
     @property

@@ -1,0 +1,379 @@
+"""House-butler phrasing for Telegram media replies.
+
+Short, confident, warm — and deterministic. Variant choice is derived from the
+subject text, so the same ask always reads the same way and tests can rely on
+the stable core of every line (title, year, status words) being present.
+
+``HEARTH_TELEGRAM_BUTLER_VOICE=false`` drops the flavour and keeps the plain
+operational sentence.
+"""
+
+from __future__ import annotations
+
+import hashlib
+
+from hearth.config import settings
+
+
+def _enabled() -> bool:
+    return bool(getattr(settings, "telegram_butler_voice", True))
+
+
+def _pick(bank: tuple[str, ...], seed: str) -> str:
+    if not bank:
+        return ""
+    if not _enabled():
+        return bank[0]
+    digest = hashlib.sha256((seed or "").encode("utf-8", "ignore")).digest()
+    return bank[digest[0] % len(bank)]
+
+
+def display_title(title: str, year: int | None = None) -> str:
+    clean = (title or "").strip() or "that title"
+    return f"{clean} ({year})" if year else clean
+
+
+def kind_word(media_type: str) -> str:
+    return "movie" if media_type == "movie" else "series"
+
+
+# --- headers ------------------------------------------------------------------
+
+
+def exact_header(label: str, *, single: bool) -> str:
+    if single:
+        return _pick(
+            (
+                f"Found it — {label}.",
+                f"Got it: {label}.",
+                f"{label} — that's the one.",
+            ),
+            label,
+        )
+    return _pick(
+        (
+            f"Closest matches for “{label}”:",
+            f"Here's what the catalog has for “{label}”:",
+            f"A few candidates for “{label}”:",
+        ),
+        label,
+    )
+
+
+def franchise_header(seed: str) -> str:
+    return _pick(
+        (
+            f"The {seed} shelf — pick your poison:",
+            f"{seed}, in order:",
+            f"Here's the {seed} run:",
+        ),
+        seed,
+    )
+
+
+def series_header(seed: str, *, dropped: str = "") -> str:
+    tail = f" (skipping {dropped})" if dropped else ""
+    return _pick(
+        (
+            f"Whole {seed} series{tail} — tap Get on each one you want:",
+            f"All of {seed}{tail}, in release order — tap Get per title:",
+            f"{seed} complete{tail}. Tap Get on the ones you want:",
+        ),
+        seed,
+    )
+
+
+def edition_header(title: str, edition_label: str) -> str:
+    return _pick(
+        (
+            f"{title} — noted, you want the {edition_label}:",
+            f"{edition_label} of {title}, coming up:",
+            f"Right, {title} in {edition_label}:",
+        ),
+        f"{title}{edition_label}",
+    )
+
+
+def person_header(name: str, *, role: str = "cast") -> str:
+    verb = "directed" if role == "directing" else "starred in"
+    return _pick(
+        (
+            f"Best of what {name} {verb}:",
+            f"{name} — the highlights:",
+            f"Pick of the {name} catalog:",
+        ),
+        f"{name}{verb}",
+    )
+
+
+def mood_header(mood_label: str) -> str:
+    return _pick(
+        (
+            f"{mood_label.capitalize()} — house shortlist:",
+            f"For {mood_label}, I'd put these on the table:",
+            f"{mood_label.capitalize()}. Try one of these:",
+        ),
+        mood_label,
+    )
+
+
+def similar_header(anchor: str) -> str:
+    return _pick(
+        (
+            f"More in the vein of {anchor}:",
+            f"If you liked {anchor}, these are next:",
+            f"Same energy as {anchor}:",
+        ),
+        anchor,
+    )
+
+
+def house_pick_header() -> str:
+    return _pick(
+        (
+            "No brief, so here are the house picks:",
+            "Dealer's choice — a few solid ones:",
+            "Nothing specific? These never miss:",
+        ),
+        "house",
+    )
+
+
+def batch_header(labels: list[str]) -> str:
+    joined = ", ".join(labels)
+    return _pick(
+        (
+            f"Two jobs on the list: {joined}." if len(labels) == 2 else f"On the list: {joined}.",
+            f"Plan: {joined}.",
+            f"Lining up {joined}.",
+        ),
+        joined,
+    )
+
+
+def follow_up_header(subject: str, *, what: str) -> str:
+    return _pick(
+        (
+            f"{what.capitalize()} of {subject}:",
+            f"{subject} — {what}:",
+        ),
+        f"{subject}{what}",
+    )
+
+
+# --- status lines -------------------------------------------------------------
+
+
+def already_available(label: str) -> str:
+    return _pick(
+        (
+            f"{label} is already on Plex — nothing to fetch.",
+            f"Already in the library: {label}. Go press play.",
+            f"{label} is sitting on Plex already.",
+        ),
+        label,
+    )
+
+
+def already_requested(label: str) -> str:
+    return _pick(
+        (
+            f"{label} is already requested — it's in the pipeline.",
+            f"Already queued: {label}. I'll leave it be.",
+            f"{label} is already on its way.",
+        ),
+        label,
+    )
+
+
+def queued(label: str, *, detail: str) -> str:
+    return _pick(
+        (
+            f"{label} — {detail}",
+            f"Done. {label} — {detail}",
+            f"On it: {label} — {detail}",
+        ),
+        label,
+    )
+
+
+def tap_get_hint(*, single: bool) -> str:
+    if single:
+        return _pick(
+            (
+                "Tap Get to request it, or reply yes / nah.",
+                "Say the word — tap Get, or just reply yes.",
+            ),
+            "single",
+        )
+    return _pick(
+        (
+            "Tap Get on the one you want.",
+            "Tap Get on whichever you fancy.",
+        ),
+        "multi",
+    )
+
+
+def nothing_requestable() -> str:
+    return _pick(
+        (
+            "Everything above is already handled — on Plex or already requested.",
+            "All of that is already sorted: available or queued.",
+        ),
+        "handled",
+    )
+
+
+def cancelled() -> str:
+    # Every variant keeps "not queueing": the user must never be left guessing
+    # whether a request slipped through.
+    return _pick(
+        (
+            "Okay — not queueing that. Send another title or description.",
+            "Right, not queueing it. What else can I dig up?",
+        ),
+        "cancel",
+    )
+
+
+def which_one() -> str:
+    return _pick(
+        (
+            "Which one? Tap Get on it, or say “the second one”.",
+            "Happy to — which of those? Tap Get, or say “number 2”.",
+        ),
+        "which",
+    )
+
+
+def pending_expired() -> str:
+    return "That offer expired. Send the title again and I'll line it up."
+
+
+def no_match(label: str) -> str:
+    return _pick(
+        (
+            f"Nothing in the catalog matches “{label}”. Give me the exact title, "
+            "a TMDB link, or describe it and I'll guess.",
+            f"No catalog hit for “{label}”. Try the exact name, a TMDB link, "
+            "or tell me the plot.",
+        ),
+        label,
+    )
+
+
+def no_more_options(subject: str) -> str:
+    return _pick(
+        (
+            f"That's the end of the good ones for {subject}. Want a different angle?",
+            f"I'm out of fresh picks for {subject}. Give me another vibe?",
+        ),
+        subject,
+    )
+
+
+def unknown_person(name: str) -> str:
+    return f"I can't find anyone called “{name}” in the catalog. Check the spelling?"
+
+
+def need_a_subject() -> str:
+    return _pick(
+        (
+            "Like what, exactly? Name a title and I'll find its neighbours.",
+            "Give me an anchor title and I'll pull similar ones.",
+        ),
+        "anchor",
+    )
+
+
+def lost_context() -> str:
+    return _pick(
+        (
+            "I've lost the thread — which title did you mean?",
+            "Nothing recent to go on. Name the title again?",
+        ),
+        "context",
+    )
+
+
+def nudge() -> str:
+    return (
+        "Give me a title, a franchise, an actor, or a vibe — “scary under 2 hours”, "
+        "“all Harry Potters”, “something like Arrival”. I'll find it; you tap Get."
+    )
+
+
+def list_ask() -> str:
+    return (
+        "I don't queue from a list ask. Name a title, franchise, edition, or vibe — "
+        "then tap Get."
+    )
+
+
+# --- failures -----------------------------------------------------------------
+
+
+def backend_not_configured() -> str:
+    return "Overseerr isn't configured here, so I can't run a real catalog search."
+
+
+def backend_auth_failed() -> str:
+    return (
+        "Overseerr rejected its configured API key. Fix the key or its request "
+        "permissions before searching again."
+    )
+
+
+def backend_unavailable() -> str:
+    return (
+        "Overseerr search is unavailable right now. That's a backend error, not a "
+        "catalog miss."
+    )
+
+
+def backend_unexpected() -> str:
+    return "Overseerr search failed unexpectedly. Try again shortly."
+
+
+def needs_openai() -> str:
+    return (
+        "That reads like a description rather than a title. Send the name, or "
+        "configure OpenAI so I can guess."
+    )
+
+
+__all__ = [
+    "already_available",
+    "already_requested",
+    "backend_auth_failed",
+    "backend_not_configured",
+    "backend_unavailable",
+    "backend_unexpected",
+    "batch_header",
+    "cancelled",
+    "display_title",
+    "edition_header",
+    "exact_header",
+    "follow_up_header",
+    "franchise_header",
+    "house_pick_header",
+    "kind_word",
+    "list_ask",
+    "lost_context",
+    "mood_header",
+    "need_a_subject",
+    "needs_openai",
+    "no_match",
+    "no_more_options",
+    "nothing_requestable",
+    "nudge",
+    "pending_expired",
+    "person_header",
+    "queued",
+    "series_header",
+    "similar_header",
+    "tap_get_hint",
+    "unknown_person",
+    "which_one",
+]
