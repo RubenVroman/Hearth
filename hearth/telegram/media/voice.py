@@ -152,12 +152,20 @@ def batch_header(labels: list[str]) -> str:
 
 
 def follow_up_header(subject: str, *, what: str) -> str:
+    if what == "prequel":
+        return _pick(
+            (
+                f"What came before {subject}:",
+                f"The prequel to {subject}:",
+            ),
+            subject,
+        )
     return _pick(
         (
-            f"{what.capitalize()} of {subject}:",
-            f"{subject} — {what}:",
+            f"The sequel to {subject}:",
+            f"What comes after {subject}:",
         ),
-        f"{subject}{what}",
+        subject,
     )
 
 

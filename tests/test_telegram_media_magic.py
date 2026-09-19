@@ -847,6 +847,24 @@ async def test_ordinal_follow_up_arms_yes_for_that_card_only(
 
 
 @pytest.mark.asyncio
+async def test_narrowing_to_one_card_keeps_the_rest_addressable(
+    bot_factory: Callable[..., TelegramMediaBot],
+) -> None:
+    fake = FakeOverseerr(results=HARRY_POTTER)
+    bot = bot_factory(fake)
+
+    assert await bot.handle_message(_message("Harry Potter")) is not None
+    second = await bot.handle_message(_message("the second one", message_id=2))
+    assert second is not None and "Chamber" in second.text
+
+    # Having narrowed to one card, the original list must still be addressable.
+    third = await bot.handle_message(_message("the third one", message_id=3))
+    assert third is not None
+    assert "Prisoner of Azkaban" in third.text
+    assert fake.request_calls == []
+
+
+@pytest.mark.asyncio
 async def test_nah_the_other_one_offers_the_runner_up(
     bot_factory: Callable[..., TelegramMediaBot],
 ) -> None:

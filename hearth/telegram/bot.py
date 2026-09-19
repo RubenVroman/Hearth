@@ -1037,20 +1037,45 @@ class TelegramMediaBot:
         )
         if hit.media_status == 5 or hit.media_status in {2, 3}:
             return BotReply(blocked_status_line(hit))
-        return self._present(
+
+        rendered = self._cards().render(
             view.chat_id,
             [hit],
             header=format_guess_confirm(hit.title, hit.year),
+            season=picked.season,
+            similar_anchor=hit,
+            offer_dismiss=True,
+        )
+        single = rendered.single_offer
+        if single is not None:
+            self._set_pending_guess(view.chat_id, single[0], season=single[1])
+        # The rest of the list stays addressable, so "the third one" still works
+        # after the user has narrowed down to one card.
+        self.memory.remember(
+            view.chat_id,
+            hits=[
+                MediaHit(
+                    media_type=remembered.media_type,  # type: ignore[arg-type]
+                    tmdb_id=remembered.tmdb_id,
+                    title=remembered.title,
+                    year=remembered.year,
+                    media_status=remembered.media_status,
+                )
+                for remembered in context.hits
+            ],
             ask_kind=context.ask_kind or "exact_title",
             ask_text=context.ask_text,
             search_title=context.search_title or hit.title,
             franchise_seed=context.franchise_seed,
-            season=picked.season,
-            remember_single_guess=True,
-            offer_similar=True,
-            offer_dismiss=True,
+            person_name=context.person_name,
+            person_role=context.person_role,
+            media_type=context.media_type,
+            anchor_id=context.anchor_id,
+            anchor_type=context.anchor_type,
+            page=context.page,
             accumulate_shown=False,
         )
+        return rendered.reply
 
     async def _offer_alternative(
         self,
