@@ -47,9 +47,31 @@ MEDIA_ASK_CRITERIA: dict[str, str] = {
         "User asked for a specific cut or quality of a known title "
         "(extended edition, director's cut, theatrical, 4K/UHD, remastered, etc.)."
     ),
+    "person_filmography": (
+        "User wants what an actor or director made, not one title "
+        "(e.g. 'anything with Florence Pugh', 'Nolan films', 'Tom Hanks movies')."
+    ),
+    "mood_vibe": (
+        "User described a mood, genre, occasion, runtime, or era instead of a "
+        "title (e.g. 'scary under 2 hours', 'Friday night comfort', 'kids movie', "
+        "'what should we watch?')."
+    ),
+    "similar_to": (
+        "User wants titles adjacent to a named one "
+        "(e.g. 'something like Arrival', 'more in that vein')."
+    ),
+    "batch_multi": (
+        "One message asking for two or more distinct titles "
+        "(e.g. 'grab Inception and Interstellar', 'LOTR extended + Hobbit theatrical')."
+    ),
+    "follow_up": (
+        "Short message that only resolves against the last few media replies "
+        "(e.g. 'the sequel', 'all of them', 'nah the other one', 'more like that', "
+        "'the second one')."
+    ),
     "descriptive_riddle": (
-        "Plot, vibe, actor, appearance, Dutch/English description, or riddle — "
-        "needs an LLM to guess the catalog title before search."
+        "Plot, appearance, Dutch/English description, or riddle about one "
+        "specific title — needs an LLM to guess the catalog name before search."
     ),
     "chat_about_title": (
         "Question about a title (plot, year, cast, 'what's that about?') "
@@ -150,7 +172,12 @@ def _media_router_questions() -> dict[str, dict[str, Any]]:
                 "Prefer exact_title or known_franchise when the user named a real title. "
                 "Use series_all only when they want every entry. "
                 "Use edition_aware when a cut/quality preference is attached to a title. "
-                "Use descriptive_riddle for plots/vibes/riddles that need an LLM. "
+                "Use person_filmography for actor/director asks, mood_vibe for "
+                "mood/genre/runtime/occasion asks, similar_to for 'like X' asks, "
+                "batch_multi when two or more distinct titles are requested at once, "
+                "and follow_up for short messages that only make sense against the "
+                "previous reply. "
+                "Use descriptive_riddle for plots/riddles that need an LLM. "
                 "Use chat_about_title for info questions without download intent. "
                 "Use not_media for lights, food, chatter, or non-catalog asks."
             ),
@@ -164,13 +191,25 @@ def _media_router_questions() -> dict[str, dict[str, Any]]:
             ),
             "criteria": {
                 "true": (
-                    "Plot/riddle/description/actor guess, or the media_ask is "
+                    "Plot/riddle/description guess, or the media_ask is "
                     "descriptive_riddle / chat_about_title with unclear title."
                 ),
                 "false": (
-                    "Exact title, franchise seed, series-all, or edition-aware ask "
-                    "that can search Overseerr/TMDB directly."
+                    "Exact title, franchise seed, series-all, edition-aware, person, "
+                    "mood, similar-to, batch, or follow-up ask that can be answered "
+                    "from Overseerr/TMDB routes directly."
                 ),
+            },
+        },
+        "multi_item": {
+            "type": "noul",
+            "instructions": (
+                "Does this message ask for more than one title (a batch, a whole "
+                "franchise, or a shortlist to choose from)?"
+            ),
+            "criteria": {
+                "true": "Two or more titles, a whole series, or a 'give me options' ask.",
+                "false": "One title, one question, or no catalog ask at all.",
             },
         },
     }
@@ -244,6 +283,7 @@ class JevAnswers:
     domain: ChoiceAnswer | None = None
     media_ask: ChoiceAnswer | None = None
     needs_llm: NoulAnswer | None = None
+    multi_item: NoulAnswer | None = None
     wants_queue: NoulAnswer | None = None
     is_confirm: NoulAnswer | None = None
     is_cancel: NoulAnswer | None = None
@@ -271,6 +311,8 @@ class JevAnswers:
             }
         if self.needs_llm is not None:
             out["needs_llm"] = round(self.needs_llm.noul, 4)
+        if self.multi_item is not None:
+            out["multi_item"] = round(self.multi_item.noul, 4)
         if self.wants_queue is not None:
             out["wants_queue"] = round(self.wants_queue.noul, 4)
         if self.is_confirm is not None:
@@ -338,6 +380,7 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
     domain = _parse_choice(answers.get("domain"))
     media_ask = _parse_choice(answers.get("media_ask"))
     needs_llm = _parse_noul(answers.get("needs_llm"))
+    multi_item = _parse_noul(answers.get("multi_item"))
     wants_queue = _parse_noul(answers.get("wants_queue"))
     is_confirm = _parse_noul(answers.get("is_confirm"))
     is_cancel = _parse_noul(answers.get("is_cancel"))
@@ -346,6 +389,7 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
         domain=domain,
         media_ask=media_ask,
         needs_llm=needs_llm,
+        multi_item=multi_item,
         wants_queue=wants_queue,
         is_confirm=is_confirm,
         is_cancel=is_cancel,

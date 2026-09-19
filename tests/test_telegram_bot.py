@@ -809,9 +809,12 @@ async def test_scar_wizard_plot_guesses_then_confirms_without_literal_search(
     assert reply.reply_markup is not None
     assert fake.request_calls == []  # never auto-queue
     assert "Wikipedia" not in reply.text
-    # Multi-hit guesses require Get (no sticky yes) — bare nah must not invent a queue.
+    # Multi-hit guesses require Get (no sticky yes). Bare nah answers out loud
+    # but must not invent a queue.
     nah = await bot.handle_message(_message("nah", message_id=2))
-    assert nah is None
+    assert nah is not None
+    assert "not queueing" in nah.text.lower()
+    assert nah.reply_markup is None
     assert fake.request_calls == []
 
 
@@ -1012,8 +1015,10 @@ async def test_land_exact_title_does_not_list_la_la_land(
     assert "Cop Land" not in reply.text
     assert "Land (2021)" in reply.text
     keyboard = reply.reply_markup["inline_keyboard"] if reply.reply_markup else []
-    assert len(keyboard) == 1
-    assert "Land (2021) movie" in keyboard[0][0]["text"]
+    # Exactly one queueing button; the trailing row only refines the conversation.
+    get_rows = [row for row in keyboard if row[0]["text"].startswith("Get ")]
+    assert len(get_rows) == 1
+    assert "Land (2021) movie" in get_rows[0][0]["text"]
 
 
 def test_looks_like_concrete_title_keeps_named_titles_and_rejects_plots() -> None:

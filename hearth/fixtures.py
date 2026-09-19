@@ -1577,7 +1577,7 @@ class MockPipeline:
 
     def list_radarr_library(self, title: str = "") -> list[dict[str, Any]]:
         """Monitored Radarr library rows (may lack a usable file)."""
-        from hearth.tools.arr import _normalize_title_tokens
+        from hearth.tools.arr import normalize_title_tokens
 
         source = (
             self.radarr_library
@@ -1594,12 +1594,12 @@ class MockPipeline:
         needle = (title or "").strip().lower()
         if not needle:
             return rows
-        needle_tokens = " ".join(_normalize_title_tokens(title))
+        needle_tokens = " ".join(normalize_title_tokens(title))
         out: list[dict[str, Any]] = []
         for row in rows:
             row_title = str(row.get("title") or "")
             row_l = row_title.lower()
-            row_tokens = " ".join(_normalize_title_tokens(row_title))
+            row_tokens = " ".join(normalize_title_tokens(row_title))
             if needle_tokens and row_tokens == needle_tokens:
                 out.append(row)
             elif needle in row_l or row_l in needle:
@@ -1740,6 +1740,47 @@ class MockPipeline:
         if not payload:
             return {"id": pid, "cast": [], "crew": []}
         return deepcopy(payload)
+
+    def neighbours_overseerr(
+        self,
+        media_id: int,
+        media_type: str,
+        *,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Mock "similar to" rows: same media type, overlapping genre ids.
+
+        Derived from the existing discover catalog rather than a hand-written
+        similarity table, so offline results stay consistent with mock search.
+        """
+        try:
+            anchor_id = int(media_id)
+        except (TypeError, ValueError):
+            return []
+        kind = media_type if media_type in {"movie", "tv"} else "movie"
+        pool = [
+            row
+            for row in MOCK_TMDB_DISCOVER
+            if str(row.get("mediaType") or "movie") == kind
+        ]
+        anchor = next(
+            (row for row in pool if int(row.get("id") or 0) == anchor_id),
+            None,
+        )
+        anchor_genres = {int(g) for g in ((anchor or {}).get("genreIds") or [])}
+        matched: list[dict[str, Any]] = []
+        for row in pool:
+            try:
+                row_id = int(row.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if row_id == anchor_id or row.get("discover") is False:
+                continue
+            genres = {int(g) for g in (row.get("genreIds") or [])}
+            if anchor_genres and not genres.intersection(anchor_genres):
+                continue
+            matched.append(dict(row))
+        return matched[: max(1, min(int(limit or 8), 20))]
 
     def discover_overseerr(
         self,

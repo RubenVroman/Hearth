@@ -303,9 +303,11 @@ async def test_jev_series_all_multi_get_never_silent_queues(
     assert len(keyboard) >= 2
     assert fake_ov.request_calls == []
 
-    # Nah / list ask must still refuse to invent a queue.
+    # Nah acknowledges out loud (never silent) but must not invent a queue.
     nah = await bot.handle_message(_message("nah", message_id=2))
-    assert nah is None
+    assert nah is not None
+    assert "not queueing" in nah.text.lower()
+    assert nah.reply_markup is None
     assert fake_ov.request_calls == []
 
     listed = await bot.handle_message(_message("list movies", message_id=3))

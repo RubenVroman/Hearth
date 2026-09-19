@@ -47,6 +47,7 @@ _DESCRIPTIVE = re.compile(
     r")\b",
     re.I,
 )
+_NUMERIC_TITLE = re.compile(r"\d{2,4}")
 _PLOT_SHELL = re.compile(
     r"(?:(?:that|this|the|a|an|die|deze|dat|een)\s+)*"
     r"(?:movie|film|films|series|show|one|ones)?",
@@ -118,6 +119,10 @@ def looks_like_concrete_title(text: str) -> bool:
         return False
     if _DESCRIPTIVE.search(cleaned) or _DESCRIPTIVE.search(raw):
         return False
+    # Numeric titles are real ("1917", "300", "1984", "2012") and must not be
+    # sent to the guess lane just because they contain no letters.
+    if _NUMERIC_TITLE.fullmatch(cleaned):
+        return True
     return bool(re.search(r"[A-Za-zÀ-ÿ]", cleaned))
 
 

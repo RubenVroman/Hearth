@@ -19,9 +19,17 @@ from hearth.telegram.models import MediaType
 
 MAX_CALLBACK_BYTES = 64
 _VERSION = "h1"
+_ACTION_VERSION = "h2"
 _DOMAIN = b"hearth.telegram.callback.v1\x00"
 _BASE36 = re.compile(r"[0-9a-z]+")
 _SIGNATURE = re.compile(r"[A-Za-z0-9_-]{16}")
+
+# Non-request buttons: refine the conversation, never queue anything.
+ACTION_SIMILAR = "l"  # more like the anchor title
+ACTION_MORE = "m"  # next page of the current lane
+ACTION_DISMISS = "n"  # nah, drop the offer
+ACTION_SERIES = "a"  # all of them (franchise expand)
+ACTION_CODES = frozenset({ACTION_SIMILAR, ACTION_MORE, ACTION_DISMISS, ACTION_SERIES})
 
 
 class CallbackError(ValueError):
@@ -42,6 +50,21 @@ class RequestCallback:
     tmdb_id: int
     season: int | None
     expires_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActionCallback:
+    """A refine button (similar / more / nah / all of them)."""
+
+    action: str
+    media_type: MediaType | None
+    tmdb_id: int | None
+    expires_at: int
+
+
+def is_action_callback(data: str) -> bool:
+    """True when the payload is a refine button rather than a queue button."""
+    return isinstance(data, str) and data.startswith(f"{_ACTION_VERSION}.")
 
 
 def _to_base36(value: int) -> str:
@@ -212,9 +235,117 @@ class CallbackCodec:
     ) -> RequestCallback:
         return self.decode(data, chat_id, now=now)
 
-    def _signature(self, payload: str, chat_id: int) -> str:
+    def encode_action(
+        self,
+        action: str,
+        chat_id: int,
+        *,
+        media_type: MediaType | None = None,
+        tmdb_id: int | None = None,
+        now: float | None = None,
+    ) -> str:
+        """Sign a refine button. These never carry queue authority on their own."""
+        if action not in ACTION_CODES:
+            raise ValueError("unsupported callback action")
+        if media_type is not None and media_type not in {"movie", "tv"}:
+            raise ValueError("media_type must be movie or tv")
+        if tmdb_id is not None:
+            if isinstance(tmdb_id, bool) or not isinstance(tmdb_id, int) or tmdb_id <= 0:
+                raise ValueError("TMDB id must be a positive integer")
+        if isinstance(chat_id, bool):
+            raise ValueError("chat_id must be an integer")
+        try:
+            bound_chat_id = int(chat_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("chat_id must be an integer") from exc
+
+        current = time.time() if now is None else float(now)
+        if not math.isfinite(current) or current < 0:
+            raise ValueError("current time must be a finite Unix timestamp")
+        expires_minute = math.ceil((current + self.ttl_seconds) / 60)
+        kind = "-" if media_type is None else ("m" if media_type == "movie" else "t")
+        payload = ".".join(
+            (
+                _ACTION_VERSION,
+                action,
+                kind,
+                "-" if tmdb_id is None else _to_base36(tmdb_id),
+                _to_base36(expires_minute),
+            )
+        )
+        signature = self._signature(payload, bound_chat_id, action=True)
+        encoded = f"{payload}.{signature}"
+        if len(encoded.encode("utf-8")) > MAX_CALLBACK_BYTES:
+            raise ValueError("callback data exceeds Telegram's 64-byte limit")
+        return encoded
+
+    def decode_action(
+        self,
+        data: str,
+        chat_id: int,
+        *,
+        now: float | None = None,
+    ) -> ActionCallback:
+        if not isinstance(data, str):
+            raise InvalidCallback("callback data must be text")
+        if isinstance(chat_id, bool):
+            raise InvalidCallback("invalid callback chat")
+        try:
+            raw = data.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise InvalidCallback("callback data must be ASCII") from exc
+        if not raw or len(raw) > MAX_CALLBACK_BYTES:
+            raise InvalidCallback("invalid callback data length")
+
+        parts = data.split(".")
+        if len(parts) != 6:
+            raise InvalidCallback("invalid callback shape")
+        version, action, kind, id_part, expiry_part, supplied_signature = parts
+        if version != _ACTION_VERSION or action not in ACTION_CODES:
+            raise InvalidCallback("unsupported callback")
+        if kind not in {"m", "t", "-"}:
+            raise InvalidCallback("invalid callback kind")
+        if not _SIGNATURE.fullmatch(supplied_signature):
+            raise InvalidCallback("invalid callback signature")
+
+        try:
+            bound_chat_id = int(chat_id)
+        except (TypeError, ValueError) as exc:
+            raise InvalidCallback("invalid callback chat") from exc
+        payload = ".".join(parts[:5])
+        expected_signature = self._signature(payload, bound_chat_id, action=True)
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            raise InvalidCallback("invalid callback signature")
+
+        tmdb_id: int | None = None
+        if id_part != "-":
+            tmdb_id = _from_base36(id_part, field="TMDB id")
+            if tmdb_id <= 0:
+                raise InvalidCallback("invalid callback TMDB id")
+        expires_minute = _from_base36(expiry_part, field="expiry")
+        expires_at = expires_minute * 60
+        current = time.time() if now is None else float(now)
+        if not math.isfinite(current) or current < 0:
+            raise InvalidCallback("invalid callback time")
+        if current >= expires_at:
+            raise ExpiredCallback("this button has expired")
+
+        media_type: MediaType | None = None
+        if kind == "m":
+            media_type = "movie"
+        elif kind == "t":
+            media_type = "tv"
+        return ActionCallback(
+            action=action,
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            expires_at=expires_at,
+        )
+
+    def _signature(self, payload: str, chat_id: int, *, action: bool = False) -> str:
         signed = (
             _DOMAIN
+            + (b"action\x00" if action else b"")
             + b"chat="
             + str(chat_id).encode("ascii")
             + b"\x00"

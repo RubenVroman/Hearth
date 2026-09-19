@@ -1,10 +1,12 @@
 """Overseerr-first Telegram media bot.
 
 **Jev-first media router:** every media-ish turn hits TypeSafe System One
-(Choice/Noul/Score) to classify exact title / franchise / series-all / edition /
-descriptive riddle / chat-about. OpenAI (gpt-4o) runs only when Jev says a
-descriptive riddle or needs_llm (or fail-open). Get / yes confirm remains the
-only queue boundary — never invent a grab from chat alone.
+(Choice/Noul/Score) to pick a lane — exact title, known franchise, series-all,
+edition, person filmography, mood/vibe, "something like X", a multi-title batch,
+or an in-thread follow-up. OpenAI (gpt-4o) runs only when Jev says a descriptive
+riddle or needs_llm (or fail-open). Get / yes confirm remains the only queue
+boundary — never invent a grab from chat alone, and confirming queues by
+mediaId, never by re-searching the title.
 """
 
 from __future__ import annotations
@@ -15,21 +17,45 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-from rapidfuzz import fuzz
-
 from hearth.config import settings
 from hearth.jev import evaluate_telegram_media, log_shadow_outcome, noul_high
-from hearth.telegram.callbacks import CallbackCodec, CallbackError
+from hearth.telegram.callbacks import (
+    ACTION_DISMISS,
+    ACTION_MORE,
+    ACTION_SERIES,
+    ACTION_SIMILAR,
+    CallbackCodec,
+    CallbackError,
+    is_action_callback,
+)
 from hearth.telegram.heuristics import (
     looks_like_concrete_title,
     looks_like_confirm_no,
     looks_like_confirm_yes,
 )
 from hearth.telegram.media import (
+    MAX_RESULTS,
+    SERIES_MAX_RESULTS,
+    AskPart,
+    CardRenderer,
+    CatalogSearch,
+    CatalogUnavailable,
+    ChatContext,
     MediaIntent,
+    MediaMemory,
     answer_catalog_question,
+    apply_exclusions,
+    best_franchise_seed,
+    blocked_status_line,
     classify_media_ask,
+    detect_mood,
     guess_catalog_titles,
+    house_pick_spec,
+    in_release_order,
+    plausible_match,
+    rank_hits,
+    voice,
+    without_ids,
 )
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
 from hearth.telegram.parse import parse_message
@@ -41,33 +67,19 @@ from hearth.telegram.progress import (
 )
 from hearth.telegram.safeguards import RateLimiter, authorized
 from hearth.telegram.store import TelegramStore
-from hearth.tools.arr import OverseerrError, overseerr, title_seed_matches
+from hearth.tools.arr import OverseerrError, overseerr
 
 log = logging.getLogger("hearth.telegram")
 
-MAX_RESULTS = 5
-SERIES_MAX_RESULTS = 8
 HELP_TEXT = (
-    "Send a movie or series title and I’ll search Overseerr. Describe a plot or "
-    "vibe and I’ll guess, then ask before requesting. Ask for a whole franchise "
-    "(e.g. Harry Potter, all movies) or an edition (extended, director’s cut). "
-    "Tap Get on the exact match to request it — I never queue from chat alone. "
-    "Commands: /search <title>, /status, /help."
+    "Send a title and I’ll find it. I also do franchises (“all Harry Potters”), "
+    "editions (“LOTR extended”), people (“anything with Florence Pugh”), vibes "
+    "(“scary under 2 hours”), lookalikes (“something like Arrival”), and several "
+    "at once (“grab Inception and Interstellar”). Follow-ups work too: “the "
+    "sequel”, “all of them”, “more like that”. Tap Get to request — I never "
+    "queue from chat alone. Commands: /search <title>, /status, /help."
 )
 _PENDING_GUESS_PREFIX = "guess:"
-
-_STATUS_MARKS = {
-    1: "○ Not requested",
-    2: "◷ Pending approval",
-    3: "◷ Requested",
-    4: "◐ Partly available",
-    5: "✓ In Plex",
-    # Archived Overseerr used 6 for deleted; current Seerr uses it for
-    # blocklisted. Keep the label honest across both servers and let the
-    # backend decide whether a fresh request is allowed.
-    6: "◇ Blocklisted or deleted",
-    7: "○ Removed",
-}
 
 
 def _integer(value: Any) -> int | None:
@@ -79,29 +91,8 @@ def _integer(value: Any) -> int | None:
         return None
 
 
-def _normalized(value: str) -> str:
-    return " ".join((value or "").casefold().split())
-
-
 def _display_title(title: str, year: int | None = None) -> str:
-    clean = (title or "").strip() or "that title"
-    return f"{clean} ({year})" if year else clean
-
-
-def _kind_label(media_type: str) -> str:
-    return "movie" if media_type == "movie" else "TV"
-
-
-def _button_label(
-    index: int,
-    hit: MediaHit,
-    *,
-    season: int | None = None,
-) -> str:
-    year_bit = f" ({hit.year})" if hit.year is not None else ""
-    season_bit = f" S{season:02d}" if season is not None else ""
-    # Telegram shows ~64 visible chars; keep index + title + year + kind.
-    return f"Get {index} · {hit.title}{year_bit} {_kind_label(hit.media_type)}{season_bit}"
+    return voice.display_title(title, year)
 
 
 class TelegramMediaBot:
@@ -117,6 +108,8 @@ class TelegramMediaBot:
         self.store = store
         self.overseerr = overseerr_client or overseerr
         self.progress = progress or ProgressTracker(overseerr_client=self.overseerr)
+        self.catalog = CatalogSearch(self.overseerr)
+        self.memory = MediaMemory(store)
         self.rate = RateLimiter()
         self.bot_user_id: int | None = None
         self._codec: CallbackCodec | None = None
@@ -126,6 +119,13 @@ class TelegramMediaBot:
         self.rate.reset()
         self.progress.reset()
         self.bot_user_id = None
+
+    def _cards(self) -> CardRenderer:
+        return CardRenderer(
+            self._callback_codec(),
+            self.store,
+            ttl_s=max(60, int(settings.telegram_callback_ttl_seconds)),
+        )
 
     @property
     def backend_configured(self) -> bool:
@@ -235,10 +235,19 @@ class TelegramMediaBot:
             return await self._queue_pending_guess(view, pending)
         if pending is not None and regex_no:
             self._clear_pending_guess(view.chat_id)
-            return BotReply("Okay — not queueing that. Send another title or description.")
+            return await self._offer_alternative(view)
         if pending is None and (regex_yes or regex_no):
-            # Bare yes/nah/no without an on-screen guess must never invent a queue.
-            return None
+            # Bare yes/nah/no without an armed offer must never invent a queue.
+            # With a live card on screen it is still a real answer, so reply.
+            context = self.memory.load(view.chat_id)
+            if context is None or not context.hits:
+                return None
+            if regex_no:
+                self.memory.forget(view.chat_id)
+                return BotReply(voice.cancelled())
+            if len(context.hits) == 1:
+                return await self._confirm_context_pick(view, context, index=1)
+            return BotReply(voice.which_one())
 
         _, query = parse_message(
             message,
@@ -271,34 +280,61 @@ class TelegramMediaBot:
         if query.tmdb_id is not None:
             return await self._search_reply(view, query)
 
+        context = self.memory.load(view.chat_id)
         # Jev-first media router (fail-open to local heuristics).
         intent = await classify_media_ask(
             query.raw_text or query.title or view.text,
             parsed=query,
+            recent=self._recent_context(context),
         )
-        return await self._route_media_intent(view, query, intent)
+        try:
+            return await self._route_media_intent(view, query, intent, context)
+        except CatalogUnavailable as exc:
+            return BotReply(exc.message)
+
+    @staticmethod
+    def _recent_context(context: ChatContext | None) -> list[str] | None:
+        """A few words of thread history so Jev can read follow-ups."""
+        if context is None:
+            return None
+        recent = [context.ask_text] if context.ask_text else []
+        recent.extend(hit.label for hit in context.hits[:3])
+        return recent or None
 
     async def _route_media_intent(
         self,
         view: MessageView,
         query: MediaQuery,
         intent: MediaIntent,
+        context: ChatContext | None = None,
     ) -> BotReply:
-        if intent.note == "list_ask" or intent.kind == "other":
-            # List / chatter / not_media — never invent a queue from a vague ask.
-            if intent.note == "list_ask":
-                return BotReply(
-                    "I don’t queue from a list ask. Send a title, franchise, "
-                    "edition, or short description — then tap Get."
-                )
-            # Fall through: treat leftover "other" as a normal title search when
-            # the parser already extracted something searchable.
+        if intent.note == "list_ask":
+            return BotReply(voice.list_ask())
+
+        if intent.kind == "other":
+            # not_media / chatter. Search anything the parser already salvaged,
+            # otherwise say what I can do — a routed media turn is never silent.
             if query.title and looks_like_concrete_title(query.title):
                 return await self._search_reply(view, query)
-            return None
+            return BotReply(voice.nudge())
 
         if intent.kind == "chat_about":
             return await self._chat_about_reply(view, query, intent)
+
+        if intent.kind == "follow_up":
+            return await self._follow_up_reply(view, query, intent, context)
+
+        if intent.kind == "batch" and settings.telegram_batch_lane:
+            return await self._batch_reply(view, intent)
+
+        if intent.kind == "person" and settings.telegram_person_lane:
+            return await self._person_reply(view, intent)
+
+        if intent.kind == "similar" and settings.telegram_similar_lane:
+            return await self._similar_reply(view, intent, context)
+
+        if intent.kind in {"mood", "house_pick"} and settings.telegram_mood_lane:
+            return await self._mood_reply(view, intent)
 
         if intent.kind == "describe" or intent.needs_llm:
             return await self._guess_reply(view, query, intent=intent)
@@ -311,6 +347,13 @@ class TelegramMediaBot:
 
         if intent.kind == "known_franchise":
             return await self._franchise_reply(view, query, intent)
+
+        # A disabled lane still has to answer something useful.
+        if intent.kind in {"batch", "person", "similar", "mood", "house_pick"}:
+            search_query = self._intent_search_query(query, intent)
+            if search_query.title:
+                return await self._search_reply(view, search_query)
+            return BotReply(voice.nudge())
 
         # exact_title — instant Overseerr path, no LLM.
         search_query = self._intent_search_query(query, intent)
@@ -381,6 +424,79 @@ class TelegramMediaBot:
             )
         return format_reject_download()
 
+    # --- presentation ------------------------------------------------------
+
+    def _present(
+        self,
+        chat_id: int,
+        hits: list[MediaHit],
+        *,
+        header: str,
+        ask_kind: str,
+        ask_text: str = "",
+        season: int | None = None,
+        edition_key: str = "",
+        edition_label: str = "",
+        search_title: str = "",
+        franchise_seed: str = "",
+        person_name: str = "",
+        person_role: str = "",
+        media_type: str = "",
+        anchor: MediaHit | None = None,
+        remember_single_guess: bool = False,
+        offer_similar: bool = False,
+        offer_series: bool = False,
+        offer_more: bool = False,
+        offer_dismiss: bool = False,
+        page: int = 1,
+        accumulate_shown: bool = True,
+    ) -> BotReply:
+        """Render cards, remember the thread context, and arm yes/nah."""
+        cards = self._cards()
+        top = hits[0] if hits else None
+        rendered = cards.render(
+            chat_id,
+            hits,
+            header=header,
+            season=season,
+            edition_key=edition_key,
+            edition_label=edition_label,
+            similar_anchor=top if (offer_similar and top is not None) else None,
+            series_anchor=top if (offer_series and top is not None) else None,
+            offer_more=offer_more,
+            offer_dismiss=offer_dismiss,
+        )
+        self.memory.remember(
+            chat_id,
+            hits=hits,
+            ask_kind=ask_kind,
+            ask_text=ask_text,
+            search_title=search_title,
+            franchise_seed=franchise_seed,
+            person_name=person_name,
+            person_role=person_role,
+            media_type=media_type,
+            anchor_id=anchor.tmdb_id if anchor is not None else None,
+            anchor_type=anchor.media_type if anchor is not None else "",
+            season=season,
+            page=page,
+            accumulate_shown=accumulate_shown,
+        )
+        single = rendered.single_offer
+        if remember_single_guess and single is not None:
+            hit, hit_season = single
+            self._set_pending_guess(chat_id, hit, season=hit_season)
+        # Nothing to request and only one candidate: answer in one clear line
+        # instead of a one-row menu with no buttons.
+        if not rendered.requestable and len(hits) == 1:
+            return BotReply(blocked_status_line(hits[0]))
+        return rendered.reply
+
+    def _miss(self, label: str) -> BotReply:
+        return BotReply(voice.no_match(label))
+
+    # --- lanes -------------------------------------------------------------
+
     async def _guess_reply(
         self,
         view: MessageView,
@@ -390,20 +506,13 @@ class TelegramMediaBot:
     ) -> BotReply:
         """LLM catalog resolve for descriptive riddles — never auto-queue."""
         if not self.backend_configured:
-            return BotReply(
-                "Overseerr is not configured, so I cannot run a real catalog search."
-            )
+            return BotReply(voice.backend_not_configured())
         if not settings.openai_configured:
-            return BotReply(
-                "That sounds like a description. Send the movie or series title "
-                "(or configure OpenAI so I can guess)."
-            )
+            return BotReply(voice.needs_openai())
 
         guesses = await guess_catalog_titles(query.raw_text or query.title)
         if not guesses:
-            return BotReply(
-                "I’m not sure which title you mean. Send the movie or series name."
-            )
+            return BotReply("I’m not sure which title you mean. Send the movie or series name.")
 
         # Search the primary guess; if empty, try the next candidate once.
         hits: list[MediaHit] = []
@@ -417,22 +526,7 @@ class TelegramMediaBot:
                 reason="guess",
                 raw_text=query.raw_text,
             )
-            try:
-                rows = await self._search_rows(guessed)
-            except OverseerrError as exc:
-                if exc.operation == "authentication" or exc.status_code in {401, 403}:
-                    return BotReply(
-                        "Overseerr rejected its configured API key. Fix the key or its "
-                        "request permissions before searching again."
-                    )
-                return BotReply(
-                    "Overseerr search is unavailable right now. This is a backend error, "
-                    "not a catalog miss."
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("telegram guess search failed")
-                return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
-            hits = self._rank_hits(rows, guessed)
+            hits = await self.catalog.hits(guessed)
             if hits:
                 break
 
@@ -447,14 +541,17 @@ class TelegramMediaBot:
             if len(hits) == 1
             else f"Which one for “{guessed.title}”?"
         )
-        if intent and intent.source == "jev":
-            header = f"{header}"
-        return self._results_reply(
+        return self._present(
             view.chat_id,
-            guessed,
             hits,
             header=header,
+            ask_kind="describe",
+            ask_text=query.raw_text or view.text,
+            search_title=guessed.title,
+            media_type=guessed.media_type or "",
             remember_single_guess=True,
+            offer_similar=len(hits) == 1,
+            offer_dismiss=len(hits) == 1,
         )
 
     async def _chat_about_reply(
@@ -481,8 +578,7 @@ class TelegramMediaBot:
                     reason="chat_about",
                     raw_text=query.raw_text,
                 )
-                rows = await self._search_rows(probe)
-                hits = self._rank_hits(rows, probe)
+                hits = await self.catalog.hits(probe)
                 if hits:
                     top = hits[0]
                     bits = [top.display_label()]
@@ -520,43 +616,67 @@ class TelegramMediaBot:
         if not search_query.title:
             return BotReply("Which franchise should I expand? Send the series name.")
         if not self.backend_configured:
-            return BotReply(
-                "Overseerr is not configured, so I cannot run a real catalog search."
-            )
-        try:
-            rows = await self._search_rows(search_query)
-        except OverseerrError as exc:
-            if exc.operation == "authentication" or exc.status_code in {401, 403}:
-                return BotReply(
-                    "Overseerr rejected its configured API key. Fix the key or its "
-                    "request permissions before searching again."
-                )
-            return BotReply(
-                "Overseerr search is unavailable right now. This is a backend error, "
-                "not a catalog miss."
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("telegram series_all search failed")
-            return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
+            return BotReply(voice.backend_not_configured())
 
-        hits = self._rank_hits(
-            rows,
+        seed = search_query.title
+        hits = await self._franchise_hits(search_query, seed)
+        if not hits:
+            return self._miss(search_query.display_label())
+
+        ordered = in_release_order(hits)
+        kept = apply_exclusions(
+            ordered,
+            drop_last=intent.drop_last,
+            drop_first=intent.drop_first,
+        )
+        # Say what was skipped by position, not by title: naming a film that has
+        # no button invites "did you queue it?".
+        dropped = ""
+        skipped = len(ordered) - len(kept)
+        if skipped > 0:
+            if intent.drop_last:
+                dropped = "the last" if intent.drop_last == 1 else f"the last {intent.drop_last}"
+            elif intent.drop_first:
+                dropped = (
+                    "the first" if intent.drop_first == 1 else f"the first {intent.drop_first}"
+                )
+        return self._present(
+            view.chat_id,
+            kept[:SERIES_MAX_RESULTS],
+            header=voice.series_header(seed, dropped=dropped),
+            ask_kind="series_all",
+            ask_text=query.raw_text or view.text,
+            search_title=seed,
+            franchise_seed=seed,
+            media_type=search_query.media_type or "",
+            edition_key=intent.edition_key,
+            edition_label=intent.edition_label,
+            offer_similar=False,
+        )
+
+    async def _franchise_hits(self, search_query: MediaQuery, seed: str) -> list[MediaHit]:
+        """Franchise entries, preferring the exact TMDB collection when there is one."""
+        hits = await self.catalog.hits(
             search_query,
-            franchise_seed=search_query.title,
+            franchise_seed=seed,
             limit=SERIES_MAX_RESULTS,
         )
         if not hits:
-            return BotReply(f"No Overseerr matches for “{search_query.display_label()}”.")
-        return self._results_reply(
-            view.chat_id,
-            search_query,
-            hits,
-            header=(
-                f"Whole series for “{search_query.title}” — tap Get on each title "
-                "you want (I won’t queue them all at once):"
-            ),
-            remember_single_guess=False,
-        )
+            return []
+        anchor = in_release_order(hits)[0]
+        if anchor.media_type != "movie":
+            return hits
+        try:
+            _, parts = await self.catalog.collection_hits(
+                anchor.media_type,
+                anchor.tmdb_id,
+                limit=SERIES_MAX_RESULTS + 4,
+            )
+        except CatalogUnavailable:
+            return hits
+        # A real collection beats fuzzy title matching, but only when it is at
+        # least as complete as what search already found.
+        return parts if len(parts) >= len(hits) else hits
 
     async def _franchise_reply(
         self,
@@ -567,44 +687,34 @@ class TelegramMediaBot:
         """Known franchise seed (e.g. Harry Potter) → franchise-aware Get cards."""
         search_query = self._intent_search_query(query, intent)
         if not self.backend_configured:
-            return BotReply(
-                "Overseerr is not configured, so I cannot run a real catalog search."
-            )
-        try:
-            rows = await self._search_rows(search_query)
-        except OverseerrError as exc:
-            if exc.operation == "authentication" or exc.status_code in {401, 403}:
-                return BotReply(
-                    "Overseerr rejected its configured API key. Fix the key or its "
-                    "request permissions before searching again."
-                )
-            return BotReply(
-                "Overseerr search is unavailable right now. This is a backend error, "
-                "not a catalog miss."
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("telegram franchise search failed")
-            return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
+            return BotReply(voice.backend_not_configured())
 
-        hits = self._rank_hits(
-            rows,
+        seed = search_query.title
+        hits = await self.catalog.hits(
             search_query,
-            franchise_seed=search_query.title,
+            franchise_seed=seed,
             limit=SERIES_MAX_RESULTS,
         )
         if not hits:
-            return BotReply(f"No Overseerr matches for “{search_query.display_label()}”.")
+            return self._miss(search_query.display_label())
+        ordered = in_release_order(hits) if len(hits) > 1 else hits
         header = (
-            f"“{search_query.title}” franchise — pick a title:"
-            if len(hits) > 1
-            else None
+            voice.franchise_header(seed)
+            if len(ordered) > 1
+            else voice.exact_header(ordered[0].title, single=True)
         )
-        return self._results_reply(
+        return self._present(
             view.chat_id,
-            search_query,
-            hits,
+            ordered,
             header=header,
-            remember_single_guess=len(hits) == 1,
+            ask_kind="known_franchise",
+            ask_text=query.raw_text or view.text,
+            search_title=seed,
+            franchise_seed=seed,
+            media_type=search_query.media_type or "",
+            remember_single_guess=len(ordered) == 1,
+            offer_similar=len(ordered) == 1,
+            offer_dismiss=len(ordered) == 1,
         )
 
     async def _edition_reply(
@@ -618,48 +728,538 @@ class TelegramMediaBot:
         if not search_query.title:
             return BotReply("Which title should I look up with that edition preference?")
         if not self.backend_configured:
-            return BotReply(
-                "Overseerr is not configured, so I cannot run a real catalog search."
-            )
-        try:
-            rows = await self._search_rows(search_query)
-        except OverseerrError as exc:
-            if exc.operation == "authentication" or exc.status_code in {401, 403}:
-                return BotReply(
-                    "Overseerr rejected its configured API key. Fix the key or its "
-                    "request permissions before searching again."
-                )
-            return BotReply(
-                "Overseerr search is unavailable right now. This is a backend error, "
-                "not a catalog miss."
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("telegram edition search failed")
-            return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
+            return BotReply(voice.backend_not_configured())
 
         seed = search_query.title
-        hits = self._rank_hits(
-            rows,
+        multiword = len(seed.split()) >= 2
+        hits = await self.catalog.hits(
             search_query,
-            franchise_seed=seed if len(seed.split()) >= 2 else None,
-            limit=SERIES_MAX_RESULTS if len(seed.split()) >= 2 else MAX_RESULTS,
+            franchise_seed=seed if multiword else None,
+            limit=SERIES_MAX_RESULTS if multiword else MAX_RESULTS,
         )
         if not hits:
-            return BotReply(f"No Overseerr matches for “{search_query.display_label()}”.")
+            return self._miss(search_query.display_label())
         label = intent.edition_label or "preferred edition"
-        header = (
-            f"Resolved “{search_query.title}” for {label} — tap Get on the film(s). "
-            f"I’ll note {label} when grabbing."
-        )
-        return self._results_reply(
+        return self._present(
             view.chat_id,
-            search_query,
-            hits,
-            header=header,
-            remember_single_guess=len(hits) == 1,
+            in_release_order(hits) if len(hits) > 1 else hits,
+            header=voice.edition_header(seed, label),
+            ask_kind="edition",
+            ask_text=query.raw_text or view.text,
+            search_title=seed,
+            franchise_seed=seed if multiword else "",
+            media_type=search_query.media_type or "",
             edition_key=intent.edition_key,
             edition_label=intent.edition_label,
+            remember_single_guess=len(hits) == 1,
+            offer_dismiss=len(hits) == 1,
         )
+
+    async def _person_reply(self, view: MessageView, intent: MediaIntent) -> BotReply:
+        """Actor / director filmography — never a literal search of the sentence."""
+        if not self.backend_configured:
+            return BotReply(voice.backend_not_configured())
+        name = intent.person_name.strip()
+        if not name:
+            return BotReply(voice.nudge())
+        resolved, hits = await self.catalog.person_hits(
+            name,
+            role=intent.person_role or "cast",
+            limit=SERIES_MAX_RESULTS,
+        )
+        if not resolved:
+            return BotReply(voice.unknown_person(name))
+        if not hits:
+            return BotReply(
+                f"I found {resolved}, but nothing of theirs is in the catalog right now."
+            )
+        return self._present(
+            view.chat_id,
+            hits,
+            header=voice.person_header(resolved, role=intent.person_role or "cast"),
+            ask_kind="person",
+            ask_text=intent.raw_text or view.text,
+            person_name=resolved,
+            person_role=intent.person_role or "cast",
+            offer_more=True,
+        )
+
+    async def _mood_reply(
+        self,
+        view: MessageView,
+        intent: MediaIntent,
+        *,
+        page: int = 1,
+        exclude_ids: frozenset[int] = frozenset(),
+    ) -> BotReply:
+        """Mood / vibe / house pick via real TMDB discover coordinates."""
+        if not self.backend_configured:
+            return BotReply(voice.backend_not_configured())
+        spec = intent.mood or house_pick_spec(
+            media_type=intent.media_type or "movie",
+        )
+        hits = await self.catalog.mood_hits(
+            spec,
+            limit=MAX_RESULTS,
+            page=page,
+            exclude_ids=exclude_ids,
+        )
+        if not hits:
+            if exclude_ids:
+                return BotReply(voice.no_more_options(spec.label))
+            return BotReply(
+                f"Nothing in the catalog fits {spec.label} right now. "
+                "Give me a title or a different vibe?"
+            )
+        header = (
+            voice.house_pick_header()
+            if intent.kind == "house_pick"
+            else voice.mood_header(spec.label)
+        )
+        return self._present(
+            view.chat_id,
+            hits,
+            header=header,
+            ask_kind=intent.kind,
+            ask_text=intent.raw_text or view.text,
+            media_type=spec.media_type,
+            offer_more=True,
+            page=page,
+        )
+
+    async def _similar_reply(
+        self,
+        view: MessageView,
+        intent: MediaIntent,
+        context: ChatContext | None,
+    ) -> BotReply:
+        """"Something like X" — resolve the anchor once, then ask TMDB for neighbours."""
+        if not self.backend_configured:
+            return BotReply(voice.backend_not_configured())
+
+        anchor_type = ""
+        anchor_id: int | None = None
+        anchor_label = intent.search_title.strip()
+        if anchor_label:
+            probe = MediaQuery(
+                action="search",
+                title=anchor_label,
+                year=intent.year,
+                media_type=intent.media_type if intent.media_type in {"movie", "tv"} else None,
+                reason="similar",
+                raw_text=intent.raw_text,
+            )
+            found = await self.catalog.hits(probe, limit=1)
+            if not found:
+                return self._miss(anchor_label)
+            anchor_type = found[0].media_type
+            anchor_id = found[0].tmdb_id
+            anchor_label = _display_title(found[0].title, found[0].year)
+        elif context is not None and context.top is not None:
+            top = context.top
+            anchor_type = top.media_type
+            anchor_id = top.tmdb_id
+            anchor_label = top.label
+        else:
+            return BotReply(voice.need_a_subject())
+
+        return await self._neighbour_reply(
+            view.chat_id,
+            anchor_type,
+            int(anchor_id),
+            anchor_label,
+            ask_text=intent.raw_text or view.text,
+            exclude_ids=frozenset(),
+        )
+
+    async def _neighbour_reply(
+        self,
+        chat_id: int,
+        anchor_type: str,
+        anchor_id: int,
+        anchor_label: str,
+        *,
+        ask_text: str,
+        exclude_ids: frozenset[int] = frozenset(),
+        edit_message_id: int | None = None,
+    ) -> BotReply:
+        hits = await self.catalog.neighbour_hits(
+            anchor_type,
+            anchor_id,
+            limit=MAX_RESULTS,
+            exclude_ids=exclude_ids,
+        )
+        if not hits:
+            return BotReply(
+                voice.no_more_options(anchor_label),
+                edit_message_id=edit_message_id,
+            )
+        anchor = MediaHit(media_type=anchor_type, tmdb_id=anchor_id, title=anchor_label)
+        reply = self._present(
+            chat_id,
+            hits,
+            header=voice.similar_header(anchor_label),
+            ask_kind="similar",
+            ask_text=ask_text,
+            search_title=anchor_label,
+            media_type=anchor_type,
+            anchor=anchor,
+            offer_more=True,
+        )
+        if edit_message_id is None:
+            return reply
+        return BotReply(reply.text, reply.reply_markup, edit_message_id=edit_message_id)
+
+    async def _batch_reply(self, view: MessageView, intent: MediaIntent) -> BotReply:
+        """A compound ask becomes one plan with per-item progress."""
+        if not self.backend_configured:
+            return BotReply(voice.backend_not_configured())
+        parts = intent.parts[: max(2, int(settings.telegram_batch_max_items))]
+        if not parts:
+            return BotReply(voice.nudge())
+
+        groups: list[tuple[str, list[MediaHit]]] = []
+        misses: list[str] = []
+        shown: list[MediaHit] = []
+        for part in parts:
+            hits = await self._part_hits(part)
+            if not hits:
+                misses.append(part.label())
+                continue
+            groups.append((part.label(), hits))
+            shown.extend(hits)
+
+        if not groups:
+            return BotReply(
+                voice.no_match(", ".join(part.label() for part in parts)),
+            )
+
+        rendered = self._cards().render_plan(
+            view.chat_id,
+            groups,
+            header=voice.batch_header([part.label() for part in parts]),
+            misses=misses,
+        )
+        self.memory.remember(
+            view.chat_id,
+            hits=shown,
+            ask_kind="batch",
+            ask_text=intent.raw_text or view.text,
+            search_title=parts[0].title,
+        )
+        return rendered.reply
+
+    async def _part_hits(self, part: AskPart) -> list[MediaHit]:
+        """Resolve one plan item with the same intelligence as a solo ask."""
+        query = MediaQuery(
+            action="search",
+            media_type=part.media_type if part.media_type in {"movie", "tv"} else None,
+            title=part.title,
+            year=part.year,
+            reason="batch",
+            raw_text=part.raw,
+        )
+        try:
+            if part.series_all:
+                hits = await self._franchise_hits(query, part.title)
+                return apply_exclusions(
+                    in_release_order(hits),
+                    drop_last=part.drop_last,
+                    drop_first=part.drop_first,
+                )[:SERIES_MAX_RESULTS]
+            hits = await self.catalog.hits(query, limit=3)
+        except CatalogUnavailable:
+            # One unavailable item must not sink the whole plan.
+            return []
+        # Silently swapping in a loosely related film would be worse than
+        # reporting the item as a miss.
+        return [hit for hit in hits if plausible_match(part.title, hit)][:1]
+
+    # --- follow-ups --------------------------------------------------------
+
+    async def _follow_up_reply(
+        self,
+        view: MessageView,
+        query: MediaQuery,
+        intent: MediaIntent,
+        context: ChatContext | None,
+    ) -> BotReply:
+        """Resolve "the sequel" / "all of them" / "more" against recent context."""
+        if context is None or not context.present:
+            # A real title that merely looks like a follow-up ("Next", "More").
+            if query.title and looks_like_concrete_title(query.title):
+                return await self._search_reply(view, query)
+            return BotReply(voice.lost_context())
+
+        kind = intent.follow_up
+        if kind == "ordinal" and intent.ordinal is not None:
+            return await self._confirm_context_pick(view, context, index=intent.ordinal)
+        if kind == "that_one":
+            return await self._confirm_context_pick(view, context, index=1)
+        if kind == "other_one":
+            return await self._offer_alternative(view, context=context)
+        if kind == "all_of_them":
+            return await self._expand_series_from_context(view, context)
+        if kind == "more_like_that":
+            top = context.top
+            if top is None:
+                return BotReply(voice.lost_context())
+            return await self._neighbour_reply(
+                view.chat_id,
+                top.media_type,
+                top.tmdb_id,
+                top.label,
+                ask_text=context.ask_text or view.text,
+            )
+        if kind in {"sequel", "prequel"}:
+            return await self._adjacent_entry_reply(view, context, direction=kind)
+        if kind == "more":
+            return await self._more_of_the_same(view, context)
+        return BotReply(voice.lost_context())
+
+    async def _confirm_context_pick(
+        self,
+        view: MessageView,
+        context: ChatContext,
+        *,
+        index: int,
+    ) -> BotReply:
+        """Arm yes/Get for the nth card that was on screen."""
+        picked = context.nth(index)
+        if picked is None:
+            return BotReply(voice.lost_context())
+        hit = MediaHit(
+            media_type=picked.media_type,  # type: ignore[arg-type]
+            tmdb_id=picked.tmdb_id,
+            title=picked.title,
+            year=picked.year,
+            media_status=picked.media_status,
+        )
+        if hit.media_status == 5 or hit.media_status in {2, 3}:
+            return BotReply(blocked_status_line(hit))
+
+        rendered = self._cards().render(
+            view.chat_id,
+            [hit],
+            header=format_guess_confirm(hit.title, hit.year),
+            season=picked.season,
+            similar_anchor=hit,
+            offer_dismiss=True,
+        )
+        single = rendered.single_offer
+        if single is not None:
+            self._set_pending_guess(view.chat_id, single[0], season=single[1])
+        # The rest of the list stays addressable, so "the third one" still works
+        # after the user has narrowed down to one card.
+        self.memory.remember(
+            view.chat_id,
+            hits=[
+                MediaHit(
+                    media_type=remembered.media_type,  # type: ignore[arg-type]
+                    tmdb_id=remembered.tmdb_id,
+                    title=remembered.title,
+                    year=remembered.year,
+                    media_status=remembered.media_status,
+                )
+                for remembered in context.hits
+            ],
+            ask_kind=context.ask_kind or "exact_title",
+            ask_text=context.ask_text,
+            search_title=context.search_title or hit.title,
+            franchise_seed=context.franchise_seed,
+            person_name=context.person_name,
+            person_role=context.person_role,
+            media_type=context.media_type,
+            anchor_id=context.anchor_id,
+            anchor_type=context.anchor_type,
+            page=context.page,
+            accumulate_shown=False,
+        )
+        return rendered.reply
+
+    async def _offer_alternative(
+        self,
+        view: MessageView,
+        *,
+        context: ChatContext | None = None,
+    ) -> BotReply:
+        """"Nah, the other one" — offer the runner-up instead of going quiet."""
+        self._clear_pending_guess(view.chat_id)
+        ctx = context if context is not None else self.memory.load(view.chat_id)
+        if ctx is None or len(ctx.hits) < 2:
+            return BotReply(voice.cancelled())
+        return await self._confirm_context_pick(view, ctx, index=2)
+
+    async def _expand_series_from_context(
+        self,
+        view: MessageView,
+        context: ChatContext,
+    ) -> BotReply:
+        """"All of them" → the franchise behind whatever was last on screen."""
+        seed = context.franchise_seed or best_franchise_seed(context.subject())
+        if not seed:
+            return BotReply(voice.lost_context())
+        intent = MediaIntent(
+            kind="series_all",
+            search_title=seed,
+            media_type=context.media_type,
+            raw_text=context.ask_text or view.text,
+            note="follow_up:all_of_them",
+        )
+        query = MediaQuery(action="search", title=seed, reason="follow_up")
+        return await self._series_all_reply(view, query, intent)
+
+    async def _adjacent_entry_reply(
+        self,
+        view: MessageView,
+        context: ChatContext,
+        *,
+        direction: str,
+    ) -> BotReply:
+        """"The sequel" / "the prequel" resolved inside the franchise, by year."""
+        top = context.top
+        if top is None:
+            return BotReply(voice.lost_context())
+        seed = context.franchise_seed or best_franchise_seed(top.title)
+        # The TMDB collection is authoritative about what "the sequel" is; a
+        # seeded title search is only the fallback.
+        _, entries = await self.catalog.collection_hits(
+            top.media_type,
+            top.tmdb_id,
+            limit=SERIES_MAX_RESULTS + 4,
+        )
+        if not entries:
+            query = MediaQuery(
+                action="search",
+                title=seed,
+                media_type=top.media_type if top.media_type in {"movie", "tv"} else None,
+                reason="follow_up",
+            )
+            entries = await self.catalog.hits(
+                query,
+                franchise_seed=seed,
+                limit=SERIES_MAX_RESULTS,
+            )
+        hits = in_release_order(entries)
+        if not hits:
+            return self._miss(seed)
+
+        anchor_year = top.year
+        if anchor_year is None:
+            anchor = next((hit for hit in hits if hit.tmdb_id == top.tmdb_id), None)
+            anchor_year = anchor.year if anchor is not None else None
+        candidates = [hit for hit in hits if hit.tmdb_id != top.tmdb_id]
+        if anchor_year is not None:
+            if direction == "sequel":
+                candidates = [
+                    hit for hit in candidates if hit.year is not None and hit.year > anchor_year
+                ]
+            else:
+                candidates = [
+                    hit for hit in candidates if hit.year is not None and hit.year < anchor_year
+                ][::-1]
+        if not candidates:
+            word = "sequel" if direction == "sequel" else "prequel"
+            return BotReply(f"{top.label} has no {word} in the catalog — that's the end of it.")
+        return self._present(
+            view.chat_id,
+            candidates[:1],
+            header=voice.follow_up_header(top.label, what=direction),
+            ask_kind="exact_title",
+            ask_text=context.ask_text,
+            search_title=candidates[0].title,
+            franchise_seed=seed,
+            remember_single_guess=True,
+            offer_series=True,
+            offer_dismiss=True,
+        )
+
+    async def _more_of_the_same(
+        self,
+        view: MessageView,
+        context: ChatContext,
+        *,
+        edit_message_id: int | None = None,
+    ) -> BotReply:
+        """"More" / "More options" — same lane, fresh titles."""
+        exclude = frozenset(context.shown_ids)
+        if context.ask_kind in {"mood", "house_pick"}:
+            spec = detect_mood(context.ask_text) or house_pick_spec(
+                media_type=context.media_type or "movie"
+            )
+            intent = MediaIntent(
+                kind=context.ask_kind,  # type: ignore[arg-type]
+                mood=spec,
+                media_type=spec.media_type,
+                raw_text=context.ask_text,
+            )
+            reply = await self._mood_reply(
+                view,
+                intent,
+                page=context.page + 1,
+                exclude_ids=exclude,
+            )
+        elif context.ask_kind == "person" and context.person_name:
+            resolved, hits = await self.catalog.person_hits(
+                context.person_name,
+                role=context.person_role or "cast",
+                limit=SERIES_MAX_RESULTS,
+                exclude_ids=exclude,
+            )
+            if not hits:
+                reply = BotReply(voice.no_more_options(resolved or context.person_name))
+            else:
+                reply = self._present(
+                    view.chat_id,
+                    hits,
+                    header=voice.person_header(
+                        resolved or context.person_name,
+                        role=context.person_role or "cast",
+                    ),
+                    ask_kind="person",
+                    ask_text=context.ask_text,
+                    person_name=resolved or context.person_name,
+                    person_role=context.person_role or "cast",
+                    offer_more=True,
+                )
+        elif context.ask_kind == "similar" and context.anchor_id:
+            reply = await self._neighbour_reply(
+                view.chat_id,
+                context.anchor_type or "movie",
+                int(context.anchor_id),
+                context.search_title or context.subject(),
+                ask_text=context.ask_text,
+                exclude_ids=exclude,
+            )
+        else:
+            subject = context.subject()
+            if not subject:
+                return BotReply(voice.lost_context())
+            query = MediaQuery(action="search", title=subject, reason="follow_up")
+            hits = without_ids(
+                await self.catalog.hits(
+                    query,
+                    franchise_seed=context.franchise_seed or None,
+                    limit=SERIES_MAX_RESULTS,
+                ),
+                set(exclude),
+            )
+            if not hits:
+                reply = BotReply(voice.no_more_options(subject))
+            else:
+                reply = self._present(
+                    view.chat_id,
+                    hits,
+                    header=voice.exact_header(subject, single=False),
+                    ask_kind=context.ask_kind or "exact_title",
+                    ask_text=context.ask_text,
+                    search_title=subject,
+                    franchise_seed=context.franchise_seed,
+                    offer_more=True,
+                )
+        if edit_message_id is None:
+            return reply
+        return BotReply(reply.text, reply.reply_markup, edit_message_id=edit_message_id)
 
     async def _queue_pending_guess(
         self,
@@ -763,74 +1363,77 @@ class TelegramMediaBot:
         return BotReply(text)
 
     async def _search_reply(self, view: MessageView, query: MediaQuery) -> BotReply:
+        """Exact-title lane: one Overseerr search, ranked, no LLM."""
         if not self.backend_configured:
-            return BotReply(
-                "Overseerr is not configured, so I cannot run a real catalog search."
-            )
-        try:
-            rows = await self._search_rows(query)
-        except OverseerrError as exc:
-            if exc.operation == "authentication" or exc.status_code in {401, 403}:
-                return BotReply(
-                    "Overseerr rejected its configured API key. Fix the key or its "
-                    "request permissions before searching again."
-                )
-            return BotReply(
-                "Overseerr search is unavailable right now. This is a backend error, "
-                "not a catalog miss."
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("telegram search failed")
-            return BotReply("Overseerr search failed unexpectedly. Try again shortly.")
-
-        hits = self._rank_hits(rows, query)
+            return BotReply(voice.backend_not_configured())
+        hits = await self.catalog.hits(query)
         if not hits:
-            return BotReply(f"No Overseerr matches for “{query.display_label()}”.")
-        return self._results_reply(view.chat_id, query, hits)
+            broadened = self._broaden(query)
+            if broadened is not None:
+                hits = await self.catalog.hits(broadened)
+            if not hits:
+                return self._miss(query.display_label())
+            query = broadened or query
+        single = len(hits) == 1
+        return self._present(
+            view.chat_id,
+            hits,
+            header=voice.exact_header(
+                _display_title(hits[0].title, hits[0].year) if single else query.display_label(),
+                single=single,
+            ),
+            ask_kind="exact_title",
+            ask_text=query.raw_text or view.text,
+            search_title=query.title,
+            media_type=query.media_type or "",
+            season=query.season,
+            remember_single_guess=single,
+            offer_similar=single,
+            offer_series=single and hits[0].media_type == "movie",
+            offer_dismiss=single,
+        )
+
+    @staticmethod
+    def _broaden(query: MediaQuery) -> MediaQuery | None:
+        """One honest retry before calling it a miss (subtitle / year / article).
+
+        A human would not give up on "Dune: Part Two (2024)" just because the
+        catalog spells it differently, so neither should the bot.
+        """
+        title = (query.title or "").strip()
+        if query.tmdb_id is not None or len(title) < 3:
+            return None
+        candidate = title
+        for separator in (":", " - ", " – ", " — "):
+            if separator in candidate:
+                head = candidate.split(separator, 1)[0].strip()
+                if len(head) >= 3:
+                    candidate = head
+                    break
+        else:
+            if query.year is None:
+                lowered = candidate.casefold()
+                for article in ("the ", "a ", "an ", "de ", "het "):
+                    if lowered.startswith(article):
+                        candidate = candidate[len(article) :].strip()
+                        break
+                else:
+                    return None
+        if not candidate or candidate.casefold() == title.casefold():
+            return None
+        return MediaQuery(
+            action="search",
+            media_type=query.media_type,
+            title=candidate,
+            year=None,
+            season=query.season,
+            reason="broadened",
+            raw_text=query.raw_text,
+        )
 
     async def _search_rows(self, query: MediaQuery) -> list[dict[str, Any]]:
-        if query.tmdb_id is not None:
-            if query.media_type not in {"movie", "tv"}:
-                return []
-            payload = await self.overseerr.media_details(query.tmdb_id, query.media_type)
-            if not payload.get("ok"):
-                return []
-            media = payload.get("media")
-            if not isinstance(media, dict):
-                media = {
-                    "mediaType": query.media_type,
-                    "mediaId": query.tmdb_id,
-                    "title": query.title or f"TMDB {query.tmdb_id}",
-                    "mediaStatus": payload.get("mediaStatus"),
-                }
-            else:
-                # Movie/TV detail routes already encode the kind in their URL,
-                # so official payloads do not consistently repeat mediaType.
-                # Preserve the exact typed id from the parsed Telegram input.
-                media = dict(media)
-                media["mediaType"] = query.media_type
-                media["tmdbId"] = query.tmdb_id
-            return [media]
-
-        title = (query.title or "").strip()
-        if len(title) < 2 or not any(character.isalnum() for character in title):
-            return []
-
-        payload = await self.overseerr.search(title, page=1)
-        if not payload.get("ok"):
-            if payload.get("reason") == "authentication_failed":
-                raise OverseerrError(
-                    "Overseerr authentication failed",
-                    operation="authentication",
-                    status_code=_integer(payload.get("status_code")),
-                )
-            if payload.get("reason") == "provider_unavailable":
-                raise OverseerrError(
-                    "Overseerr TMDB provider is unavailable",
-                    operation="search",
-                )
-            raise OverseerrError("Overseerr search failed", operation="search")
-        return [row for row in (payload.get("results") or []) if isinstance(row, dict)]
+        """Compatibility shim over :class:`CatalogSearch`."""
+        return await self.catalog.rows(query)
 
     @staticmethod
     def _rank_hits(
@@ -840,66 +1443,7 @@ class TelegramMediaBot:
         franchise_seed: str | None = None,
         limit: int = MAX_RESULTS,
     ) -> list[MediaHit]:
-        hits: list[MediaHit] = []
-        seen: set[tuple[str, int]] = set()
-        for row in rows:
-            try:
-                hit = MediaHit.from_overseerr(row)
-            except ValueError:
-                continue
-            key = (hit.media_type, hit.tmdb_id)
-            if key in seen:
-                continue
-            if query.media_type and hit.media_type != query.media_type:
-                continue
-            seen.add(key)
-            hits.append(hit)
-
-        asked = _normalized(query.title)
-        seed = _normalized(franchise_seed or "")
-        # Franchise / series-all: keep prefix matches for the seed.
-        if seed:
-            seeded = [
-                hit
-                for hit in hits
-                if title_seed_matches(franchise_seed or "", hit.title)
-                or title_seed_matches(franchise_seed or "", hit.original_title)
-            ]
-            if seeded:
-                hits = seeded
-        # Short exact titles must not become substring menus (Land→La La Land).
-        elif asked and looks_like_concrete_title(query.title):
-            seeded = [
-                hit
-                for hit in hits
-                if title_seed_matches(query.title, hit.title)
-                or title_seed_matches(query.title, hit.original_title)
-            ]
-            if seeded:
-                hits = seeded
-
-        def score(hit: MediaHit) -> float:
-            title = _normalized(hit.title)
-            original = _normalized(hit.original_title)
-            candidates = [candidate for candidate in (title, original) if candidate]
-            relevance = (
-                max(float(fuzz.WRatio(asked or seed, candidate)) for candidate in candidates)
-                if (asked or seed) and candidates
-                else 100.0
-            )
-            if asked and asked in candidates:
-                relevance += 1000
-            elif asked and any(candidate.startswith(asked) for candidate in candidates):
-                relevance += 300
-            if query.year is not None and hit.year == query.year:
-                relevance += 500
-            # Prefer earlier release years for franchise lists (stable order).
-            if seed and hit.year is not None:
-                relevance += max(0, 2100 - hit.year) / 100.0
-            return relevance
-
-        hits.sort(key=score, reverse=True)
-        return hits[: max(1, int(limit))]
+        return rank_hits(rows, query, franchise_seed=franchise_seed, limit=limit)
 
     def _results_reply(
         self,
@@ -912,62 +1456,114 @@ class TelegramMediaBot:
         edition_key: str = "",
         edition_label: str = "",
     ) -> BotReply:
-        lines = [header or f"Overseerr results for “{query.display_label()}”:"]
-        buttons: list[list[dict[str, str]]] = []
-        codec = self._callback_codec()
-        ttl = max(60, int(settings.telegram_callback_ttl_seconds))
-        requestable: list[tuple[MediaHit, int | None]] = []
-        for index, hit in enumerate(hits, start=1):
-            status = _STATUS_MARKS.get(hit.media_status, "○ Not requested")
-            lines.append(f"{index}. {hit.display_label()} — {status}")
-            explicitly_requesting_tv_season = (
-                hit.media_type == "tv" and query.season is not None
-            )
-            non_requestable = hit.media_status == 5 or (
-                hit.media_status in {2, 3} and not explicitly_requesting_tv_season
-            )
-            if non_requestable:
-                continue
-            season = query.season if hit.media_type == "tv" else None
-            callback_data = codec.encode(
-                hit.media_type,
-                hit.tmdb_id,
-                chat_id,
-                season=season,
-            )
-            payload: dict[str, Any] = {
-                "chat_id": chat_id,
-                "media_type": hit.media_type,
-                "tmdb_id": hit.tmdb_id,
-                "title": hit.title,
-                "year": hit.year,
-                "season": season,
-            }
-            if edition_key:
-                payload["edition_key"] = edition_key
-                payload["edition_label"] = edition_label
-            self.store.put_callback_media(
-                callback_data,
-                payload,
-                ttl_s=ttl,
-            )
-            label = _button_label(index, hit, season=season)
-            buttons.append(
-                [{"text": label[:64], "callback_data": callback_data}]
-            )
-            requestable.append((hit, season))
-        if remember_single_guess and len(requestable) == 1:
-            hit, season = requestable[0]
-            self._set_pending_guess(chat_id, hit, season=season)
-            lines.append("Tap Get to request it, or reply yes / nah.")
-        elif buttons:
-            lines.append("Tap Get on the exact title to request it.")
-        else:
-            lines.append("Everything shown is already handled or unavailable.")
-        return BotReply(
-            "\n".join(lines),
-            reply_markup={"inline_keyboard": buttons} if buttons else None,
+        """Render result cards for an already-ranked hit list."""
+        rendered = self._cards().render(
+            chat_id,
+            hits,
+            header=header or voice.exact_header(query.display_label(), single=False),
+            season=query.season,
+            edition_key=edition_key,
+            edition_label=edition_label,
         )
+        single = rendered.single_offer
+        if remember_single_guess and single is not None:
+            hit, season = single
+            self._set_pending_guess(chat_id, hit, season=season)
+        return rendered.reply
+
+    async def _handle_action_callback(
+        self,
+        chat_id: int,
+        message_id: int,
+        data: str,
+        *,
+        user_id: int | None,
+    ) -> BotReply:
+        """Refine buttons: change the conversation, never queue anything."""
+        try:
+            action = self._callback_codec().decode_action(data, chat_id)
+        except CallbackError:
+            return BotReply(
+                "That button is invalid or expired. Search again for fresh results.",
+                edit_message_id=message_id,
+            )
+        except RuntimeError:
+            return BotReply(
+                "Callback signing is not configured on Hearth.",
+                edit_message_id=message_id,
+            )
+
+        if action.action == ACTION_DISMISS:
+            self.memory.forget(chat_id)
+            return BotReply(voice.cancelled(), edit_message_id=message_id)
+
+        view = MessageView(chat_id=chat_id, message_id=message_id, user_id=user_id, text="")
+        context = self.memory.load(chat_id)
+        try:
+            if action.action == ACTION_SIMILAR and action.tmdb_id:
+                anchor_label = ""
+                if context is not None:
+                    match = next(
+                        (hit for hit in context.hits if hit.tmdb_id == action.tmdb_id),
+                        None,
+                    )
+                    anchor_label = match.label if match is not None else ""
+                return await self._neighbour_reply(
+                    chat_id,
+                    action.media_type or "movie",
+                    int(action.tmdb_id),
+                    anchor_label or "that one",
+                    ask_text=context.ask_text if context is not None else "",
+                    edit_message_id=message_id,
+                )
+            if action.action == ACTION_SERIES and action.tmdb_id:
+                return await self._expand_series_from_button(
+                    view,
+                    action.media_type or "movie",
+                    int(action.tmdb_id),
+                    context,
+                )
+            if action.action == ACTION_MORE:
+                if context is None or not context.present:
+                    return BotReply(voice.lost_context(), edit_message_id=message_id)
+                return await self._more_of_the_same(
+                    view,
+                    context,
+                    edit_message_id=message_id,
+                )
+        except CatalogUnavailable as exc:
+            return BotReply(exc.message, edit_message_id=message_id)
+        return BotReply(voice.lost_context(), edit_message_id=message_id)
+
+    async def _expand_series_from_button(
+        self,
+        view: MessageView,
+        media_type: str,
+        tmdb_id: int,
+        context: ChatContext | None,
+    ) -> BotReply:
+        """"All of them" tapped on a card — expand that title's franchise."""
+        label = ""
+        if context is not None:
+            match = next((hit for hit in context.hits if hit.tmdb_id == tmdb_id), None)
+            label = match.title if match is not None else ""
+        seed = best_franchise_seed(label) if label else ""
+        if not seed:
+            details = await self.catalog.details(tmdb_id, media_type)
+            media = details.get("media") if isinstance(details.get("media"), dict) else {}
+            seed = best_franchise_seed(str(media.get("title") or ""))
+        if not seed:
+            return BotReply(voice.lost_context(), edit_message_id=view.message_id)
+        intent = MediaIntent(
+            kind="series_all",
+            search_title=seed,
+            media_type=media_type if media_type in {"movie", "tv"} else "",
+            raw_text=context.ask_text if context is not None else "",
+            note="button:all_of_them",
+        )
+        query = MediaQuery(action="search", title=seed, reason="follow_up")
+        reply = await self._series_all_reply(view, query, intent)
+        return BotReply(reply.text, reply.reply_markup, edit_message_id=view.message_id)
 
     async def handle_callback(self, callback: dict[str, Any]) -> BotReply | None:
         message = callback.get("message")
@@ -989,6 +1585,13 @@ class TelegramMediaBot:
         self._clear_pending_guess(chat_id)
 
         data = str(callback.get("data") or "")
+        if is_action_callback(data):
+            return await self._handle_action_callback(
+                chat_id,
+                message_id,
+                data,
+                user_id=user_id,
+            )
         try:
             request = self._callback_codec().decode(data, chat_id)
         except CallbackError:

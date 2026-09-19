@@ -455,7 +455,7 @@ Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve →
 
 ## Telegram media bot
 
-A dedicated house Telegram group can search and request movies and series through **Overseerr**. Every media-ish turn is classified first by **Jev** (TypeSafe System One Choice/Noul/Score): exact title, known franchise, series-all, edition-aware, descriptive riddle, or chat-about. Exact / franchise / series / edition paths hit Overseerr/TMDB immediately with little or no LLM prose. Descriptive riddles and title Q&A use gpt-4o only when Jev says so (or on fail-open). Hearth shows ranked movie/TV matches with signed **Get** buttons; pressing a button (or explicit yes on a single pending guess) requests that exact TMDB id. Chat alone never queues. Radarr/Sonarr are observed only for progress on requests made by this bot.
+A dedicated house Telegram group can search and request movies and series through **Overseerr**. Every media-ish turn is classified first by **Jev** (TypeSafe System One Choice/Noul/Score), which picks a lane: exact title, known franchise, series-all, edition-aware, person filmography, mood/vibe, "something like X", a multi-title batch, an in-thread follow-up, a descriptive riddle, or chat-about. Every lane except the last two answers straight from Overseerr/TMDB with no LLM prose; gpt-4o runs only when Jev says a riddle or `needs_llm` (or on fail-open). Hearth shows ranked matches with signed **Get** buttons; pressing a button (or explicit yes on a single pending guess) requests that exact TMDB id — confirming never re-searches by title. Chat alone never queues. Radarr/Sonarr are observed only for progress on requests made by this bot.
 
 ### Setup (Ruben)
 
@@ -482,16 +482,45 @@ A dedicated house Telegram group can search and request movies and series throug
 
 ### Behavior
 
-- **Jev media router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics. See `docs/jev.md`.
+- **Jev media router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics that route the same lanes. See `docs/jev.md`.
 - `/search <title>`, a plain title, franchise seed (`Harry Potter`), series-all (`Harry Potter, all movies`), edition (`Lord of the Rings extended edition`), plot/riddle, or typed TMDB movie/TV link. A year or season marker narrows results. Overseerr requests whole seasons, so `S02E03` is rejected. `/help` and `/status` as before.
-- Search returns ranked movie/TV results with year/kind on each **Get** button. Franchise / series-all show multiple Get cards — tap each; Hearth never silent-queues the whole list.
+- **Intent beats the literal string.** A sentence is never searched verbatim when a human would know better:
+  - *People* — `anything with Florence Pugh`, `directed by Christopher Nolan`, `Tom Hanks filmography` resolve through TMDB person credits.
+  - *Mood* — `scary under 2 hours`, `kids movie`, `best 90s sci-fi`, `Friday night comfort` become real discover filters (genre, runtime, era, rating). No LLM.
+  - *Lookalikes* — `something like Arrival`, `more in that vein` resolve the anchor once, then ask Overseerr for its neighbours.
+  - *Batches* — `grab Inception and Interstellar`, `LOTR extended + Hobbit theatrical` become one plan with a Get button per item and any miss reported by name. Titles that merely contain "and" (`Harry Potter and the Chamber of Secrets`, `Mr. and Mrs. Smith`) are never split.
+  - *Exclusions* — `all Harry Potters except the last` drops entries by release order.
+  - *Vague but actionable* — `what should we watch?` returns house picks instead of a shrug.
+- **Follow-ups work in-thread** for `HEARTH_TELEGRAM_CONTEXT_TTL_SECONDS` (30 min default): `the sequel`, `all of them`, `the second one`, `nah the other one`, `more like that`, `more`. Only media coordinates are remembered, in the existing bounded SQLite file.
+- Franchise expansion prefers the title's real TMDB **collection** over fuzzy title matching, and lists entries in release order.
+- Cards carry a **Get** button per result plus refine buttons — *More like this*, *All of them*, *More options*, *Nah* — which are signed and chat-bound like Get but carry **no** queue authority.
+- **Never silent, never a fake miss.** A routed media turn always answers. Already-available and already-requested titles say so in one line with no Get button. A zero-hit exact title is retried once (subtitle / year / leading article) before being called a miss, and a backend failure is reported as a backend error rather than an empty catalog.
 - Title info questions (`what's X about?`) get a short answer with **no** Get / queue.
-- A text message never downloads by itself. **Get** is the confirmation (or yes on a single sticky guess). Callbacks are HMAC-signed, chat-bound, and expire after `TELEGRAM_CALLBACK_TTL_SECONDS`.
-- Nah/No without a pending guess, and vague list asks, never invent a queue.
+- A text message never downloads by itself. **Get** is the confirmation (or yes on a single sticky guess), and it queues by `mediaId` — confirming never runs a second title search. Callbacks are HMAC-signed, chat-bound, and expire after `TELEGRAM_CALLBACK_TTL_SECONDS`.
+- Nah/No never queues: with an offer on screen it says so out loud; with nothing on screen it stays quiet rather than replying to chatter.
 - Magnets, `.torrent` files, and raw media attachments are refused. Rate limits, maximum title length, durable SQLite deduplication, secret redaction, ordered handling within each chat, and bounded concurrency across chats are enabled by default.
 - Progress checks Radarr/Sonarr only for titles this bot queued.
 
-The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, `TELEGRAM_DB_PATH`, plus the Jev variables in `docs/jev.md`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.
+The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, `TELEGRAM_DB_PATH`, the lane switches (`HEARTH_TELEGRAM_MOOD_LANE`, `HEARTH_TELEGRAM_PERSON_LANE`, `HEARTH_TELEGRAM_SIMILAR_LANE`, `HEARTH_TELEGRAM_BATCH_LANE`, `HEARTH_TELEGRAM_BATCH_MAX_ITEMS`, `HEARTH_TELEGRAM_CONTEXT_TTL_SECONDS`, `HEARTH_TELEGRAM_BUTLER_VOICE` — all default on), plus the Jev variables in `docs/jev.md`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.
+
+### Media modules
+
+`hearth/telegram/bot.py` is the transport and the decision tree; the intelligence lives in small modules under `hearth/telegram/media/`:
+
+| Module | Responsibility |
+| --- | --- |
+| `classify.py` | Jev-first lane choice, with a strong deterministic fallback |
+| `phrases.py` | Shared series / franchise / exclusion phrasing |
+| `moods.py` | Vibe language → real discover coordinates |
+| `people.py` | Person asks + credit ranking |
+| `similar.py` | "Like X" anchors |
+| `compound.py` | Conservative multi-item splitting |
+| `followups.py` | In-thread follow-up vocabulary |
+| `memory.py` | Bounded per-chat media context |
+| `ranking.py` | Ordering, franchise matching, exclusions |
+| `search.py` | The only place lanes call Overseerr |
+| `cards.py` | Result cards, Get buttons, refine buttons |
+| `voice.py` | House-butler phrasing |
 
 ## What is stubbed vs live in v0.1
 
