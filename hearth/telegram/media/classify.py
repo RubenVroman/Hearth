@@ -31,7 +31,12 @@ from hearth.telegram.heuristics import (
 from hearth.telegram.media.compound import split_compound_ask
 from hearth.telegram.media.editions import extract_edition
 from hearth.telegram.media.followups import detect_follow_up
-from hearth.telegram.media.moods import detect_mood, house_pick_spec, looks_like_vague_ask
+from hearth.telegram.media.moods import (
+    detect_mood,
+    house_pick_spec,
+    looks_like_riddle,
+    looks_like_vague_ask,
+)
 from hearth.telegram.media.people import detect_person_ask
 from hearth.telegram.media.phrases import (
     clean_title_bits,
@@ -112,20 +117,23 @@ _CHAT_TITLE_TAIL = re.compile(
 
 
 def _title_hint_from_chat(text: str, parsed: MediaQuery | None) -> tuple[str, int | None, str]:
+    """Pull the title out of a question, stripping the question itself first."""
+    for candidate in (text, (parsed.title if parsed else "") or ""):
+        raw = (candidate or "").strip()
+        if not raw:
+            continue
+        cleaned = _CHAT_TITLE_STRIP.sub("", raw)
+        cleaned = _CHAT_TITLE_TAIL.sub("", cleaned)
+        cleaned = cleaned.strip(" ?!.")
+        title, year = clean_title_bits(cleaned)
+        if title and looks_like_concrete_title(title):
+            if parsed and parsed.year is not None:
+                year = parsed.year
+            return title, year, (parsed.media_type or "") if parsed else ""
     if parsed and parsed.title and looks_like_concrete_title(parsed.title):
-        year = parsed.year
-        title = parsed.title.strip()
-        if year is None:
-            title, year = clean_title_bits(title)
-        return title, year, (parsed.media_type or "")
-    raw = (text or "").strip()
-    cleaned = _CHAT_TITLE_STRIP.sub("", raw)
-    cleaned = _CHAT_TITLE_TAIL.sub("", cleaned)
-    cleaned = cleaned.strip(" ?!.")
-    title, year = clean_title_bits(cleaned)
-    if looks_like_concrete_title(title):
-        return title, year, ""
-    return "", year, ""
+        title, year = clean_title_bits(parsed.title.strip())
+        return title, parsed.year if parsed.year is not None else year, parsed.media_type or ""
+    return "", parsed.year if parsed else None, ""
 
 
 def _title_from_parsed(raw: str, parsed: MediaQuery | None) -> tuple[str, int | None, str]:
@@ -375,6 +383,11 @@ def _local_kind(raw: str, *, parsed: MediaQuery | None) -> MediaAskKind:
         clean, _ = clean_title_bits(edition.clean_title)
         if looks_like_concrete_title(clean):
             return "edition"
+
+    # "the one where the guy loses his memory" is short enough to pass as a
+    # title but is really a riddle — send it to the guess lane.
+    if looks_like_riddle(raw):
+        return "describe"
 
     probe = raw
     if parsed and parsed.title and parsed.reason == "title":

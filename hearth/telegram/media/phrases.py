@@ -47,6 +47,16 @@ BARE_SERIES_ALL = re.compile(
     re.I,
 )
 
+# "the whole LOTR trilogy", "alle Harry Potter films", "complete Alien saga".
+WHOLE_OF = re.compile(
+    r"^\s*(?:the\s+|de\s+|het\s+)?"
+    r"(?:whole|complete|full|entire|every|all(?:\s+the)?|alle|hele|gehele)\s+"
+    r"(?P<title>.+?)\s+"
+    r"(?:series|franchise|saga|trilogy|collection|movies|films|parts|ones|"
+    r"reeks|serie|trilogie|delen)\s*$",
+    re.I,
+)
+
 # "except the last", "minus the last two", "skip the first one", "all but the last"
 EXCLUDE_TAIL = re.compile(
     r"[,\s]*\b(?:except|excluding|but\s+not|minus|without|skip(?:ping)?|"
@@ -151,6 +161,13 @@ def series_seed(text: str) -> str | None:
     raw = (text or "").strip()
     if not raw:
         return None
+    # "the whole LOTR trilogy" / "alle Harry Potter films" wrap the seed between
+    # the quantifier and the collective noun.
+    wrapped = WHOLE_OF.match(raw)
+    if wrapped:
+        seed = normalize_franchise_seed(clean_title_bits(wrapped.group("title"))[0])
+        if len(seed) >= 2:
+            return seed
     if not (SERIES_ALL.search(raw) or ALL_PREFIX.match(raw) or TITLE_ALL_SUFFIX.match(raw)):
         return None
     for pattern in (TITLE_ALL_SUFFIX, ALL_PREFIX):
@@ -182,6 +199,7 @@ __all__ = [
     "KNOWN_FRANCHISE_SEEDS",
     "SERIES_ALL",
     "TITLE_ALL_SUFFIX",
+    "WHOLE_OF",
     "YEAR_PAREN",
     "clean_title_bits",
     "extract_exclusion",

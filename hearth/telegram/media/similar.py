@@ -18,7 +18,8 @@ _LIKE_TITLE = re.compile(
 )
 _BARE_LIKE = re.compile(
     r"^(?:\s*(?:got|have|any)\s+)?(?:something|anything|iets)?\s*"
-    r"(?:like|similar\s+to|zoals)\s+(?P<anchor>.+)$",
+    r"(?:like|similar\s+to|in\s+the\s+vein\s+of|in\s+the\s+style\s+of|zoals)\s+"
+    r"(?P<anchor>.+)$",
     re.I,
 )
 _VEIN_ONLY = re.compile(

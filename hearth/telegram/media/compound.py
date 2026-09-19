@@ -47,6 +47,19 @@ _CONNECTIVE_ONLY = re.compile(
     r"^\s*(?:and|en|plus|also|too|both|as\s+well|ook|en\s+ook|then|dan)\s*$",
     re.I,
 )
+# An honorific or initial is part of one name ("Mr. and Mrs. Smith"), never a
+# request of its own.
+_HONORIFIC_ONLY = re.compile(
+    r"^\s*(?:mr|mrs|ms|miss|dr|prof|st|sgt|capt|jr|sr|mme|mlle)\.?\s*$",
+    re.I,
+)
+# A vibe pronoun means the user is describing a mood, not naming a second title
+# ("anything good and recent").
+_VIBE_LEAD = re.compile(
+    r"^\s*(?:something|somethin|anything|everything|nothing|iets|alles|niets|"
+    r"whatever|any)\b",
+    re.I,
+)
 _BARE_EDITION = re.compile(
     r"^\s*(?:in\s+|the\s+)?(?:extended|director'?s?|theatrical|unrated|ultimate|special|"
     r"collector'?s?|anniversary|remaster(?:ed)?|criterion|imax|4k|uhd|2160p|1080p|hdr)"
@@ -107,6 +120,8 @@ def _split_segments(text: str) -> list[str]:
 def _as_part(segment: str) -> AskPart | None:
     raw = _TRAILING_POLITE.sub("", segment.strip(" -–—|,.")).strip()
     if not raw or _CONNECTIVE_ONLY.match(raw):
+        return None
+    if _HONORIFIC_ONLY.match(raw) or _VIBE_LEAD.match(raw) or len(raw) < 3:
         return None
 
     remainder, drop_last, drop_first = extract_exclusion(raw)

@@ -21,7 +21,8 @@ _STOP_TAIL = re.compile(
 _LEAD_FILLER = re.compile(
     r"^(?:(?:show|give|get|grab|find|download|request|queue|haal|zoek|vraag)\s+"
     r"(?:me\s+|us\s+|mij\s+|ons\s+)?)?"
-    r"(?:some|any|all|alle|the|de|het|a\s+few)?\s*",
+    # The \b matters: without it "de" eats the "De" of "Denzel Washington".
+    r"(?:(?:some|any|all|alle|the|de|het|a\s+few)\b\s*)?",
     re.I,
 )
 

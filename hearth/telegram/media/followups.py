@@ -11,52 +11,55 @@ from dataclasses import dataclass
 
 from hearth.telegram.media.types import FollowUpKind
 
+# A follow-up is a *bare* fragment. Anchoring every pattern is what keeps real
+# titles safe: "Dune: Part Two" contains "part two" but is not a follow-up, and
+# "alle Harry Potter films" contains "alle" but names its own franchise.
+_PREFIX = (
+    r"^\s*(?:(?:and|ok|okay|alright|right|hmm+|well|so|en|nou|ja|yeah)[,!]?\s+)?"
+    r"(?:(?:can|could)\s+(?:you|i|we)\s+|please\s+|pls\s+|i'?d\s+like\s+|"
+    r"give\s+me\s+|get\s+me\s+|grab\s+|doe\s+)?"
+)
+_SUFFIX = r"(?:\s+(?:please|pls|graag|aub|then|dan|instead|too|also|ook))?\s*[.!?]*\s*$"
+
+
+def _bare(core: str) -> re.Pattern[str]:
+    return re.compile(_PREFIX + r"(?:" + core + r")" + _SUFFIX, re.I)
+
+
 # "the second one" / "the first one" are ordinals against the cards on screen,
 # so they are deliberately absent here and handled by ``_ORDINAL`` below.
-_SEQUEL = re.compile(
-    r"\b(?:the\s+)?(?:sequel|next\s+one|next\s+part|part\s+(?:two|2)|"
-    r"follow[-\s]?up|het\s+vervolg|vervolg|deel\s+(?:twee|2))\b",
-    re.I,
+_SEQUEL = _bare(
+    r"(?:the\s+)?(?:sequel|next\s+one|next\s+part|part\s+(?:two|2)|"
+    r"follow[-\s]?up|het\s+vervolg|vervolg|deel\s+(?:twee|2))"
 )
-_PREQUEL = re.compile(
-    r"\b(?:the\s+)?(?:prequel|the\s+original|earlier\s+one|"
-    r"het\s+origineel|eerste\s+deel)\b",
-    re.I,
+_PREQUEL = _bare(
+    r"(?:the\s+)?(?:prequel|original|earlier\s+one|het\s+origineel|eerste\s+deel)"
 )
-_ALL_OF_THEM = re.compile(
-    r"\b(?:all\s+of\s+(?:them|those|these|it)|all\s+(?:three|four|five|of\s+em)|"
-    r"the\s+whole\s+(?:lot|set|thing)|give\s+me\s+(?:them\s+)?all|"
-    r"alle(?:maal)?|allemaal|de\s+hele\s+(?:set|reeks))\b",
-    re.I,
+_ALL_OF_THEM = _bare(
+    r"all\s+of\s+(?:them|those|these|it|em)|all\s+(?:three|four|five)|"
+    r"all\s+of\s+the(?:m|se)?|them\s+all|the\s+whole\s+(?:lot|set|thing)|"
+    r"all\s+(?:the\s+)?(?:movies|films|parts|ones)|"
+    r"alle(?:maal)?|allemaal|de\s+hele\s+(?:set|reeks)"
 )
-_MORE_LIKE_THAT = re.compile(
-    r"\b(?:more\s+like\s+(?:that|this|those|it)|more\s+in\s+that\s+vein|"
-    r"same\s+(?:vibe|energy|kind)|something\s+similar|"
-    r"meer\s+(?:zoals\s+)?(?:dat|die|zoiets))\b",
-    re.I,
+_MORE_LIKE_THAT = _bare(
+    r"more\s+like\s+(?:that|this|those|it)|more\s+in\s+that\s+vein|"
+    r"(?:the\s+)?same\s+(?:vibe|energy|kind)|something\s+similar|"
+    r"meer\s+(?:zoals\s+)?(?:dat|die|zoiets)"
 )
-_MORE = re.compile(
-    r"^\s*(?:"
-    r"more|more\s+(?:please|options|choices)|others?|any\s+others?|what\s+else|"
+_MORE = _bare(
+    r"more|more\s+(?:options|choices)|others?|any\s+others?|what\s+else|"
     r"something\s+else|anything\s+else|next|keep\s+going|show\s+more|"
     r"meer|anders|nog\s+(?:meer|wat|iets)|volgende"
-    r")\s*[.!?]*\s*$",
-    re.I,
 )
-_OTHER_ONE = re.compile(
-    r"\b(?:(?:nah|no|nope|nee),?\s*)?the\s+other\s+(?:one|movie|film|version)|"
-    r"\b(?:nah|nee),?\s*(?:the\s+)?other\b|"
-    r"\bnot\s+that\s+one\b|"
-    r"\bde\s+andere\b",
-    re.I,
+_OTHER_ONE = _bare(
+    r"(?:(?:nah|no|nope|nee)[,!]?\s*)?"
+    r"(?:the\s+other(?:\s+(?:one|movie|film|version))?|not\s+that\s+one|"
+    r"de\s+andere(?:\s+(?:film|serie))?)"
 )
-_THAT_ONE = re.compile(
-    r"^\s*(?:"
-    r"(?:yeah|yea|yes|yep|yup|ja|jup|sure|ok|okay)[,!]?\s*"
-    r"(?:that\s+(?:one|is\s+the\s+one|one\s+please)|die|dat\s+is\s+(?:hem|die)|deze)"
-    r"|that\s+one|that\s+one\s+please|die\s+bedoel\s+ik"
-    r")\s*[.!?]*\s*$",
-    re.I,
+_THAT_ONE = _bare(
+    r"(?:(?:yeah|yea|yes|yep|yup|ja|jup|sure|ok|okay)[,!]?\s*)?"
+    r"(?:that\s+(?:one|is\s+the\s+one)|that\s+one\s+yes|die|dat\s+is\s+(?:hem|die)|"
+    r"deze|die\s+bedoel\s+ik)"
 )
 _ORDINAL_WORDS = {
     "first": 1,
@@ -90,6 +93,9 @@ _ORDINAL = re.compile(
     r"(?:\s+(?:one|ones|movie|film|show|please|graag))?\s*[.!?]*\s*$",
     re.I,
 )
+# Numerals and "last" alone are too title-like to claim ("1917", "The Last of
+# Us"); an ordinal follow-up needs the article or the counting noun.
+_ORDINAL_NEEDS_FRAME = re.compile(r"^\s*(?:1|2|3|4|5|last|laatste)\s*$", re.I)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,23 +116,20 @@ def detect_follow_up(text: str) -> FollowUpAsk | None:
     if not raw or len(raw) > 60:
         return None
 
-    if _MORE_LIKE_THAT.search(raw):
-        return FollowUpAsk(kind="more_like_that")
-    if _ALL_OF_THEM.search(raw):
-        return FollowUpAsk(kind="all_of_them")
-    if _SEQUEL.search(raw):
-        return FollowUpAsk(kind="sequel")
-    if _PREQUEL.search(raw):
-        return FollowUpAsk(kind="prequel")
-    if _OTHER_ONE.search(raw):
-        return FollowUpAsk(kind="other_one")
-    if _THAT_ONE.match(raw):
-        return FollowUpAsk(kind="that_one")
-    if _MORE.match(raw):
-        return FollowUpAsk(kind="more")
+    for pattern, kind in (
+        (_MORE_LIKE_THAT, "more_like_that"),
+        (_ALL_OF_THEM, "all_of_them"),
+        (_SEQUEL, "sequel"),
+        (_PREQUEL, "prequel"),
+        (_OTHER_ONE, "other_one"),
+        (_THAT_ONE, "that_one"),
+        (_MORE, "more"),
+    ):
+        if pattern.match(raw):
+            return FollowUpAsk(kind=kind)  # type: ignore[arg-type]
 
     ordinal = _ORDINAL.match(raw)
-    if ordinal:
+    if ordinal and not _ORDINAL_NEEDS_FRAME.match(raw):
         word = ordinal.group("word").casefold()
         value = _ORDINAL_WORDS.get(word)
         if value is None and word.isdigit():

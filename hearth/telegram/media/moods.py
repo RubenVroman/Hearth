@@ -227,17 +227,27 @@ _MOVIE_HINT = re.compile(r"\b(?:movie|movies|film|films|flick)\b", re.I)
 # genre word inside such a sentence ("became a wizard") is a clue, not a mood,
 # so discover must not hijack it from the LLM guess lane.
 _RIDDLE_FRAME = re.compile(
-    r"\b(?:"
-    r"(?:that|this|the)\s+(?:movie|film|one|show|series)\b|"
-    r"die\s+film|deze\s+film|het\s+filmpje|die\s+serie|"
-    r"the\s+one\s+(?:where|with|about)|"
-    r"looking\s+for|can'?t\s+remember|forgot\s+the\s+name|"
-    r"(?:guy|girl|man|woman|boy|kid|someone|iemand)\s+(?:with|who|die|met)|"
-    r"with\s+the\s+\w+|met\s+de\s+\w+|"
-    r"became\s+a|turns?\s+into"
-    r")\b",
+    r"(?:"
+    r"\b(?:that|this)\s+(?:movie|film|one|show|series)\b|"
+    r"\b(?:die|deze)\s+(?:film|serie)\b|\bhet\s+filmpje\b|"
+    r"\bthe\s+one\s+(?:where|with|about|who)\b|"
+    r"\blooking\s+for\b|\bcan'?t\s+remember\b|\bforgot\s+the\s+name\b|"
+    r"\b(?:guy|girl|man|woman|boy|kid|someone|iemand)\s+(?:with|who|die|met)\b|"
+    r"\bbecame?\s+an?\b|\bturns?\s+into\b|\bwhere\s+(?:a|the|they|he|she)\b"
+    r")",
     re.I,
 )
+# Deliberately *not* a riddle signal: "with the <noun>" appears in plenty of real
+# titles ("Gone with the Wind", "Late Night with the Devil").
+
+
+def looks_like_riddle(text: str) -> bool:
+    """True when the message describes one half-remembered title.
+
+    Such a message is for the LLM guess lane: it is neither a catalog title nor
+    a mood, and searching it verbatim is a guaranteed miss.
+    """
+    return bool(_RIDDLE_FRAME.search((text or "").strip()))
 
 _RUNTIME_HOURS = re.compile(
     r"\b(?:under|below|less\s+than|shorter\s+than|max(?:imum)?|within|no\s+more\s+than|"
@@ -269,7 +279,7 @@ _BARE_MOOD_ASKS = frozenset(
         "kids movies",
         "family movie",
         "horror movie",
-        "scary movie",
+        # "Scary Movie" is a real franchise, so it stays on the title path.
         "comfort movie",
         "action movie",
         "kinderfilm",
@@ -459,4 +469,9 @@ def looks_like_vague_ask(text: str) -> bool:
     return bool(_VIBE_FRAME.search(raw)) and detect_mood(raw) is None
 
 
-__all__ = ["detect_mood", "house_pick_spec", "looks_like_vague_ask"]
+__all__ = [
+    "detect_mood",
+    "house_pick_spec",
+    "looks_like_riddle",
+    "looks_like_vague_ask",
+]

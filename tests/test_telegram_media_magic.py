@@ -391,6 +391,57 @@ def test_series_all_honours_except_the_last() -> None:
     assert intent.needs_llm is False
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        # Each of these once tripped a lane detector and became a wrong route.
+        "Dune: Part Two",  # "part two" read as "the sequel"
+        "Mr. and Mrs. Smith",  # split into two requests
+        "Scary Movie",  # read as a horror mood
+        "Late Night with the Devil",  # read as a plot riddle
+        "The Last of Us",
+        "Harry Potter and the Chamber of Secrets",
+        "Beauty and the Beast",
+        "La La Land",
+        "Horror Express",
+        "1917",  # numeric titles are titles, not riddles
+    ],
+)
+def test_real_titles_are_never_stolen_by_a_lane_detector(title: str) -> None:
+    intent = classify_media_ask_sync(title)
+    assert intent.kind in {"exact_title", "known_franchise"}, f"{title} → {intent.kind}"
+    assert intent.needs_llm is False
+    assert intent.search_title
+
+
+def test_franchise_asks_survive_a_seed_in_the_middle() -> None:
+    for text, seed in (
+        ("the whole LOTR trilogy", "LOTR"),
+        ("alle Harry Potter films", "Harry Potter"),
+        ("the complete Alien saga", "Alien"),
+    ):
+        intent = classify_media_ask_sync(text)
+        assert intent.kind == "series_all", text
+        assert intent.search_title == seed, text
+
+
+def test_dutch_person_ask_keeps_the_whole_name() -> None:
+    ask = detect_person_ask("films van Denzel Washington")
+    assert ask is not None
+    assert ask.name == "Denzel Washington"
+
+
+def test_vibe_words_never_become_a_second_plan_item() -> None:
+    assert split_compound_ask("anything good and recent") == ()
+    assert split_compound_ask("Mr. and Mrs. Smith") == ()
+
+
+def test_riddle_framing_beats_a_title_shaped_sentence() -> None:
+    intent = classify_media_ask_sync("the one where the guy loses his memory")
+    assert intent.kind == "describe"
+    assert intent.needs_llm is True
+
+
 def test_local_classifier_routes_every_new_lane_without_an_llm() -> None:
     expected = {
         "Dune": "exact_title",
