@@ -784,16 +784,18 @@ async def test_scar_wizard_plot_guesses_then_confirms_without_literal_search(
     bot, _, _ = bot_factory(fake)
     monkeypatch.setattr(settings, "openai_api_key", "sk-test-not-used")
 
-    async def _fake_guess(text: str) -> CatalogGuess:
+    async def _fake_guess(text: str):
         assert "wizard" in text.lower() or "scar" in text.lower()
-        return CatalogGuess(
-            search_title="Harry Potter",
-            year=2001,
-            media_kind="movie",
-            confidence=0.95,
-        )
+        return [
+            CatalogGuess(
+                search_title="Harry Potter",
+                year=2001,
+                media_kind="movie",
+                confidence=0.95,
+            )
+        ]
 
-    monkeypatch.setattr(bot_mod, "guess_catalog_title", _fake_guess)
+    monkeypatch.setattr(bot_mod, "guess_catalog_titles", _fake_guess)
 
     plot = "That movie with the wizard with a scar on his face"
     reply = await bot.handle_message(_message(plot))
@@ -835,11 +837,11 @@ async def test_dutch_plot_guess_path_searches_resolved_title_not_plot(
     bot, _, _ = bot_factory(fake)
     monkeypatch.setattr(settings, "openai_api_key", "sk-test")
 
-    async def _fake_guess(text: str) -> CatalogGuess:
+    async def _fake_guess(text: str):
         assert "tovenaar" in text.lower() or "litteken" in text.lower()
-        return CatalogGuess(search_title="Harry Potter", year=2001, media_kind="movie")
+        return [CatalogGuess(search_title="Harry Potter", year=2001, media_kind="movie")]
 
-    monkeypatch.setattr(bot_mod, "guess_catalog_title", _fake_guess)
+    monkeypatch.setattr(bot_mod, "guess_catalog_titles", _fake_guess)
 
     reply = await bot.handle_message(_message(dutch))
 
@@ -877,10 +879,10 @@ async def test_plot_guess_yes_queues_by_tmdb_media_id_nah_does_not(
     bot, _, progress = bot_factory(fake)
     monkeypatch.setattr(settings, "openai_api_key", "sk-test")
 
-    async def _fake_guess(text: str) -> CatalogGuess:
-        return CatalogGuess(search_title="Harry Potter", year=2001, media_kind="movie")
+    async def _fake_guess(text: str):
+        return [CatalogGuess(search_title="Harry Potter", year=2001, media_kind="movie")]
 
-    monkeypatch.setattr(bot_mod, "guess_catalog_title", _fake_guess)
+    monkeypatch.setattr(bot_mod, "guess_catalog_titles", _fake_guess)
 
     ask = await bot.handle_message(
         _message("That movie with the wizard with a scar on his face")

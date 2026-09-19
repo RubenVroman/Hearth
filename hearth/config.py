@@ -228,6 +228,18 @@ class Settings(BaseSettings):
         le=1.0,
         alias="HEARTH_JEV_CONFIRM_THRESHOLD",
     )
+    jev_media_ask_confidence: float = Field(
+        default=0.72,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_MEDIA_ASK_CONFIDENCE",
+    )
+    jev_needs_llm_threshold: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_NEEDS_LLM_THRESHOLD",
+    )
 
     @property
     def openai_configured(self) -> bool:

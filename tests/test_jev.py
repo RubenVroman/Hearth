@@ -191,6 +191,53 @@ def test_parse_answers_from_http_shape() -> None:
     assert answers.risk.level in {"harmless", "needs_confirm", "do_not_auto_run"}
 
 
+def test_parse_answers_media_ask_and_needs_llm() -> None:
+    payload = _payload(domain="chat")
+    payload["answers"]["media_ask"] = {
+        "type": "choice",
+        "choice": "descriptive_riddle",
+        "confidence": 0.88,
+        "probabilities": {"descriptive_riddle": 0.88},
+    }
+    payload["answers"]["needs_llm"] = {"type": "noul", "noul": 0.91}
+    answers = parse_answers(payload)
+    assert answers.media_ask is not None
+    assert answers.media_ask.choice == "descriptive_riddle"
+    assert answers.needs_llm is not None
+    assert answers.needs_llm.noul == pytest.approx(0.91)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_telegram_media_uses_media_router_questions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hearth.jev import evaluate_telegram_media
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    payload = _payload(domain="chat")
+    payload["answers"]["media_ask"] = {
+        "type": "choice",
+        "choice": "edition_aware",
+        "confidence": 0.93,
+        "probabilities": {"edition_aware": 0.93},
+    }
+    payload["answers"]["needs_llm"] = {"type": "noul", "noul": 0.08}
+    fake = FakeSystemOne(payload)
+    set_client(fake)
+    verdict = await evaluate_telegram_media("Lord of the Rings extended edition")
+    assert verdict.ok is True
+    assert verdict.answers is not None
+    assert verdict.answers.media_ask is not None
+    assert verdict.answers.media_ask.choice == "edition_aware"
+    assert fake.calls
+    questions = fake.calls[0]["questions"] or {}
+    assert "media_ask" in questions
+    assert "needs_llm" in questions
+    assert "domain" not in questions
+
+
 @pytest.mark.asyncio
 async def test_http_client_posts_bearer_without_logging_key() -> None:
     seen: dict[str, Any] = {}
