@@ -56,11 +56,17 @@ class MoodSpec:
     vote_average_gte: float | None = None
     vote_count_gte: int = 200
     release_date_gte: str = ""
+    release_date_lte: str = ""
     sort_by: str = "popularity.desc"
 
     @property
     def present(self) -> bool:
-        return bool(self.genre_ids or self.runtime_lte or self.release_date_gte)
+        return bool(
+            self.genre_ids
+            or self.runtime_lte
+            or self.release_date_gte
+            or self.release_date_lte
+        )
 
 
 @dataclass(frozen=True, slots=True)

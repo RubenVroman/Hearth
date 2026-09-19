@@ -179,7 +179,9 @@ class CatalogSearch:
                 media_type=spec.media_type,
                 limit=max(1, int(limit)),
                 page=max(1, int(page)),
-                primary_release_date_lte=_today(),
+                # An era ceiling is stricter than "released already", which is
+                # the default guard against upcoming vaporware.
+                primary_release_date_lte=min(spec.release_date_lte or _today(), _today()),
                 primary_release_date_gte=spec.release_date_gte or None,
                 vote_count_gte=spec.vote_count_gte,
                 vote_average_gte=spec.vote_average_gte,

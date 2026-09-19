@@ -297,7 +297,10 @@ _RECENT = re.compile(
     r"just\s+(?:out|released))\b",
     re.I,
 )
-_CLASSIC = re.compile(r"\b(?:classic|classics|old(?:er|\s+school)?|vintage|klassiek(?:er)?)\b", re.I)
+_CLASSIC = re.compile(
+    r"\b(?:classic|classics|old(?:er|\s+school)?|vintage|klassiek(?:er)?)\b",
+    re.I,
+)
 _ACCLAIMED = re.compile(
     r"\b(?:best|top[-\s]?(?:rated|notch)|highly\s+rated|acclaimed|award[-\s]?winning|"
     r"masterpiece|beste|hoog\s+gewaardeerd)\b",
@@ -334,20 +337,32 @@ def _runtime_cap(text: str) -> int | None:
     return None
 
 
-def _era_floor(text: str) -> str:
-    """Return a ``YYYY-01-01`` release floor for era language, else ""."""
-    if _RECENT.search(text):
-        return "2021-01-01"
+def _decade_floor(text: str) -> str:
     decade = _DECADE.search(text)
-    if decade:
-        raw = decade.group("full") or decade.group("decade") or ""
-        digits = re.sub(r"\D", "", raw)[:4]
-        if len(digits) == 4:
-            return f"{digits[:3]}0-01-01"
-        if len(digits) == 2:
-            century = "19" if int(digits[0]) >= 3 else "20"
-            return f"{century}{digits[0]}0-01-01"
+    if not decade:
+        return ""
+    raw = decade.group("full") or decade.group("decade") or ""
+    digits = re.sub(r"\D", "", raw)[:4]
+    if len(digits) == 4:
+        return f"{digits[:3]}0-01-01"
+    if len(digits) == 2:
+        century = "19" if int(digits[0]) >= 3 else "20"
+        return f"{century}{digits[0]}0-01-01"
     return ""
+
+
+def _era_bounds(text: str) -> tuple[str, str]:
+    """Return ``(floor, ceiling)`` release dates for era language."""
+    floor = _decade_floor(text)
+    if floor:
+        # A named decade is a window, not an open-ended floor.
+        year = int(floor[:4])
+        return floor, f"{year + 9}-12-31"
+    if _RECENT.search(text):
+        return "2021-01-01", ""
+    if _CLASSIC.search(text):
+        return "", "1995-12-31"
+    return "", ""
 
 
 def _tv_genres(ids: tuple[int, ...]) -> tuple[int, ...]:
@@ -376,10 +391,10 @@ def detect_mood(text: str) -> MoodSpec | None:
             matched.append((key, label, include, exclude))
 
     runtime_lte = _runtime_cap(raw)
-    era_floor = _era_floor(raw)
+    era_floor, era_ceiling = _era_bounds(raw)
     acclaimed = bool(_ACCLAIMED.search(raw))
     framed = bool(_VIBE_FRAME.search(raw))
-    constrained = bool(runtime_lte or era_floor or acclaimed)
+    constrained = bool(runtime_lte or era_floor or era_ceiling or acclaimed)
 
     if not matched and not (framed and constrained):
         return None
@@ -443,6 +458,7 @@ def detect_mood(text: str) -> MoodSpec | None:
         vote_average_gte=7.2 if acclaimed else None,
         vote_count_gte=500 if acclaimed else 200,
         release_date_gte=era_floor,
+        release_date_lte=era_ceiling,
         sort_by="vote_average.desc" if acclaimed else "popularity.desc",
     )
 

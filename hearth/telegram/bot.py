@@ -812,7 +812,9 @@ class TelegramMediaBot:
                 "Give me a title or a different vibe?"
             )
         header = (
-            voice.house_pick_header() if intent.kind == "house_pick" else voice.mood_header(spec.label)
+            voice.house_pick_header()
+            if intent.kind == "house_pick"
+            else voice.mood_header(spec.label)
         )
         return self._present(
             view.chat_id,
