@@ -374,6 +374,140 @@ def _tv_genres(ids: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(mapped)
 
 
+
+# --- House night-mode (Ruben's house phrases) ---------------------------------
+# Deterministic lifestyle moods beyond generic TMDB genres. Gated by
+# HEARTH_TELEGRAM_HOUSE_NIGHTS (default on).
+
+_HOUSE_NIGHT_RULES: tuple[tuple[str, str, re.Pattern[str], tuple[int, ...], tuple[int, ...], int | None], ...] = (
+    (
+        "date_night",
+        "Friday night for us",
+        re.compile(
+            r"\b(?:"
+            r"friday\s+night\s+for\s+us|"
+            r"date[- ]?night(?:\s+for\s+us)?|"
+            r"night\s+for\s+(?:us|two)|"
+            r"something\s+(?:cosy|cozy)\s+for\s+(?:us|two)|"
+            r"romantisch\s+avondje|"
+            r"avondje\s+(?:voor\s+ons|samen)"
+            r")\b",
+            re.I,
+        ),
+        (COMEDY, FAMILY, ROMANCE),
+        (HORROR, WAR, DOCUMENTARY),
+        None,
+    ),
+    (
+        "parel_kids",
+        "kids movie for Parel",
+        re.compile(
+            r"\b(?:"
+            r"kids?\s+movie\s+for\s+parel|"
+            r"(?:for|voor)\s+parel|"
+            r"parel(?:'s)?\s+(?:movie|film|kids?\s+movie)|"
+            r"something\s+for\s+parel|"
+            r"family[- ]safe(?:\s+for\s+parel)?"
+            r")\b",
+            re.I,
+        ),
+        (FAMILY, ANIMATION),
+        (HORROR, WAR, THRILLER, CRIME),
+        None,
+    ),
+    (
+        "cooking_short",
+        "something short while cooking",
+        re.compile(
+            r"\b(?:"
+            r"something\s+short\s+while\s+cooking|"
+            r"(?:short|quick)\s+(?:one|watch|movie|film)?\s+while\s+cooking|"
+            r"while\s+(?:i(?:'m|\s+am)?\s+)?cooking|"
+            r"during\s+cooking|"
+            r"tijdens\s+het\s+koken|"
+            r"iets\s+korts?\s+(?:tijdens|bij)\s+(?:het\s+)?koken"
+            r")\b",
+            re.I,
+        ),
+        (COMEDY, ANIMATION, FAMILY),
+        (HORROR, WAR, DOCUMENTARY),
+        90,
+    ),
+    (
+        "sofa_sunday",
+        "sofa Sunday",
+        re.compile(
+            r"\b(?:"
+            r"sofa\s+sunday|sunday\s+sofa|"
+            r"rainy\s+(?:sunday|afternoon)\s+(?:movie|film|watch)?|"
+            r"lazy\s+sunday"
+            r")\b",
+            re.I,
+        ),
+        (COMEDY, FAMILY, ROMANCE, DRAMA),
+        (HORROR, WAR),
+        None,
+    ),
+    (
+        "background_noise",
+        "something on in the background",
+        re.compile(
+            r"\b(?:"
+            r"background(?:\s+(?:noise|watch|movie|film))?|"
+            r"something\s+on\s+in\s+the\s+background|"
+            r"half[- ]watching|"
+            r"op\s+de\s+achtergrond"
+            r")\b",
+            re.I,
+        ),
+        (COMEDY, ANIMATION),
+        (HORROR, THRILLER, WAR),
+        100,
+    ),
+)
+
+
+def detect_house_night(text: str) -> MoodSpec | None:
+    """House lifestyle moods for Ruben's phrases — no LLM."""
+    from hearth.config import settings as _settings
+
+    if not bool(getattr(_settings, "telegram_house_nights", True)):
+        return None
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    for key, label, pattern, include, exclude, runtime_lte in _HOUSE_NIGHT_RULES:
+        if not pattern.search(raw):
+            continue
+        media_type = "tv" if _TV_HINT.search(raw) and not _MOVIE_HINT.search(raw) else "movie"
+        include_ids = tuple(include)
+        exclude_ids = tuple(g for g in exclude if g not in include_ids)
+        if media_type == "tv":
+            include_ids = _tv_genres(include_ids)
+            exclude_ids = tuple(g for g in _tv_genres(exclude_ids) if g not in include_ids)
+        # Cooking / background phrases always prefer a short runtime.
+        cap = runtime_lte
+        if cap is None:
+            cap = _runtime_cap(raw)
+        out_label = label
+        if cap is not None:
+            hours, minutes = divmod(cap, 60)
+            span = f"{hours}h{minutes:02d}" if minutes else f"{hours}h"
+            if "under" not in out_label:
+                out_label = f"{out_label} under {span}"
+        return MoodSpec(
+            key=key,
+            label=out_label,
+            media_type=media_type,
+            genre_ids=include_ids,
+            exclude_genre_ids=exclude_ids,
+            runtime_lte=cap,
+            vote_count_gte=150 if key == "parel_kids" else 200,
+            sort_by="popularity.desc",
+        )
+    return None
+
+
 def detect_mood(text: str) -> MoodSpec | None:
     """Return discover coordinates for a vibe ask, or None when it is a title.
 
@@ -384,6 +518,10 @@ def detect_mood(text: str) -> MoodSpec | None:
     raw = (text or "").strip()
     if not raw:
         return None
+
+    house = detect_house_night(raw)
+    if house is not None:
+        return house
 
     matched: list[tuple[str, str, tuple[int, ...], tuple[int, ...]]] = []
     for key, label, pattern, include, exclude in _MOOD_RULES:
@@ -486,6 +624,7 @@ def looks_like_vague_ask(text: str) -> bool:
 
 
 __all__ = [
+    "detect_house_night",
     "detect_mood",
     "house_pick_spec",
     "looks_like_riddle",

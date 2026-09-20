@@ -29,7 +29,18 @@ ACTION_SIMILAR = "l"  # more like the anchor title
 ACTION_MORE = "m"  # next page of the current lane
 ACTION_DISMISS = "n"  # nah, drop the offer
 ACTION_SERIES = "a"  # all of them (franchise expand)
-ACTION_CODES = frozenset({ACTION_SIMILAR, ACTION_MORE, ACTION_DISMISS, ACTION_SERIES})
+ACTION_PLAY = "p"  # play available title on the TV (never queues)
+ACTION_STATUS = "s"  # acknowledge pending/downloading (never queues)
+ACTION_CODES = frozenset(
+    {
+        ACTION_SIMILAR,
+        ACTION_MORE,
+        ACTION_DISMISS,
+        ACTION_SERIES,
+        ACTION_PLAY,
+        ACTION_STATUS,
+    }
+)
 
 
 class CallbackError(ValueError):
