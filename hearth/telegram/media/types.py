@@ -39,6 +39,7 @@ FollowUpKind = Literal[
     "other_one",
     "ordinal",
     "that_one",
+    "continue_pack",
 ]
 
 

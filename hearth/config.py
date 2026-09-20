@@ -223,6 +223,17 @@ class Settings(BaseSettings):
     # House-butler phrasing. Off keeps the plain operational sentences.
     telegram_butler_voice: bool = Field(default=True, alias="HEARTH_TELEGRAM_BUTLER_VOICE")
 
+    # Plex-aware Get/Play buttons + status marks (Overseerr mediaStatus).
+    telegram_status_truth: bool = Field(default=True, alias="HEARTH_TELEGRAM_STATUS_TRUTH")
+    # House night-mode moods (Friday night for us / kids for Parel / cooking).
+    telegram_house_nights: bool = Field(default=True, alias="HEARTH_TELEGRAM_HOUSE_NIGHTS")
+    # After queuing Part One, remember Part Two for "what's next" / sequel.
+    telegram_watch_next: bool = Field(default=True, alias="HEARTH_TELEGRAM_WATCH_NEXT")
+    # Confidence-scaled butler verbosity (terse on exact Get, warmer on mood).
+    telegram_voice_verbosity: bool = Field(default=True, alias="HEARTH_TELEGRAM_VOICE_VERBOSITY")
+    # Remote Play button / "put it on the TV" via Infuse or Plex.
+    telegram_play_lane: bool = Field(default=True, alias="HEARTH_TELEGRAM_PLAY_LANE")
+
     # TypeSafe Jev (System One) — cheap typed decision gate before gpt/tools.
     # Off by default. When enabled, shadow mode logs only (does not enforce).
     # API key stays on the VAULT host .env; never log it.

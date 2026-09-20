@@ -29,7 +29,12 @@ from hearth.telegram.media.compound import split_compound_ask
 from hearth.telegram.media.editions import EditionPreference, extract_edition
 from hearth.telegram.media.followups import FollowUpAsk, detect_follow_up
 from hearth.telegram.media.memory import ChatContext, MediaMemory, RememberedHit
-from hearth.telegram.media.moods import detect_mood, house_pick_spec, looks_like_vague_ask
+from hearth.telegram.media.moods import (
+    detect_house_night,
+    detect_mood,
+    house_pick_spec,
+    looks_like_vague_ask,
+)
 from hearth.telegram.media.people import PersonAsk, detect_person_ask
 from hearth.telegram.media.ranking import (
     MAX_RESULTS,
@@ -72,6 +77,7 @@ __all__ = [
     "classify_media_ask",
     "classify_media_ask_sync",
     "detect_follow_up",
+    "detect_house_night",
     "detect_mood",
     "detect_person_ask",
     "detect_similar_ask",

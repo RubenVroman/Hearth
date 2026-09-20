@@ -22,8 +22,10 @@ from hearth.jev import evaluate_telegram_media, log_shadow_outcome, noul_high
 from hearth.telegram.callbacks import (
     ACTION_DISMISS,
     ACTION_MORE,
+    ACTION_PLAY,
     ACTION_SERIES,
     ACTION_SIMILAR,
+    ACTION_STATUS,
     CallbackCodec,
     CallbackError,
     is_action_callback,
@@ -57,6 +59,13 @@ from hearth.telegram.media import (
     voice,
     without_ids,
 )
+from hearth.telegram.media.play import looks_like_play_command, play_on_tv
+from hearth.telegram.media.watch_next import (
+    WatchNext,
+    looks_like_continue_pack,
+    pick_next_in_order,
+)
+
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
 from hearth.telegram.parse import parse_message
 from hearth.telegram.progress import (
@@ -1011,7 +1020,22 @@ class TelegramMediaBot:
                 top.label,
                 ask_text=context.ask_text or view.text,
             )
+        if kind == "continue_pack":
+            offered = await self._offer_watch_next(view, context)
+            if offered is not None:
+                return offered
+            # Fall through to sequel when no stored watch-next exists.
+            return await self._adjacent_entry_reply(view, context, direction="sequel")
+        if kind == "continue_pack":
+            offered = await self._offer_watch_next(view, context)
+            if offered is not None:
+                return offered
+            return await self._adjacent_entry_reply(view, context, direction="sequel")
         if kind in {"sequel", "prequel"}:
+            if kind == "sequel":
+                offered = await self._offer_watch_next(view, context)
+                if offered is not None:
+                    return offered
             return await self._adjacent_entry_reply(view, context, direction=kind)
         if kind == "more":
             return await self._more_of_the_same(view, context)
@@ -1360,6 +1384,15 @@ class TelegramMediaBot:
                 )
             except Exception:  # noqa: BLE001
                 log.exception("failed to attach tracker after yes-confirm")
+        nudge = await self._remember_watch_next_after_queue(
+            view.chat_id,
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            title=title,
+            year=year,
+        )
+        if nudge:
+            text = f"{text}\n{nudge}"
         return BotReply(text)
 
     async def _search_reply(self, view: MessageView, query: MediaQuery) -> BotReply:
@@ -1531,9 +1564,170 @@ class TelegramMediaBot:
                     context,
                     edit_message_id=message_id,
                 )
+            if action.action == ACTION_PLAY and action.tmdb_id:
+                return await self._play_callback(
+                    chat_id,
+                    message_id,
+                    media_type=action.media_type or "movie",
+                    tmdb_id=int(action.tmdb_id),
+                    context=context,
+                )
+            if action.action == ACTION_STATUS and action.tmdb_id:
+                return self._status_ack_callback(
+                    message_id,
+                    media_type=action.media_type or "movie",
+                    tmdb_id=int(action.tmdb_id),
+                    context=context,
+                )
         except CatalogUnavailable as exc:
-            return BotReply(exc.message, edit_message_id=message_id)
+            return BotReply(str(getattr(exc, "message", exc)), edit_message_id=message_id)
         return BotReply(voice.lost_context(), edit_message_id=message_id)
+
+    async def _offer_watch_next(
+        self,
+        view: MessageView,
+        context: ChatContext | None,
+    ) -> BotReply | None:
+        """Surface a stored watch-next card when the lane is enabled."""
+        if not bool(getattr(settings, "telegram_watch_next", True)):
+            return None
+        if context is None:
+            return None
+        payload = context.watch_next()
+        if not payload:
+            return None
+        watch = WatchNext.from_dict(payload)
+        if watch is None or not watch.present:
+            return None
+        hits: list[MediaHit] = []
+        try:
+            details = await self.catalog.details(watch.tmdb_id, watch.media_type)
+            media = details.get("media") if isinstance(details, dict) else None
+            if isinstance(media, dict):
+                hits = [
+                    MediaHit(
+                        media_type=watch.media_type,  # type: ignore[arg-type]
+                        tmdb_id=watch.tmdb_id,
+                        title=str(media.get("title") or watch.title),
+                        year=watch.year,
+                        media_status=(
+                            int(media["mediaStatus"])
+                            if media.get("mediaStatus") is not None
+                            else None
+                        ),
+                    )
+                ]
+        except Exception:
+            hits = []
+        if not hits:
+            hits = [watch.as_hit()]
+        header = voice.watch_next_offer(
+            watch.label,
+            after=watch.from_title or "the last one",
+        )
+        self.memory.clear_watch_next(view.chat_id)
+        return self._present(
+            view.chat_id,
+            hits,
+            header=header,
+            ask_kind="follow_up",
+            ask_text=view.text or "what's next",
+            media_type=watch.media_type,
+            remember_single_guess=True,
+            offer_dismiss=True,
+        )
+
+    def _status_ack_callback(
+        self,
+        message_id: int,
+        *,
+        media_type: str,
+        tmdb_id: int,
+        context: ChatContext | None,
+    ) -> BotReply:
+        label = "that title"
+        status = None
+        if context is not None:
+            match = next((h for h in context.hits if h.tmdb_id == tmdb_id), None)
+            if match is not None:
+                label = match.label
+                status = match.media_status
+        state = "downloading" if status == 3 else "pending" if status == 2 else "in flight"
+        return BotReply(voice.status_ack(label, state=state), edit_message_id=message_id)
+
+    async def _play_callback(
+        self,
+        chat_id: int,
+        message_id: int,
+        *,
+        media_type: str,
+        tmdb_id: int,
+        context: ChatContext | None,
+    ) -> BotReply:
+        title = "that title"
+        year: int | None = None
+        if context is not None:
+            match = next((h for h in context.hits if h.tmdb_id == tmdb_id), None)
+            if match is not None:
+                title = match.title
+                year = match.year
+        if title == "that title":
+            title = f"TMDB {tmdb_id}"
+        label = f"{title} ({year})" if year else title
+        outcome = await play_on_tv(
+            title=title,
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            year=year,
+        )
+        if outcome.ok:
+            text = voice.play_started(label)
+        else:
+            text = voice.play_failed(label, reason=outcome.message)
+        return BotReply(text, edit_message_id=message_id)
+
+    async def _remember_watch_next_after_queue(
+        self,
+        chat_id: int,
+        *,
+        media_type: str,
+        tmdb_id: int,
+        title: str,
+        year: int | None,
+    ) -> str | None:
+        """After a successful Get, remember the next franchise entry when possible."""
+        if not bool(getattr(settings, "telegram_watch_next", True)):
+            return None
+        try:
+            _name, entries = await self.catalog.collection_hits(
+                media_type,
+                tmdb_id,
+                limit=SERIES_MAX_RESULTS + 4,
+            )
+        except Exception:
+            return None
+        if not entries:
+            return None
+        nxt = pick_next_in_order(
+            entries,
+            after_tmdb_id=tmdb_id,
+            after_year=year,
+        )
+        if nxt is None or nxt.tmdb_id == tmdb_id:
+            return None
+        self.memory.remember_watch_next(
+            chat_id,
+            media_type=nxt.media_type,
+            tmdb_id=nxt.tmdb_id,
+            title=nxt.title,
+            year=nxt.year,
+            from_title=title,
+            from_tmdb_id=tmdb_id,
+        )
+        return voice.watch_next_nudge(
+            f"{nxt.title} ({nxt.year})" if nxt.year else nxt.title,
+            after=title,
+        )
 
     async def _expand_series_from_button(
         self,
@@ -1802,6 +1996,15 @@ class TelegramMediaBot:
                     metadata=tracked_metadata,
                 ):
                     log.warning("accepted request remains pending for reconciliation")
+        nudge = await self._remember_watch_next_after_queue(
+            chat_id,
+            media_type=request.media_type,
+            tmdb_id=request.tmdb_id,
+            title=title,
+            year=year,
+        )
+        if nudge:
+            text = f"{text}\n{nudge}"
         return BotReply(text, edit_message_id=message_id)
 
     async def _recover_uncertain_request(

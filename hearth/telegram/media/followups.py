@@ -28,6 +28,13 @@ def _bare(core: str) -> re.Pattern[str]:
 
 # "the second one" / "the first one" are ordinals against the cards on screen,
 # so they are deliberately absent here and handled by ``_ORDINAL`` below.
+_CONTINUE_PACK = _bare(
+    r"(?:what(?:'s|\s+is)?\s+next|whats\s+next|what\s+next|"
+    r"continue(?:\s+the)?\s+pack|(?:the\s+)?rest\s+of\s+(?:the\s+)?(?:pack|collection|series)|"
+    r"next\s+in\s+(?:the\s+)?(?:series|pack|collection)|"
+    r"keep\s+going|carry\s+on|volgende|wat\s+nu|ga\s+verder)"
+)
+
 _SEQUEL = _bare(
     r"(?:the\s+)?(?:sequel|next\s+one|next\s+part|part\s+(?:two|2)|"
     r"follow[-\s]?up|het\s+vervolg|vervolg|deel\s+(?:twee|2))"
@@ -117,6 +124,7 @@ def detect_follow_up(text: str) -> FollowUpAsk | None:
         return None
 
     for pattern, kind in (
+        (_CONTINUE_PACK, "continue_pack"),
         (_MORE_LIKE_THAT, "more_like_that"),
         (_ALL_OF_THEM, "all_of_them"),
         (_SEQUEL, "sequel"),

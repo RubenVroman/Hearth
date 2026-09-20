@@ -40,15 +40,17 @@ def kind_word(media_type: str) -> str:
 # --- headers ------------------------------------------------------------------
 
 
-def exact_header(label: str, *, single: bool) -> str:
+def exact_header(label: str, *, single: bool, kind: str = "exact_title", confidence: float = 1.0) -> str:
     if single:
-        return _pick(
+        return terse_pick(
             (
                 f"Found it — {label}.",
                 f"Got it: {label}.",
                 f"{label} — that's the one.",
             ),
             label,
+            kind=kind,
+            confidence=confidence,
         )
     return _pick(
         (
@@ -351,7 +353,83 @@ def needs_openai() -> str:
     )
 
 
+
+
+# --- verbosity ---------------------------------------------------------------
+
+
+def verbosity_for(kind: str, *, confidence: float = 1.0) -> str:
+    """Return ``terse`` / ``warm`` based on lane + confidence.
+
+    Exact title / sure Get stays short. Fuzzy mood / person / similar gets a
+    slightly richer line. Disabled when ``HEARTH_TELEGRAM_VOICE_VERBOSITY`` is off.
+    """
+    from hearth.config import settings as _settings
+
+    if not bool(getattr(_settings, "telegram_voice_verbosity", True)):
+        return "terse"
+    kind = (kind or "").strip().lower()
+    conf = float(confidence or 0.0)
+    if kind in {"exact_title", "edition", "known_franchise"} and conf >= 0.8:
+        return "terse"
+    if kind in {"mood", "person", "similar", "house_pick", "batch", "follow_up"}:
+        return "warm"
+    if conf < 0.65:
+        return "warm"
+    return "terse"
+
+
+def terse_pick(bank: tuple[str, ...], seed: str, *, kind: str = "", confidence: float = 1.0) -> str:
+    """Like ``_pick``, but forces the first (shortest) line on the fast path."""
+    if not bank:
+        return ""
+    if verbosity_for(kind, confidence=confidence) == "terse":
+        return bank[0]
+    return _pick(bank, seed)
+
+
+def play_started(label: str, *, where: str = "the TV") -> str:
+    return _pick(
+        (
+            f"Playing {label} on {where}.",
+            f"On the screen: {label}.",
+            f"{label} — going out to {where}.",
+        ),
+        label,
+    )
+
+
+def play_failed(label: str, *, reason: str) -> str:
+    clean = (reason or "playback isn't wired for that right now").strip()
+    return f"Couldn't play {label} — {clean}"
+
+
+def status_ack(label: str, *, state: str) -> str:
+    if state == "pending":
+        return f"{label} is still waiting for approval — nothing to Get again."
+    if state == "downloading":
+        return f"{label} is already downloading — I'll leave the queue alone."
+    return f"{label} is already handled ({state})."
+
+
+def watch_next_nudge(label: str, *, after: str) -> str:
+    return (
+        f"Queued. Next in the pack after {after}: {label} — "
+        "say “what's next” or “the sequel” when you want it."
+    )
+
+
+def watch_next_offer(label: str, *, after: str) -> str:
+    return f"Continuing the pack after {after} — {label}:"
+
 __all__ = [
+    "verbosity_for",
+    "terse_pick",
+    "play_started",
+    "play_failed",
+    "status_ack",
+    "watch_next_nudge",
+    "watch_next_offer",
     "already_available",
     "already_requested",
     "backend_auth_failed",

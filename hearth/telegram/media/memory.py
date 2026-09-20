@@ -120,11 +120,21 @@ class ChatContext:
     anchor_type: str = ""
     shown_ids: tuple[int, ...] = ()
     page: int = 1
+    # Next franchise entry after a successful queue (same TTL as the thread).
+    watch_next_media_type: str = ""
+    watch_next_tmdb_id: int | None = None
+    watch_next_title: str = ""
+    watch_next_year: int | None = None
+    watch_next_from_title: str = ""
+    watch_next_from_tmdb_id: int | None = None
     updated_at: float = field(default=0.0)
 
     @property
     def present(self) -> bool:
-        return bool(self.hits or self.search_title or self.person_name or self.ask_text)
+        return bool(
+            self.hits or self.search_title or self.person_name or self.ask_text
+            or self.watch_next_tmdb_id
+        )
 
     @property
     def top(self) -> RememberedHit | None:
@@ -162,6 +172,12 @@ class ChatContext:
             "anchor_type": self.anchor_type,
             "shown_ids": list(self.shown_ids),
             "page": self.page,
+            "watch_next_media_type": self.watch_next_media_type,
+            "watch_next_tmdb_id": self.watch_next_tmdb_id,
+            "watch_next_title": self.watch_next_title,
+            "watch_next_year": self.watch_next_year,
+            "watch_next_from_title": self.watch_next_from_title,
+            "watch_next_from_tmdb_id": self.watch_next_from_tmdb_id,
             "updated_at": self.updated_at,
         }
 
@@ -199,6 +215,28 @@ class ChatContext:
             anchor_id = None
         if anchor_id is not None and anchor_id <= 0:
             anchor_id = None
+
+        watch_next_tmdb_id: int | None
+        try:
+            watch_next_tmdb_id = int(payload.get("watch_next_tmdb_id"))
+        except (TypeError, ValueError):
+            watch_next_tmdb_id = None
+        if watch_next_tmdb_id is not None and watch_next_tmdb_id <= 0:
+            watch_next_tmdb_id = None
+        watch_next_year: int | None
+        try:
+            watch_next_year = int(payload.get("watch_next_year")) if payload.get("watch_next_year") is not None else None
+        except (TypeError, ValueError):
+            watch_next_year = None
+        watch_next_from_tmdb_id: int | None
+        try:
+            watch_next_from_tmdb_id = (
+                int(payload.get("watch_next_from_tmdb_id"))
+                if payload.get("watch_next_from_tmdb_id") is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            watch_next_from_tmdb_id = None
         return cls(
             hits=tuple(hits[:_MAX_REMEMBERED_HITS]),
             ask_kind=str(payload.get("ask_kind") or ""),
@@ -212,8 +250,30 @@ class ChatContext:
             anchor_type=str(payload.get("anchor_type") or ""),
             shown_ids=tuple(dict.fromkeys(shown))[-_MAX_SHOWN_IDS:],
             page=page,
+            watch_next_media_type=str(payload.get("watch_next_media_type") or ""),
+            watch_next_tmdb_id=watch_next_tmdb_id,
+            watch_next_title=str(payload.get("watch_next_title") or ""),
+            watch_next_year=watch_next_year,
+            watch_next_from_title=str(payload.get("watch_next_from_title") or ""),
+            watch_next_from_tmdb_id=watch_next_from_tmdb_id,
             updated_at=updated_at,
         )
+
+
+    def watch_next(self) -> dict[str, Any] | None:
+        """Return the stored watch-next payload, or None."""
+        if self.watch_next_tmdb_id is None or not self.watch_next_title:
+            return None
+        if self.watch_next_media_type not in {"movie", "tv"}:
+            return None
+        return {
+            "media_type": self.watch_next_media_type,
+            "tmdb_id": self.watch_next_tmdb_id,
+            "title": self.watch_next_title,
+            "year": self.watch_next_year,
+            "from_title": self.watch_next_from_title,
+            "from_tmdb_id": self.watch_next_from_tmdb_id,
+        }
 
 
 class MediaMemory:
@@ -307,5 +367,80 @@ class MediaMemory:
             page=page,
         )
 
+
+
+    def remember_watch_next(
+        self,
+        chat_id: int,
+        *,
+        media_type: str,
+        tmdb_id: int,
+        title: str,
+        year: int | None = None,
+        from_title: str = "",
+        from_tmdb_id: int | None = None,
+    ) -> ChatContext:
+        """Attach a watch-next entry to the existing chat context (or create one)."""
+        import time as _time
+        previous = self.load(chat_id)
+        base = previous or ChatContext()
+        context = ChatContext(
+            hits=base.hits,
+            ask_kind=base.ask_kind,
+            ask_text=base.ask_text,
+            search_title=base.search_title,
+            franchise_seed=base.franchise_seed,
+            person_name=base.person_name,
+            person_role=base.person_role,
+            media_type=base.media_type or media_type,
+            anchor_id=base.anchor_id,
+            anchor_type=base.anchor_type,
+            shown_ids=base.shown_ids,
+            page=base.page,
+            watch_next_media_type=media_type,
+            watch_next_tmdb_id=int(tmdb_id),
+            watch_next_title=title.strip(),
+            watch_next_year=year,
+            watch_next_from_title=(from_title or "").strip(),
+            watch_next_from_tmdb_id=from_tmdb_id,
+            updated_at=_time.time(),
+        )
+        self.store.put_callback_media(
+            self._key(chat_id),
+            context.to_dict(),
+            ttl_s=self.ttl_seconds,
+        )
+        return context
+
+    def clear_watch_next(self, chat_id: int) -> ChatContext | None:
+        """Drop only the watch-next fields, keeping the rest of the thread."""
+        import time as _time
+        previous = self.load(chat_id)
+        if previous is None:
+            return None
+        context = ChatContext(
+            hits=previous.hits,
+            ask_kind=previous.ask_kind,
+            ask_text=previous.ask_text,
+            search_title=previous.search_title,
+            franchise_seed=previous.franchise_seed,
+            person_name=previous.person_name,
+            person_role=previous.person_role,
+            media_type=previous.media_type,
+            anchor_id=previous.anchor_id,
+            anchor_type=previous.anchor_type,
+            shown_ids=previous.shown_ids,
+            page=previous.page,
+            updated_at=_time.time(),
+        )
+        if not context.present:
+            self.forget(chat_id)
+            return None
+        self.store.put_callback_media(
+            self._key(chat_id),
+            context.to_dict(),
+            ttl_s=self.ttl_seconds,
+        )
+        return context
 
 __all__ = ["ChatContext", "ContextStore", "MediaMemory", "RememberedHit"]

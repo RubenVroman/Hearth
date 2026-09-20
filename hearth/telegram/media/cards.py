@@ -2,7 +2,8 @@
 
 Every Get button carries signed request coordinates (media type + TMDB id +
 season) so confirming never re-searches by title. Refine buttons are signed too
-but carry no queue authority.
+but carry no queue authority. When status truth is on, buttons reflect real
+Overseerr state: Get / Downloading… / On Plex · Play.
 """
 
 from __future__ import annotations
@@ -10,22 +11,33 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
+from hearth.config import settings
 from hearth.telegram.callbacks import (
     ACTION_DISMISS,
     ACTION_MORE,
+    ACTION_PLAY,
     ACTION_SERIES,
     ACTION_SIMILAR,
+    ACTION_STATUS,
     CallbackCodec,
 )
 from hearth.telegram.media import voice
+from hearth.telegram.media.status import (
+    availability_of,
+    play_button_label,
+    request_button_label,
+    status_button_label,
+    status_mark,
+)
 from hearth.telegram.models import BotReply, MediaHit
 
+# Kept for callers/tests that still import STATUS_MARKS directly.
 STATUS_MARKS: dict[int, str] = {
     1: "○ Not requested",
     2: "◷ Pending approval",
-    3: "◷ Requested",
-    4: "◐ Partly available",
-    5: "✓ In Plex",
+    3: "◷ Downloading…",
+    4: "◐ Partly on Plex",
+    5: "✓ On Plex",
     # Archived Overseerr used 6 for deleted; current Seerr uses it for
     # blocklisted. Keep the label honest across both servers and let the
     # backend decide whether a fresh request is allowed.
@@ -60,14 +72,18 @@ class RenderedCards:
 
 
 def button_label(index: int, hit: MediaHit, *, season: int | None = None) -> str:
+    """Backward-compatible Get label; prefer ``request_button_label`` for new code."""
+    if bool(getattr(settings, "telegram_status_truth", True)):
+        return request_button_label(index, hit, season=season)
     year_bit = f" ({hit.year})" if hit.year is not None else ""
     season_bit = f" S{season:02d}" if season is not None else ""
     kind = "movie" if hit.media_type == "movie" else "TV"
-    # Telegram shows ~64 visible chars; keep index + title + year + kind.
     return f"Get {index} · {hit.title}{year_bit} {kind}{season_bit}"
 
 
 def status_of(hit: MediaHit) -> str:
+    if bool(getattr(settings, "telegram_status_truth", True)):
+        return status_mark(hit)
     return STATUS_MARKS.get(hit.media_status, "○ Not requested")
 
 
@@ -84,12 +100,45 @@ def blocked_status_line(hit: MediaHit) -> str:
 
 
 class CardRenderer:
-    """Builds result messages, Get buttons, and refine buttons."""
+    """Builds result messages, Get / Play / status buttons, and refine buttons."""
 
     def __init__(self, codec: CallbackCodec, store: MediaKeyStore, *, ttl_s: int) -> None:
         self.codec = codec
         self.store = store
         self.ttl_s = max(60, int(ttl_s))
+
+    @property
+    def _status_truth(self) -> bool:
+        return bool(getattr(settings, "telegram_status_truth", True))
+
+    @property
+    def _play_lane(self) -> bool:
+        return bool(getattr(settings, "telegram_play_lane", True))
+
+    def _store_payload(
+        self,
+        callback_data: str,
+        *,
+        chat_id: int,
+        hit: MediaHit,
+        season: int | None,
+        edition_key: str,
+        edition_label: str,
+        action: str = "request",
+    ) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "media_type": hit.media_type,
+            "tmdb_id": hit.tmdb_id,
+            "title": hit.title,
+            "year": hit.year,
+            "season": season,
+            "action": action,
+        }
+        if edition_key:
+            payload["edition_key"] = edition_key
+            payload["edition_label"] = edition_label
+        self.store.put_callback_media(callback_data, payload, ttl_s=self.ttl_s)
 
     def _emit(
         self,
@@ -108,33 +157,77 @@ class CardRenderer:
         index = start_index
         for hit in hits:
             lines.append(f"{index}. {hit.display_label()} — {status_of(hit)}")
-            explicitly_requesting_tv_season = hit.media_type == "tv" and season is not None
-            non_requestable = hit.media_status == 5 or (
-                hit.media_status in {2, 3} and not explicitly_requesting_tv_season
-            )
             position = index
             index += 1
-            if non_requestable:
-                continue
             hit_season = season if hit.media_type == "tv" else None
+            avail = availability_of(hit, season=season)
+
+            if self._status_truth and avail.playable and self._play_lane:
+                callback_data = self.codec.encode_action(
+                    ACTION_PLAY,
+                    chat_id,
+                    media_type=hit.media_type,
+                    tmdb_id=hit.tmdb_id,
+                )
+                self._store_payload(
+                    callback_data,
+                    chat_id=chat_id,
+                    hit=hit,
+                    season=hit_season,
+                    edition_key=edition_key,
+                    edition_label=edition_label,
+                    action="play",
+                )
+                rows.append(
+                    [{"text": play_button_label(hit)[:64], "callback_data": callback_data}]
+                )
+                continue
+
+            if self._status_truth and avail.in_flight:
+                callback_data = self.codec.encode_action(
+                    ACTION_STATUS,
+                    chat_id,
+                    media_type=hit.media_type,
+                    tmdb_id=hit.tmdb_id,
+                )
+                self._store_payload(
+                    callback_data,
+                    chat_id=chat_id,
+                    hit=hit,
+                    season=hit_season,
+                    edition_key=edition_key,
+                    edition_label=edition_label,
+                    action="status",
+                )
+                rows.append(
+                    [
+                        {
+                            "text": status_button_label(hit, season=season)[:64],
+                            "callback_data": callback_data,
+                        }
+                    ]
+                )
+                continue
+
+            if not avail.requestable:
+                # Legacy path when status truth is off, or blocked titles.
+                continue
+
             callback_data = self.codec.encode(
                 hit.media_type,
                 hit.tmdb_id,
                 chat_id,
                 season=hit_season,
             )
-            payload: dict[str, Any] = {
-                "chat_id": chat_id,
-                "media_type": hit.media_type,
-                "tmdb_id": hit.tmdb_id,
-                "title": hit.title,
-                "year": hit.year,
-                "season": hit_season,
-            }
-            if edition_key:
-                payload["edition_key"] = edition_key
-                payload["edition_label"] = edition_label
-            self.store.put_callback_media(callback_data, payload, ttl_s=self.ttl_s)
+            self._store_payload(
+                callback_data,
+                chat_id=chat_id,
+                hit=hit,
+                season=hit_season,
+                edition_key=edition_key,
+                edition_label=edition_label,
+                action="request",
+            )
             label = button_label(position, hit, season=hit_season)
             rows.append([{"text": label[:64], "callback_data": callback_data}])
             requestable.append((hit, hit_season))
