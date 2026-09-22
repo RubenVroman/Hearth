@@ -629,10 +629,12 @@ class TelegramMediaBot:
         if remember_single_guess and single is not None:
             hit, hit_season = single
             self._set_pending_guess(chat_id, hit, season=hit_season)
-        # Nothing to request and only one candidate: answer in one clear line
-        # instead of a one-row menu with no buttons.
+        # Nothing to request and only one candidate: lead with the one clear
+        # status line instead of a numbered list of one. Any Play / status /
+        # refine button still belongs on it — "On Plex" is exactly when Play is
+        # the useful action.
         if not rendered.requestable and len(hits) == 1:
-            return BotReply(blocked_status_line(hits[0]))
+            return BotReply(blocked_status_line(hits[0]), rendered.reply.reply_markup)
         return rendered.reply
 
     def _miss(self, label: str) -> BotReply:
