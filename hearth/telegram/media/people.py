@@ -14,7 +14,7 @@ from typing import Any
 
 _NAME_WORD = r"[A-Z][\w'’.-]+|[a-z]{2,}"
 _STOP_TAIL = re.compile(
-    r"\s+(?:movies?|films?|shows?|series|filmography|stuff|things|catalog(?:ue)?|"
+    r"\s+(?:movies?|films?|shows?|serie|series|filmography|stuff|things|catalog(?:ue)?|"
     r"anything|everything|titles?)\s*$",
     re.I,
 )
@@ -22,7 +22,9 @@ _LEAD_FILLER = re.compile(
     r"^(?:(?:show|give|get|grab|find|download|request|queue|haal|zoek|vraag)\s+"
     r"(?:me\s+|us\s+|mij\s+|ons\s+)?)?"
     # The \b matters: without it "de" eats the "De" of "Denzel Washington".
-    r"(?:(?:some|any|all|alle|the|de|het|a\s+few)\b\s*)?",
+    # The lookahead matters too: in "de Niro" the "de" is a surname particle,
+    # not a Dutch article, and stripping it loses the actor.
+    r"(?:(?:some|any|all|alle|the|a\s+few)\b\s*|(?:de|het)\b\s+(?!(?-i:[A-Z])))?",
     re.I,
 )
 
@@ -55,9 +57,11 @@ _DIRECTOR_HINT = re.compile(
     r"\b(?:directed\s+by|dir\.?\s+by|director|regie|geregisseerd)\b",
     re.I,
 )
-# Words that prove the tail is a description, not a human being.
+# Words that prove the tail is a description, not a human being. "de" is
+# deliberately absent: it is a surname particle far more often than a Dutch
+# article here ("Robert de Niro", "Brian De Palma", "Olivia de Havilland").
 _NOT_A_NAME = re.compile(
-    r"\b(?:the|a|an|de|het|een|that|this|those|scar|glasses|wizard|robot|"
+    r"\b(?:the|a|an|het|een|that|this|those|scar|glasses|wizard|robot|"
     r"spaceship|about|where|who|which|when|plot|vibe|ending|twist|"
     r"subtitles?|dubbed|4k|1080p)\b",
     re.I,

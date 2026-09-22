@@ -19,6 +19,7 @@ from hearth.telegram.callbacks import (
     ACTION_SERIES,
     ACTION_SIMILAR,
     ACTION_STATUS,
+    ACTION_TITLE,
     CallbackCodec,
 )
 from hearth.telegram.media import voice
@@ -247,6 +248,7 @@ class CardRenderer:
         offer_more: bool = False,
         offer_dismiss: bool = False,
         series_anchor: MediaHit | None = None,
+        title_chip: str = "",
     ) -> RenderedCards:
         lines = [header]
         rows: list[list[dict[str, str]]] = []
@@ -274,6 +276,7 @@ class CardRenderer:
             series_anchor=series_anchor,
             offer_more=offer_more,
             offer_dismiss=offer_dismiss,
+            title_chip=title_chip,
         )
         if refine:
             rows.append(refine)
@@ -343,6 +346,19 @@ class CardRenderer:
             shown=tuple(shown),
         )
 
+    def _title_chip(self, chat_id: int, title: str) -> dict[str, str]:
+        """"I meant the title" — the one-tap correction for an ambiguous vibe ask."""
+        callback_data = self.codec.encode_action(ACTION_TITLE, chat_id)
+        self.store.put_callback_media(
+            callback_data,
+            {"chat_id": chat_id, "title": title, "action": "title"},
+            ttl_s=self.ttl_s,
+        )
+        label = f"🎬 I meant “{title}”"
+        if len(label) > 64:
+            label = "🎬 I meant the title"
+        return {"text": label, "callback_data": callback_data}
+
     def _refine_row(
         self,
         chat_id: int,
@@ -351,8 +367,13 @@ class CardRenderer:
         series_anchor: MediaHit | None,
         offer_more: bool,
         offer_dismiss: bool,
+        title_chip: str = "",
     ) -> list[dict[str, str]]:
         row: list[dict[str, str]] = []
+        # A misread ask is the most valuable thing to be able to undo, so the
+        # correction chip outranks the other refinements for the 3-slot row.
+        if title_chip:
+            row.append(self._title_chip(chat_id, title_chip))
         if similar_anchor is not None:
             row.append(
                 {

@@ -4,6 +4,12 @@
 of Secrets" is one. Splitting is therefore conservative: a separator only wins
 when both sides survive as plausible titles, and trailing modifiers ("extended
 edition", "all movies") fold back into the item they describe.
+
+"and", "&" and a two-item comma are *risky* separators — "Bonnie and Clyde",
+"Cowboys & Aliens" and "Crouching Tiger, Hidden Dragon" are single films that
+look exactly like two-item plans. Those separators therefore also need an
+explicit plan signal: a grab verb ("grab X and Y"), an unambiguous separator
+("X + Y", "X and also Y"), or three or more items.
 """
 
 from __future__ import annotations
@@ -71,17 +77,23 @@ _TYPE_HINT_TV = re.compile(r"\b(?:series|show|serie)\b\s*$", re.I)
 _TRAILING_POLITE = re.compile(r"\s+(?:please|pls|aub|thanks|thx|graag|alsjeblieft)\s*$", re.I)
 
 
-def _and_split_is_safe(text: str, pieces: list[str]) -> bool:
+def _and_split_is_safe(text: str, pieces: list[str], *, plan_signal: bool) -> bool:
     """Decide whether " and " joins two requests or lives inside one title.
 
     Three signals veto the split: the whole phrase is a known franchise, the
     left side is itself a franchise seed ("Harry Potter and the …"), or a later
     piece opens with a lower-case article, which only happens mid-title.
+
+    The franchise-prefix veto is dropped once the ask is explicitly a plan:
+    "grab Harry Potter and Dune" is two requests, and the lower-case article
+    still protects "grab Harry Potter and the Chamber of Secrets".
     """
     if is_known_franchise(text):
         return False
     if any(_LOWER_ARTICLE.match(piece) for piece in pieces[1:]):
         return False
+    if plan_signal:
+        return True
     prefix = ""
     for piece in pieces[:-1]:
         prefix = f"{prefix} and {piece}".strip(" and ") if prefix else piece
@@ -90,30 +102,56 @@ def _and_split_is_safe(text: str, pieces: list[str]) -> bool:
     return True
 
 
-def _split_once(text: str) -> list[str]:
+def _pieces(pattern: re.Pattern[str], text: str) -> list[str]:
+    return [piece.strip() for piece in pattern.split(text) if piece.strip()]
+
+
+def _has_plan_signal(body: str, *, grab_prefix: bool) -> bool:
+    """True when the ask is explicitly a multi-item plan rather than one title.
+
+    Without one of these the risky separators stay inside the title, because
+    "Bonnie and Clyde" and "Cowboys & Aliens" are single films.
+    """
+    return grab_prefix or bool(_PLUS.search(body)) or bool(_ALSO.search(body))
+
+
+def _split_once(text: str, *, plan_signal: bool) -> list[str]:
     """Split on the strongest separator present, or return a single segment."""
-    for pattern in (_PLUS, _ALSO, _AMPERSAND):
-        pieces = [piece.strip() for piece in pattern.split(text) if piece.strip()]
+    for pattern in (_PLUS, _ALSO):
+        pieces = _pieces(pattern, text)
         if len(pieces) >= 2:
             return pieces
-    pieces = [piece.strip() for piece in _COMMA.split(text) if piece.strip()]
-    if len(pieces) >= 2 and not any(_LOWER_ARTICLE.match(piece) for piece in pieces[1:]):
+    pieces = _pieces(_COMMA, text)
+    if (
+        len(pieces) >= 2
+        and (plan_signal or len(pieces) >= 3)
+        and not any(_LOWER_ARTICLE.match(piece) for piece in pieces[1:])
+    ):
         return pieces
-    # " and " is the riskiest separator: plenty of real titles contain it.
-    pieces = [piece.strip() for piece in _AND.split(text) if piece.strip()]
-    if len(pieces) >= 2 and _and_split_is_safe(text, pieces):
-        return pieces
+    # " and " / " & " are the riskiest separators: plenty of real titles join
+    # two bare nouns exactly that way, so they need an explicit plan signal.
+    for pattern in (_AND, _AMPERSAND):
+        pieces = _pieces(pattern, text)
+        if (
+            len(pieces) >= 2
+            and (plan_signal or len(pieces) >= 3)
+            and _and_split_is_safe(text, pieces, plan_signal=plan_signal)
+        ):
+            return pieces
     return [text.strip()]
 
 
-def _split_segments(text: str) -> list[str]:
+def _split_segments(text: str, *, plan_signal: bool) -> list[str]:
     """Split, then split each comma segment again on "and" when it is safe."""
-    first = _split_once(text)
+    first = _split_once(text, plan_signal=plan_signal)
     if len(first) < 2:
         return first
     out: list[str] = []
     for segment in first:
-        out.extend(_split_once(segment) if len(out) < MAX_PARTS + 2 else [segment])
+        if len(out) >= MAX_PARTS + 2:
+            out.append(segment)
+            continue
+        out.extend(_split_once(segment, plan_signal=plan_signal))
     return out
 
 
@@ -216,7 +254,8 @@ def split_compound_ask(text: str, *, max_parts: int = MAX_PARTS) -> tuple[AskPar
     if not body:
         return ()
 
-    segments = _split_segments(body)
+    plan_signal = _has_plan_signal(body, grab_prefix=body != raw)
+    segments = _split_segments(body, plan_signal=plan_signal)
     if len(segments) < 2:
         return ()
 
