@@ -102,7 +102,12 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
     payload = dict(args or {})
     if name == "chief_of_staff":
         payload.setdefault("said", said or json.dumps(payload))
-    result = await registry.call(name, payload)
+    result = await registry.call(
+        name,
+        payload,
+        user_text=said or name,
+        channel="voice_realtime",
+    )
     return result.as_dict()
 
 

@@ -1,13 +1,16 @@
 """Cheap Jev decision gate before the expensive agent / Telegram tool loop.
 
-Shadow mode (default when enabled): log typed answers; never change behavior.
-Enforce mode: high-confidence cancel blocks queue tools; high-confidence
-escalate_cos prefers Chief of Staff; API errors and low confidence fail open.
+Shadow mode keeps cancel/confirm/CoS governance advisory. Media lane routing
+and the shared allow/which-tool gate are first-class whenever Jev answers with
+enough confidence. Disabled/unavailable/error/low-confidence Jev fails open.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from hearth.config import settings
@@ -16,15 +19,48 @@ from hearth.jev.schema import (
     EnforceAction,
     JevAnswers,
     JevVerdict,
+    NO_TOOL,
     QUEUE_TOOLS,
     hearth_system_one_questions,
     telegram_media_system_one_questions,
+    tool_call_system_one_questions,
 )
 from hearth.memory.redact import redact
 
 log = logging.getLogger("hearth.jev")
 
 _client: SystemOneClient | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolGateDecision:
+    """Authoritative Jev allow/which-tool result, or an explicit fail-open."""
+
+    allowed: bool
+    requested_tool: str
+    selected_tool: str
+    fail_open: bool
+    reason: str
+    verdict: JevVerdict
+
+    @property
+    def rerouted(self) -> bool:
+        return bool(
+            self.allowed
+            and self.selected_tool
+            and self.selected_tool != self.requested_tool
+        )
+
+    def as_log_dict(self) -> dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "requested_tool": self.requested_tool,
+            "selected_tool": self.selected_tool or None,
+            "rerouted": self.rerouted,
+            "fail_open": self.fail_open,
+            "reason": self.reason,
+            "jev": self.verdict.as_log_dict(),
+        }
 
 
 def reset_client() -> None:
@@ -96,6 +132,7 @@ async def evaluate_message(
     recent: list[str] | None = None,
     client: SystemOneClient | None = None,
     questions: dict[str, dict[str, Any]] | None = None,
+    state_extra: Mapping[str, Any] | None = None,
 ) -> JevVerdict:
     """Run one parallel System One call (all questions in one request).
 
@@ -137,8 +174,22 @@ async def evaluate_message(
 
     try:
         active = client or get_client()
+        state = build_state(text, recent=recent)
+        if state_extra:
+            for key, value in state_extra.items():
+                name = str(key).strip()
+                if not name:
+                    continue
+                if isinstance(value, str):
+                    serialized = value
+                else:
+                    try:
+                        serialized = json.dumps(value, default=str, sort_keys=True)
+                    except (TypeError, ValueError):
+                        serialized = str(value)
+                state[name] = redact(serialized)[:500]
         answers = await active.system_one(
-            state=build_state(text, recent=recent),
+            state=state,
             questions=questions or hearth_system_one_questions(),
             model=settings.jev_model,
         )
@@ -166,6 +217,123 @@ async def evaluate_message(
             reason="api_error",
             error=type(exc).__name__,
         )
+
+
+async def evaluate_tool_call(
+    user_text: str,
+    *,
+    proposed_tool: str,
+    args: Mapping[str, Any] | None = None,
+    allowed_tools: Mapping[str, str],
+    channel: str = "tool",
+    recent: list[str] | None = None,
+    client: SystemOneClient | None = None,
+) -> ToolGateDecision:
+    """Ask Jev whether a tool may run and which listed tool owns the turn.
+
+    Tool routing is first-class even when governance is in shadow mode. Disabled
+    Jev, missing credentials, API errors, missing answers, and low-confidence
+    choices fail open to ``proposed_tool``.
+    """
+    requested = str(proposed_tool or "").strip()
+    tools = {
+        str(name).strip(): str(description or f"Run the {name} Hearth tool.")
+        for name, description in allowed_tools.items()
+        if str(name).strip()
+    }
+    if requested and requested not in tools:
+        tools[requested] = f"Run the proposed {requested} Hearth tool."
+
+    verdict = await evaluate_message(
+        user_text or requested,
+        recent=recent,
+        client=client,
+        questions=tool_call_system_one_questions(tools),
+        state_extra={
+            "channel": channel,
+            "proposed_tool": requested,
+            "tool_arguments": dict(args or {}),
+        },
+    )
+
+    def finish(
+        *,
+        allowed: bool,
+        selected_tool: str,
+        fail_open: bool,
+        reason: str,
+    ) -> ToolGateDecision:
+        decision = ToolGateDecision(
+            allowed=allowed,
+            requested_tool=requested,
+            selected_tool=selected_tool,
+            fail_open=fail_open,
+            reason=reason,
+            verdict=verdict,
+        )
+        log.info("jev.tool_gate %s", decision.as_log_dict())
+        return decision
+
+    if not verdict.enabled:
+        return finish(
+            allowed=True,
+            selected_tool=requested,
+            fail_open=True,
+            reason="disabled",
+        )
+    if not verdict.ok or verdict.answers is None:
+        return finish(
+            allowed=True,
+            selected_tool=requested,
+            fail_open=True,
+            reason=verdict.reason or "unavailable",
+        )
+
+    allow_answer = verdict.answers.allow_tool
+    which_answer = verdict.answers.which_tool
+    if allow_answer is None or which_answer is None:
+        return finish(
+            allowed=True,
+            selected_tool=requested,
+            fail_open=True,
+            reason="missing_tool_gate_answers",
+        )
+    if float(allow_answer.noul) < float(settings.jev_tool_allow_threshold):
+        return finish(
+            allowed=False,
+            selected_tool="",
+            fail_open=False,
+            reason="jev_denied_tool",
+        )
+
+    selected = str(which_answer.choice or "").strip()
+    if selected == NO_TOOL:
+        return finish(
+            allowed=False,
+            selected_tool="",
+            fail_open=False,
+            reason="jev_selected_no_tool",
+        )
+    if float(which_answer.confidence) < float(settings.jev_tool_confidence):
+        return finish(
+            allowed=True,
+            selected_tool=requested,
+            fail_open=True,
+            reason="low_tool_confidence",
+        )
+    if selected not in tools:
+        return finish(
+            allowed=True,
+            selected_tool=requested,
+            fail_open=True,
+            reason="unknown_tool_choice",
+        )
+    return finish(
+        allowed=True,
+        selected_tool=selected,
+        fail_open=False,
+        reason="jev_selected_tool",
+    )
 
 
 async def evaluate_telegram_media(
@@ -268,8 +436,10 @@ def noul_high(answers: JevAnswers | None, field: str, threshold: float) -> bool:
 
 __all__ = [
     "QUEUE_TOOLS",
+    "ToolGateDecision",
     "build_state",
     "evaluate_message",
+    "evaluate_tool_call",
     "evaluate_telegram_media",
     "get_client",
     "log_shadow_outcome",

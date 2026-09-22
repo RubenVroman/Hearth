@@ -104,13 +104,69 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
-    async def call(self, name: str, args: dict[str, Any] | None = None) -> ToolResult:
+    async def call(
+        self,
+        name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        user_text: str = "",
+        channel: str = "registry",
+    ) -> ToolResult:
         args = dict(args or {})
+        requested_name = name
         spec = self._tools.get(name)
         runtime.begin_tool(name)
         if spec is None:
             result = ToolResult(name=name, ok=False, data={"error": f"unknown tool {name}"})
             return _finish_tool(result)
+
+        gate_decision = None
+        try:
+            from hearth.jev import evaluate_tool_call
+
+            gate_decision = await evaluate_tool_call(
+                user_text or name,
+                proposed_tool=name,
+                args=args,
+                allowed_tools={
+                    tool.name: tool.description
+                    for tool in self._tools.values()
+                },
+                channel=channel,
+            )
+        except Exception:  # noqa: BLE001 — the tool gate is explicitly fail-open
+            gate_decision = None
+
+        if gate_decision is not None and not gate_decision.allowed:
+            result = ToolResult(
+                name=name,
+                ok=False,
+                data={
+                    "ok": False,
+                    "error": "Jev decided that no tool should run for this turn.",
+                    "jev_gate": gate_decision.as_log_dict(),
+                },
+            )
+            return _finish_tool(result, flash_error=False)
+        if gate_decision is not None and gate_decision.rerouted:
+            selected = self._tools.get(gate_decision.selected_tool)
+            if selected is None:
+                result = ToolResult(
+                    name=name,
+                    ok=False,
+                    data={
+                        "ok": False,
+                        "error": (
+                            f"Jev selected unknown tool "
+                            f"{gate_decision.selected_tool!r}; nothing was run."
+                        ),
+                        "jev_gate": gate_decision.as_log_dict(),
+                    },
+                )
+                return _finish_tool(result, flash_error=False)
+            name = selected.name
+            spec = selected
+            runtime.begin_tool(name)
 
         if spec.configured is not None and not spec.configured():
             message = spec.not_configured or f"{name} is not configured"
@@ -208,7 +264,9 @@ class ToolRegistry:
             result = ToolResult(name=name, ok=False, data={"error": str(exc)})
             return _finish_tool(result)
 
-        payload_data = data if isinstance(data, dict) else {"result": data}
+        payload_data = dict(data) if isinstance(data, dict) else {"result": data}
+        if gate_decision is not None and gate_decision.verdict.enabled:
+            payload_data.setdefault("jev_gate", gate_decision.as_log_dict())
         ok = not (isinstance(payload_data, dict) and payload_data.get("ok") is False)
 
         if (
@@ -235,7 +293,10 @@ class ToolRegistry:
             _offer_memory(spec, finished)
             return finished
 
-        if spec.destructive or (runtime.pending is not None and runtime.pending.tool == name):
+        if spec.destructive or (
+            runtime.pending is not None
+            and runtime.pending.tool in {requested_name, name}
+        ):
             runtime.pending = None
         result = ToolResult(name=name, ok=ok, data=payload_data)
         finished = _finish_tool(result)

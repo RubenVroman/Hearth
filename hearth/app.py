@@ -396,7 +396,13 @@ async def chat(body: ChatBody) -> dict[str, Any]:
 async def invoke(body: InvokeBody) -> dict[str, Any]:
     if registry.get(body.tool) is None:
         raise HTTPException(status_code=404, detail="unknown tool")
-    result = await registry.call(body.tool, body.args)
+    said = body.args.get("said")
+    result = await registry.call(
+        body.tool,
+        body.args,
+        user_text=str(said) if isinstance(said, str) and said.strip() else body.tool,
+        channel="web_invoke",
+    )
     return {**result.as_dict(), "widgets": runtime.list_widgets()}
 
 

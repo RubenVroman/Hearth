@@ -327,6 +327,7 @@ class TelegramMediaBot:
             media_type=hit.media_type,
             year=hit.year,
             season=hit.season,
+            request_text=view.text,
         )
         return BotReply(outcome.message)
 
@@ -1707,6 +1708,7 @@ class TelegramMediaBot:
             tmdb_id=tmdb_id,
             media_type=media_type,
             year=year,
+            request_text=f"Play {title} on the TV",
         )
         return BotReply(outcome.message, edit_message_id=message_id)
 

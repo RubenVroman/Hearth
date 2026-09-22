@@ -12,8 +12,9 @@ import httpx
 import pytest
 
 from hearth.agent.loop import AgentLoop
+from hearth.agent.registry import ToolRegistry, ToolSpec
 from hearth.config import settings
-from hearth.jev import evaluate_message, reset_client, set_client
+from hearth.jev import evaluate_message, evaluate_tool_call, reset_client, set_client
 from hearth.jev.client import HttpSystemOneClient
 from hearth.jev.gate import suggest_action
 from hearth.jev.schema import (
@@ -52,8 +53,11 @@ def _payload(
     is_confirm: float = 0.05,
     is_cancel: float = 0.05,
     risk: float = 0.2,
+    allow_tool: float | None = None,
+    which_tool: str | None = None,
+    tool_confidence: float = 0.95,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "model": "jev-1.13.0",
         "answers": {
             "domain": {
@@ -74,6 +78,17 @@ def _payload(
             },
         },
     }
+    answers = payload["answers"]
+    if allow_tool is not None:
+        answers["allow_tool"] = {"type": "noul", "noul": allow_tool}
+    if which_tool is not None:
+        answers["which_tool"] = {
+            "type": "choice",
+            "choice": which_tool,
+            "confidence": tool_confidence,
+            "probabilities": {which_tool: tool_confidence},
+        }
+    return payload
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +151,168 @@ async def test_jev_fail_open_on_api_error(monkeypatch: pytest.MonkeyPatch) -> No
     assert verdict.ok is False
     assert verdict.action == "continue"
     assert verdict.reason == "api_error"
+
+
+@pytest.mark.asyncio
+async def test_tool_gate_applies_allow_and_which_tool_in_shadow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    fake = FakeSystemOne(
+        _payload(
+            allow_tool=0.98,
+            which_tool="infuse_play",
+            tool_confidence=0.96,
+        )
+    )
+    set_client(fake)
+
+    decision = await evaluate_tool_call(
+        "put it on the TV",
+        proposed_tool="plex_play",
+        args={"query": "The Endless"},
+        allowed_tools={
+            "infuse_play": "Play in Infuse on Apple TV.",
+            "plex_play": "Play on a Plex client.",
+        },
+        channel="test",
+    )
+
+    assert decision.allowed is True
+    assert decision.selected_tool == "infuse_play"
+    assert decision.rerouted is True
+    assert decision.fail_open is False
+    assert len(fake.calls) == 1
+    assert set(fake.calls[0]["questions"]) == {"allow_tool", "which_tool"}
+    assert fake.calls[0]["state"]["proposed_tool"] == "plex_play"
+
+
+@pytest.mark.asyncio
+async def test_tool_gate_denies_when_jev_disallows_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    fake = FakeSystemOne(
+        _payload(allow_tool=0.02, which_tool="no_tool")
+    )
+    set_client(fake)
+
+    decision = await evaluate_tool_call(
+        "no, don't turn on the TV",
+        proposed_tool="ha_media_control",
+        args={"device": "tv", "action": "turn_on"},
+        allowed_tools={"ha_media_control": "Control TV power."},
+    )
+
+    assert decision.allowed is False
+    assert decision.selected_tool == ""
+    assert decision.fail_open is False
+
+
+@pytest.mark.asyncio
+async def test_tool_gate_api_error_fails_open_to_proposed_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    set_client(FakeSystemOne(error=RuntimeError("jev offline")))
+
+    decision = await evaluate_tool_call(
+        "pause",
+        proposed_tool="infuse_transport",
+        args={"action": "pause"},
+        allowed_tools={"infuse_transport": "Pause Apple TV playback."},
+    )
+
+    assert decision.allowed is True
+    assert decision.selected_tool == "infuse_transport"
+    assert decision.fail_open is True
+    assert decision.reason == "api_error"
+
+
+@pytest.mark.asyncio
+async def test_tool_gate_missing_answers_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    set_client(FakeSystemOne(_payload(domain="media")))
+
+    decision = await evaluate_tool_call(
+        "turn on the TV",
+        proposed_tool="ha_media_control",
+        args={"device": "tv", "action": "turn_on"},
+        allowed_tools={"ha_media_control": "Control TV power."},
+    )
+
+    assert decision.allowed is True
+    assert decision.selected_tool == "ha_media_control"
+    assert decision.fail_open is True
+    assert decision.reason == "missing_tool_gate_answers"
+
+
+@pytest.mark.asyncio
+async def test_registry_executes_the_tool_jev_selected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    set_client(
+        FakeSystemOne(
+            _payload(
+                allow_tool=0.99,
+                which_tool="infuse_play",
+                tool_confidence=0.99,
+            )
+        )
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def plex_handler(args: dict[str, Any]) -> dict[str, Any]:
+        calls.append(("plex_play", args))
+        return {"ok": True}
+
+    async def infuse_handler(args: dict[str, Any]) -> dict[str, Any]:
+        calls.append(("infuse_play", args))
+        return {"ok": True, "played": True}
+
+    tools = ToolRegistry()
+    tools.register(
+        ToolSpec(
+            name="plex_play",
+            description="Play on Plex.",
+            parameters={"type": "object", "properties": {}},
+            handler=plex_handler,
+        )
+    )
+    tools.register(
+        ToolSpec(
+            name="infuse_play",
+            description="Play in Infuse.",
+            parameters={"type": "object", "properties": {}},
+            handler=infuse_handler,
+        )
+    )
+
+    result = await tools.call(
+        "plex_play",
+        {"query": "The Endless"},
+        user_text="put it on the TV",
+        channel="test",
+    )
+
+    assert result.ok is True
+    assert result.name == "infuse_play"
+    assert calls == [("infuse_play", {"query": "The Endless"})]
+    assert result.data["jev_gate"]["requested_tool"] == "plex_play"
+    assert result.data["jev_gate"]["selected_tool"] == "infuse_play"
 
 
 @pytest.mark.asyncio
@@ -205,6 +382,21 @@ def test_parse_answers_media_ask_and_needs_llm() -> None:
     assert answers.media_ask.choice == "descriptive_riddle"
     assert answers.needs_llm is not None
     assert answers.needs_llm.noul == pytest.approx(0.91)
+
+
+def test_parse_answers_tool_gate_fields() -> None:
+    answers = parse_answers(
+        _payload(
+            allow_tool=0.87,
+            which_tool="ha_media_control",
+            tool_confidence=0.93,
+        )
+    )
+    assert answers.allow_tool is not None
+    assert answers.allow_tool.noul == pytest.approx(0.87)
+    assert answers.which_tool is not None
+    assert answers.which_tool.choice == "ha_media_control"
+    assert answers.which_tool.confidence == pytest.approx(0.93)
 
 
 @pytest.mark.asyncio

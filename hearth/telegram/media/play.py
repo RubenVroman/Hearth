@@ -1,9 +1,9 @@
 """Remote “play it on the TV” for Telegram — real HA / Infuse / Plex paths only.
 
-Prefers Infuse on Apple TV when ``HEARTH_APPLE_TV_PLAYER=infuse`` (house default):
-wake the Denon → LG → Apple TV chain via Home Assistant, then send the Infuse
-deep link. Falls back to Plex ``playMedia`` for an explicit Plex client.
-Never invents success — failures become an honest spoken line.
+Proposes the configured Infuse/Plex preference, then the shared Jev
+``allow_tool`` / ``which_tool`` gate makes the final backend decision. Infuse
+wakes the Denon → LG → Apple TV chain through Home Assistant before sending the
+deep link. Never invents success — failures become an honest spoken line.
 """
 
 from __future__ import annotations
@@ -14,8 +14,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from hearth.config import settings
+from hearth.jev import ToolGateDecision, evaluate_tool_call
 
 log = logging.getLogger("hearth.telegram.media.play")
+
+_PLAY_TOOLS = {
+    "infuse_play": (
+        "Play or open a title in Infuse on the living-room Apple TV through Home Assistant."
+    ),
+    "plex_play": "Play a Plex library title on an explicit online Plex client.",
+}
 
 _PLAY_PHRASE = re.compile(
     r"^\s*(?:"
@@ -54,6 +62,17 @@ def _honest_failure(reason: str, *, path: str = "none") -> PlayOutcome:
     return PlayOutcome(ok=False, message=reason, path=path)
 
 
+def _with_gate(outcome: PlayOutcome, decision: ToolGateDecision) -> PlayOutcome:
+    detail = dict(outcome.detail or {})
+    detail["jev_gate"] = decision.as_log_dict()
+    return PlayOutcome(
+        ok=outcome.ok,
+        message=outcome.message,
+        path=outcome.path,
+        detail=detail,
+    )
+
+
 async def play_on_tv(
     *,
     title: str,
@@ -61,8 +80,9 @@ async def play_on_tv(
     media_type: str = "movie",
     year: int | None = None,
     season: int | None = None,
+    request_text: str = "",
 ) -> PlayOutcome:
-    """Start playback on the living-room path. Never fakes success."""
+    """Jev-select and start the living-room playback path. Never fakes success."""
     if not play_lane_enabled():
         return _honest_failure(
             "Play-from-Telegram is turned off (HEARTH_TELEGRAM_PLAY_LANE=false)."
@@ -70,18 +90,43 @@ async def play_on_tv(
 
     label = f"{title} ({year})" if year else (title or "that title")
     prefer = _player_preference()
+    proposed = "infuse_play" if prefer in {"infuse", "firecore", ""} else "plex_play"
+    decision = await evaluate_tool_call(
+        request_text or f"Play {label} on the TV",
+        proposed_tool=proposed,
+        args={
+            "query": title,
+            "tmdbId": tmdb_id,
+            "media_type": media_type,
+            "year": year,
+            "season": season,
+        },
+        allowed_tools=_PLAY_TOOLS,
+        channel="telegram_play",
+    )
+    if not decision.allowed:
+        return _with_gate(
+            _honest_failure(
+                "Jev decided not to run a TV playback tool for that message."
+            ),
+            decision,
+        )
 
-    if prefer in {"infuse", "firecore", ""}:
+    selected = decision.selected_tool or proposed
+    if selected == "infuse_play":
         outcome = await _play_infuse(
             title=title,
             tmdb_id=tmdb_id,
             season=season,
             label=label,
         )
-        if outcome.ok or outcome.path == "infuse":
-            return outcome
-
-    return await _play_plex(title=title, label=label, media_type=media_type)
+    elif selected == "plex_play":
+        outcome = await _play_plex(title=title, label=label, media_type=media_type)
+    else:
+        outcome = _honest_failure(
+            f"Jev selected unsupported playback tool {selected!r}."
+        )
+    return _with_gate(outcome, decision)
 
 
 async def _play_infuse(

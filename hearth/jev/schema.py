@@ -115,6 +115,46 @@ QUEUE_TOOLS = frozenset(
     }
 )
 
+NO_TOOL = "no_tool"
+
+
+def tool_call_system_one_questions(
+    tools: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Shared allow/which-tool gate for every proposed registry invocation."""
+    criteria = {
+        str(name): str(description or f"Run the {name} Hearth tool.")[:400]
+        for name, description in sorted(tools.items())
+        if str(name).strip()
+    }
+    criteria[NO_TOOL] = (
+        "Run no tool: the message is chatter, a cancellation, unsafe, or needs clarification."
+    )
+    return {
+        "allow_tool": {
+            "type": "noul",
+            "instructions": (
+                "Should Hearth execute a tool for this user turn now? Consider user_message, "
+                "proposed_tool, and tool_arguments. A direct authenticated UI action counts as "
+                "an explicit request. Return false for cancellation, chatter, unsafe actions, "
+                "or requests that need clarification."
+            ),
+            "criteria": {
+                "true": "A listed tool should run now for the explicit request.",
+                "false": "No tool should run now.",
+            },
+        },
+        "which_tool": {
+            "type": "choice",
+            "instructions": (
+                "Choose the single listed Hearth tool that should handle this turn. "
+                "Do not defer to the proposed tool when another listed tool is more accurate. "
+                f"Choose {NO_TOOL} when no tool should run."
+            ),
+            "criteria": criteria,
+        },
+    }
+
 
 def _confirm_cancel_risk_questions() -> dict[str, dict[str, Any]]:
     return {
@@ -282,6 +322,8 @@ class ScoreAnswer:
 class JevAnswers:
     domain: ChoiceAnswer | None = None
     media_ask: ChoiceAnswer | None = None
+    which_tool: ChoiceAnswer | None = None
+    allow_tool: NoulAnswer | None = None
     needs_llm: NoulAnswer | None = None
     multi_item: NoulAnswer | None = None
     wants_queue: NoulAnswer | None = None
@@ -309,6 +351,16 @@ class JevAnswers:
                     k: round(v, 4) for k, v in self.media_ask.probabilities.items()
                 },
             }
+        if self.which_tool is not None:
+            out["which_tool"] = {
+                "choice": self.which_tool.choice,
+                "confidence": round(self.which_tool.confidence, 4),
+                "probabilities": {
+                    k: round(v, 4) for k, v in self.which_tool.probabilities.items()
+                },
+            }
+        if self.allow_tool is not None:
+            out["allow_tool"] = round(self.allow_tool.noul, 4)
         if self.needs_llm is not None:
             out["needs_llm"] = round(self.needs_llm.noul, 4)
         if self.multi_item is not None:
@@ -379,6 +431,8 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
 
     domain = _parse_choice(answers.get("domain"))
     media_ask = _parse_choice(answers.get("media_ask"))
+    which_tool = _parse_choice(answers.get("which_tool"))
+    allow_tool = _parse_noul(answers.get("allow_tool"))
     needs_llm = _parse_noul(answers.get("needs_llm"))
     multi_item = _parse_noul(answers.get("multi_item"))
     wants_queue = _parse_noul(answers.get("wants_queue"))
@@ -388,6 +442,8 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
     return JevAnswers(
         domain=domain,
         media_ask=media_ask,
+        which_tool=which_tool,
+        allow_tool=allow_tool,
         needs_llm=needs_llm,
         multi_item=multi_item,
         wants_queue=wants_queue,
@@ -480,6 +536,7 @@ __all__ = [
     "DOMAIN_CRITERIA",
     "MEDIA_ASK_CRITERIA",
     "MEDIA_ASK_KINDS",
+    "NO_TOOL",
     "Domain",
     "EnforceAction",
     "JevAnswers",
@@ -492,4 +549,5 @@ __all__ = [
     "hearth_system_one_questions",
     "parse_answers",
     "telegram_media_system_one_questions",
+    "tool_call_system_one_questions",
 ]

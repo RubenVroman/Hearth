@@ -113,6 +113,9 @@ Confirmation policy (lenient by default):
 
 Rules:
 - Prefer a tool over guessing. For news, streaming where-to-watch, or anything past training cutoff, call web_search.
+- Every proposed tool invocation passes the shared Jev allow_tool / which_tool gate. Jev may
+  route to a different registered tool; use that result rather than claiming the proposed tool ran.
+  If Jev is disabled, unavailable, low-confidence, or errors, the gate fails open.
 - When recommending movies/shows or asked to show titles on the UI/screen/overlay, call
   suggest_titles so cards appear — chat text alone is not enough.
 - Pass chief_of_staff task as a clear instruction, said as the original user text, repo as

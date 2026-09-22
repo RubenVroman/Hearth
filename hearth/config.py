@@ -261,6 +261,18 @@ class Settings(BaseSettings):
         le=1.0,
         alias="HEARTH_JEV_DOMAIN_CONFIDENCE",
     )
+    jev_tool_confidence: float = Field(
+        default=0.72,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_TOOL_CONFIDENCE",
+    )
+    jev_tool_allow_threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_TOOL_ALLOW_THRESHOLD",
+    )
     jev_cancel_threshold: float = Field(
         default=0.78,
         ge=0.0,

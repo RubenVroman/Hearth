@@ -112,9 +112,11 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HEARTH_COS_WEBHOOK_KEY` | Optional. Sent as `Authorization: Bearer <key>`. |
 | `HEARTH_COS_REPO` | Default `RubenVroman/Hearth`. |
 | `TYPESAFE_API_KEY` | Optional. TypeSafe Jev (System One) decision gate. Host `.env` only — never log. See [docs/jev.md](docs/jev.md). |
-| `HEARTH_JEV_ENABLED` | Default `false`. When true, run one System One call before the agent tool loop. |
-| `HEARTH_JEV_SHADOW` | Default `true`. Log Jev answers without enforcing. Set `false` only after reviewing shadow logs. |
+| `HEARTH_JEV_ENABLED` | Default `false`. When true, run System One before the agent loop and before every registry tool invocation. Disabled/missing/error Jev fails open. |
+| `HEARTH_JEV_SHADOW` | Default `true`. Cancel/confirm/CoS governance stays advisory. Confident `media_ask` and `allow_tool`/`which_tool` routing remain first-class. |
 | `HEARTH_JEV_MODEL` | Default `jev-latest` (pin a versioned id once thresholds are tuned). |
+| `HEARTH_JEV_TOOL_CONFIDENCE` | Minimum `which_tool` confidence. Lower confidence fails open to the proposed tool. Default `0.72`. |
+| `HEARTH_JEV_TOOL_ALLOW_THRESHOLD` | Minimum `allow_tool` Noul needed to execute a tool when Jev answers successfully. Default `0.5`. |
 | `DOCKER_SOCKET` | Read-only socket is mounted. If missing → mocked container list (plex/sonarr/…/gluetun). |
 | `WORKSPACE_PATH` | Inside the container, `/app/workspace`. |
 | `HEARTH_MOCK_IF_UNCONFIGURED` | Default `true`. Fixtures are used only when a backend is unconfigured. A configured live HA failure is never turned into fake success. |
@@ -522,7 +524,7 @@ A dedicated house Telegram group can search and request movies and series throug
 
 ### Behavior
 
-- **Jev media router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics that route the same lanes. See `docs/jev.md`.
+- **Jev media + tool router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search, then every actual tool invocation passes the shared `allow_tool` / `which_tool` gate. Telegram Play offers only `infuse_play` and `plex_play` to that gate. Missing key / errors / low confidence fail open. See `docs/jev.md`.
 - `/search <title>`, a plain title, franchise seed (`Harry Potter`), series-all (`Harry Potter, all movies`), edition (`Lord of the Rings extended edition`), plot/riddle, or typed TMDB movie/TV link. A year or season marker narrows results. Overseerr requests whole seasons, so `S02E03` is rejected. `/help` and `/status` as before.
 - **Intent beats the literal string.** A sentence is never searched verbatim when a human would know better:
   - *People* — `anything with Florence Pugh`, `directed by Christopher Nolan`, `Tom Hanks filmography` resolve through TMDB person credits.

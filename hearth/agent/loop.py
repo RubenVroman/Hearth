@@ -36,7 +36,12 @@ class AgentLoop:
                 args = dict(pending.args)
                 args["confirm"] = True
                 args["dry_run"] = False
-                result = await self.tools.call(pending.tool, args)
+                result = await self.tools.call(
+                    pending.tool,
+                    args,
+                    user_text=text or pending.tool,
+                    channel="chat_confirm",
+                )
                 reply = _format_tool_reply([result.as_dict()])
                 runtime.note("assistant", reply)
                 out = {
@@ -84,6 +89,8 @@ class AgentLoop:
                 result = await self.tools.call(
                     "chief_of_staff",
                     {"task": text, "said": text, "repo": settings.cos_repo},
+                    user_text=text,
+                    channel="chat_jev_redirect",
                 )
                 used = [result.as_dict()]
                 reply = _format_tool_reply(used)
@@ -222,7 +229,12 @@ class AgentLoop:
                     if tc.function.name == "chief_of_staff":
                         args.setdefault("said", user_text)
                         args.setdefault("task", user_text)
-                    result = await self.tools.call(tc.function.name, args)
+                    result = await self.tools.call(
+                        tc.function.name,
+                        args,
+                        user_text=user_text,
+                        channel="chat_openai",
+                    )
                     used.append(result.as_dict())
                     messages.append(
                         {
@@ -261,7 +273,12 @@ class AgentLoop:
             return {"reply": reply, "mode": "local", "tools": used}
 
         runtime.set_status("tool")
-        result = await self.tools.call(plan["tool"], plan.get("args") or {})
+        result = await self.tools.call(
+            plan["tool"],
+            plan.get("args") or {},
+            user_text=user_text,
+            channel="chat_local",
+        )
         used.append(result.as_dict())
         reply = _format_tool_reply(used)
         runtime.note("assistant", reply)

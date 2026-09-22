@@ -7,8 +7,10 @@ import pytest
 from hearth.agent.loop import route_intent
 from hearth.agent.registry import registry
 from hearth.config import settings
+from hearth.jev import set_client
+from hearth.jev.schema import parse_answers
 from hearth.runtime import Widget, runtime
-from hearth.telegram.media.play import PlayOutcome
+from hearth.telegram.media.play import PlayOutcome, play_on_tv
 from hearth.telegram.models import MediaHit
 from hearth.tools.ha import HomeAssistant
 from hearth.tools.infuse import Infuse
@@ -286,6 +288,67 @@ async def test_plex_verification_requires_matching_playing_session(
 
     assert result["ok"] is False
     assert "No matching playing session" in result["error"]
+
+
+async def test_telegram_play_uses_shared_jev_tool_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from importlib import import_module
+
+    play_module = import_module("hearth.telegram.media.play")
+    calls: list[str] = []
+
+    class FakeSystemOne:
+        async def system_one(
+            self,
+            *,
+            state: Any,
+            questions: dict[str, Any] | None = None,
+            model: str | None = None,
+        ) -> Any:
+            assert state["proposed_tool"] == "infuse_play"
+            assert set(questions or {}) == {"allow_tool", "which_tool"}
+            return parse_answers(
+                {
+                    "model": model or "jev-test",
+                    "answers": {
+                        "allow_tool": {"type": "noul", "noul": 0.99},
+                        "which_tool": {
+                            "type": "choice",
+                            "choice": "plex_play",
+                            "confidence": 0.98,
+                        },
+                    },
+                }
+            )
+
+    async def infuse(**_kwargs: Any) -> PlayOutcome:
+        raise AssertionError("Jev selected Plex, so Infuse must not run")
+
+    async def plex(**_kwargs: Any) -> PlayOutcome:
+        calls.append("plex_play")
+        return PlayOutcome(True, "Playing The Endless on LG.", "plex")
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test")
+    monkeypatch.setattr(settings, "apple_tv_player", "infuse")
+    set_client(FakeSystemOne())
+    monkeypatch.setattr(play_module, "_play_infuse", infuse)
+    monkeypatch.setattr(play_module, "_play_plex", plex)
+
+    outcome = await play_on_tv(
+        title="The Endless",
+        tmdb_id=430231,
+        year=2017,
+        request_text="put it on the TV",
+    )
+
+    assert outcome.ok is True
+    assert outcome.path == "plex"
+    assert calls == ["plex_play"]
+    assert outcome.detail is not None
+    assert outcome.detail["jev_gate"]["selected_tool"] == "plex_play"
 
 
 async def test_telegram_put_it_on_tv_uses_thread_context(
