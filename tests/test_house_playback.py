@@ -163,8 +163,9 @@ async def test_infuse_reports_partial_media_path_failure(
             "playback_confirmed": True,
         }
 
-    import hearth.tools.infuse as infuse_module
+    from importlib import import_module
 
+    infuse_module = import_module("hearth.tools.infuse")
     monkeypatch.setattr(client, "resolve_play", plan)
     monkeypatch.setattr(infuse_module.ha, "activate_media_path", activity)
     monkeypatch.setattr(infuse_module.ha, "media_control", control)
