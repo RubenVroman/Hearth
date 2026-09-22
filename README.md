@@ -117,10 +117,14 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HEARTH_COS_WEBHOOK` | **Live** Chief of Staff POST. Empty → tool returns “not configured” (not fake success). |
 | `HEARTH_COS_WEBHOOK_KEY` | Optional. Sent as `Authorization: Bearer <key>`. |
 | `HEARTH_COS_REPO` | Default `RubenVroman/Hearth`. |
-| `TYPESAFE_API_KEY` | Optional. TypeSafe Jev (System One) decision gate. Host `.env` only — never log. See [docs/jev.md](docs/jev.md). |
-| `HEARTH_JEV_ENABLED` | Default `false`. When true, run one System One call before the agent tool loop. |
-| `HEARTH_JEV_SHADOW` | Default `true`. Log Jev answers without enforcing. Set `false` only after reviewing shadow logs. |
+| `TYPESAFE_API_KEY` | TypeSafe Jev (System One) — the tool-calling gate. Host `.env` only — never log. Without it Jev is a no-op and every path fails open. See [docs/jev.md](docs/jev.md). |
+| `HEARTH_JEV_ENABLED` | Default `true`. One typed System One call per turn decides every tool call in that turn. |
+| `HEARTH_JEV_SHADOW` | Default `true`. Log the allow/deny/confirm decision Jev *would* have taken without taking it. Set `false` only after reviewing `jev.tool_gate` logs. |
+| `HEARTH_JEV_TOOL_GATE` | Default `true`. Gate every `ToolRegistry.call()` plus the Telegram queue/play chokepoints. |
+| `HEARTH_JEV_ROUTE_LOCAL_TOOLS` | Default `true`. Let a confident `tool_lane` pick the tool in the local (no-OpenAI) router. |
+| `HEARTH_JEV_TIMEOUT_SECONDS` | Default `8`. Hard ceiling on one System One call, so a slow gate cannot stall a house turn. |
 | `HEARTH_JEV_MODEL` | Default `jev-latest` (pin a versioned id once thresholds are tuned). |
+| `HEARTH_JEV_TOOL_ALLOW_THRESHOLD` / `_TOOL_LANE_CONFIDENCE` / `_RISK_CONFIDENCE` | Tool-gate thresholds. Fail-open biased — a write is denied only when Jev is clearly against it. Full table in [docs/jev.md](docs/jev.md). |
 | `DOCKER_SOCKET` | Read-only socket is mounted. If missing → mocked container list (plex/sonarr/…/gluetun). |
 | `WORKSPACE_PATH` | Inside the container, `/app/workspace`. |
 | `HEARTH_MOCK_IF_UNCONFIGURED` | Default `true`. Fixtures are used only when a backend is unconfigured. A configured live HA failure is never turned into fake success. |
@@ -244,6 +248,50 @@ Webhook payload:
 Auth: `Authorization: Bearer <HEARTH_COS_WEBHOOK_KEY>` when the key is set. Escalation runs
 immediately when asked (no Hearth confirm step). If `HEARTH_COS_WEBHOOK` is empty, the tool
 says it is not configured.
+
+### Jev decides the tool call
+
+Every tool call in Hearth — chat, voice, `/api/invoke`, and the Telegram queue and play
+chokepoints — is decided by **Jev** (TypeSafe System One), not by regex precedence or gpt
+alone. Jev is not an LLM: it returns typed Choice / Noul / Score answers.
+
+- **Which tool** — a `tool_lane` Choice narrows the turn to one of fourteen tool families
+  (`lights`, `media_playback`, `media_library`, `media_queue`, `media_status`, `food`,
+  `weather`, `web`, `files`, `memory_read`, `memory_write`, `network`, `escalate_cos`,
+  `no_tool`). The local router follows the lane; the lane's **arguments are still derived
+  deterministically** from the text, never from prose.
+- **Allow or deny** — a `tool_allow` Noul, the `is_cancel` Noul, and a `risk` Score gate any
+  tool that changes state, spends money, or queues a download. A `needs_confirm` risk
+  escalates a normally auto-run tool into the same "Confirm to run" gate a destructive tool
+  gets.
+- **Whether an LLM is needed** — a `needs_llm` Noul, so a lane can skip or force a gpt hop.
+
+`ToolRegistry.call()` is the chokepoint, and **one typed call decides a whole turn**: an
+eight-tool OpenAI turn costs one System One call, not eight. Reads are never denied except by
+a hard stop (`refuse` / `do_not_auto_run`), so a misread gate can stop Hearth *acting* but
+never stop it *answering*. Button taps and typed yeses are pre-authorized — the gate runs and
+logs, but only hard stops can block something the user just pressed.
+
+Everything fails open: Jev off, no `TYPESAFE_API_KEY`, no state, an API error, or a timeout all
+run the tool with a reason in the log. Shadow mode (the default) computes and logs the decision
+it *would* have taken, so enforcement can be reviewed from `jev.tool_gate` lines first. Full
+threshold table, decision order, and ops runbook in [docs/jev.md](docs/jev.md).
+
+## Health and readiness
+
+| Route | Auth | Purpose |
+| --- | --- | --- |
+| `GET /health` | public | Liveness. The process is up and serving; no dependency checks. |
+| `GET /readyz` | public | Deploy verification. 200 when Hearth can serve house turns (tool registry populated, auth DB open), 503 otherwise. Makes no network calls, so it is safe as a container probe. |
+| `GET /api/status` | session | Full house snapshot, including a `jev` block (mode, tool gate, thresholds, lanes). |
+
+`/readyz` separates *unready* from *degraded*: an unconfigured Overseerr key or a Jev switch
+with no API key appear in `degraded` rather than failing the probe, because a house with no
+Overseerr is still a working house. Neither route ever includes a secret.
+
+```bash
+curl -s http://vault:8787/readyz | jq '{ready, jev_mode, degraded}'
+```
 
 ## Glass info overlay
 
@@ -400,6 +448,14 @@ High-risk / irreversible / paid actions **default to dry-run** until `confirm=tr
 - `workspace_delete` — irreversible sandbox delete
 - `docker_stop` — stops a house container
 - `memory_forget` / `memory_export` / `memory_purge`
+- Anything Jev scores `needs_confirm` for this turn, even if it normally auto-runs
+
+An armed confirm is **claimed atomically**, so a double-tap — or a browser and a
+voice session confirming at once — runs the paid tool once, not twice. It also
+expires after `HEARTH_CONFIRM_TTL_SECONDS` (default 300): a "yes" that arrives
+long after its preview is read as a fresh message rather than firing a stale
+destructive tool. The Plex "Try again" loop re-arms its own pending, so waiting
+for a client to come online is unaffected.
 
 Read-only / inspect:
 
@@ -425,11 +481,11 @@ confirmation for those UI paths. Auth / house-token gating is unchanged.
 
 ```
 hearth/          FastAPI runtime, agent loop, tools, voice gateway, house memory
-hearth/jev/      TypeSafe Jev (System One) decision gate — see docs/jev.md
+hearth/jev/      TypeSafe Jev (System One) tool-calling gate — see docs/jev.md
 hearth/ui/       Static command center (no Node build)
 workspace/       Sandboxed files + skills
 ha/              Home Assistant config (onboarding still required)
-docs/            Operator notes (Jev sandbox, Telegram media smoke script, …)
+docs/            Operator notes (Jev gate, Telegram media smoke script, …)
 data/            Auth + memory SQLite (compose bind-mount; gitignores *.db)
 docker-compose.yml
 Dockerfile
@@ -523,9 +579,8 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
    TELEGRAM_CHAT_IDS=-1001234567890
    # optional house-member allowlist:
    # TELEGRAM_USER_IDS=111,222
-   # Jev-first media router (recommended on VAULT):
-   # HEARTH_JEV_ENABLED=true
-   # HEARTH_JEV_SHADOW=true   # cancel/confirm still advisory; media_ask routes
+   # Jev routes the media lanes and gates the queue button. On by default; add
+   # the key to switch it on for real (shadow keeps allow/deny advisory):
    # TYPESAFE_API_KEY=…
    # OPENAI_API_KEY=…         # only for descriptive riddles / title Q&A
    ```
@@ -542,6 +597,7 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
   List first when a friendly name is unclear. Hearth returns actionable HA recovery copy instead
   of claiming a failed write worked. The command menu is published with `setMyCommands` on startup.
 - **Jev media router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics that route the same lanes. See `docs/jev.md`.
+- **Jev media router** (on by default; needs `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics that route the same lanes. The same call also gates the Overseerr queue and the Play button, so a Get tap is checked against Jev's hard stops before anything leaves the house. See `docs/jev.md`.
 - `/search <title>`, a plain title, franchise seed (`Harry Potter`), series-all (`Harry Potter, all movies`), edition (`Lord of the Rings extended edition`), plot/riddle, or typed TMDB movie/TV link. A year or season marker narrows results. Overseerr requests whole seasons, so `S02E03` is rejected. `/help` and `/status` as before.
 - **Intent beats the literal string.** A sentence is never searched verbatim when a human would know better:
   - *People* — `anything with Florence Pugh`, `directed by Christopher Nolan`, `Tom Hanks filmography` resolve through TMDB person credits.

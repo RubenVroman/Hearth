@@ -12,6 +12,7 @@ from hearth.config import settings
 
 PUBLIC_EXACT = {
     "/health",
+    "/readyz",
     "/login",
     "/auth/token",
     "/auth/session/refresh",

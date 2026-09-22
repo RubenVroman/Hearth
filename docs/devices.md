@@ -226,12 +226,12 @@ an unavailable feeder is reported rather than quietly treated as fed.
 
 ## Jev gates every device call
 
-`house_feeder`, `house_climate`, and `house_purifier` are registered with
-`jev_gated=True`. The gate lives in the **tool registry**, so chat, voice,
-Telegram, and `POST /api/invoke` pass through one decision instead of each
-surface inventing its own guard. It is a no-op while Jev is disabled (the
-default), observes-only in shadow mode, and fails open on any API error — a
-flaky System One call must not leave the pets unfed. See [jev.md](jev.md).
+`house_feeder`, `house_climate`, and `house_purifier` ride the shared
+`ToolRegistry.call()` Jev chokepoint (lights lane + write-tool allow/deny).
+Chat, voice, Telegram, and `POST /api/invoke` all pass through one decision.
+It is a no-op without a TypeSafe key, observes-only in shadow mode, and fails
+open on any API error — a flaky System One call must not leave the pets unfed.
+See [jev.md](jev.md).
 
 ## Troubleshooting
 

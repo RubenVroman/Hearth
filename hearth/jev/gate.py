@@ -7,21 +7,18 @@ escalate_cos prefers Chief of Staff; API errors and low confidence fail open.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextvars import ContextVar
-from dataclasses import dataclass
 from typing import Any
 
 from hearth.config import settings
 from hearth.jev.client import SystemOneClient, build_system_one_client
 from hearth.jev.schema import (
-    DEVICE_TOOLS,
     EnforceAction,
     JevAnswers,
     JevVerdict,
     QUEUE_TOOLS,
     hearth_system_one_questions,
-    house_device_system_one_questions,
     telegram_media_system_one_questions,
 )
 from hearth.memory.redact import redact
@@ -29,11 +26,6 @@ from hearth.memory.redact import redact
 log = logging.getLogger("hearth.jev")
 
 _client: SystemOneClient | None = None
-
-# The utterance that caused the current turn. Surfaces that own the user's words
-# (chat, voice, Telegram) publish it here so a tool gate deep in the registry can
-# judge the real sentence instead of the tool arguments it was flattened into.
-_utterance: ContextVar[str] = ContextVar("hearth_jev_utterance", default="")
 
 
 def reset_client() -> None:
@@ -55,13 +47,9 @@ def set_client(client: SystemOneClient | None) -> None:
     _client = client
 
 
-def set_utterance(text: str) -> None:
-    """Record the user sentence driving this turn (chat / voice / Telegram)."""
-    _utterance.set((text or "").strip())
-
-
-def current_utterance() -> str:
-    return _utterance.get()
+def _gate_deadline() -> float:
+    """Wall-clock ceiling for one System One call, including transport."""
+    return max(0.5, float(settings.jev_timeout_seconds))
 
 
 def build_state(user_text: str, *, recent: list[str] | None = None) -> dict[str, Any]:
@@ -155,11 +143,14 @@ async def evaluate_message(
 
     try:
         active = client or get_client()
-        answers = await active.system_one(
-            state=build_state(text, recent=recent),
-            questions=questions or hearth_system_one_questions(),
-            model=settings.jev_model,
-        )
+        # The client has its own HTTP timeout, but an injected or SDK client may
+        # not. A cheap gate must never be what makes a house turn hang.
+        async with asyncio.timeout(_gate_deadline()):
+            answers = await active.system_one(
+                state=build_state(text, recent=recent),
+                questions=questions or hearth_system_one_questions(),
+                model=settings.jev_model,
+            )
         suggested, reason = suggest_action(answers)
         action: EnforceAction = suggested if (enabled and not shadow) else "continue"
         verdict = JevVerdict(
@@ -173,6 +164,17 @@ async def evaluate_message(
         )
         log.info("jev.gate %s", verdict.as_log_dict())
         return verdict
+    except TimeoutError:
+        log.warning("jev.gate fail-open: timeout after %.1fs", _gate_deadline())
+        return JevVerdict(
+            enabled=True,
+            shadow=shadow,
+            ok=False,
+            suggested="continue",
+            action="continue",
+            reason="timeout",
+            error="TimeoutError",
+        )
     except Exception as exc:  # noqa: BLE001 — fail open to today's behavior
         log.warning("jev.gate fail-open: %s", type(exc).__name__)
         return JevVerdict(
@@ -205,123 +207,6 @@ async def evaluate_telegram_media(
         client=client,
         questions=telegram_media_system_one_questions(),
     )
-
-
-async def evaluate_house_device(
-    user_text: str,
-    *,
-    recent: list[str] | None = None,
-    client: SystemOneClient | None = None,
-) -> JevVerdict:
-    """Gate in front of the physical device layer (feeder / airco / purifier).
-
-    Same fail-open contract as ``evaluate_message``: disabled Jev, a missing key,
-    or an API error all return ``continue``. Enforce mode is what turns a
-    high-confidence cancel into a refusal to dispense food or start the airco.
-    """
-    return await evaluate_message(
-        user_text,
-        recent=recent,
-        client=client,
-        questions=house_device_system_one_questions(),
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class ToolGate:
-    """What the shared gate decided about one house-device tool call."""
-
-    allowed: bool
-    reason: str = "pass"
-    message: str = ""
-    verdict: JevVerdict | None = None
-
-    def as_log_dict(self) -> dict[str, Any]:
-        return {
-            "allowed": self.allowed,
-            "reason": self.reason,
-            "verdict": self.verdict.as_log_dict() if self.verdict else None,
-        }
-
-
-_GATE_BLOCK_MESSAGE = (
-    "Okay — I won't touch that device. Say it again plainly if you did mean it."
-)
-
-
-async def guard_tool_call(
-    tool: str,
-    args: dict[str, Any] | None = None,
-    *,
-    said: str = "",
-    client: SystemOneClient | None = None,
-) -> ToolGate:
-    """Run the shared Jev gate before a physical house-device tool executes.
-
-    Called from the tool registry for every ``jev_gated`` spec, so chat, voice,
-    Telegram, and ``/api/invoke`` all pass through the same decision instead of
-    each surface inventing its own guard. Fails open in every ambiguous case —
-    a flaky System One call must not leave the pets unfed.
-    """
-    if tool not in DEVICE_TOOLS:
-        return ToolGate(allowed=True, reason="not_gated")
-    if not settings.jev_enabled:
-        return ToolGate(allowed=True, reason="disabled")
-
-    payload = args or {}
-    text = (said or str(payload.get("said") or "") or current_utterance()).strip()
-    if not text:
-        # No sentence to judge (a bare API/tool invocation). The caller is
-        # already trusted by auth; Jev has nothing to add.
-        return ToolGate(allowed=True, reason="no_utterance")
-
-    verdict = await evaluate_house_device(text, client=client)
-    log_shadow_outcome(verdict, channel="house_device", tools=[tool], outcome=tool)
-    if not verdict.enforcing or not verdict.ok:
-        return ToolGate(allowed=True, reason=verdict.reason or "fail_open", verdict=verdict)
-
-    answers = verdict.answers
-    if noul_high(answers, "is_cancel", settings.jev_cancel_threshold):
-        return ToolGate(
-            allowed=False,
-            reason="high_confidence_cancel",
-            message=_GATE_BLOCK_MESSAGE,
-            verdict=verdict,
-        )
-    if (
-        answers is not None
-        and answers.risk is not None
-        and answers.risk.level == "do_not_auto_run"
-        and answers.risk.confidence >= settings.jev_device_confidence
-    ):
-        return ToolGate(
-            allowed=False,
-            reason="high_risk",
-            message=(
-                "That reads as something I should not run on the house hardware "
-                "without a clearer instruction."
-            ),
-            verdict=verdict,
-        )
-    return ToolGate(allowed=True, reason="pass", verdict=verdict)
-
-
-def device_ask_choice(
-    answers: JevAnswers | None,
-    *,
-    confidence_min: float | None = None,
-) -> tuple[str, float] | None:
-    """Return ``(device_ask choice, confidence)`` when above threshold."""
-    if answers is None or answers.device_ask is None:
-        return None
-    floor = (
-        settings.jev_device_confidence if confidence_min is None else float(confidence_min)
-    )
-    choice = str(answers.device_ask.choice or "").strip()
-    conf = float(answers.device_ask.confidence)
-    if not choice or conf < floor:
-        return None
-    return choice, conf
 
 
 def media_ask_choice(
@@ -402,23 +287,16 @@ def noul_high(answers: JevAnswers | None, field: str, threshold: float) -> bool:
 
 
 __all__ = [
-    "DEVICE_TOOLS",
     "QUEUE_TOOLS",
-    "ToolGate",
     "build_state",
-    "current_utterance",
-    "device_ask_choice",
-    "evaluate_house_device",
     "evaluate_message",
     "evaluate_telegram_media",
     "get_client",
-    "guard_tool_call",
     "log_shadow_outcome",
     "media_ask_choice",
     "needs_llm_resolve",
     "noul_high",
     "reset_client",
     "set_client",
-    "set_utterance",
     "suggest_action",
 ]

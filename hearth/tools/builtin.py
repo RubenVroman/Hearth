@@ -901,7 +901,6 @@ def register_builtin_tools() -> None:
                 "required": ["action"],
             },
             handler=_house_climate,
-            jev_gated=True,
         )
     )
     registry.register(
@@ -940,7 +939,6 @@ def register_builtin_tools() -> None:
                 },
             },
             handler=_house_feeder,
-            jev_gated=True,
         )
     )
     registry.register(
@@ -974,7 +972,6 @@ def register_builtin_tools() -> None:
                 },
             },
             handler=_house_purifier,
-            jev_gated=True,
         )
     )
     registry.register(

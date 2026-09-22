@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from hearth.runtime import PendingConfirm, runtime
 from hearth import widgets as widget_bus
+
+if TYPE_CHECKING:  # pragma: no cover — avoids a jev <-> registry import cycle
+    from hearth.jev.tools import ToolDecision
+
+log = logging.getLogger("hearth.tools")
 
 Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 ConfiguredFn = Callable[[], bool]
@@ -29,11 +35,6 @@ class ToolSpec:
     # Optional: async resolve during destructive dry-run (e.g. plex_play plan).
     # Return ok=False to surface ambiguity/errors without a confirm button.
     preview_handler: Handler | None = None
-    # Physical house hardware (pet feeder, airco, air purifier). The shared Jev
-    # gate runs here rather than in each surface, so chat, voice, Telegram and
-    # /api/invoke are governed by one decision. No-ops while Jev is disabled or
-    # in shadow mode, which is the default.
-    jev_gated: bool = False
 
 
 @dataclass
@@ -109,7 +110,22 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
-    async def call(self, name: str, args: dict[str, Any] | None = None) -> ToolResult:
+    async def call(
+        self,
+        name: str,
+        args: dict[str, Any] | None = None,
+        *,
+        said: str = "",
+        explicit_confirm: bool = False,
+        gate: bool = True,
+    ) -> ToolResult:
+        """Run one tool after Jev has decided it may run.
+
+        ``said`` is the user text the gate reasons about (defaults to the open
+        turn's text). ``explicit_confirm`` marks a call the user already
+        confirmed — a button tap or a typed yes — so only Jev's hard stops apply.
+        ``gate=False`` is for internal replays that were already authorized.
+        """
         args = dict(args or {})
         spec = self._tools.get(name)
         runtime.begin_tool(name)
@@ -126,25 +142,32 @@ class ToolRegistry:
             )
             return _finish_tool(result)
 
-        if spec.jev_gated:
-            gate = await _jev_gate(name, args)
-            if gate is not None and not gate.allowed:
-                result = ToolResult(
-                    name=name,
-                    ok=False,
-                    data={
-                        "ok": False,
-                        "blocked_by": "jev",
-                        "reason": gate.reason,
-                        "error": gate.message,
-                        "speak": gate.message,
-                        "jev": gate.as_log_dict(),
-                    },
-                )
-                # A governance refusal is a decision, not a backend failure.
-                return _finish_tool(result, flash_error=False)
+        decision: ToolDecision | None = None
+        if gate:
+            decision = await _jev_decision(
+                name,
+                args,
+                said=said,
+                explicit_confirm=explicit_confirm,
+            )
+        if decision is not None and decision.denied:
+            result = ToolResult(
+                name=name,
+                ok=False,
+                data={
+                    "ok": False,
+                    "denied": True,
+                    "error": f"jev denied {name}: {decision.reason}",
+                    "speak": decision.message,
+                    "jev": decision.as_log_dict(),
+                },
+            )
+            # A governance decision is not a backend failure; don't flash an error.
+            return _finish_tool(result, flash_error=False)
 
-        if spec.destructive:
+        # Jev may ask for a confirm on a tool that is not marked destructive.
+        confirm_gated = spec.destructive or (decision is not None and decision.needs_confirm)
+        if confirm_gated:
             confirm = bool(args.get("confirm"))
             dry_run = args.get("dry_run")
             if dry_run is None:
@@ -195,6 +218,11 @@ class ToolRegistry:
                     "would_call_with": preview_args,
                     "hint": "Re-run with confirm=true to execute. High-risk tools default to dry-run.",
                 }
+                if decision is not None and decision.needs_confirm:
+                    preview["jev"] = decision.as_log_dict()
+                    preview["speak"] = (
+                        f"That reads risky enough to check first. Confirm and I'll run {name}."
+                    )
                 if plan is not None:
                     preview["plan"] = plan
                     if plan.get("speak"):
@@ -258,7 +286,7 @@ class ToolRegistry:
             _offer_memory(spec, finished)
             return finished
 
-        if spec.destructive or (runtime.pending is not None and runtime.pending.tool == name):
+        if confirm_gated or (runtime.pending is not None and runtime.pending.tool == name):
             runtime.pending = None
         result = ToolResult(name=name, ok=ok, data=payload_data)
         finished = _finish_tool(result)
@@ -266,13 +294,29 @@ class ToolRegistry:
         return finished
 
 
-async def _jev_gate(name: str, args: dict[str, Any]) -> Any:
-    """Ask the shared Jev gate about a physical-device call (never raises)."""
-    try:
-        from hearth.jev import guard_tool_call
+async def _jev_decision(
+    name: str,
+    args: dict[str, Any],
+    *,
+    said: str,
+    explicit_confirm: bool,
+) -> ToolDecision | None:
+    """Ask the Jev tool gate about this call. ``None`` means "no opinion, run it"."""
+    from hearth.config import settings
 
-        return await guard_tool_call(name, args)
-    except Exception:  # noqa: BLE001 — governance must fail open, not break tools
+    if not (settings.jev_enabled and settings.jev_tool_gate):
+        return None
+    try:
+        from hearth.jev.tools import authorize_tool
+
+        return await authorize_tool(
+            name,
+            args,
+            said=said or None,
+            explicit_confirm=explicit_confirm,
+        )
+    except Exception:  # noqa: BLE001 — the gate must never break a tool call
+        log.warning("jev tool gate failed open for %s", name, exc_info=True)
         return None
 
 

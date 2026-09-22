@@ -18,6 +18,8 @@ from hearth.auth.db import init_db
 from hearth.auth.gate import http_authorized, is_public_path, ws_authorized
 from hearth.auth.routers import auth_router
 from hearth.config import settings
+from hearth.jev import status_snapshot as jev_status_snapshot
+from hearth.jev import tool_turn
 from hearth.memory.prune import prune_loop
 from hearth.memory.retrieve import search as memory_search
 from hearth.memory.retrieve import status_snapshot as memory_status_snapshot
@@ -112,11 +114,70 @@ class ChatBody(BaseModel):
 class InvokeBody(BaseModel):
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
+    # Optional user text so the Jev tool gate has state to reason about.
+    said: str = ""
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    """Liveness only: the process is up and serving. No dependency checks."""
     return {"ok": True, "name": "hearth", "version": __version__, "house": settings.house_name}
+
+
+def _readiness() -> dict[str, Any]:
+    """Deploy verification markers. No network calls, so probes stay cheap.
+
+    ``ready`` means Hearth can serve house turns: the tool registry is populated
+    and the auth/memory databases are open. Integrations that are merely
+    unconfigured are reported under ``degraded`` rather than failing readiness —
+    a house with no Overseerr key is still a working house.
+    """
+    tool_names = registry.names()
+    checks: dict[str, Any] = {
+        "tools": {"ok": bool(tool_names), "count": len(tool_names)},
+        "auth_db": {"ok": settings.auth_db_path.exists(), "path": str(settings.auth_db_path)},
+        "memory": memory_status_snapshot(),
+        "jev": jev_status_snapshot(),
+        "telegram": telegram_inbox.status_snapshot(),
+        "integrations": {
+            "openai": settings.openai_configured,
+            "ha": settings.ha_configured,
+            "plex": settings.plex_configured,
+            "overseerr": settings.overseerr_configured,
+            "radarr": settings.radarr_configured,
+            "sonarr": settings.sonarr_configured,
+        },
+    }
+    degraded: list[str] = []
+    for name, configured in checks["integrations"].items():
+        if not configured:
+            degraded.append(f"{name}:unconfigured")
+    if settings.jev_enabled and not settings.typesafe_configured:
+        # Jev is on but will no-op: every gate decision fails open.
+        degraded.append("jev:no_api_key")
+    if settings.telegram_configured and not checks["telegram"].get("running"):
+        degraded.append("telegram:not_polling")
+    if not settings.app_secret_key.strip():
+        # Nobody can log in, but the machine token and Telegram paths still work.
+        degraded.append("auth:no_signing_key")
+    ready = bool(checks["tools"]["ok"] and checks["auth_db"]["ok"])
+    return {
+        "ok": ready,
+        "ready": ready,
+        "name": "hearth",
+        "version": __version__,
+        "house": settings.house_name,
+        "jev_mode": settings.jev_mode,
+        "degraded": degraded,
+        "checks": checks,
+    }
+
+
+@app.get("/readyz")
+async def readyz() -> JSONResponse:
+    """Readiness for deploy verification: 200 when Hearth can serve turns, 503 otherwise."""
+    snapshot = _readiness()
+    return JSONResponse(snapshot, status_code=200 if snapshot["ready"] else 503)
 
 
 @app.get("/api/status")
@@ -163,6 +224,7 @@ async def status() -> dict[str, Any]:
         "tools": registry.names(),
         "workspace": str(settings.workspace_path.resolve()),
         "memory": memory_status_snapshot(),
+        "jev": jev_status_snapshot(),
     }
 
 
@@ -478,7 +540,15 @@ async def chat(body: ChatBody) -> dict[str, Any]:
 async def invoke(body: InvokeBody) -> dict[str, Any]:
     if registry.get(body.tool) is None:
         raise HTTPException(status_code=404, detail="unknown tool")
-    result = await registry.call(body.tool, body.args)
+    # A direct invoke is an explicit instruction from an authenticated operator,
+    # so the Jev gate still runs and logs but only its hard stops apply.
+    with tool_turn(body.said, channel="invoke"):
+        result = await registry.call(
+            body.tool,
+            body.args,
+            said=body.said,
+            explicit_confirm=True,
+        )
     return {**result.as_dict(), "widgets": runtime.list_widgets()}
 
 

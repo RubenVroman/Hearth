@@ -20,7 +20,7 @@ import pytest
 from hearth.agent.loop import route_intent
 from hearth.agent.registry import registry
 from hearth.config import settings
-from hearth.jev import guard_tool_call, reset_client, set_client, set_utterance
+from hearth.jev import reset_client, set_client, tool_turn
 from hearth.jev.schema import parse_answers
 from hearth.telegram.house import telegram_plan
 from hearth.tools.device_intent import match_device_phrase
@@ -755,7 +755,7 @@ async def test_live_write_accepted_but_not_observed_is_not_success(
 
 
 # --------------------------------------------------------------------------
-# Jev gating
+# Jev gating — house devices share ToolRegistry.call() with every other tool
 # --------------------------------------------------------------------------
 
 
@@ -782,7 +782,8 @@ class FakeSystemOne:
 
 def _device_payload(
     *,
-    device_ask: str = "feed_pets",
+    tool_lane: str = "lights",
+    tool_allow: float = 0.95,
     is_cancel: float = 0.05,
     risk: float = 0.2,
     risk_confidence: float = 0.9,
@@ -790,7 +791,13 @@ def _device_payload(
     return {
         "model": "jev-1.13.0",
         "answers": {
-            "device_ask": {"type": "choice", "choice": device_ask, "confidence": 0.95},
+            "tool_lane": {
+                "type": "choice",
+                "choice": tool_lane,
+                "confidence": 0.93,
+                "probabilities": {tool_lane: 0.93},
+            },
+            "tool_allow": {"type": "noul", "noul": tool_allow},
             "is_cancel": {"type": "noul", "noul": is_cancel},
             "risk": {"type": "score", "score": risk, "confidence": risk_confidence},
         },
@@ -802,6 +809,7 @@ def jev_enforcing(monkeypatch: pytest.MonkeyPatch):
     def _install(payload: dict[str, Any], *, error: Exception | None = None) -> FakeSystemOne:
         monkeypatch.setattr(settings, "jev_enabled", True)
         monkeypatch.setattr(settings, "jev_shadow", False)
+        monkeypatch.setattr(settings, "jev_tool_gate", True)
         monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
         fake = FakeSystemOne(payload, error=error)
         set_client(fake)
@@ -812,33 +820,39 @@ def jev_enforcing(monkeypatch: pytest.MonkeyPatch):
 
 
 async def test_gate_is_a_no_op_while_jev_is_disabled() -> None:
-    gate = await guard_tool_call("house_feeder", {"said": "feed the cats"})
-    assert gate.allowed is True
-    assert gate.reason == "disabled"
+    with tool_turn("feed the cats", channel="chat"):
+        result = await registry.call("house_feeder", {"said": "feed the cats"})
+    assert result.ok is True
 
 
-async def test_gate_asks_the_device_question_set(jev_enforcing) -> None:
+async def test_gate_asks_the_shared_tool_question_set(jev_enforcing) -> None:
     fake = jev_enforcing(_device_payload())
-    gate = await guard_tool_call("house_feeder", {"said": "feed the cats"})
-    assert gate.allowed is True
+    with tool_turn("feed the cats", channel="chat"):
+        result = await registry.call("house_feeder", {"said": "feed the cats"})
+    assert result.ok is True
     asked = fake.calls[0]["questions"]
-    assert "device_ask" in asked
-    # The media router costs money and says nothing useful about a feeder.
+    assert "tool_lane" in asked
+    assert "tool_allow" in asked
+    # Feeder turns are not Overseerr asks; the media router stays off this path.
     assert "media_ask" not in asked
 
 
 async def test_gate_blocks_a_high_confidence_cancel(jev_enforcing) -> None:
     jev_enforcing(_device_payload(is_cancel=0.96))
-    gate = await guard_tool_call("house_feeder", {"said": "no, don't feed them"})
-    assert gate.allowed is False
-    assert gate.reason == "high_confidence_cancel"
+    with tool_turn("no, don't feed them", channel="chat"):
+        result = await registry.call("house_feeder", {"said": "no, don't feed them"})
+    assert result.ok is False
+    assert result.data["denied"] is True
+    assert result.data["jev"]["reason"] == "cancelled"
 
 
 async def test_gate_blocks_a_do_not_auto_run_risk(jev_enforcing) -> None:
     jev_enforcing(_device_payload(risk=2.0, risk_confidence=0.95))
-    gate = await guard_tool_call("house_climate", {"said": "airco 21"})
-    assert gate.allowed is False
-    assert gate.reason == "high_risk"
+    with tool_turn("airco 21", channel="chat"):
+        result = await registry.call("house_climate", {"action": "set", "temperature": 21})
+    assert result.ok is False
+    assert result.data["denied"] is True
+    assert result.data["jev"]["reason"] == "high_risk"
 
 
 async def test_shadow_mode_observes_but_never_blocks(
@@ -846,41 +860,42 @@ async def test_shadow_mode_observes_but_never_blocks(
 ) -> None:
     fake = jev_enforcing(_device_payload(is_cancel=0.99))
     monkeypatch.setattr(settings, "jev_shadow", True)
-    gate = await guard_tool_call("house_feeder", {"said": "no, don't feed them"})
-    assert gate.allowed is True
+    with tool_turn("no, don't feed them", channel="chat"):
+        result = await registry.call("house_feeder", {"said": "no, don't feed them"})
+    assert result.ok is True
     assert fake.calls, "shadow mode should still consult Jev"
 
 
 async def test_gate_fails_open_when_system_one_errors(jev_enforcing) -> None:
     jev_enforcing(_device_payload(), error=RuntimeError("system one down"))
-    gate = await guard_tool_call("house_feeder", {"said": "feed the cats"})
-    assert gate.allowed is True
-    assert gate.reason == "api_error"
+    with tool_turn("feed the cats", channel="chat"):
+        result = await registry.call("house_feeder", {"said": "feed the cats"})
+    assert result.ok is True
 
 
 async def test_a_blocked_tool_never_touches_the_hardware(jev_enforcing) -> None:
     jev_enforcing(_device_payload(is_cancel=0.97))
     before = (await ha.get_state("button.pet_feeder"))["state"]["state"]
-    result = await registry.call("house_feeder", {"said": "nee, niet voeren"})
+    with tool_turn("nee, niet voeren", channel="chat"):
+        result = await registry.call("house_feeder", {"said": "nee, niet voeren"})
     assert not result.ok
-    assert result.data["blocked_by"] == "jev"
+    assert result.data["denied"] is True
     assert (await ha.get_state("button.pet_feeder"))["state"]["state"] == before
 
 
 async def test_the_gate_reads_the_utterance_from_the_turn(jev_enforcing) -> None:
     """Tool args alone can be too thin to judge; the turn's sentence is not."""
     jev_enforcing(_device_payload(is_cancel=0.97))
-    set_utterance("actually no, leave the cats alone")
-    try:
+    with tool_turn("actually no, leave the cats alone", channel="chat"):
         result = await registry.call("house_feeder", {})
-        assert not result.ok
-        assert result.data["blocked_by"] == "jev"
-    finally:
-        set_utterance("")
+    assert not result.ok
+    assert result.data["denied"] is True
 
 
-async def test_read_only_tools_skip_the_gate_entirely(jev_enforcing) -> None:
+async def test_discovery_reads_are_not_denied_by_a_cancel(jev_enforcing) -> None:
     fake = jev_enforcing(_device_payload(is_cancel=0.99))
-    result = await registry.call("ha_discover_entities", {})
+    with tool_turn("which feeder entities exist", channel="chat"):
+        result = await registry.call("ha_discover_entities", {})
     assert result.ok
-    assert fake.calls == []
+    assert "denied" not in result.data
+    assert fake.calls, "reads still consult the turn gate; they just cannot be cancelled"
