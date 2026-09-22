@@ -63,6 +63,28 @@ The Telegram media question map does **not** include `butler_ask` or `domain`. S
 - The scene button sends a canonical phrase (`movie night`, `quiet hours`, `good night`) through the same gate. An unknown preset still gets the local “I know movie night…” reply when Jev is off.
 - The after-queue shelf line calls `evaluate_message` and skips the Plex read only on enforced `block_cancel`. It does not require `butler_ask=shelf`.
 
+## House-device gate (`device_ask`)
+
+Tools registered with `jev_gated=True` — `house_feeder`, `house_climate`,
+`house_purifier` — are gated inside the **tool registry**, so chat, voice,
+Telegram and `POST /api/invoke` share one decision rather than each surface
+writing its own guard.
+
+`house_device_system_one_questions()` asks the `device_ask` Choice (`feed_pets`,
+`feeder_schedule`, `airco`, `air_purifier`, `device_status`, `discover_entities`,
+`not_house_device`) plus the usual confirm / cancel / risk questions. It
+deliberately omits the media router: a feeder turn is never an Overseerr ask.
+
+In enforce mode a high-confidence `is_cancel` (≥ `HEARTH_JEV_CANCEL_THRESHOLD`)
+or a `do_not_auto_run` risk level above `HEARTH_JEV_DEVICE_CONFIDENCE` blocks the
+call; the result carries `blocked_by: "jev"` and Home Assistant is never touched.
+Everything else fails open — a flaky System One call must not leave the pets
+unfed.
+
+Surfaces publish the sentence they received (`set_utterance`, or a `said`
+argument) so the gate judges what was actually said rather than the arguments a
+model flattened it into.
+
 ## Shadow vs enforce
 
 - **Shadow** (`HEARTH_JEV_ENABLED=true`, `HEARTH_JEV_SHADOW=true`): cancel/confirm/CoS stay advisory (logged). Telegram **media_ask routing still applies** when confidence clears the media threshold — that is the product differentiator. Confident **butler_ask** choices still run `house_shelf` / `house_scene`.
