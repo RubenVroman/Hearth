@@ -273,6 +273,14 @@ def no_match(label: str) -> str:
     )
 
 
+def exclusion_left_nothing(seed: str, *, found: int) -> str:
+    entries = "1 entry" if found == 1 else f"{found} entries"
+    return (
+        f"That leaves nothing — the catalog only has {entries} for {seed}, and you "
+        "asked me to skip at least that many. Narrow the exclusion?"
+    )
+
+
 def no_more_options(subject: str) -> str:
     return _pick(
         (
@@ -476,6 +484,7 @@ __all__ = [
     "display_title",
     "edition_header",
     "exact_header",
+    "exclusion_left_nothing",
     "follow_up_header",
     "franchise_header",
     "house_pick_header",

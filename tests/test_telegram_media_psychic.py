@@ -25,7 +25,9 @@ from hearth.telegram.media.cards import CardRenderer
 from hearth.telegram.media.classify import classify_media_ask_sync
 from hearth.telegram.media.compound import split_compound_ask
 from hearth.telegram.media.moods import detect_mood, looks_like_vague_ask, names_one_release
+from hearth.telegram.media.people import detect_person_ask
 from hearth.telegram.media.play import PlayOutcome
+from hearth.telegram.media.ranking import apply_exclusions
 from hearth.telegram.models import MediaHit
 from hearth.telegram.store import TelegramStore
 
@@ -65,6 +67,18 @@ HARRY_POTTER = [
         "releaseDate": "2002-11-15",
     },
 ]
+LOTR = {
+    "mediaType": "movie",
+    "id": 120,
+    "title": "The Lord of the Rings: The Fellowship of the Ring",
+    "releaseDate": "2001-12-19",
+}
+HOBBIT = {
+    "mediaType": "movie",
+    "id": 49051,
+    "title": "The Hobbit: An Unexpected Journey",
+    "releaseDate": "2012-11-26",
+}
 SCARY_PICKS = [
     {"mediaType": "movie", "id": 900, "title": "Hereditary", "releaseDate": "2018-06-07"},
     {"mediaType": "movie", "id": 901, "title": "The Witch", "releaseDate": "2015-02-19"},
@@ -97,15 +111,20 @@ class FakeOverseerr:
         *,
         results: list[dict[str, Any]] | None = None,
         discover_results: list[dict[str, Any]] | None = None,
+        aliases: dict[str, str] | None = None,
     ) -> None:
         self.results = list(results or [])
         self.discover_results = list(discover_results or [])
+        # TMDB resolves well-known abbreviations; the fake needs to as well or
+        # it cannot exercise the alias path at all.
+        self.aliases = {k.casefold(): v.casefold() for k, v in (aliases or {}).items()}
         self.search_calls: list[str] = []
         self.discover_calls: list[dict[str, Any]] = []
 
     async def search(self, query: str, *, page: int = 1) -> dict[str, Any]:
         self.search_calls.append(query)
         needle = " ".join(query.casefold().split())
+        needle = self.aliases.get(needle, needle)
         rows = [
             row
             for row in self.results
@@ -601,6 +620,125 @@ async def test_an_unsure_jev_verdict_keeps_a_deterministic_franchise_seed(
     assert overseerr.search_calls, "the franchise seed must still hit Overseerr"
     assert "Harry Potter" in reply.text
     assert "configure OpenAI" not in reply.text
+
+
+# --- 7) Plans, exclusions, names and "next" ------------------------------------
+
+
+async def test_a_franchise_alias_in_a_plan_is_not_reported_as_a_miss(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"LOTR" can never fuzzy-match its own full title — the guard ate the item."""
+    monkeypatch.setattr(settings, "telegram_batch_lane", True)
+    overseerr = FakeOverseerr(
+        results=[LOTR, HOBBIT],
+        aliases={"LOTR": "The Lord of the Rings"},
+    )
+    bot = bot_factory(overseerr)
+
+    reply = await bot.handle_message(_message("grab LOTR and Hobbit"))
+
+    assert reply is not None
+    assert "no catalog match" not in reply.text
+    assert "Fellowship" in reply.text
+    assert "Hobbit" in reply.text
+
+
+def test_an_explicit_plan_beats_the_franchise_prefix_veto() -> None:
+    """The veto protects mid-title "and"; a grab verb says it is two requests."""
+    assert [p.title for p in split_compound_ask("grab Harry Potter and Dune")] == [
+        "Harry Potter",
+        "Dune",
+    ]
+    assert [p.title for p in split_compound_ask("grab LOTR and Hobbit")] == ["LOTR", "Hobbit"]
+    # The lower-case article still holds the real title together.
+    assert split_compound_ask("grab Harry Potter and the Chamber of Secrets") == ()
+    assert split_compound_ask("grab Beauty and the Beast") == ()
+    assert split_compound_ask("grab Romeo and Juliet") == ()
+
+
+def test_a_numeric_exclusion_is_read_not_searched() -> None:
+    from hearth.telegram.media.phrases import extract_exclusion
+
+    assert extract_exclusion("all Harry Potters except the last 4") == ("all Harry Potters", 4, 0)
+    assert extract_exclusion("all Harry Potters except the first 2") == ("all Harry Potters", 0, 2)
+
+
+def test_an_exclusion_that_swallows_everything_returns_nothing() -> None:
+    hits = [
+        MediaHit(media_type="movie", tmdb_id=index, title=title, year=2000 + index)
+        for index, title in enumerate(["One", "Two", "Three"], start=1)
+    ]
+    assert apply_exclusions(hits, drop_last=3) == []
+    assert apply_exclusions(hits, drop_first=3) == []
+    assert apply_exclusions(hits, drop_last=2, drop_first=2) == []
+    # A real exclusion is untouched.
+    assert [h.title for h in apply_exclusions(hits, drop_last=1)] == ["One", "Two"]
+
+
+async def test_over_excluding_a_franchise_says_so_instead_of_showing_it_all(
+    bot_factory,
+) -> None:
+    overseerr = FakeOverseerr(results=HARRY_POTTER)
+    bot = bot_factory(overseerr)
+
+    # The fixture holds two entries, so skipping two leaves nothing at all.
+    reply = await bot.handle_message(_message("all Harry Potters except the last two"))
+
+    assert reply is not None
+    assert "leaves nothing" in reply.text
+    assert [b for b in _buttons(reply) if b["text"].startswith("Get ")] == []
+
+
+@pytest.mark.parametrize(
+    ("ask", "name"),
+    [
+        ("movies with Robert de Niro", "Robert de Niro"),
+        ("movies with Robert De Niro", "Robert De Niro"),
+        ("anything with Olivia de Havilland", "Olivia de Havilland"),
+        ("directed by Brian De Palma", "Brian De Palma"),
+        ("anything with de Niro", "de Niro"),
+        ("films van Carice van Houten", "Carice van Houten"),
+    ],
+)
+def test_surname_particles_survive_the_person_lane(ask: str, name: str) -> None:
+    found = detect_person_ask(ask)
+    assert found is not None, ask
+    assert found.name == name
+
+
+def test_descriptions_are_still_not_people() -> None:
+    for text in ("the movie with the spaceship", "iets met het meisje", "iets met de film"):
+        assert detect_person_ask(text) is None, text
+
+
+async def test_next_after_a_queue_continues_the_pack(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The nudge names the next film; "next" must not page the old search."""
+    monkeypatch.setattr(settings, "telegram_watch_next", True)
+    overseerr = FakeOverseerr(results=HARRY_POTTER)
+    bot = bot_factory(overseerr)
+
+    await bot.handle_message(_message("Harry Potter"))
+    bot.memory.remember_watch_next(
+        CHAT_ID,
+        media_type="movie",
+        tmdb_id=672,
+        title="Harry Potter and the Chamber of Secrets",
+        year=2002,
+        from_title="Harry Potter and the Philosopher's Stone",
+        from_tmdb_id=671,
+    )
+
+    reply = await bot.handle_message(_message("next", message_id=2))
+
+    assert reply is not None
+    assert "Chamber of Secrets" in reply.text
+    # And the offer is consumed, so a second "next" pages normally again.
+    assert bot.memory.load(CHAT_ID).watch_next() is None
 
 
 def test_an_unresolvable_lane_falls_back_to_search_not_to_prose() -> None:

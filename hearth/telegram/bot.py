@@ -63,6 +63,7 @@ from hearth.telegram.media import (
     without_ids,
 )
 from hearth.telegram.media.memory import speaker_scope, storage_key
+from hearth.telegram.media.phrases import is_known_franchise
 from hearth.telegram.media.play import looks_like_play_command, play_lane_enabled, play_on_tv
 from hearth.telegram.media.watch_next import (
     WatchNext,
@@ -774,6 +775,8 @@ class TelegramMediaBot:
             drop_last=intent.drop_last,
             drop_first=intent.drop_first,
         )
+        if not kept:
+            return BotReply(voice.exclusion_left_nothing(seed, found=len(ordered)))
         # Say what was skipped by position, not by title: naming a film that has
         # no button invites "did you queue it?".
         dropped = ""
@@ -1107,6 +1110,7 @@ class TelegramMediaBot:
             reason="batch",
             raw_text=part.raw,
         )
+        known_seed = is_known_franchise(part.title)
         try:
             if part.series_all:
                 hits = await self._franchise_hits(query, part.title)
@@ -1115,13 +1119,23 @@ class TelegramMediaBot:
                     drop_last=part.drop_last,
                     drop_first=part.drop_first,
                 )[:SERIES_MAX_RESULTS]
-            hits = await self.catalog.hits(query, limit=3)
+            hits = await self.catalog.hits(
+                query,
+                franchise_seed=part.title if known_seed else None,
+                limit=3,
+            )
         except CatalogUnavailable:
             # One unavailable item must not sink the whole plan.
             return []
         # Silently swapping in a loosely related film would be worse than
         # reporting the item as a miss.
-        return [hit for hit in hits if plausible_match(part.title, hit)][:1]
+        kept = [hit for hit in hits if plausible_match(part.title, hit)]
+        if not kept and known_seed:
+            # An alias like "LOTR" can never fuzzy-match "The Lord of the Rings:
+            # The Fellowship of the Ring", so the guard that protects unknown
+            # titles would turn a franchise everyone knows into a plan miss.
+            kept = hits
+        return kept[:1]
 
     # --- follow-ups --------------------------------------------------------
 
@@ -1190,6 +1204,12 @@ class TelegramMediaBot:
                     return offered
             return await self._adjacent_entry_reply(view, context, direction=kind)
         if kind == "more":
+            # "next" lands here too, and a watch-next only exists in the moments
+            # after a queue — when the nudge has just named the next film in the
+            # pack. Honour that before paging the old search again.
+            offered = await self._offer_watch_next(view, context)
+            if offered is not None:
+                return offered
             return await self._more_of_the_same(view, context)
         return BotReply(voice.lost_context())
 

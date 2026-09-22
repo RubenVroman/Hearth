@@ -77,17 +77,23 @@ _TYPE_HINT_TV = re.compile(r"\b(?:series|show|serie)\b\s*$", re.I)
 _TRAILING_POLITE = re.compile(r"\s+(?:please|pls|aub|thanks|thx|graag|alsjeblieft)\s*$", re.I)
 
 
-def _and_split_is_safe(text: str, pieces: list[str]) -> bool:
+def _and_split_is_safe(text: str, pieces: list[str], *, plan_signal: bool) -> bool:
     """Decide whether " and " joins two requests or lives inside one title.
 
     Three signals veto the split: the whole phrase is a known franchise, the
     left side is itself a franchise seed ("Harry Potter and the …"), or a later
     piece opens with a lower-case article, which only happens mid-title.
+
+    The franchise-prefix veto is dropped once the ask is explicitly a plan:
+    "grab Harry Potter and Dune" is two requests, and the lower-case article
+    still protects "grab Harry Potter and the Chamber of Secrets".
     """
     if is_known_franchise(text):
         return False
     if any(_LOWER_ARTICLE.match(piece) for piece in pieces[1:]):
         return False
+    if plan_signal:
+        return True
     prefix = ""
     for piece in pieces[:-1]:
         prefix = f"{prefix} and {piece}".strip(" and ") if prefix else piece
@@ -129,7 +135,7 @@ def _split_once(text: str, *, plan_signal: bool) -> list[str]:
         if (
             len(pieces) >= 2
             and (plan_signal or len(pieces) >= 3)
-            and _and_split_is_safe(text, pieces)
+            and _and_split_is_safe(text, pieces, plan_signal=plan_signal)
         ):
             return pieces
     return [text.strip()]

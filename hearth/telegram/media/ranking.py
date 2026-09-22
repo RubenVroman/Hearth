@@ -177,12 +177,17 @@ def apply_exclusions(
     drop_last: int = 0,
     drop_first: int = 0,
 ) -> list[MediaHit]:
-    """Honour "all of them except the last" against release order."""
+    """Honour "all of them except the last" against release order.
+
+    An exclusion that swallows the whole list returns nothing. Handing back the
+    full list instead would show every title the user just asked to leave out,
+    with no sign the exclusion was dropped.
+    """
     ordered = in_release_order(hits)
     start = max(0, int(drop_first))
     end = len(ordered) - max(0, int(drop_last))
     if end <= start:
-        return ordered
+        return []
     return ordered[start:end]
 
 
