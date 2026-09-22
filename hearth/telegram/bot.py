@@ -59,7 +59,7 @@ from hearth.telegram.media import (
     voice,
     without_ids,
 )
-from hearth.telegram.media.play import looks_like_play_command, play_on_tv
+from hearth.telegram.media.play import looks_like_play_command, play_lane_enabled, play_on_tv
 from hearth.telegram.media.watch_next import (
     WatchNext,
     looks_like_continue_pack,
@@ -258,6 +258,9 @@ class TelegramMediaBot:
                 return await self._confirm_context_pick(view, context, index=1)
             return BotReply(voice.which_one())
 
+        if looks_like_play_command(view.text):
+            return await self._play_from_context(view)
+
         _, query = parse_message(
             message,
             max_length=max(20, int(settings.telegram_max_title_length)),
@@ -300,6 +303,32 @@ class TelegramMediaBot:
             return await self._route_media_intent(view, query, intent, context)
         except CatalogUnavailable as exc:
             return BotReply(exc.message)
+
+    async def _play_from_context(self, view: MessageView) -> BotReply:
+        """Run the explicit Telegram Play follow-up without entering classify/search."""
+        if not play_lane_enabled():
+            return BotReply(
+                "Play-from-Telegram is turned off "
+                "(HEARTH_TELEGRAM_PLAY_LANE=false)."
+            )
+        context = self.memory.load(view.chat_id)
+        if context is None or not context.hits:
+            return BotReply(
+                "I don't have a title in this thread to put on the TV. "
+                "Send or pick one first."
+            )
+        if len(context.hits) > 1:
+            names = ", ".join(hit.label for hit in context.hits[:4])
+            return BotReply(f"Which one should I put on the TV? {names}.")
+        hit = context.hits[0]
+        outcome = await play_on_tv(
+            title=hit.title,
+            tmdb_id=hit.tmdb_id,
+            media_type=hit.media_type,
+            year=hit.year,
+            season=hit.season,
+        )
+        return BotReply(outcome.message)
 
     @staticmethod
     def _recent_context(context: ChatContext | None) -> list[str] | None:
@@ -1673,18 +1702,13 @@ class TelegramMediaBot:
                 year = match.year
         if title == "that title":
             title = f"TMDB {tmdb_id}"
-        label = f"{title} ({year})" if year else title
         outcome = await play_on_tv(
             title=title,
             tmdb_id=tmdb_id,
             media_type=media_type,
             year=year,
         )
-        if outcome.ok:
-            text = voice.play_started(label)
-        else:
-            text = voice.play_failed(label, reason=outcome.message)
-        return BotReply(text, edit_message_id=message_id)
+        return BotReply(outcome.message, edit_message_id=message_id)
 
     async def _remember_watch_next_after_queue(
         self,

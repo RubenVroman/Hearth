@@ -648,6 +648,13 @@ _PLAY_ON_TV = re.compile(
     r")\b",
     re.I,
 )
+_PLAY_REFERENCE = re.compile(
+    r"^\s*(?:put|play|throw|send)\s+(?:it|that|this)\s+on\s+(?:the\s+)?("
+    r"infuse|firecore|apple\s*tv|atv|lg(?:\s*webos)?(?:\s*tv)?|webos|"
+    r"living\s*room(?:\s*tv)?|shield|plex|tv|television"
+    r")\s*[.!?]*\s*$",
+    re.I,
+)
 _PLAY_TITLE = re.compile(
     r"\b(?:play|put on)\s+(.+?)(?:\s+please)?$",
     re.I,
@@ -659,9 +666,13 @@ _PUT_ON_INFUSE = re.compile(
 _INFUSE_TRANSPORT = re.compile(
     r"\b(pause|stop|skip(?:\s+(?:ahead|forward))?|next(?:\s+track)?|"
     r"resume|unpause|play|go\s+back|previous(?:\s+track)?)\b"
-    r".*\b(?:apple\s*tv|infuse|atv)\b"
-    r"|\b(?:apple\s*tv|infuse|atv)\b.*"
+    r".*\b(?:apple\s*tv|infuse|atv|tv|television)\b"
+    r"|\b(?:apple\s*tv|infuse|atv|tv|television)\b.*"
     r"\b(pause|stop|skip|next|resume|unpause|go\s+back|previous)\b",
+    re.I,
+)
+_BARE_TRANSPORT = re.compile(
+    r"^\s*(pause|resume|unpause)(?:\s+(?:it|that|this))?\s*[.!?]*\s*$",
     re.I,
 )
 _MEDIA_STATUS = re.compile(
@@ -679,6 +690,16 @@ _NETWORK_STATUS = re.compile(
 _MEDIA_ACTIVITY = re.compile(
     r"\b(?:watch|use|start|prepare|switch to)\s+(?:the\s+)?(apple\s*tv|atv|tv|television)\b"
     r"|\b(?:turn|switch|power)\s+(?:the\s+)?(?:whole\s+)?(?:media|tv)\s+(chain\s+)?off\b",
+    re.I,
+)
+_MOVIE_NIGHT = re.compile(
+    r"^\s*(?:(?:set|start|prepare|activate|it'?s)\s+)?"
+    r"(?:movie|film|cinema)\s+night(?:\s+mode)?\s*[.!?]*\s*$",
+    re.I,
+)
+_LIGHTS_DOWN = re.compile(
+    r"^\s*(?:turn|bring|put|dim)?\s*(?:the\s+)?lights?\s+down\s*[.!?]*\s*$"
+    r"|^\s*dim\s+(?:the\s+)?lights?\s*[.!?]*\s*$",
     re.I,
 )
 _PLEX_CLIENTS = re.compile(
@@ -767,6 +788,11 @@ _TURN_ON = re.compile(r"\bturn on\s+(.+)$", re.I)
 _TURN_OFF = re.compile(r"\bturn off\s+(.+)$", re.I)
 _VOLUME = re.compile(
     r"\b(?:set\s+)?(?:the\s+)?(tv|lg|avr|denon|receiver)?\s*volume\s*(?:to\s*)?(\d{1,3})%?",
+    re.I,
+)
+_VOLUME_STEP = re.compile(
+    r"\b(?:(?:(tv|lg|avr|denon|receiver)\s+)?volume\s+(up|down)"
+    r"|turn\s+(?:(?:the\s+)?(tv|lg|avr|denon|receiver|it)\s+)?(up|down))\b",
     re.I,
 )
 _MUTE = re.compile(r"\b(un)?mute\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\b", re.I)
@@ -966,9 +992,25 @@ def route_intent(text: str) -> dict[str, Any] | None:
         return {"tool": "overseerr_request", "args": {"query": query or raw}}
     if _NETWORK_STATUS.search(raw):
         return {"tool": "house_network", "args": {}}
+    if _MOVIE_NIGHT.search(raw):
+        return {"tool": "media_activity", "args": {"activity": "movie_night"}}
+    if _LIGHTS_DOWN.search(raw):
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": settings.ha_movie_night_scene.strip() or "Movie night",
+                "domain": "scene",
+                "action": "activate",
+            },
+        }
     videoland_plan = _videoland_plan(raw)
     if videoland_plan is not None:
         return videoland_plan
+    play_reference = _PLAY_REFERENCE.search(raw)
+    if play_reference:
+        reference_plan = _play_reference_plan(play_reference.group(1))
+        if reference_plan is not None:
+            return reference_plan
     activity = _MEDIA_ACTIVITY.search(raw)
     if activity:
         lower_activity = raw.lower()
@@ -989,6 +1031,8 @@ def route_intent(text: str) -> dict[str, Any] | None:
     play_on = _PLAY_ON_TV.search(raw)
     if play_on:
         title = _play_title_clean(play_on.group(1))
+        if title.lower() in {"it", "that", "this", "something"}:
+            return None
         player = _plex_player_hint(play_on.group(2))
         from hearth.tools.infuse import prefer_infuse_for_apple_tv
 
@@ -1020,6 +1064,15 @@ def route_intent(text: str) -> dict[str, Any] | None:
         device = _media_device(mute.group(2))
         action = "unmute" if mute.group(1) else "volume_mute"
         return {"tool": "ha_media_control", "args": {"device": device, "action": action}}
+    volume_step = _VOLUME_STEP.search(raw)
+    if volume_step:
+        device_name = volume_step.group(1) or volume_step.group(3) or "avr"
+        direction = volume_step.group(2) or volume_step.group(4)
+        device = _media_device("avr" if device_name == "it" else device_name)
+        return {
+            "tool": "ha_media_control",
+            "args": {"device": device, "action": f"volume_{direction.lower()}"},
+        }
     vol = _VOLUME.search(raw)
     if vol:
         device = _media_device(vol.group(1) or "avr")
@@ -1468,12 +1521,53 @@ def _plex_player_hint(phrase: str | None) -> str:
     return phrase.strip() if phrase else "tv"
 
 
+def _play_reference_plan(target: str) -> dict[str, Any] | None:
+    """Resolve “put it on the TV” from the active server-side media card."""
+    widget = runtime.get_widget("media")
+    if widget is None:
+        return None
+    data = widget.data if isinstance(widget.data, dict) else {}
+    active = data.get("item") if isinstance(data.get("item"), dict) else None
+    items = [row for row in data.get("items") or [] if isinstance(row, dict)]
+    active_id = str(data.get("active_id") or "")
+    if active_id:
+        active = next(
+            (row for row in items if str(row.get("id") or "") == active_id),
+            active,
+        )
+    if not active:
+        return None
+    title = str(active.get("title") or "").strip()
+    if not title:
+        return None
+    player = _plex_player_hint(target)
+    args: dict[str, Any] = {"query": title}
+    rating_key = active.get("ratingKey")
+    tmdb_id = active.get("tmdbId")
+    if rating_key is not None and str(rating_key).strip():
+        args["ratingKey"] = str(rating_key)
+    if tmdb_id is not None:
+        args["tmdbId"] = tmdb_id
+
+    from hearth.tools.infuse import prefer_infuse_for_apple_tv
+
+    if prefer_infuse_for_apple_tv(player) or player.lower() in {"infuse", "firecore"}:
+        return {"tool": "infuse_play", "args": args}
+    args.pop("tmdbId", None)
+    args["player"] = player
+    return {"tool": "plex_play", "args": args}
+
+
 def _infuse_transport_plan(raw: str) -> dict[str, Any] | None:
     match = _INFUSE_TRANSPORT.search(raw)
-    if not match:
-        return None
-    # Action may be in group 1 or 2 depending on word order.
-    action_raw = (match.group(1) or match.group(2) or "").strip().lower()
+    if match:
+        # Action may be in group 1 or 2 depending on word order.
+        action_raw = (match.group(1) or match.group(2) or "").strip().lower()
+    else:
+        bare = _BARE_TRANSPORT.match(raw)
+        if not bare:
+            return None
+        action_raw = bare.group(1).strip().lower()
     action_raw = re.sub(r"\s+", " ", action_raw)
     mapping = {
         "pause": "pause",
@@ -1496,7 +1590,12 @@ def _infuse_transport_plan(raw: str) -> dict[str, Any] | None:
     # Bare "play …" with a title is handled elsewhere; only transport when ATV/Infuse is named.
     if action == "play" and _PLAY_ON_TV.search(raw):
         return None
-    if action == "play" and _PLAY_TITLE.search(raw) and "apple" not in raw.lower() and "infuse" not in raw.lower():
+    if (
+        action == "play"
+        and _PLAY_TITLE.search(raw)
+        and "apple" not in raw.lower()
+        and "infuse" not in raw.lower()
+    ):
         return None
     return {"tool": "infuse_transport", "args": {"action": action}}
 
@@ -1544,32 +1643,6 @@ def _turn_plan(phrase: str, *, on: bool) -> dict[str, Any]:
         "tool": "ha_device_control",
         "args": {"device": cleaned, "action": "turn_on" if on else "turn_off"},
     }
-
-
-def _guess_entity(phrase: str, *, on: bool) -> dict[str, Any]:
-    name = re.sub(r"^(the|my|our)\s+", "", phrase.strip(), flags=re.I).lower().rstrip(".")
-    mapping = {
-        "living room": "light.living_room",
-        "living room lights": "light.living_room",
-        "kitchen": "light.kitchen",
-        "kitchen lights": "light.kitchen",
-        "office": "light.office",
-        "movie night": "scene.movie_night",
-        "good night": "scene.good_night",
-        "tv": "media_player.lg_webos_tv",
-        "lg": "media_player.lg_webos_tv",
-        "denon": "media_player.denon_avr_x3700h",
-        "avr": "media_player.denon_avr_x3700h",
-    }
-    entity = mapping.get(name, f"light.{name.replace(' ', '_')}")
-    domain = entity.split(".", 1)[0]
-    if domain == "scene":
-        service = "turn_on"
-    elif domain == "media_player":
-        service = "turn_on" if on else "turn_off"
-    else:
-        service = "turn_on" if on else "turn_off"
-    return {"domain": domain, "service": service, "entity_id": entity}
 
 
 _MEDIA_NOISE = re.compile(

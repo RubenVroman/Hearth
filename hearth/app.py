@@ -140,6 +140,7 @@ async def status() -> dict[str, Any]:
             "tv_entity": settings.ha_tv_entity,
             "avr_entity": settings.ha_avr_entity,
             "apple_tv_entity": settings.ha_apple_tv_entity,
+            "movie_night_scene": settings.ha_movie_night_scene or "Movie night",
             "apple_tv_player": settings.apple_tv_player,
         },
         "plex": {"configured": settings.plex_configured},
@@ -240,6 +241,7 @@ async def rooms() -> dict[str, Any]:
             "tv": settings.ha_tv_entity,
             "avr": settings.ha_avr_entity,
             "apple_tv": settings.ha_apple_tv_entity,
+            "movie_night_scene": settings.ha_movie_night_scene or None,
         },
     }
 

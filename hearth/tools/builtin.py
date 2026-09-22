@@ -634,16 +634,17 @@ def register_builtin_tools() -> None:
         ToolSpec(
             name="media_activity",
             description=(
-                "Prepare or stop the receiver-centric living-room chain. apple_tv wakes Denon, LG, "
-                "selects the Denon Apple TV input, then wakes Apple TV; tv selects TV Audio; off "
-                "powers Apple TV, LG, then Denon down. Runs immediately."
+                "Prepare or stop the receiver-centric living-room chain. movie_night activates "
+                "the configured HA movie-night scene and prepares Apple TV; apple_tv wakes Denon, "
+                "LG, selects the Denon Apple TV input, then wakes Apple TV; tv selects TV Audio; "
+                "off powers Apple TV, LG, then Denon down. Runs immediately."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "activity": {
                         "type": "string",
-                        "enum": ["apple_tv", "tv", "off"],
+                        "enum": ["movie_night", "apple_tv", "tv", "off"],
                     }
                 },
                 "required": ["activity"],
