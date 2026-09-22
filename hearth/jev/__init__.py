@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from hearth.jev.gate import (
     ToolGateDecision,
+    current_tool_gate,
     evaluate_message,
     evaluate_telegram_media,
     evaluate_tool_call,
@@ -19,6 +20,7 @@ from hearth.jev.gate import (
     noul_high,
     reset_client,
     set_client,
+    tool_gate_scope,
 )
 from hearth.jev.schema import (
     MEDIA_ASK_CRITERIA,
@@ -37,6 +39,7 @@ __all__ = [
     "NO_TOOL",
     "QUEUE_TOOLS",
     "ToolGateDecision",
+    "current_tool_gate",
     "evaluate_message",
     "evaluate_telegram_media",
     "evaluate_tool_call",
@@ -46,4 +49,5 @@ __all__ = [
     "noul_high",
     "reset_client",
     "set_client",
+    "tool_gate_scope",
 ]

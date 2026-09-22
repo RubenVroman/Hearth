@@ -259,7 +259,10 @@ class ToolRegistry:
             args["dry_run"] = False
 
         try:
-            data = await spec.handler(args)
+            from hearth.jev import tool_gate_scope
+
+            with tool_gate_scope(gate_decision):
+                data = await spec.handler(args)
         except Exception as exc:  # noqa: BLE001 — surface tool errors to the agent
             result = ToolResult(name=name, ok=False, data={"error": str(exc)})
             return _finish_tool(result)

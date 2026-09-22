@@ -254,6 +254,47 @@ class HomeAssistant:
         entity_id: str,
         data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        gate_decision = None
+        try:
+            from hearth.jev import current_tool_gate, evaluate_tool_call
+
+            gate_decision = current_tool_gate()
+            if gate_decision is None:
+                gate_decision = await evaluate_tool_call(
+                    f"Home Assistant {domain}.{service} for {entity_id}",
+                    proposed_tool="ha_call_service",
+                    args={
+                        "domain": domain,
+                        "service": service,
+                        "entity_id": entity_id,
+                        "data": data or {},
+                    },
+                    allowed_tools={
+                        "ha_call_service": (
+                            "Call one Home Assistant service for an explicitly resolved entity."
+                        )
+                    },
+                    channel="ha_service",
+                )
+        except Exception:  # noqa: BLE001 — direct HA writes fail open if Jev is unavailable
+            gate_decision = None
+
+        gate_data = (
+            {"jev_gate": gate_decision.as_log_dict()}
+            if gate_decision is not None
+            else {}
+        )
+        if gate_decision is not None and not gate_decision.allowed:
+            return {
+                "mode": "live" if self.live else "mock",
+                "ok": False,
+                "accepted": False,
+                "entity_id": entity_id,
+                "service": f"{domain}.{service}",
+                "error": "Jev decided that this Home Assistant service call should not run.",
+                **gate_data,
+            }
+
         payload = {"entity_id": entity_id, **(data or {})}
         if not self.live:
             result = _mock.call_service(domain, service, entity_id, data)
@@ -264,6 +305,7 @@ class HomeAssistant:
                 **result,
                 "entity_id": entity_id,
                 "state": state,
+                **gate_data,
             }
         try:
             response, attempts = await self._request(
@@ -283,6 +325,7 @@ class HomeAssistant:
                 "entity_id": entity_id,
                 "changed": changed,
                 "state": state,
+                **gate_data,
             }
             # Keep the historical ``entity`` key for UI/memory consumers while
             # exposing the clearer ``state`` key used by newer control tools.
@@ -297,6 +340,7 @@ class HomeAssistant:
                 "ok": False,
                 "accepted": False,
                 "error": _error_text(exc),
+                **gate_data,
             }
 
     def entity_for(self, device: str) -> str:
@@ -460,6 +504,64 @@ class HomeAssistant:
             "reachable": _state_reachable(top),
             "resolved": "exact" if top_score >= 100 else "friendly_name",
         }
+
+    async def resolve_control_target(
+        self,
+        hint: str,
+        *,
+        domains: Iterable[str] | None = None,
+        configured_entity_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Shared config-first resolver for every controllable LAN device.
+
+        Device-specific tools may provide an optional configured entity id, but
+        all of them fall back to the same exact/friendly-name discovery and
+        ambiguity handling used by generic house control.
+        """
+        query = (hint or "").strip()
+        configured = (configured_entity_id or "").strip()
+        allowed = {d.rstrip(".") for d in domains or [] if d}
+        configured_error = ""
+
+        if configured:
+            configured_domain = _domain(configured)
+            if allowed and configured_domain not in allowed:
+                return {
+                    "ok": False,
+                    "configured_entity_id": configured,
+                    "error": (
+                        f"Configured entity {configured!r} is not in the allowed "
+                        f"domains: {', '.join(sorted(allowed))}"
+                    ),
+                }
+            state_result = await self.get_state(configured)
+            state = state_result.get("state")
+            if state_result.get("ok") and state is not None:
+                return {
+                    "ok": True,
+                    "mode": state_result.get("mode"),
+                    "entity_id": configured,
+                    "configured_entity_id": configured,
+                    "state": state,
+                    "reachable": _state_reachable(state),
+                    "resolved": "config",
+                }
+            configured_error = str(
+                state_result.get("error") or f"{configured} was not found"
+            )
+
+        resolved = await self.resolve_entity(query or configured, domains=allowed)
+        if configured:
+            resolved["configured_entity_id"] = configured
+            if not resolved.get("ok"):
+                fallback_error = str(resolved.get("error") or "discovery failed")
+                resolved["error"] = (
+                    f"Configured entity {configured!r} failed ({configured_error}); "
+                    f"{fallback_error}"
+                )
+            else:
+                resolved["configured_error"] = configured_error
+        return resolved
 
     async def media_control(
         self,
@@ -958,9 +1060,14 @@ class HomeAssistant:
         *,
         domain: str | None = None,
         value: float | str | bool | None = None,
+        configured_entity_id: str | None = None,
     ) -> dict[str, Any]:
         """Control any routine HA entity by friendly name, safely and dynamically."""
-        resolved = await self.resolve_entity(device, domains=[domain] if domain else _CONTROL_DOMAINS)
+        resolved = await self.resolve_control_target(
+            device,
+            domains=[domain] if domain else _CONTROL_DOMAINS,
+            configured_entity_id=configured_entity_id,
+        )
         if not resolved.get("ok"):
             return resolved
         entity_id = str(resolved["entity_id"])
@@ -975,6 +1082,9 @@ class HomeAssistant:
             "mode": result.get("mode"),
             "device": device,
             "entity_id": entity_id,
+            "configured_entity_id": resolved.get("configured_entity_id"),
+            "resolved": resolved.get("resolved"),
+            "configured_error": resolved.get("configured_error"),
             "service": f"{entity_domain}.{service}",
             "data": data or None,
             "result": result,

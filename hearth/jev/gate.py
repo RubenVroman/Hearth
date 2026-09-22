@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -61,6 +63,32 @@ class ToolGateDecision:
             "reason": self.reason,
             "jev": self.verdict.as_log_dict(),
         }
+
+
+_tool_gate_context: ContextVar[ToolGateDecision | None] = ContextVar(
+    "hearth_tool_gate",
+    default=None,
+)
+
+
+def current_tool_gate() -> ToolGateDecision | None:
+    """Decision authorizing the currently executing registry tool, if any."""
+    return _tool_gate_context.get()
+
+
+@contextmanager
+def tool_gate_scope(
+    decision: ToolGateDecision | None,
+) -> Iterator[ToolGateDecision | None]:
+    """Propagate one gate decision through nested backend/service calls."""
+    if decision is None:
+        yield None
+        return
+    token = _tool_gate_context.set(decision)
+    try:
+        yield decision
+    finally:
+        _tool_gate_context.reset(token)
 
 
 def reset_client() -> None:
@@ -438,6 +466,7 @@ __all__ = [
     "QUEUE_TOOLS",
     "ToolGateDecision",
     "build_state",
+    "current_tool_gate",
     "evaluate_message",
     "evaluate_tool_call",
     "evaluate_telegram_media",
@@ -449,4 +478,5 @@ __all__ = [
     "reset_client",
     "set_client",
     "suggest_action",
+    "tool_gate_scope",
 ]

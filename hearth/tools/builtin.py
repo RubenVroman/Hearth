@@ -58,7 +58,10 @@ async def _house_network(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _ha_device_control(args: dict[str, Any]) -> dict[str, Any]:
-    device = str(args.get("device") or "")
+    configured_entity_id = str(
+        args.get("entity_id") or args.get("configured_entity_id") or ""
+    ).strip()
+    device = str(args.get("device") or configured_entity_id)
     action = str(args.get("action") or "")
     if not device or not action:
         return {"ok": False, "error": "device and action required"}
@@ -67,6 +70,7 @@ async def _ha_device_control(args: dict[str, Any]) -> dict[str, Any]:
         action,
         domain=str(args.get("domain") or "") or None,
         value=args.get("value"),
+        configured_entity_id=configured_entity_id or None,
     )
 
 
@@ -627,6 +631,13 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "device": {"type": "string", "description": "Friendly name or entity_id."},
+                    "entity_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional config-provided entity id. Checked first, then the shared "
+                            "friendly-name resolver is used as an honest fallback."
+                        ),
+                    },
                     "action": {
                         "type": "string",
                         "description": (

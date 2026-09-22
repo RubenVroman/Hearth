@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from hearth.agent.loop import route_intent
-from hearth.agent.registry import registry
+from hearth.agent.registry import ToolRegistry, ToolSpec, registry
 from hearth.config import settings
 from hearth.jev import set_client
 from hearth.jev.schema import parse_answers
@@ -15,6 +15,46 @@ from hearth.telegram.models import MediaHit
 from hearth.tools.ha import HomeAssistant
 from hearth.tools.infuse import Infuse
 from hearth.tools.plex import Plex
+
+
+class _GateSystemOne:
+    def __init__(
+        self,
+        *,
+        allow: float = 0.99,
+        which: str = "ha_call_service",
+        confidence: float = 0.98,
+        error: Exception | None = None,
+    ) -> None:
+        self.allow = allow
+        self.which = which
+        self.confidence = confidence
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    async def system_one(
+        self,
+        *,
+        state: Any,
+        questions: dict[str, Any] | None = None,
+        model: str | None = None,
+    ) -> Any:
+        self.calls.append({"state": state, "questions": questions, "model": model})
+        if self.error is not None:
+            raise self.error
+        return parse_answers(
+            {
+                "model": model or "jev-test",
+                "answers": {
+                    "allow_tool": {"type": "noul", "noul": self.allow},
+                    "which_tool": {
+                        "type": "choice",
+                        "choice": self.which,
+                        "confidence": self.confidence,
+                    },
+                },
+            }
+        )
 
 
 async def test_media_path_rejects_unknown_denon_source(
@@ -290,6 +330,179 @@ async def test_plex_verification_requires_matching_playing_session(
     assert "No matching playing session" in result["error"]
 
 
+async def test_registry_gate_propagates_to_nested_ha_service_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test")
+    gate = _GateSystemOne(which="lan_control")
+    set_client(gate)
+    client = HomeAssistant()
+
+    async def control(_args: dict[str, Any]) -> dict[str, Any]:
+        return await client.call_service(
+            "light",
+            "turn_on",
+            "light.kitchen",
+        )
+
+    tools = ToolRegistry()
+    tools.register(
+        ToolSpec(
+            name="lan_control",
+            description="Control an entity represented by Home Assistant.",
+            parameters={"type": "object", "properties": {}},
+            handler=control,
+        )
+    )
+
+    result = await tools.call(
+        "lan_control",
+        {},
+        user_text="turn on the kitchen light",
+        channel="test_lan",
+    )
+
+    assert result.ok is True
+    assert len(gate.calls) == 1
+    assert result.data["jev_gate"]["requested_tool"] == "lan_control"
+    assert result.data["entity_id"] == "light.kitchen"
+
+
+async def test_direct_ha_service_call_is_jev_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from importlib import import_module
+
+    ha_module = import_module("hearth.tools.ha")
+    calls: list[tuple[str, str, str]] = []
+
+    def service(
+        domain: str,
+        action: str,
+        entity_id: str,
+        _data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        calls.append((domain, action, entity_id))
+        return {"ok": True}
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test")
+    monkeypatch.setattr(ha_module._mock, "call_service", service)
+    gate = _GateSystemOne(allow=0.01, which="no_tool")
+    set_client(gate)
+
+    denied = await HomeAssistant().call_service(
+        "switch",
+        "turn_on",
+        "switch.petzero_feeder",
+    )
+
+    assert denied["ok"] is False
+    assert denied["accepted"] is False
+    assert calls == []
+    assert denied["jev_gate"]["reason"] == "jev_denied_tool"
+
+
+async def test_direct_ha_service_jev_error_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from importlib import import_module
+
+    ha_module = import_module("hearth.tools.ha")
+    calls: list[tuple[str, str, str]] = []
+
+    def service(
+        domain: str,
+        action: str,
+        entity_id: str,
+        _data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        calls.append((domain, action, entity_id))
+        return {"ok": True}
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test")
+    monkeypatch.setattr(ha_module._mock, "call_service", service)
+    set_client(_GateSystemOne(error=RuntimeError("jev offline")))
+
+    result = await HomeAssistant().call_service(
+        "fan",
+        "turn_on",
+        "fan.air_purifier",
+    )
+
+    assert result["ok"] is True
+    assert calls == [("fan", "turn_on", "fan.air_purifier")]
+    assert result["jev_gate"]["fail_open"] is True
+    assert result["jev_gate"]["reason"] == "api_error"
+
+
+async def test_shared_control_target_prefers_config_then_discovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HomeAssistant()
+    configured = "climate.living_room_airco"
+    configured_state = {
+        "entity_id": configured,
+        "state": "cool",
+        "attributes": {"friendly_name": "Living Room Airco"},
+    }
+
+    async def configured_get(entity_id: str) -> dict[str, Any]:
+        assert entity_id == configured
+        return {"ok": True, "mode": "live", "state": configured_state}
+
+    async def no_discovery(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("configured entity should resolve before discovery")
+
+    monkeypatch.setattr(client, "get_state", configured_get)
+    monkeypatch.setattr(client, "resolve_entity", no_discovery)
+    exact = await client.resolve_control_target(
+        "Living Room Airco",
+        domains=["climate"],
+        configured_entity_id=configured,
+    )
+
+    assert exact["ok"] is True
+    assert exact["entity_id"] == configured
+    assert exact["resolved"] == "config"
+
+    async def missing_get(_entity_id: str) -> dict[str, Any]:
+        return {"ok": False, "mode": "live", "error": "not found"}
+
+    async def discover(hint: str, *, domains: Any = None) -> dict[str, Any]:
+        assert hint == "PetZero feeder"
+        assert set(domains or []) == {"button", "switch"}
+        return {
+            "ok": True,
+            "mode": "live",
+            "entity_id": "button.petzero_feed",
+            "state": {
+                "entity_id": "button.petzero_feed",
+                "state": "unknown",
+                "attributes": {"friendly_name": "PetZero feeder"},
+            },
+            "resolved": "friendly_name",
+        }
+
+    monkeypatch.setattr(client, "get_state", missing_get)
+    monkeypatch.setattr(client, "resolve_entity", discover)
+    fallback = await client.resolve_control_target(
+        "PetZero feeder",
+        domains=["button", "switch"],
+        configured_entity_id="button.old_petzero_feed",
+    )
+
+    assert fallback["ok"] is True
+    assert fallback["entity_id"] == "button.petzero_feed"
+    assert fallback["configured_entity_id"] == "button.old_petzero_feed"
+    assert fallback["configured_error"] == "not found"
+
+
 async def test_telegram_play_uses_shared_jev_tool_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -297,30 +510,6 @@ async def test_telegram_play_uses_shared_jev_tool_selection(
 
     play_module = import_module("hearth.telegram.media.play")
     calls: list[str] = []
-
-    class FakeSystemOne:
-        async def system_one(
-            self,
-            *,
-            state: Any,
-            questions: dict[str, Any] | None = None,
-            model: str | None = None,
-        ) -> Any:
-            assert state["proposed_tool"] == "infuse_play"
-            assert set(questions or {}) == {"allow_tool", "which_tool"}
-            return parse_answers(
-                {
-                    "model": model or "jev-test",
-                    "answers": {
-                        "allow_tool": {"type": "noul", "noul": 0.99},
-                        "which_tool": {
-                            "type": "choice",
-                            "choice": "plex_play",
-                            "confidence": 0.98,
-                        },
-                    },
-                }
-            )
 
     async def infuse(**_kwargs: Any) -> PlayOutcome:
         raise AssertionError("Jev selected Plex, so Infuse must not run")
@@ -333,7 +522,8 @@ async def test_telegram_play_uses_shared_jev_tool_selection(
     monkeypatch.setattr(settings, "jev_shadow", True)
     monkeypatch.setattr(settings, "typesafe_api_key", "ts-test")
     monkeypatch.setattr(settings, "apple_tv_player", "infuse")
-    set_client(FakeSystemOne())
+    gate = _GateSystemOne(which="plex_play")
+    set_client(gate)
     monkeypatch.setattr(play_module, "_play_infuse", infuse)
     monkeypatch.setattr(play_module, "_play_plex", plex)
 
@@ -349,6 +539,8 @@ async def test_telegram_play_uses_shared_jev_tool_selection(
     assert calls == ["plex_play"]
     assert outcome.detail is not None
     assert outcome.detail["jev_gate"]["selected_tool"] == "plex_play"
+    assert gate.calls[0]["state"]["proposed_tool"] == "infuse_play"
+    assert set(gate.calls[0]["questions"] or {}) == {"allow_tool", "which_tool"}
 
 
 async def test_telegram_put_it_on_tv_uses_thread_context(

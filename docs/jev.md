@@ -59,6 +59,11 @@ Missing key, disabled Jev, API errors, or low confidence → **fail open** to lo
 
 A confident different choice reroutes to that registered tool; the raw LLM/local proposal is not executed. A confident deny runs nothing. Disabled Jev, missing credentials, API errors, missing tool-gate answers, unknown choices, or low `which_tool` confidence fail open to the proposed tool. This fail-open contract is shared by chat, Realtime voice, authenticated web invokes, future Telegram house commands that use the registry, and Telegram Play’s direct Infuse/Plex dispatcher.
 
+The accepted decision is propagated through nested backend calls. Home Assistant service writes
+reuse that parent decision; a direct `HomeAssistant.call_service()` with no parent decision
+self-gates as `ha_call_service`. This gives feeder/climate/purifier tools one governance boundary
+without paying for a second Jev call inside an already-approved house tool.
+
 Telegram Play deliberately gives Jev only `infuse_play` and `plex_play` as choices. Title/TMDB/season arguments remain deterministic and server-side; Jev chooses the backend but does not generate playback arguments.
 
 ## Shadow vs enforce

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from hearth.config import settings
-from hearth.jev import ToolGateDecision, evaluate_tool_call
+from hearth.jev import ToolGateDecision, evaluate_tool_call, tool_gate_scope
 
 log = logging.getLogger("hearth.telegram.media.play")
 
@@ -113,19 +113,20 @@ async def play_on_tv(
         )
 
     selected = decision.selected_tool or proposed
-    if selected == "infuse_play":
-        outcome = await _play_infuse(
-            title=title,
-            tmdb_id=tmdb_id,
-            season=season,
-            label=label,
-        )
-    elif selected == "plex_play":
-        outcome = await _play_plex(title=title, label=label, media_type=media_type)
-    else:
-        outcome = _honest_failure(
-            f"Jev selected unsupported playback tool {selected!r}."
-        )
+    with tool_gate_scope(decision):
+        if selected == "infuse_play":
+            outcome = await _play_infuse(
+                title=title,
+                tmdb_id=tmdb_id,
+                season=season,
+                label=label,
+            )
+        elif selected == "plex_play":
+            outcome = await _play_plex(title=title, label=label, media_type=media_type)
+        else:
+            outcome = _honest_failure(
+                f"Jev selected unsupported playback tool {selected!r}."
+            )
     return _with_gate(outcome, decision)
 
 

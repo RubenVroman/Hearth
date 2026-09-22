@@ -193,7 +193,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Whole-house snapshot → `house_status` / `GET /api/house/status`; one HA read reports what is
   on, climate and cover state, unavailable entities, and feeder last-fed only when HA exposes it
 - Everything HA represents on the house network → `house_network` / `GET /api/network`; reports reachability, unavailable entities, domains, and explicit Denon/LG/Apple TV links
-- Any routine HA entity by friendly name → `ha_device_control` (lights, switches, fans, covers, climate, scenes, scripts, buttons, vacuums); covers support open/close/stop/position, and ambiguous matches are returned instead of guessed
+- Any routine HA entity by config-provided id or friendly name → `ha_device_control` (lights, switches, fans, covers, climate, scenes, scripts, buttons, vacuums); the shared config-first resolver supports cover positioning, falls back to discovery, and returns ambiguity instead of guessing
 - LG TV / Denon AVR / Apple TV power, volume, source, transport → `ha_media_control` (prefer over raw `ha_call_service`)
 - Receiver-centric “movie night”, “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; movie night activates the configured HA scene, then orders Denon → LG → Denon source → Apple TV and reports every failed step
 - **Videoland on the LG** → `videoland_play` (Dutch/English: “zet B&B Vol Liefde aan op Videoland”, “open Videoland”, “open het profiel Parel”). HA can **launch** the Videoland app via `media_player.select_source`; it **cannot** start a named title or select an in-app profile. See [Videoland on LG webOS](#videoland-on-lg-webos).
@@ -462,6 +462,13 @@ Hearth will not talk webOS, Denon, or Infuse protocol itself. After HA is on:
    the Apple TV media path.
 
 For LAN discovery (Cast, some TVs), you may want host networking on the HA service — see comments in `docker-compose.yml`. Hearth itself stays on the `hearth` bridge.
+
+All HA writes inherit the active registry Jev decision. A direct
+`HomeAssistant.call_service()` call (including future PetZero feeder, airco, purifier, or Tuya
+tools) runs the same `allow_tool` / `which_tool` gate when no parent decision exists, then fails
+open if Jev is unavailable. Device-specific tools should use
+`ha.resolve_control_target(..., configured_entity_id=...)` so entity ids, friendly-name fallback,
+domain filtering, and ambiguity handling stay shared.
 
 ### HA playback smoke test (Ruben)
 
