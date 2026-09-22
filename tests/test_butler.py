@@ -7,11 +7,13 @@ from typing import Any
 
 import pytest
 
+from hearth.agent.loop import route_intent
 from hearth.butler.nudge import aside_for, queue_shelf_aside
 from hearth.butler.phrases import classify_house_phrase, house_route
 from hearth.butler.scenes import activate_preset
 from hearth.butler.shelf import shelf_snapshot
 from hearth.config import settings
+from hearth.jev import reset_client, set_client
 from hearth.telegram.bot import TelegramMediaBot
 from hearth.telegram.media.memory import MediaMemory, speaker_scope
 from hearth.telegram.models import MediaHit
@@ -153,6 +155,40 @@ def test_chat_tonight_and_scenes(client) -> None:
     assert unknown.json()["ok"] is False
 
 
+def test_route_intent_leaves_unclaimed_butler_phrases_to_the_gate() -> None:
+    assert route_intent("what's on tonight") is None
+    assert route_intent("quiet hours") is None
+    movie = route_intent("movie night")
+    assert movie is not None and movie["tool"] == "media_activity"
+    turned = route_intent("turn on movie night")
+    assert turned is not None and turned["tool"] == "ha_device_control"
+    kitchen = route_intent("turn on the kitchen")
+    assert kitchen is not None
+    assert kitchen["tool"] == "ha_device_control"
+
+
+def test_scene_button_honors_jev_other(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_jev import FakeSystemOne, _butler_payload
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    set_client(FakeSystemOne(_butler_payload("other", confidence=0.96)))
+    try:
+        scene = client.post("/api/house/scene", json={"preset": "movie_night"})
+        assert scene.status_code == 200
+        body = scene.json()
+        assert body["ok"] is False
+        assert "left it alone" in body["speak"]
+        rooms = client.get("/api/rooms")
+        living = next(
+            row for row in rooms.json()["lights"] if row["entity_id"] == "light.living_room"
+        )
+        assert living["attributes"]["brightness"] == 180
+    finally:
+        reset_client()
+        _mock.reset()
+
+
 def test_group_memory_is_per_speaker(tmp_path) -> None:
     store = TelegramStore(tmp_path / "threads.db")
     memory = MediaMemory(store)
@@ -229,9 +265,8 @@ async def test_telegram_shelf_and_scene_skip_overseerr(shelf_bot: TelegramMediaB
     assert fake.search_calls == []
 
     movie = await shelf_bot.handle_message(_message("movie night", user_id=7, message_id=2))
-    assert movie is not None
-    assert "Movie night is on" in movie.text
-    assert fake.search_calls == []
+    assert movie is None or "Movie night is on" not in movie.text
+    assert _mock.get_state("light.living_room")["attributes"]["brightness"] != 40
 
     quiet = await shelf_bot.handle_message(_message("quiet hours", user_id=7, message_id=3))
     assert quiet is not None
@@ -239,6 +274,78 @@ async def test_telegram_shelf_and_scene_skip_overseerr(shelf_bot: TelegramMediaB
     assert "Quiet hours" in quiet.text
     assert "is on" not in quiet.text
     _mock.reset()
+
+
+@pytest.mark.asyncio
+async def test_telegram_jev_other_does_not_run_the_scene(
+    shelf_bot: TelegramMediaBot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.test_jev import FakeSystemOne, _butler_payload
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    set_client(FakeSystemOne(_butler_payload("other", confidence=0.97)))
+    try:
+        movie = await shelf_bot.handle_message(_message("quiet hours", user_id=7))
+        assert movie is not None
+        assert "left it alone" in movie.text
+        assert "is on" not in movie.text
+        living = _mock.get_state("light.living_room")
+        assert living is not None
+        assert living["attributes"]["brightness"] == 180
+        assert shelf_bot.overseerr.search_calls == []
+    finally:
+        reset_client()
+        _mock.reset()
+
+
+@pytest.mark.asyncio
+async def test_queue_aside_skips_only_enforced_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_jev import FakeSystemOne, _payload
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    set_client(FakeSystemOne(_payload(is_cancel=0.95)))
+    try:
+        assert await queue_shelf_aside("Arrival") is None
+    finally:
+        reset_client()
+
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    set_client(FakeSystemOne(_payload(is_cancel=0.99)))
+    try:
+        spoken = await queue_shelf_aside("Arrival")
+        assert spoken is not None and "40%" in spoken
+    finally:
+        reset_client()
+
+
+@pytest.mark.asyncio
+async def test_voice_house_tool_refuses_without_a_jev_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hearth.voice.webrtc import run_house_tool
+    from tests.test_jev import FakeSystemOne, _butler_payload
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    set_client(FakeSystemOne(_butler_payload("other", confidence=0.95)))
+    try:
+        result = await run_house_tool(
+            "house_scene",
+            {"preset": "movie_night"},
+            said="movie night",
+        )
+        assert result["ok"] is False
+        assert "left it alone" in result["speak"]
+        living = _mock.get_state("light.living_room")
+        assert living is not None
+        assert living["attributes"]["brightness"] == 180
+    finally:
+        reset_client()
+        _mock.reset()
 
 
 @pytest.mark.asyncio

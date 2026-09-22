@@ -89,6 +89,20 @@ MEDIA_ASK_CRITERIA: dict[str, str] = {
 
 MEDIA_ASK_KINDS = tuple(MEDIA_ASK_CRITERIA.keys())
 
+# Butler tools (shelf readout, scene presets). Chosen by Jev, not by the LLM.
+BUTLER_ASK_CRITERIA: dict[str, str] = {
+    "shelf": (
+        "What's already on Plex: continue watching, on deck, recently added, "
+        "or 'what's on tonight'. Not live now-playing and not a new download."
+    ),
+    "movie_night": "Run the movie-night, film-night, cinema, or lights-down scene.",
+    "quiet_hours": "Run quiet hours, hush the house, or stilte.",
+    "good_night": "Run good night, bedtime, or lights out.",
+    "other": "Not a Plex shelf readout and not one of those scene presets.",
+}
+
+BUTLER_ASK_KINDS = tuple(BUTLER_ASK_CRITERIA.keys())
+
 RISK_LEVELS = (
     "harmless",  # routine read / chat
     "needs_confirm",  # paid, destructive, or queue-ish — confirm gate
@@ -230,6 +244,16 @@ def hearth_system_one_questions() -> dict[str, dict[str, Any]]:
             ),
             "criteria": dict(DOMAIN_CRITERIA),
         },
+        "butler_ask": {
+            "type": "choice",
+            "instructions": (
+                "Is this a house-butler tool ask that must run before any language model "
+                "picks a tool? shelf = what's already on Plex tonight / continue watching. "
+                "movie_night, quiet_hours, or good_night = run that Home Assistant scene. "
+                "other = anything else, including ordinary chat, playback, and downloads."
+            ),
+            "criteria": dict(BUTLER_ASK_CRITERIA),
+        },
         **_media_router_questions(),
         **_confirm_cancel_risk_questions(),
     }
@@ -285,6 +309,7 @@ class ScoreAnswer:
 @dataclass(frozen=True, slots=True)
 class JevAnswers:
     domain: ChoiceAnswer | None = None
+    butler_ask: ChoiceAnswer | None = None
     media_ask: ChoiceAnswer | None = None
     needs_llm: NoulAnswer | None = None
     multi_item: NoulAnswer | None = None
@@ -303,6 +328,14 @@ class JevAnswers:
                 "confidence": round(self.domain.confidence, 4),
                 "probabilities": {
                     k: round(v, 4) for k, v in self.domain.probabilities.items()
+                },
+            }
+        if self.butler_ask is not None:
+            out["butler_ask"] = {
+                "choice": self.butler_ask.choice,
+                "confidence": round(self.butler_ask.confidence, 4),
+                "probabilities": {
+                    k: round(v, 4) for k, v in self.butler_ask.probabilities.items()
                 },
             }
         if self.media_ask is not None:
@@ -382,6 +415,7 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
                     answers[name] = _answer_from_object(value, default_type=bucket)
 
     domain = _parse_choice(answers.get("domain"))
+    butler_ask = _parse_choice(answers.get("butler_ask"))
     media_ask = _parse_choice(answers.get("media_ask"))
     needs_llm = _parse_noul(answers.get("needs_llm"))
     multi_item = _parse_noul(answers.get("multi_item"))
@@ -391,6 +425,7 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
     risk = _parse_score(answers.get("risk"))
     return JevAnswers(
         domain=domain,
+        butler_ask=butler_ask,
         media_ask=media_ask,
         needs_llm=needs_llm,
         multi_item=multi_item,
@@ -481,6 +516,8 @@ def _parse_score(raw: Any) -> ScoreAnswer | None:
 
 
 __all__ = [
+    "BUTLER_ASK_CRITERIA",
+    "BUTLER_ASK_KINDS",
     "DOMAIN_CRITERIA",
     "MEDIA_ASK_CRITERIA",
     "MEDIA_ASK_KINDS",

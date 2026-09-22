@@ -1629,10 +1629,8 @@ def register_builtin_tools() -> None:
             name="house_shelf",
             description=(
                 "What’s already on Plex tonight: continue watching (On Deck), recently added "
-                "library titles, and the last finished play. Use for “what’s on tonight”, "
-                "“what can we watch”, “already on Plex”, “continue watching”. Not for "
-                "requesting a new title and not for what’s playing right this second "
-                "(use plex_now_playing for that)."
+                "library titles, and the last finished play. The Jev gate calls this — not the "
+                "language model. Not for a new download and not for what’s playing this second."
             ),
             parameters={"type": "object", "properties": {}},
             handler=_house_shelf,
@@ -1643,8 +1641,9 @@ def register_builtin_tools() -> None:
             name="house_scene",
             description=(
                 "Run a house scene preset through Home Assistant: movie_night, quiet_hours, "
-                "or good_night. Activates the matching scene when it exists. If it does not, "
-                "the tool says so and does not pretend the lights changed."
+                "or good_night. The Jev gate calls this — not the language model. Activates "
+                "the matching scene when it exists. If it does not, say so and do not pretend "
+                "the lights changed."
             ),
             parameters={
                 "type": "object",

@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from hearth.config import settings
-from hearth.jev import evaluate_telegram_media, log_shadow_outcome, noul_high
+from hearth.jev import evaluate_message, evaluate_telegram_media, log_shadow_outcome, noul_high
 from hearth.telegram.callbacks import (
     ACTION_DISMISS,
     ACTION_MORE,
@@ -79,6 +79,7 @@ from hearth.telegram.progress import (
 )
 from hearth.telegram.safeguards import RateLimiter, authorized
 from hearth.telegram.store import TelegramStore
+from hearth.butler.decision import decide_butler_tool
 from hearth.butler.nudge import queue_shelf_aside
 from hearth.butler.phrases import classify_house_phrase
 from hearth.butler.scenes import activate_preset
@@ -105,6 +106,12 @@ HELP_TEXT = (
     "Commands: /search <title>, /status, /help."
 )
 _PENDING_GUESS_PREFIX = "guess:"
+
+
+def _catalog_movie_night(text: str) -> bool:
+    """Bare movie/film/cinema night is a media vibe, not the scene preset."""
+    raw = " ".join((text or "").strip().split()).strip(" .!?").casefold()
+    return raw in {"movie night", "film night", "cinema night"}
 
 
 def _integer(value: Any) -> int | None:
@@ -1789,11 +1796,33 @@ class TelegramMediaBot:
         return BotReply(outcome.message, edit_message_id=message_id)
 
     async def _house_aside(self, view: MessageView) -> BotReply | None:
-        """Shelf and scene asks. Not a search, and not a queue."""
+        """Shelf and scene asks. Jev chooses the tool; the phrase only fail-opens.
+
+        Bare “movie night” stays a catalog vibe. House sleep / filmavond / good
+        night stay on the ritual commands.
+        """
         phrase = classify_house_phrase(view.text)
-        if phrase is None:
+        if phrase is None or looks_like_house_control(view.text):
             return None
-        if phrase.kind == "shelf":
+        if _catalog_movie_night(view.text):
+            return None
+        verdict = await evaluate_message(view.text)
+        decision = decide_butler_tool(view.text, verdict)
+        log_shadow_outcome(
+            verdict,
+            channel="telegram_butler",
+            tools=[decision.tool] if decision.run else [],
+            outcome=decision.source,
+        )
+        if decision.blocked_by_jev:
+            if decision.source == "jev_cancel":
+                return BotReply("Okay — I won't run that.")
+            return BotReply(
+                "That doesn't sound like the shelf or a house scene, so I left it alone."
+            )
+        if not decision.run:
+            return None
+        if decision.tool == "house_shelf":
             try:
                 snap = await shelf_snapshot()
             except Exception:  # noqa: BLE001
@@ -1803,8 +1832,9 @@ class TelegramMediaBot:
                     "I won’t guess a title."
                 )
             return BotReply(str(snap.get("speak") or "The shelf is quiet."))
+        preset = decision.as_args().get("preset") or phrase.preset
         try:
-            result = await activate_preset(phrase.preset)
+            result = await activate_preset(preset)
         except Exception:  # noqa: BLE001
             log.exception("telegram scene preset failed")
             return BotReply(

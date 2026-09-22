@@ -54,7 +54,16 @@ def aside_for(
 
 
 async def queue_shelf_aside(title: str) -> str | None:
-    """One extra line after Get. Silent when the title isn’t mid-watch."""
+    """One extra line after Get. Silent when the title isn’t mid-watch.
+
+    The shared Jev gate runs first. Only an enforced cancel skips the Plex read;
+    a shelf choice is not required, or an on title would go quiet whenever Jev is on.
+    """
+    from hearth.jev import evaluate_message
+
+    verdict = await evaluate_message(f"Is {title} already on the Plex shelf?")
+    if verdict.action == "block_cancel":
+        return None
     try:
         deck = await plex.on_deck(limit=12)
         playing = await plex.now_playing()
