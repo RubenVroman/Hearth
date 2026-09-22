@@ -29,6 +29,7 @@ from hearth.telegram.media.moods import detect_mood, looks_like_vague_ask, names
 from hearth.telegram.media.people import detect_person_ask
 from hearth.telegram.media.play import PlayOutcome
 from hearth.telegram.media.ranking import apply_exclusions
+from hearth.jev.tools import is_write_tool, lane_for_tool
 from hearth.telegram.models import MediaHit
 from hearth.telegram.store import TelegramStore
 
@@ -151,8 +152,14 @@ class FakeOverseerr:
 
 
 class FakeSystemOne:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
+    def __init__(
+        self,
+        payload: dict[str, Any] | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.payload = payload or {}
+        self.error = error
         self.calls: list[dict[str, Any]] = []
 
     async def system_one(
@@ -163,6 +170,8 @@ class FakeSystemOne:
         model: str | None = None,
     ):
         self.calls.append({"state": state, "questions": questions, "model": model})
+        if self.error is not None:
+            raise self.error
         return parse_answers(self.payload)
 
 
@@ -773,6 +782,206 @@ async def test_next_after_a_queue_continues_the_pack(
     # And the offer is consumed, so a second "next" pages normally again.
     with speaker_scope(CHAT_ID, USER_ID):
         assert bot.memory.load(CHAT_ID).watch_next() is None
+
+
+# --- 8) Every Telegram tool call is decided by the shared Jev gate -------------
+
+
+def _gate_payload(
+    *,
+    domain: str = "media",
+    domain_conf: float = 0.9,
+    tool_allow: float = 0.9,
+    is_cancel: float = 0.02,
+    risk: float = 0.0,
+    risk_conf: float = 0.9,
+    media_ask: str = "exact_title",
+) -> dict[str, Any]:
+    """A Telegram media verdict that also carries the tool-gate signals."""
+    payload = _media_payload(media_ask)
+    payload["answers"].update(
+        {
+            "domain": {
+                "type": "choice",
+                "choice": domain,
+                "confidence": domain_conf,
+                "probabilities": {domain: domain_conf},
+            },
+            "tool_allow": {"type": "noul", "noul": tool_allow},
+            "is_cancel": {"type": "noul", "noul": is_cancel},
+            "risk": {
+                "type": "score",
+                "score": risk,
+                "confidence": risk_conf,
+                "legend": {"0": "harmless", "1": "needs_confirm", "2": "do_not_auto_run"},
+            },
+        }
+    )
+    return payload
+
+
+def _enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+    monkeypatch.setattr(settings, "jev_tool_gate", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+
+
+async def test_one_telegram_turn_asks_jev_once_for_routing_and_every_tool(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routing and authorization share one System One call, not one per lookup."""
+    _enforce(monkeypatch)
+    overseerr = FakeOverseerr(results=HARRY_POTTER)
+    bot = bot_factory(overseerr)
+    fake = FakeSystemOne(_gate_payload(media_ask="series_all"))
+    set_client(fake)
+
+    reply = await bot.handle_message(_message("all Harry Potters"))
+
+    assert reply is not None
+    assert overseerr.search_calls, "the catalog read still happened"
+    assert len(fake.calls) == 1, f"one turn must cost one typed call, not {len(fake.calls)}"
+
+
+async def test_a_refused_turn_stops_before_the_catalog(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hard stop applies to reads too, and the user is told rather than ignored."""
+    _enforce(monkeypatch)
+    overseerr = FakeOverseerr(results=[DUNE])
+    bot = bot_factory(overseerr)
+    set_client(FakeSystemOne(_gate_payload(domain="refuse", domain_conf=0.97)))
+
+    reply = await bot.handle_message(_message("Dune"))
+
+    assert reply is not None
+    assert reply.text.strip()
+    assert overseerr.search_calls == [], "a refused turn must not reach Overseerr"
+
+
+async def test_a_catalog_read_fails_open_when_the_gate_is_unreachable(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A house that cannot reach its gate behaves like a house without one."""
+    _enforce(monkeypatch)
+    overseerr = FakeOverseerr(results=[DUNE])
+    bot = bot_factory(overseerr)
+    set_client(FakeSystemOne(error=RuntimeError("typesafe unreachable")))
+
+    reply = await bot.handle_message(_message("Dune"))
+
+    assert reply is not None
+    assert overseerr.search_calls == ["Dune"]
+    assert "Dune" in reply.text
+
+
+async def test_shadow_mode_never_blocks_a_catalog_read(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enforce(monkeypatch)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    overseerr = FakeOverseerr(results=[DUNE])
+    bot = bot_factory(overseerr)
+    set_client(FakeSystemOne(_gate_payload(domain="refuse", domain_conf=0.99)))
+
+    reply = await bot.handle_message(_message("Dune"))
+
+    assert reply is not None
+    assert overseerr.search_calls == ["Dune"], "shadow computes the deny but never acts on it"
+
+
+async def test_a_typed_play_goes_through_the_write_gate(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typed instruction is not a tap, so cancel language stops it."""
+    _enforce(monkeypatch)
+    monkeypatch.setattr(settings, "telegram_play_lane", True)
+    overseerr = FakeOverseerr(results=[DUNE])
+    bot = bot_factory(overseerr)
+
+    async def _never(**kwargs: Any) -> PlayOutcome:  # pragma: no cover - must not run
+        raise AssertionError("a denied play must never reach the TV")
+
+    monkeypatch.setattr("hearth.telegram.bot.play_on_tv", _never)
+
+    set_client(FakeSystemOne(_gate_payload()))
+    await bot.handle_message(_message("Dune"))
+
+    set_client(FakeSystemOne(_gate_payload(is_cancel=0.95)))
+    reply = await bot.handle_message(_message("play it on the TV", message_id=2))
+
+    assert reply is not None
+    assert reply.text.strip()
+
+
+async def test_an_allowed_typed_play_still_reaches_the_tv(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enforce(monkeypatch)
+    monkeypatch.setattr(settings, "telegram_play_lane", True)
+    overseerr = FakeOverseerr(results=[DUNE])
+    bot = bot_factory(overseerr)
+    played: list[dict[str, Any]] = []
+
+    async def _fake_play(**kwargs: Any) -> PlayOutcome:
+        played.append(kwargs)
+        return PlayOutcome(ok=True, message="Playing", path="infuse")
+
+    monkeypatch.setattr("hearth.telegram.bot.play_on_tv", _fake_play)
+    set_client(FakeSystemOne(_gate_payload()))
+
+    await bot.handle_message(_message("Dune"))
+    await bot.handle_message(_message("play it on the TV", message_id=2))
+
+    assert played and played[0]["title"] == "Dune"
+
+
+async def test_the_status_probe_is_authorized_like_any_other_read(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enforce(monkeypatch)
+    overseerr = FakeOverseerr(results=[DUNE])
+    probes: list[int] = []
+
+    async def _probe() -> dict[str, Any]:
+        probes.append(1)
+        return {"ok": True}
+
+    overseerr.provider_probe = _probe  # type: ignore[attr-defined]
+    bot = bot_factory(overseerr)
+    set_client(FakeSystemOne(_gate_payload(domain="refuse", domain_conf=0.97)))
+
+    reply = await bot.handle_message(_message("/status"))
+
+    assert reply is not None
+    assert probes == [], "a refused turn must not leave the house for a health check"
+
+
+def test_catalog_reads_are_not_classified_as_writes() -> None:
+    """Gating a read must never be able to turn a healthy catalog into a miss."""
+    assert is_write_tool("overseerr_search") is False
+    assert lane_for_tool("overseerr_search") == "media_status"
+    assert lane_for_tool("plex_play") == "media_playback"
+    assert is_write_tool("plex_play") is True
+
+
+def test_the_telegram_surface_has_no_second_gate() -> None:
+    """Every Jev entry point under telegram/ is the shared one."""
+    root = Path(__file__).resolve().parents[1] / "hearth" / "telegram"
+    offenders: list[str] = []
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if "system_one(" in text or "SystemOneClient(" in text:
+            offenders.append(str(path.relative_to(root)))
+    assert offenders == [], f"telegram must not call System One directly: {offenders}"
 
 
 def test_an_unresolvable_lane_falls_back_to_search_not_to_prose() -> None:

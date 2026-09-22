@@ -3,14 +3,21 @@
 Each method returns ranked :class:`MediaHit` rows or raises
 :class:`CatalogUnavailable` carrying the sentence the user should read. Keeping
 the transport quirks here is what lets the router read like a decision tree.
+
+It is also the one boundary every Telegram catalog read crosses, so this is
+where those reads are authorized by the shared Jev tool gate rather than at
+twenty call sites. Reads fail open unless Jev raised a hard stop for the turn,
+so the gate can never turn a healthy catalog into a miss.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+from hearth.jev import authorize_tool
 from hearth.telegram.media import voice
 from hearth.telegram.media.people import pick_person, rank_credits
 from hearth.telegram.media.ranking import (
@@ -64,8 +71,31 @@ class CatalogSearch:
         log.exception("telegram %s failed", operation)
         return CatalogUnavailable(voice.backend_unexpected(), reason="unexpected")
 
+    async def _authorize(
+        self,
+        operation: str,
+        args: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Let the shared Jev gate decide this catalog read before it happens.
+
+        ``said`` is deliberately omitted: the Telegram turn already opened a
+        tool scope, so every lane in one message shares that single System One
+        answer set instead of asking again per lookup.
+        """
+        decision = await authorize_tool(
+            "overseerr_search",
+            dict(args or {}),
+            channel=f"telegram_catalog:{operation}",
+        )
+        if decision.denied:
+            raise CatalogUnavailable(decision.message, reason=f"jev:{decision.reason}")
+
     async def rows(self, query: MediaQuery) -> list[dict[str, Any]]:
         """Raw Overseerr rows for one query (exact id path or title search)."""
+        await self._authorize(
+            "search",
+            {"title": query.title, "tmdb_id": query.tmdb_id, "media_type": query.media_type},
+        )
         try:
             if query.tmdb_id is not None:
                 if query.media_type not in {"movie", "tv"}:
@@ -122,6 +152,7 @@ class CatalogSearch:
         )
 
     async def details(self, tmdb_id: int, media_type: str) -> dict[str, Any]:
+        await self._authorize("details", {"tmdb_id": tmdb_id, "media_type": media_type})
         try:
             payload = await self.client.media_details(tmdb_id, media_type)
         except Exception as exc:  # noqa: BLE001
@@ -142,6 +173,7 @@ class CatalogSearch:
         asked = (name or "").strip()
         if not asked:
             return "", []
+        await self._authorize("person", {"name": asked, "role": role})
         try:
             found = await self.client.search_person(asked)
         except Exception as exc:  # noqa: BLE001
@@ -172,6 +204,7 @@ class CatalogSearch:
         exclude_ids: set[int] | frozenset[int] = frozenset(),
     ) -> list[MediaHit]:
         """Discover titles that match a vibe, newest vaporware excluded."""
+        await self._authorize("discover", {"mood": spec.key, "media_type": spec.media_type})
         try:
             payload = await self.client.discover(
                 genre_ids=list(spec.genre_ids),
@@ -207,6 +240,7 @@ class CatalogSearch:
         exclude_ids: set[int] | frozenset[int] = frozenset(),
     ) -> list[MediaHit]:
         """"Something like X" via the documented similar/recommendations routes."""
+        await self._authorize("neighbours", {"tmdb_id": tmdb_id, "media_type": media_type})
         try:
             payload = await self.client.neighbours(
                 tmdb_id,
@@ -236,6 +270,7 @@ class CatalogSearch:
         collection_id = _integer(payload.get("collectionId"))
         if collection_id is None or collection_id <= 0:
             return "", []
+        await self._authorize("collection", {"collection_id": collection_id})
         try:
             collection = await self.client.collection(collection_id, limit=limit)
         except Exception as exc:  # noqa: BLE001
