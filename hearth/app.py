@@ -156,6 +156,9 @@ def _readiness() -> dict[str, Any]:
         degraded.append("jev:no_api_key")
     if settings.telegram_configured and not checks["telegram"].get("running"):
         degraded.append("telegram:not_polling")
+    if not settings.app_secret_key.strip():
+        # Nobody can log in, but the machine token and Telegram paths still work.
+        degraded.append("auth:no_signing_key")
     ready = bool(checks["tools"]["ok"] and checks["auth_db"]["ok"])
     return {
         "ok": ready,
