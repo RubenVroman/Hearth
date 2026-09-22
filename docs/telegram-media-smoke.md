@@ -145,9 +145,42 @@ answer **without** a gpt call. Only a descriptive riddle (`the one where the guy
 loses his memory`) or a plot question should reach OpenAI.
 
 ```bash
-docker compose logs -f hearth | grep -E 'jev.gate|openai'
+docker compose logs -f hearth | grep -E 'jev.gate|jev.tool_gate|openai'
 ```
 
 An ask that Jev is unsure about but that still has a seed — `all Harry Potters`,
 `LOTR extended` — must stay on the deterministic lane rather than falling back
 to a guess.
+
+## 10. Jev decides every tool call
+
+Every Telegram path that leaves the house goes through the shared tool gate in
+`hearth/jev/tools.py`. Nothing on this surface picks a tool any other way.
+
+| Path | Tool | Gate notes |
+| --- | --- | --- |
+| any catalog lookup (search, details, person, discover, neighbours, collection) | `overseerr_search` | read — allowed unless Jev raised a hard stop |
+| `/status` provider probe | `overseerr_search` | read, but it does leave the house |
+| tapping **Get**, or replying `yes` | `overseerr_request` | write; the tap/yes *is* the confirm |
+| tapping **▶ Play** | `plex_play` | write; the tap *is* the confirm |
+| typing `play it on the TV` | `plex_play` | write, **no** explicit confirm — full gate |
+| `/lights`, `/scene`, `house sleep`, `feed the cat` | the named house tool | write |
+
+Two properties to check in the logs, not just the replies:
+
+```bash
+docker compose logs -f hearth | grep jev.tool_gate
+```
+
+1. **One typed call per turn.** A single message that classifies a lane *and*
+   runs several catalog reads must produce one `jev.gate` line, not one per
+   lookup — the router hands its verdict to the gate.
+2. **Shadow changes nothing.** With `HEARTH_JEV_SHADOW=true` every
+   `jev.tool_gate` line still reports the `suggested` action it *would* have
+   taken while `action` stays `allow`. Flip `HEARTH_JEV_SHADOW=false` only after
+   those log lines look right.
+
+Fail-open is the point: stop TypeSafe, or clear `TYPESAFE_API_KEY`, and the bot
+must behave exactly as it did before the gate existed — every lane still
+answers. A gate the house cannot reach must never be able to make the catalog
+look empty.
