@@ -29,6 +29,7 @@ from typing import Any, Callable
 
 from hearth.config import settings
 from hearth.tools.ha import ha
+from hearth.tools.tuya_lan import probe_tuya_lan
 
 # Custom integrations that actually adopt this hardware. Presence in HA's loaded
 # component list means at least one config entry exists.
@@ -406,6 +407,7 @@ async def discover_entities(
     keywords: Sequence[str] | None = None,
     domain: str = "",
     limit: int = 40,
+    check_lan: bool | None = None,
 ) -> dict[str, Any]:
     """List the HA entities that could be a feeder / airco / purifier.
 
@@ -527,6 +529,11 @@ async def discover_entities(
     ]
     unresolved = [info for info in roles.values() if not info["resolved_entity_id"]]
 
+    # Probing the LAN only earns its cost when Home Assistant came up short:
+    # it is what turns "nothing found" into "the hardware is there, unpaired".
+    want_lan = bool(unresolved) if check_lan is None else bool(check_lan)
+    lan = await probe_tuya_lan() if want_lan else None
+
     parts: list[str] = []
     if found:
         parts.append("Resolved " + ", ".join(found) + ".")
@@ -543,6 +550,14 @@ async def discover_entities(
             parts.append(
                 f"Not on Home Assistant yet: {names}. {integration['speak']}"
             )
+        if lan is not None and lan.get("open_count"):
+            parts.append(
+                f"{lan['open_count']} Tuya device(s) do answer on the LAN "
+                f"(port {lan['port']}), so the hardware is there and waiting to "
+                "be added — it is a pairing step, not a broken device."
+            )
+        elif lan is not None and lan.get("configured"):
+            parts.append(lan["speak"])
     if want_tuya:
         parts.append(f"{len(tuya)} entity(ies) look like Tuya or Smart Life hardware.")
     if not parts:
@@ -554,6 +569,7 @@ async def discover_entities(
         "total_entities": len(rows),
         "domains": _domain_counts(rows),
         "integration": integration,
+        "lan": lan,
         "roles": roles,
         "tuya": tuya,
         "keyword_matches": keyword_matches,

@@ -37,6 +37,9 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "hearth_delivery_street", "")
     monkeypatch.setattr(settings, "hearth_delivery_postcode", "")
     monkeypatch.setattr(settings, "hearth_delivery_city", "")
+    # No LAN probing by default: tests that want it configure hosts themselves.
+    monkeypatch.setattr(settings, "tuya_lan_hosts", "")
+    monkeypatch.setattr(settings, "tuya_lan_timeout_seconds", 0.05)
     monkeypatch.setattr(settings, "weather_force_mock", True)
     monkeypatch.setattr(settings, "brave_search_api_key", "")
     monkeypatch.setattr(settings, "web_search_force_mock", True)

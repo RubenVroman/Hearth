@@ -8,6 +8,7 @@ from hearth.tools import files as workspace_files
 from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.cos import cos_configured, escalate, not_configured_message
 from hearth.tools.devices import discover_entities
+from hearth.tools.tuya_lan import probe_tuya_lan
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.house import (
@@ -78,6 +79,15 @@ async def _ha_device_control(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+async def _tuya_lan_probe(args: dict[str, Any]) -> dict[str, Any]:
+    hosts = args.get("hosts")
+    if isinstance(hosts, str):
+        hosts = [part for part in hosts.replace(";", ",").split(",") if part.strip()]
+    elif not isinstance(hosts, list):
+        hosts = None
+    return await probe_tuya_lan(hosts)
+
+
 async def _discover_entities(args: dict[str, Any]) -> dict[str, Any]:
     keywords = args.get("keywords")
     if isinstance(keywords, str):
@@ -88,11 +98,13 @@ async def _discover_entities(args: dict[str, Any]) -> dict[str, Any]:
         limit = int(args.get("limit") or 40)
     except (TypeError, ValueError):
         limit = 40
+    check_lan = args.get("check_lan")
     return await discover_entities(
         str(args.get("kind") or ""),
         keywords=keywords,
         domain=str(args.get("domain") or ""),
         limit=limit,
+        check_lan=None if check_lan is None else bool(check_lan),
     )
 
 
@@ -730,7 +742,9 @@ def register_builtin_tools() -> None:
                 "air purifier by domain and keyword, and report what .env currently "
                 "points at. Read-only wiring aid — use it before claiming a device is "
                 "missing, and to hand back real entity ids after pairing instead of "
-                "guessing them. kind=feeder|airco|purifier|tuya|all."
+                "guessing them. kind=feeder|airco|purifier|tuya|all. When a device is "
+                "not in HA it also checks whether the Tuya hardware still answers on "
+                "the LAN, so an unpaired device is not mistaken for a dead one."
             ),
             parameters={
                 "type": "object",
@@ -754,9 +768,40 @@ def register_builtin_tools() -> None:
                         ),
                     },
                     "limit": {"type": "integer", "description": "Max rows per group (default 40)."},
+                    "check_lan": {
+                        "type": "boolean",
+                        "description": (
+                            "Probe the Tuya LAN addresses too. Defaults on only when "
+                            "a device is missing from Home Assistant."
+                        ),
+                    },
                 },
             },
             handler=_discover_entities,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="tuya_lan_probe",
+            description=(
+                "Check whether the house's Tuya devices still answer on their LAN "
+                "control port (TCP 6668, hosts from TUYA_LAN_HOSTS). Use to tell an "
+                "unpaired device apart from an unplugged one, or after a device goes "
+                "unavailable in Home Assistant. Read-only, private addresses only. "
+                "An open port proves a Tuya device is at that address — it does NOT "
+                "say which one, so never name a device from this alone."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional LAN addresses. Defaults to TUYA_LAN_HOSTS.",
+                    }
+                },
+            },
+            handler=_tuya_lan_probe,
         )
     )
     registry.register(

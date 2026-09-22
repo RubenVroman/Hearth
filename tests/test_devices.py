@@ -282,6 +282,116 @@ def test_discovery_endpoint_is_reachable(client) -> None:
 
 
 # --------------------------------------------------------------------------
+# Tuya hardware on the LAN
+# --------------------------------------------------------------------------
+
+
+async def test_lan_probe_reports_nothing_configured() -> None:
+    result = await registry.call("tuya_lan_probe", {})
+    assert result.ok
+    assert result.data["configured"] is False
+    assert "TUYA_LAN_HOSTS" in result.data["speak"]
+
+
+async def test_lan_probe_refuses_anything_off_the_house_network() -> None:
+    """Globally routable addresses and loopback are never dialled."""
+    result = await registry.call(
+        "tuya_lan_probe", {"hosts": ["8.8.8.8", "1.1.1.1", "127.0.0.1"]}
+    )
+    assert result.ok
+    assert result.data["open_count"] == 0
+    for row in result.data["hosts"]:
+        assert row["open"] is False
+        assert "private" in row["error"], f"{row['host']} should have been refused outright"
+
+
+async def test_lan_probe_reports_silence_without_claiming_a_device_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "tuya_lan_hosts", "192.168.2.5,192.168.2.8")
+    result = await registry.call("tuya_lan_probe", {})
+    assert result.ok
+    assert result.data["open_count"] == 0
+    assert "powered" in result.data["speak"]
+    # An address check can never name a device.
+    assert result.data["identifies_devices"] is False
+
+
+async def test_lan_probe_sees_a_real_open_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the socket path, not just the refusals."""
+    import asyncio
+
+    from hearth.tools import tuya_lan
+
+    server = await asyncio.start_server(lambda _r, w: w.close(), "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    # Loopback is normally refused; allow it so the connect path is real.
+    monkeypatch.setattr(tuya_lan, "_private", lambda _host: True)
+    try:
+        result = await tuya_lan.probe_tuya_lan(["127.0.0.1"], port=port, timeout=1.0)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert result["open_count"] == 1
+    assert result["hosts"][0]["open"] is True
+    assert "answer on port" in result["speak"]
+
+
+async def test_lan_probe_caps_the_host_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A long list would be a subnet scan, not a health check."""
+    from hearth.tools.tuya_lan import MAX_HOSTS
+
+    many = [f"192.168.2.{n}" for n in range(2, 2 + MAX_HOSTS + 10)]
+    result = await registry.call("tuya_lan_probe", {"hosts": many})
+    assert len(result.data["hosts"]) == MAX_HOSTS
+
+
+async def test_discovery_says_the_hardware_is_there_but_unpaired(
+    ruben_ha, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point: unpaired reads differently to unplugged."""
+    from hearth.tools import devices as devices_module
+
+    async def _lan(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "port": 6668,
+            "configured": True,
+            "open_count": 4,
+            "hosts": [{"host": h, "open": True} for h in ("192.168.2.5", "192.168.2.8")],
+            "speak": "All 4 Tuya addresses answer on port 6668.",
+        }
+
+    monkeypatch.setattr(devices_module, "probe_tuya_lan", _lan)
+    result = await registry.call("ha_discover_entities", {})
+    assert result.ok
+    assert result.data["lan"]["open_count"] == 4
+    speak = result.data["speak"]
+    assert "do answer on the LAN" in speak
+    assert "pairing step, not a broken device" in speak
+
+
+async def test_discovery_skips_the_lan_probe_once_everything_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to diagnose on a paired house, so do not touch the network."""
+    from hearth.tools import devices as devices_module
+
+    called = False
+
+    async def _lan(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal called
+        called = True
+        return {"ok": True, "open_count": 0, "configured": False, "speak": "", "port": 6668}
+
+    monkeypatch.setattr(devices_module, "probe_tuya_lan", _lan)
+    result = await registry.call("ha_discover_entities", {})
+    assert result.ok
+    assert result.data["lan"] is None
+    assert called is False
+
+
+# --------------------------------------------------------------------------
 # Graceful degradation on the control path
 # --------------------------------------------------------------------------
 

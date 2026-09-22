@@ -155,6 +155,21 @@ class Settings(BaseSettings):
         default="fan.air_purifier,fan.kpt_air_purifier,humidifier.air_purifier,switch.air_purifier",
         alias="HA_AIR_PURIFIER_ENTITIES",
     )
+    # Tuya hardware observed answering on the LAN protocol port during the
+    # 2026-09-22 sweep of the house network. These are addresses, not entity
+    # ids: Hearth only checks whether they still answer, so that "Home Assistant
+    # has no purifier" can be told apart from "the purifier is off the network".
+    # Reserve them in DHCP; a lease change makes this list stale, not wrong.
+    tuya_lan_hosts: str = Field(
+        default="192.168.2.5,192.168.2.8,192.168.2.9,192.168.2.10",
+        alias="TUYA_LAN_HOSTS",
+    )
+    tuya_lan_port: int = Field(default=6668, alias="TUYA_LAN_PORT")
+    tuya_lan_timeout_seconds: float = Field(
+        default=1.5,
+        gt=0.0,
+        alias="TUYA_LAN_TIMEOUT_SECONDS",
+    )
     # The Denon is the switching/audio hub. Activity commands wake the chain in
     # order and route its input before playback is sent to the Apple TV.
     receiver_centric: bool = Field(default=True, alias="HEARTH_RECEIVER_CENTRIC")
@@ -447,6 +462,10 @@ class Settings(BaseSettings):
     @property
     def air_purifier_entity_list(self) -> list[str]:
         return self._parse_entity_list(self.ha_air_purifier_entities)
+
+    @property
+    def tuya_lan_host_list(self) -> list[str]:
+        return self._parse_entity_list(self.tuya_lan_hosts)
 
     @staticmethod
     def _parse_id_list(raw: str) -> list[int]:
