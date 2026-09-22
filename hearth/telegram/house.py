@@ -15,6 +15,7 @@ from typing import Any, Literal
 from hearth.agent.registry import ToolRegistry, registry
 from hearth.jev import evaluate_message, log_shadow_outcome
 from hearth.telegram.models import BotReply
+from hearth.tools.device_intent import match_device_phrase
 from hearth.tools.house import (
     climate_control,
     comfort_snapshot,
@@ -648,7 +649,10 @@ def telegram_plan(text: str) -> dict[str, Any] | None:
         "what's the air quality",
     }:
         return {"tool": "house_comfort", "args": {}}
-    return None
+    # Same wider net the voice router uses, so a phrase does not mean one thing
+    # spoken and another in Telegram.
+    device = match_device_phrase(text)
+    return device.as_plan(text) if device is not None else None
 
 
 async def house_control_reply(text: str) -> BotReply:
@@ -682,11 +686,26 @@ async def _run(plan: dict[str, Any]) -> dict[str, Any]:
         return await climate_control(
             str(args.get("action") or "status"),
             temperature=float(temperature) if temperature is not None else None,
+            fan_mode=str(args.get("fan_mode") or "") or None,
         )
     if tool == "house_feeder":
-        return await feeder_control(str(args.get("action") or "feed"))
+        portions = args.get("portions")
+        return await feeder_control(
+            str(args.get("action") or "feed"),
+            portions=int(portions) if portions is not None else None,
+            force=bool(args.get("force")),
+        )
     if tool == "house_purifier":
-        return await purifier_control(str(args.get("action") or "status"))
+        percentage = args.get("percentage")
+        return await purifier_control(
+            str(args.get("action") or "status"),
+            percentage=float(percentage) if percentage is not None else None,
+            preset_mode=str(args.get("preset_mode") or "") or None,
+        )
+    if tool == "ha_discover_entities":
+        from hearth.tools.devices import discover_entities
+
+        return await discover_entities(str(args.get("kind") or ""))
     return await comfort_snapshot()
 
 

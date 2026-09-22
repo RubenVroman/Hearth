@@ -7,6 +7,8 @@ from hearth.memory.tools import register_memory_tools
 from hearth.tools import files as workspace_files
 from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.cos import cos_configured, escalate, not_configured_message
+from hearth.tools.devices import discover_entities
+from hearth.tools.tuya_lan import probe_tuya_lan
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.house import (
@@ -89,6 +91,35 @@ async def _ha_device_control(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+async def _tuya_lan_probe(args: dict[str, Any]) -> dict[str, Any]:
+    hosts = args.get("hosts")
+    if isinstance(hosts, str):
+        hosts = [part for part in hosts.replace(";", ",").split(",") if part.strip()]
+    elif not isinstance(hosts, list):
+        hosts = None
+    return await probe_tuya_lan(hosts)
+
+
+async def _discover_entities(args: dict[str, Any]) -> dict[str, Any]:
+    keywords = args.get("keywords")
+    if isinstance(keywords, str):
+        keywords = [part for part in keywords.replace(";", ",").split(",") if part.strip()]
+    elif not isinstance(keywords, list):
+        keywords = None
+    try:
+        limit = int(args.get("limit") or 40)
+    except (TypeError, ValueError):
+        limit = 40
+    check_lan = args.get("check_lan")
+    return await discover_entities(
+        str(args.get("kind") or ""),
+        keywords=keywords,
+        domain=str(args.get("domain") or ""),
+        limit=limit,
+        check_lan=None if check_lan is None else bool(check_lan),
+    )
+
+
 async def _media_activity(args: dict[str, Any]) -> dict[str, Any]:
     return await media_activity(str(args.get("activity") or ""))
 
@@ -107,13 +138,21 @@ async def _house_climate(args: dict[str, Any]) -> dict[str, Any]:
         str(args.get("action") or "status"),
         temperature=parsed,
         entity=str(args.get("entity") or "") or None,
+        fan_mode=str(args.get("fan_mode") or "") or None,
     )
 
 
 async def _house_feeder(args: dict[str, Any]) -> dict[str, Any]:
+    portions = args.get("portions")
+    try:
+        count = int(portions) if portions is not None and portions != "" else None
+    except (TypeError, ValueError):
+        count = None
     return await feeder_control(
         str(args.get("action") or "feed"),
         entity=str(args.get("entity") or "") or None,
+        portions=count,
+        force=bool(args.get("force")),
     )
 
 
@@ -127,6 +166,7 @@ async def _house_purifier(args: dict[str, Any]) -> dict[str, Any]:
         str(args.get("action") or "status"),
         entity=str(args.get("entity") or "") or None,
         percentage=parsed,
+        preset_mode=str(args.get("preset_mode") or "") or None,
     )
 
 
@@ -708,6 +748,76 @@ def register_builtin_tools() -> None:
     )
     registry.register(
         ToolSpec(
+            name="ha_discover_entities",
+            description=(
+                "Find candidate Home Assistant entities for the pet feeder, airco, and "
+                "air purifier by domain and keyword, and report what .env currently "
+                "points at. Read-only wiring aid — use it before claiming a device is "
+                "missing, and to hand back real entity ids after pairing instead of "
+                "guessing them. kind=feeder|airco|purifier|tuya|all. When a device is "
+                "not in HA it also checks whether the Tuya hardware still answers on "
+                "the LAN, so an unpaired device is not mistaken for a dead one."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": (
+                            "feeder, airco, purifier, tuya, or all (default). Any other "
+                            "word is treated as a free-text keyword."
+                        ),
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Extra words to match against entity ids and names.",
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": (
+                            "Optional HA domain filter: climate, fan, switch, button, …"
+                        ),
+                    },
+                    "limit": {"type": "integer", "description": "Max rows per group (default 40)."},
+                    "check_lan": {
+                        "type": "boolean",
+                        "description": (
+                            "Probe the Tuya LAN addresses too. Defaults on only when "
+                            "a device is missing from Home Assistant."
+                        ),
+                    },
+                },
+            },
+            handler=_discover_entities,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="tuya_lan_probe",
+            description=(
+                "Check whether the house's Tuya devices still answer on their LAN "
+                "control port (TCP 6668, hosts from TUYA_LAN_HOSTS). Use to tell an "
+                "unpaired device apart from an unplugged one, or after a device goes "
+                "unavailable in Home Assistant. Read-only, private addresses only. "
+                "An open port proves a Tuya device is at that address — it does NOT "
+                "say which one, so never name a device from this alone."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "hosts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional LAN addresses. Defaults to TUYA_LAN_HOSTS.",
+                    }
+                },
+            },
+            handler=_tuya_lan_probe,
+        )
+    )
+    registry.register(
+        ToolSpec(
             name="media_activity",
             description=(
                 "Prepare or stop the receiver-centric living-room chain. movie_night activates "
@@ -767,13 +877,26 @@ def register_builtin_tools() -> None:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "status, warmer, cooler, set, off, heat, cool, auto",
+                        "description": (
+                            "status, on, warmer, cooler, set, fan_mode, off, heat, cool, "
+                            "dry, fan_only, auto"
+                        ),
                     },
                     "temperature": {
                         "type": "number",
                         "description": "Setpoint in °C for action=set.",
                     },
+                    "fan_mode": {
+                        "type": "string",
+                        "description": (
+                            "Fan speed for action=fan_mode, e.g. low, medium, high, auto."
+                        ),
+                    },
                     "entity": {"type": "string", "description": "Optional climate entity_id."},
+                    "said": {
+                        "type": "string",
+                        "description": "The user's verbatim words, so Jev can gate the request.",
+                    },
                 },
                 "required": ["action"],
             },
@@ -791,8 +914,28 @@ def register_builtin_tools() -> None:
             parameters={
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "description": "feed or status"},
+                    "action": {
+                        "type": "string",
+                        "description": (
+                            "feed, status, schedule_status, schedule_on, or schedule_off"
+                        ),
+                    },
+                    "portions": {
+                        "type": "integer",
+                        "description": (
+                            "How many portions (default 1, capped by "
+                            "HA_PET_FEEDER_MAX_PORTIONS)."
+                        ),
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Feed again inside the anti-double-feed cooldown.",
+                    },
                     "entity": {"type": "string", "description": "Optional feeder entity_id."},
+                    "said": {
+                        "type": "string",
+                        "description": "The user's verbatim words, so Jev can gate the request.",
+                    },
                 },
             },
             handler=_house_feeder,
@@ -809,11 +952,22 @@ def register_builtin_tools() -> None:
             parameters={
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "description": "status, on, off, or toggle"},
+                    "action": {
+                        "type": "string",
+                        "description": "status, on, off, toggle, set_speed, or set_mode",
+                    },
                     "entity": {"type": "string"},
                     "percentage": {
                         "type": "number",
-                        "description": "Optional fan percentage when turning on.",
+                        "description": "Fan percentage for set_speed, or when turning on.",
+                    },
+                    "preset_mode": {
+                        "type": "string",
+                        "description": "Preset for set_mode, e.g. auto, sleep, turbo.",
+                    },
+                    "said": {
+                        "type": "string",
+                        "description": "The user's verbatim words, so Jev can gate the request.",
                     },
                 },
             },

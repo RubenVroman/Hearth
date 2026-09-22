@@ -4,7 +4,7 @@ import asyncio
 import re
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import httpx
@@ -14,6 +14,11 @@ from hearth.fixtures import MockHouse
 
 _mock = MockHouse()
 
+
+def reset_mock_house() -> None:
+    """Restore the fixture house — tool calls mutate it in place (tests)."""
+    _mock.reset()
+
 _MEDIA_DOMAINS = ("media_player", "remote", "switch")
 _CONTROL_DOMAINS = frozenset(
     {
@@ -21,12 +26,16 @@ _CONTROL_DOMAINS = frozenset(
         "climate",
         "cover",
         "fan",
+        "humidifier",
         "input_boolean",
+        "input_number",
         "light",
         "media_player",
+        "number",
         "remote",
         "scene",
         "script",
+        "select",
         "switch",
         "vacuum",
     }
@@ -58,18 +67,36 @@ _KEEP_ATTRS = (
     "temperature_unit",
     "unit_of_measurement",
     "hvac_action",
-    "preset_mode",
+    "hvac_mode",
+    "hvac_modes",
+    "min_temp",
+    "max_temp",
+    "target_temp_step",
     "fan_mode",
+    "fan_modes",
+    "swing_mode",
+    "swing_modes",
+    "preset_mode",
+    "preset_modes",
     "humidity",
     "current_humidity",
+    "oscillating",
     "percentage",
+    "percentage_step",
     "current_position",
     "battery_level",
+    "min",
+    "max",
+    "step",
+    "options",
+    # Tuya air purifiers publish air quality + consumables here.
+    "pm25",
+    "air_quality",
+    "filter_life_remaining",
     "last_fed",
     "last_feed",
     "last_feeding",
     "last_feeding_time",
-    "hvac_modes",
 )
 
 
@@ -201,6 +228,45 @@ class HomeAssistant:
                 "mode": "live",
                 "configured": True,
                 "error": _error_text(exc),
+            }
+
+    async def loaded_integrations(self) -> dict[str, Any]:
+        """Which integrations Home Assistant has actually loaded.
+
+        ``/api/config`` lists the components that are set up right now. A custom
+        integration copied into ``custom_components`` does not appear until it
+        has a config entry, so its absence is the signal that the files are on
+        disk but no device has been added yet — which reads very differently to
+        "the integration is missing".
+        """
+        if not self.live:
+            return {
+                "ok": True,
+                "mode": "mock",
+                "components": [],
+                "version": "",
+                "known": False,
+            }
+        try:
+            response, attempts = await self._request("GET", "/api/config")
+            payload = response.json() if response.content else {}
+            components = [str(name) for name in payload.get("components") or []]
+            return {
+                "ok": True,
+                "mode": "live",
+                "attempts": attempts,
+                "components": sorted(components),
+                "version": str(payload.get("version") or ""),
+                "known": True,
+            }
+        except Exception as exc:  # noqa: BLE001 — diagnosis must not raise
+            return {
+                "ok": False,
+                "mode": "live",
+                "error": _error_text(exc),
+                "components": [],
+                "version": "",
+                "known": False,
             }
 
     async def list_states(self, domain: str | None = None) -> dict[str, Any]:
@@ -991,6 +1057,76 @@ class HomeAssistant:
             "error": result.get("error"),
         }
 
+    async def call_and_verify(
+        self,
+        domain: str,
+        service: str,
+        entity_id: str,
+        data: dict[str, Any] | None = None,
+        *,
+        expect: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Write to one entity, then observe its real state.
+
+        Same contract as ``media_control``: an accepted HTTP call is not a
+        successful mutation. ``expect`` receives the summarized state dict and
+        decides whether the device actually landed where it was asked to go.
+        Without ``expect`` the state is read back once and ``verified`` is None.
+        """
+        result = await self.call_service(domain, service, entity_id, data)
+        base: dict[str, Any] = {
+            "entity_id": entity_id,
+            "service": f"{domain}.{service}",
+            "data": data or None,
+            "mode": result.get("mode"),
+            "attempts": result.get("attempts", 1),
+            "result": result,
+        }
+        if not result.get("ok"):
+            return {
+                **base,
+                "ok": False,
+                "accepted": False,
+                "verified": False,
+                "error": result.get("error") or "Home Assistant rejected the service call",
+            }
+        state, verified = await self._poll_state(entity_id, expect)
+        out: dict[str, Any] = {
+            **base,
+            "ok": verified is not False,
+            "accepted": True,
+            "verified": verified,
+            "state": state,
+        }
+        if verified is False:
+            message = (
+                "Home Assistant accepted the command, but the requested state "
+                "was not observed"
+            )
+            out["warning"] = message
+            out["error"] = message
+        return out
+
+    async def _poll_state(
+        self,
+        entity_id: str,
+        expect: Callable[[dict[str, Any]], bool] | None,
+    ) -> tuple[dict[str, Any] | None, bool | None]:
+        snapshot = await self.get_state(entity_id)
+        if expect is None:
+            return snapshot.get("state"), None
+        timeout = 0.0 if not self.live else max(0.0, float(settings.ha_verify_timeout_seconds))
+        interval = max(0.05, float(settings.ha_verify_poll_interval))
+        deadline = time.monotonic() + timeout
+        latest: dict[str, Any] | None = snapshot.get("state")
+        while True:
+            if latest is not None and expect(latest):
+                return latest, True
+            if time.monotonic() >= deadline:
+                return latest, False
+            await asyncio.sleep(interval)
+            latest = (await self.get_state(entity_id)).get("state")
+
 
 def _media_service(
     action: str,
@@ -1071,21 +1207,55 @@ def _generic_service(
             return "", data, "cover position required (0–100)"
         data["position"] = max(0, min(100, int(float(value))))
         return "set_cover_position", data, None
-    if domain == "climate" and action in {"temperature", "set_temperature", "heat_to"}:
+    if domain == "climate" and action in {"temperature", "set_temperature", "heat_to", "cool_to"}:
         if value is None:
             return "", data, "temperature value required"
         data["temperature"] = float(value)
         return "set_temperature", data, None
+    if domain == "climate" and action in {"mode", "hvac_mode", "set_mode", "set_hvac_mode"}:
+        if value is None:
+            return "", data, "hvac mode required (cool, heat, dry, fan_only, auto, off)"
+        data["hvac_mode"] = str(value)
+        return "set_hvac_mode", data, None
+    if domain in {"climate", "fan"} and action in {"fan_mode", "set_fan_mode", "fan_speed"}:
+        if value is None:
+            return "", data, "fan mode required"
+        data["fan_mode"] = str(value)
+        return "set_fan_mode", data, None
     if action in {"brightness", "dim", "set_brightness"} and domain == "light":
         if value is None:
             return "", data, "brightness value required"
         data["brightness_pct"] = max(0.0, min(100.0, float(value)))
         return "turn_on", data, None
-    if action in {"percentage", "set_percentage"} and domain == "fan":
+    if action in {"percentage", "set_percentage", "speed", "set_speed"} and domain == "fan":
         if value is None:
             return "", data, "percentage value required"
         data["percentage"] = max(0.0, min(100.0, float(value)))
         return "set_percentage", data, None
+    if action in {"preset", "preset_mode", "set_preset_mode"} and domain in {
+        "climate",
+        "fan",
+        "humidifier",
+    }:
+        if value is None:
+            return "", data, "preset mode required"
+        data["preset_mode"] = str(value)
+        return "set_preset_mode", data, None
+    if domain == "humidifier" and action in {"humidity", "set_humidity"}:
+        if value is None:
+            return "", data, "humidity value required"
+        data["humidity"] = max(0.0, min(100.0, float(value)))
+        return "set_humidity", data, None
+    if domain in {"number", "input_number"} and action in {"value", "set_value", "set"}:
+        if value is None:
+            return "", data, "value required"
+        data["value"] = float(value)
+        return "set_value", data, None
+    if domain == "select" and action in {"option", "select_option", "set_option"}:
+        if value is None:
+            return "", data, "option required"
+        data["option"] = str(value)
+        return "select_option", data, None
     if domain == "vacuum" and action in {"start", "stop", "pause", "return_to_base"}:
         return action, data, None
     aliases = {
@@ -1095,7 +1265,7 @@ def _generic_service(
         "turn_off": "turn_off",
         "toggle": "toggle",
     }
-    if action in aliases and domain not in {"button", "climate", "cover", "scene"}:
+    if action in aliases and domain not in {"button", "cover", "scene"}:
         return aliases[action], data, None
     return "", data, f"action {action!r} is not supported for {domain}"
 
@@ -1221,7 +1391,12 @@ def _slug(value: str) -> str:
 
 
 def _state_reachable(state: dict[str, Any]) -> bool:
-    return str(state.get("state") or "").lower() not in _UNREACHABLE_STATES
+    status = str(state.get("state") or "").lower()
+    # A button that has never been pressed reports "unknown" by design. Counting
+    # it as unreachable would mark a healthy house degraded.
+    if _domain(str(state.get("entity_id") or "")) == "button":
+        return status != "unavailable"
+    return status not in _UNREACHABLE_STATES
 
 
 def _friendly_name(state: dict[str, Any]) -> str:
@@ -1488,7 +1663,7 @@ def _summarize_one(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "entity_id": state.get("entity_id"),
         "state": state.get("state"),
-        "reachable": str(state.get("state") or "").lower() not in _UNREACHABLE_STATES,
+        "reachable": _state_reachable(state),
         "attributes": keep,
         "last_changed": state.get("last_changed"),
         "last_updated": state.get("last_updated"),

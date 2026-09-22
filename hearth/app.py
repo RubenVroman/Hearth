@@ -33,6 +33,7 @@ from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.builtin import register_builtin_tools
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.devices import discover_entities
 from hearth.tools.house import comfort_snapshot
 from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
@@ -347,6 +348,15 @@ async def house_status() -> dict[str, Any]:
 async def comfort() -> dict[str, Any]:
     """Climate, indoor air, purifier, and feeder chips for the command center."""
     return await comfort_snapshot()
+
+
+@app.get("/api/devices/discover")
+async def devices_discover(
+    kind: str = Query(default=""),
+    domain: str = Query(default=""),
+) -> dict[str, Any]:
+    """Wiring view: which HA entities could be the feeder / airco / purifier yet."""
+    return await discover_entities(kind, domain=domain)
 
 
 @app.get("/api/rooms")

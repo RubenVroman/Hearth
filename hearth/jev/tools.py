@@ -57,6 +57,7 @@ TOOL_LANES: dict[str, tuple[str, ...]] = {
         "ha_get_state",
         "ha_call_service",
         "ha_device_control",
+        "ha_discover_entities",
         "house_scene",
         "house_ritual",
         "house_climate",
@@ -123,7 +124,7 @@ TOOL_LANES: dict[str, tuple[str, ...]] = {
         "memory_export",
         "memory_purge",
     ),
-    "network": ("house_network",),
+    "network": ("house_network", "tuya_lan_probe"),
     "escalate_cos": ("chief_of_staff",),
     "no_tool": ("end_call",),
 }

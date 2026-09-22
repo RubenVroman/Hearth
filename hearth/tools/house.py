@@ -8,6 +8,7 @@ is not represented in HA, the tool says so and does not invent a result.
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
 from hearth.config import settings
@@ -32,6 +33,20 @@ _AIR_CLASSES = {
 
 _PURIFIER_WORDS = ("purifier", "luchtreiniger", "air_purifier", "hepa")
 _FEEDER_WORDS = ("feeder", "voeder", "voerbak", "pet_feeder", "cat_feeder", "dog_feeder")
+# Entities that share the feeder's device name but do not dispense anything.
+_FEEDER_COMPANIONS = (
+    "schedule",
+    "auto_feed",
+    "portion",
+    "child_lock",
+    "indicator",
+    "buzzer",
+    "sound",
+    "volume",
+    "calibrat",
+    "_led",
+    "light",
+)
 _SLEEP_SCENES = ("good_night", "goodnight", "house_sleep", "welterusten", "lights_out")
 _MORNING_SCENES = ("good_morning", "goodmorning", "morning_lights", "wake_up")
 _MOVIE_SCENES = ("movie_night", "cinema", "filmavond", "cinema_mode")
@@ -55,7 +70,12 @@ def voice_plan(text: str) -> dict[str, Any] | None:
         return {"tool": "house_purifier", "args": purifier}
     if _voice_comfort(raw):
         return {"tool": "house_comfort", "args": {}}
-    return None
+    # Wider net for the words the exact table above does not carry: "airco"
+    # rather than "thermostat", Dutch phrasing, portions, speeds, presets.
+    from hearth.tools.device_intent import match_device_phrase
+
+    device = match_device_phrase(text)
+    return device.as_plan(text) if device is not None else None
 
 
 async def run_ritual(ritual: str) -> dict[str, Any]:
@@ -87,6 +107,7 @@ async def climate_control(
     *,
     temperature: float | None = None,
     entity: str | None = None,
+    fan_mode: str | None = None,
 ) -> dict[str, Any]:
     snapshot = await _snapshot()
     if not snapshot.get("ok"):
@@ -124,8 +145,28 @@ async def climate_control(
             }
         steps.extend(await _nudge_climate(chosen, float(temperature), heat_if_off=False))
     elif verb in {"off", "heat", "cool", "auto", "dry", "fan_only"}:
+        mode = _supported_hvac_mode(chosen, verb)
+        if mode is None:
+            return _unsupported_option(name, verb, _hvac_modes(chosen), "mode")
         steps.append(
-            await _service("climate", "set_hvac_mode", entity_id, {"hvac_mode": verb})
+            await _service("climate", "set_hvac_mode", entity_id, {"hvac_mode": mode})
+        )
+    elif verb in {"on", "turn_on"}:
+        # An air conditioner has no plain "on" — pick a real running mode.
+        mode = _default_hvac_mode(chosen)
+        if mode is None:
+            steps.append(await _service("climate", "turn_on", entity_id))
+        else:
+            steps.append(
+                await _service("climate", "set_hvac_mode", entity_id, {"hvac_mode": mode})
+            )
+    elif verb in {"fan_mode", "set_fan_mode", "fan"}:
+        available = _fan_modes(chosen)
+        mode = _match_option(fan_mode or "", available)
+        if mode is None:
+            return _unsupported_option(name, fan_mode or "", available, "fan speed")
+        steps.append(
+            await _service("climate", "set_fan_mode", entity_id, {"fan_mode": mode})
         )
     else:
         return {
@@ -133,12 +174,17 @@ async def climate_control(
             "error": f"unknown climate action {action!r}",
             "speak": (
                 "I can read the climate, nudge it warmer or cooler, "
-                "set a temperature, or turn it off."
+                "set a temperature, change mode or fan speed, or turn it off."
             ),
         }
     fresh = await ha.get_state(entity_id)
     state = fresh.get("state") if fresh.get("ok") else chosen
     speak = _climate_sentence(_name(state or chosen), state or chosen)
+    if verb in {"fan_mode", "set_fan_mode", "fan"}:
+        # Confirm what was actually asked for, not just the temperature.
+        current_fan = ((state or chosen).get("attributes") or {}).get("fan_mode")
+        if current_fan:
+            speak = f"{speak.rstrip('.')}, fan {current_fan}."
     if any(step.get("ok") is False for step in steps):
         speak = f"{speak} Home Assistant did not take every step."
     return _finish(
@@ -149,12 +195,20 @@ async def climate_control(
     )
 
 
-async def feeder_control(action: str = "feed", *, entity: str | None = None) -> dict[str, Any]:
+async def feeder_control(
+    action: str = "feed",
+    *,
+    entity: str | None = None,
+    portions: int | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
     snapshot = await _snapshot()
     if not snapshot.get("ok"):
         return _ha_down(snapshot)
     feeders = _feeder_rows(snapshot["rows"])
     verb = (action or "feed").strip().lower()
+    if verb.startswith("schedule"):
+        return await _feeder_schedule(verb.removeprefix("schedule_") or "status")
     if verb in {"status", "state", "list"}:
         if not feeders:
             return _missing(
@@ -174,17 +228,67 @@ async def feeder_control(action: str = "feed", *, entity: str | None = None) -> 
     assert chosen is not None
     entity_id = str(chosen["entity_id"])
     domain = entity_id.split(".", 1)[0]
-    if domain == "button":
-        step = await _service("button", "press", entity_id)
-    else:
-        step = await _service(domain, "turn_on", entity_id)
     name = _name(chosen)
-    speak = f"Pressed {name}." if step.get("ok") else f"Could not feed via {name}."
+
+    # Dispensed food cannot be recalled, and voice plus Telegram make an
+    # accidental second meal easy. A repeat inside the cooldown asks first.
+    waiting = _feed_cooldown_remaining(entity_id) if not force else 0
+    if waiting:
+        minutes = max(1, round(waiting / 60))
+        message = (
+            f"{name} already dispensed a portion just now. Ask again in about "
+            f"{minutes} minute(s), or say feed them anyway for a second one."
+        )
+        return {
+            "ok": False,
+            "mode": snapshot.get("mode"),
+            "entity_id": entity_id,
+            "cooldown_active": True,
+            "cooldown_remaining_s": waiting,
+            "error": message,
+            "speak": message,
+        }
+
+    count, capped = _feed_portions(portions)
+    steps: list[dict[str, Any]] = []
+    presses = count
+    portion_entity = _portion_entity(snapshot["rows"])
+    if count > 1 and portion_entity:
+        # A portion number means N portions is one trigger, not N presses.
+        steps.append(
+            await _service(
+                portion_entity.split(".", 1)[0],
+                "set_value",
+                portion_entity,
+                {"value": float(count)},
+            )
+        )
+        presses = 1
+
+    service = "press" if domain == "button" else "turn_on"
+    for _ in range(presses):
+        steps.append(await _service(domain, service, entity_id))
+
+    ok = not any(step.get("ok") is False for step in steps)
+    if ok:
+        _record_feed(entity_id)
+    meal = "one portion" if count == 1 else f"{count} portions"
+    speak = f"Fed the pets — {meal} via {name}." if ok else f"Could not feed via {name}."
+    if ok and capped:
+        speak += f" Capped at {settings.ha_pet_feeder_max_portions} portions."
     return _finish(
-        [step],
+        steps,
         snapshot.get("mode"),
         speak=speak,
-        extra={"action": "feed", "entity_id": entity_id},
+        extra={
+            "action": "feed",
+            "entity_id": entity_id,
+            "portions": count,
+            "portions_capped": capped,
+            "presses": presses,
+            "portion_entity_id": portion_entity if presses == 1 and count > 1 else None,
+            "forced": bool(force),
+        },
     )
 
 
@@ -193,6 +297,7 @@ async def purifier_control(
     *,
     entity: str | None = None,
     percentage: float | None = None,
+    preset_mode: str | None = None,
 ) -> dict[str, Any]:
     snapshot = await _snapshot()
     if not snapshot.get("ok"):
@@ -235,17 +340,56 @@ async def purifier_control(
         step = await _service(domain, "turn_off", entity_id)
     elif verb == "toggle":
         step = await _service(domain, "toggle", entity_id)
+    elif verb in {"set_speed", "speed", "set_percentage", "percentage"}:
+        if percentage is None:
+            return {
+                "ok": False,
+                "error": "percentage required",
+                "speak": "Give me a speed percentage, for example purifier 40%.",
+            }
+        if domain != "fan":
+            message = (
+                f"{_name(chosen)} is a {domain} entity in Home Assistant, so it only "
+                "does on and off. Re-pair it with Tuya Local to get fan speeds."
+            )
+            return {"ok": False, "error": message, "speak": message}
+        step = await _service(
+            "fan",
+            "set_percentage",
+            entity_id,
+            {"percentage": max(0.0, min(100.0, float(percentage)))},
+        )
+    elif verb in {"set_mode", "mode", "preset", "preset_mode", "set_preset_mode"}:
+        available = _preset_modes(chosen)
+        mode = _match_option(preset_mode or "", available)
+        if mode is None:
+            return _unsupported_option(_name(chosen), preset_mode or "", available, "mode")
+        step = await _service(domain, "set_preset_mode", entity_id, {"preset_mode": mode})
     else:
         return {
             "ok": False,
             "error": f"unknown purifier action {action!r}",
-            "speak": "I can turn the purifier on, off, or tell you its state.",
+            "speak": (
+                "I can turn the purifier on or off, set a speed or mode, "
+                "or tell you its state."
+            ),
         }
     fresh = await ha.get_state(entity_id)
-    state = (fresh.get("state") or {}).get("state") if fresh.get("ok") else None
+    row = fresh.get("state") if fresh.get("ok") else None
+    state = (row or {}).get("state")
     label = state or ("on" if verb in {"on", "turn_on", "toggle"} else "off")
+    # Confirm the thing that was asked for. "Air purifier is on" in answer to
+    # "purifier 40%" reads like the speed was ignored.
+    attrs = (row or {}).get("attributes") or {}
+    detail = ""
+    if verb in {"set_speed", "speed", "set_percentage", "percentage"}:
+        shown = attrs.get("percentage", percentage)
+        detail = f" at {shown:g}%" if isinstance(shown, (int, float)) else ""
+    elif verb in {"set_mode", "mode", "preset", "preset_mode", "set_preset_mode"}:
+        shown = attrs.get("preset_mode") or preset_mode
+        detail = f" in {shown} mode" if shown else ""
     speak = (
-        f"{_name(chosen)} is {label}."
+        f"{_name(chosen)} is {label}{detail}."
         if step.get("ok")
         else f"Could not change {_name(chosen)}."
     )
@@ -458,7 +602,8 @@ async def _nudge_climate(
     heat_if_off: bool,
 ) -> list[dict[str, Any]]:
     entity_id = str(row["entity_id"])
-    bounded = max(5.0, min(30.0, round(float(target) * 2) / 2))
+    low, high = _temperature_bounds(row)
+    bounded = max(low, min(high, round(float(target) * 2) / 2))
     steps: list[dict[str, Any]] = []
     if heat_if_off and str(row.get("state") or "").lower() == "off":
         steps.append(
@@ -514,8 +659,37 @@ def _ha_down(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_PAIRING_HINTS = {
+    "climate": (
+        "Add the air conditioner in Home Assistant (Settings → Devices & Services "
+        "→ Add Integration → Tuya Local), then set HA_CLIMATE_ENTITY. "
+        "Ask me to discover entities to see what is actually there."
+    ),
+    "feeder": (
+        "Add the PetZero feeder in Home Assistant (Settings → Devices & Services "
+        "→ Add Integration → Tuya Local), then set HA_FEEDER_ENTITY. "
+        "Ask me to discover entities to see what is actually there."
+    ),
+    "purifier": (
+        "Add the air purifier in Home Assistant (Settings → Devices & Services "
+        "→ Add Integration → Tuya Local), then set HA_PURIFIER_ENTITY. "
+        "Ask me to discover entities to see what is actually there."
+    ),
+}
+
+
 def _missing(kind: str, speak: str) -> dict[str, Any]:
-    return {"ok": False, "configured": False, "kind": kind, "error": speak, "speak": speak}
+    """Not-paired is a setup gap, so say what to do rather than just refusing."""
+    hint = _PAIRING_HINTS.get(kind, "")
+    return {
+        "ok": False,
+        "configured": False,
+        "kind": kind,
+        "error": speak,
+        "speak": f"{speak} {hint}".strip() if hint else speak,
+        "hint": hint,
+        "discover_with": "ha_discover_entities",
+    }
 
 
 def _no_setpoint(name: str) -> dict[str, Any]:
@@ -603,6 +777,10 @@ def _feeder_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         state = str(row.get("state") or "").lower()
         if state == "unavailable":
+            continue
+        # Tuya feeders publish several switches under the same device name.
+        # Only the feed control belongs here, never its companions.
+        if _looks_like(row, _FEEDER_COMPANIONS):
             continue
         if _looks_like(row, _FEEDER_WORDS):
             found.append(row)
@@ -877,6 +1055,215 @@ def _clean(text: str) -> str:
 
 def _controllable(row: dict[str, Any]) -> bool:
     return str(row.get("state") or "").lower() not in {"unavailable", "unknown"}
+
+
+# --- Tuya depth: option matching, portions, and the anti-double-feed cooldown ---
+
+# Tuya hardware spells its modes inconsistently, and the house speaks Dutch.
+_OPTION_ALIASES: dict[str, tuple[str, ...]] = {
+    "cool": ("cooling", "koel", "koelen", "koeling"),
+    "heat": ("heating", "warm", "verwarmen", "verwarming"),
+    "dry": ("dehumidify", "drogen", "ontvochtigen"),
+    "fan_only": ("fan", "ventileren", "ventilator", "blow"),
+    "auto": ("automatic", "automatisch"),
+    "low": ("laag", "silent", "stil"),
+    "medium": ("midden", "mid"),
+    "high": ("hoog", "turbo", "boost"),
+    "sleep": ("slaap", "night", "nacht"),
+    "manual": ("handmatig",),
+}
+
+# Which running mode "airco on" reaches for when the unit offers several.
+_HVAC_ON_PREFERENCE = ("cool", "heat_cool", "auto", "heat", "dry", "fan_only")
+
+_FEED_HISTORY: dict[str, float] = {}
+
+
+def reset_feed_history() -> None:
+    """Drop the anti-double-feed cooldown (tests / restarts)."""
+    _FEED_HISTORY.clear()
+
+
+def _feed_cooldown_remaining(entity_id: str) -> int:
+    cooldown = max(0.0, float(settings.ha_pet_feeder_cooldown_seconds))
+    last = _FEED_HISTORY.get(entity_id)
+    if not cooldown or last is None:
+        return 0
+    waited = time.monotonic() - last
+    return int(round(cooldown - waited)) if waited < cooldown else 0
+
+
+def _record_feed(entity_id: str) -> None:
+    _FEED_HISTORY[entity_id] = time.monotonic()
+
+
+def _feed_portions(requested: int | None) -> tuple[int, bool]:
+    wanted = settings.ha_pet_feeder_default_portions if requested is None else int(requested)
+    cap = max(1, int(settings.ha_pet_feeder_max_portions))
+    count = max(1, min(cap, wanted))
+    return count, count != wanted
+
+
+def _portion_entity(rows: list[dict[str, Any]]) -> str:
+    """A number entity that sets how much one trigger dispenses."""
+    configured = settings.pet_feeder_portion_entity_list
+    by_id = {str(row.get("entity_id") or "").lower(): row for row in rows}
+    for entity_id in configured:
+        if entity_id.lower() in by_id:
+            return entity_id
+    for row in rows:
+        entity_id = str(row.get("entity_id") or "")
+        if _domain(row) != "number":
+            continue
+        if "portion" in _blob(row) and _looks_like(row, _FEEDER_WORDS):
+            return entity_id
+    return ""
+
+
+def _temperature_bounds(row: dict[str, Any]) -> tuple[float, float]:
+    """The unit's own published range wins; config only guards misheard numbers."""
+    low = float(settings.ha_airco_min_temperature)
+    high = float(settings.ha_airco_max_temperature)
+    attributes = row.get("attributes") or {}
+    try:
+        if attributes.get("min_temp") is not None:
+            low = float(attributes["min_temp"])
+        if attributes.get("max_temp") is not None:
+            high = float(attributes["max_temp"])
+    except (TypeError, ValueError):
+        pass
+    return (high, low) if low > high else (low, high)
+
+
+def _options(row: dict[str, Any], key: str) -> list[str]:
+    values = (row.get("attributes") or {}).get(key)
+    return [str(value) for value in values] if isinstance(values, list) else []
+
+
+def _hvac_modes(row: dict[str, Any]) -> list[str]:
+    return _options(row, "hvac_modes")
+
+
+def _fan_modes(row: dict[str, Any]) -> list[str]:
+    return _options(row, "fan_modes")
+
+
+def _preset_modes(row: dict[str, Any]) -> list[str]:
+    return _options(row, "preset_modes")
+
+
+def _match_option(requested: str, available: list[str]) -> str | None:
+    """Pick the entity's own spelling, or None when it cannot do this at all."""
+    wanted = _slug(requested)
+    if not wanted:
+        return None
+    if not available:
+        # Entity publishes no option list; pass the request through as asked.
+        return requested
+    for option in available:
+        if _slug(option) == wanted:
+            return option
+    canonical = ""
+    for name, aliases in _OPTION_ALIASES.items():
+        if wanted == name or wanted in {_slug(alias) for alias in aliases}:
+            canonical = name
+            break
+    if canonical:
+        for option in available:
+            if _slug(option) == canonical:
+                return option
+        for option in available:
+            if _slug(option) in {_slug(alias) for alias in _OPTION_ALIASES[canonical]}:
+                return option
+    for option in available:
+        if wanted in _slug(option) or _slug(option) in wanted:
+            return option
+    return None
+
+
+def _supported_hvac_mode(row: dict[str, Any], verb: str) -> str | None:
+    return _match_option(verb, _hvac_modes(row))
+
+
+def _default_hvac_mode(row: dict[str, Any]) -> str | None:
+    modes = _hvac_modes(row)
+    if not modes:
+        return None
+    preferred = (settings.ha_airco_default_mode or "").strip()
+    if preferred:
+        chosen = _match_option(preferred, modes)
+        if chosen and _slug(chosen) != "off":
+            return chosen
+    for candidate in _HVAC_ON_PREFERENCE:
+        chosen = _match_option(candidate, modes)
+        if chosen and _slug(chosen) != "off":
+            return chosen
+    return None
+
+
+def _unsupported_option(
+    name: str,
+    requested: str,
+    available: list[str],
+    noun: str,
+) -> dict[str, Any]:
+    """Refuse with the entity's real option list rather than guessing."""
+    listed = ", ".join(available) or "none reported"
+    message = f"{name} has no {requested!r} {noun}. Available: {listed}."
+    return {"ok": False, "error": message, "speak": message, "available": available}
+
+
+async def _feeder_schedule(action: str) -> dict[str, Any]:
+    """Read or flip the feeder's own timetable, when HA exposes one at all."""
+    entity_id = ""
+    for candidate in settings.pet_feeder_schedule_entity_list:
+        probe = await ha.get_state(candidate)
+        if probe.get("ok") and probe.get("state") is not None:
+            entity_id = candidate
+            break
+    if not entity_id:
+        message = (
+            "This feeder does not expose its schedule to Home Assistant — only "
+            "manual feeding is available. Set the timetable in the feeder's own "
+            "app or integration, or point HA_PET_FEEDER_SCHEDULE_ENTITIES at the "
+            "schedule switch if one exists."
+        )
+        return {"ok": False, "supported": False, "error": message, "speak": message}
+
+    snapshot = await ha.get_state(entity_id)
+    state = snapshot.get("state") or {}
+    label = _name(state) if state else "Feeder schedule"
+    if action in {"status", "state", "read"}:
+        status = str(state.get("state") or "unknown")
+        return {
+            "ok": True,
+            "supported": True,
+            "entity_id": entity_id,
+            "enabled": status == "on",
+            "speak": f"{label} is {status}.",
+        }
+    if action in {"on", "enable", "start", "resume"}:
+        service, spoken = "turn_on", "on"
+    elif action in {"off", "disable", "stop", "pause"}:
+        service, spoken = "turn_off", "off"
+    else:
+        message = f"Unknown schedule action {action!r}; use status, on, or off."
+        return {"ok": False, "supported": True, "error": message, "speak": message}
+    step = await _service(entity_id.split(".", 1)[0], service, entity_id)
+    ok = bool(step.get("ok"))
+    speak = (
+        f"Scheduled feeding is {spoken}."
+        if ok
+        else str(step.get("error") or "The feeder schedule did not change.")
+    )
+    return {
+        "ok": ok,
+        "supported": True,
+        "action": spoken,
+        "entity_id": entity_id,
+        "speak": speak,
+        "error": None if ok else speak,
+    }
 
 
 def _looks_like(row: dict[str, Any], words: tuple[str, ...]) -> bool:

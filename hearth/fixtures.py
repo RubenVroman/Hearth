@@ -56,6 +56,11 @@ MOCK_HA_STATES: list[dict[str, Any]] = [
             "hvac_action": "heating",
             "humidity": 48,
             "hvac_modes": ["off", "heat", "cool", "auto"],
+            "fan_mode": "auto",
+            "fan_modes": ["auto", "low", "medium", "high"],
+            "min_temp": 16,
+            "max_temp": 30,
+            "target_temp_step": 0.5,
         },
     },
     {
@@ -102,13 +107,40 @@ MOCK_HA_STATES: list[dict[str, Any]] = [
         "attributes": {
             "friendly_name": "Air purifier",
             "percentage": 0,
+            "percentage_step": 25,
+            "preset_mode": None,
+            "preset_modes": ["auto", "sleep", "manual", "turbo"],
             "device_class": "air_purifier",
+            "filter_life_remaining": 78,
         },
     },
     {
         "entity_id": "button.pet_feeder",
         "state": "2026-09-22T07:00:00+00:00",
         "attributes": {"friendly_name": "Pet feeder"},
+    },
+    # Companions a Tuya feeder publishes alongside the feed button. They share
+    # the device name but must never be mistaken for the feed control.
+    {
+        "entity_id": "number.pet_feeder_portion",
+        "state": "1",
+        "attributes": {
+            "friendly_name": "Pet feeder portion",
+            "min": 1,
+            "max": 12,
+            "step": 1,
+        },
+    },
+    {
+        "entity_id": "switch.pet_feeder_schedule",
+        "state": "on",
+        "attributes": {"friendly_name": "Pet feeder schedule"},
+    },
+    # An unrelated Tuya relay, so discovery has something to disambiguate against.
+    {
+        "entity_id": "switch.tuya_desk_plug",
+        "state": "off",
+        "attributes": {"friendly_name": "Tuya desk plug"},
     },
     {
         "entity_id": "sensor.living_room_pm25",
@@ -2630,8 +2662,6 @@ class MockHouse:
                 position = max(0, min(100, int(data.get("position") or 0)))
                 state["attributes"]["current_position"] = position
                 state["state"] = "closed" if position == 0 else "open"
-        elif domain == "climate" and service == "set_temperature":
-            state["attributes"]["temperature"] = float(data.get("temperature"))
         elif domain == "media_player":
             if service == "volume_set" and "volume_level" in data:
                 state["attributes"]["volume_level"] = float(data["volume_level"])
@@ -2676,6 +2706,30 @@ class MockHouse:
                 mode = str(data["hvac_mode"])
                 state["state"] = mode
                 state["attributes"]["hvac_action"] = "off" if mode == "off" else mode
+            elif service == "set_fan_mode" and data.get("fan_mode"):
+                state["attributes"]["fan_mode"] = str(data["fan_mode"])
+            elif service == "turn_on":
+                modes = [str(m) for m in state["attributes"].get("hvac_modes") or []]
+                if state["state"] == "off":
+                    state["state"] = next((m for m in modes if m != "off"), "heat")
+            elif service == "turn_off":
+                state["state"] = "off"
+        elif domain in {"number", "input_number"} and service == "set_value" and "value" in data:
+            value = float(data["value"])
+            state["state"] = str(int(value)) if value.is_integer() else str(value)
+        elif domain == "select" and service == "select_option" and "option" in data:
+            state["state"] = str(data["option"])
+        elif domain == "humidifier":
+            if service == "turn_on":
+                state["state"] = "on"
+            elif service == "turn_off":
+                state["state"] = "off"
+            elif service == "set_humidity" and "humidity" in data:
+                state["attributes"]["humidity"] = float(data["humidity"])
+            elif service in {"set_mode", "set_preset_mode"}:
+                mode = data.get("mode") or data.get("preset_mode")
+                if mode:
+                    state["attributes"]["preset_mode"] = str(mode)
         elif domain == "fan":
             if service == "turn_on":
                 state["state"] = "on"
@@ -2692,6 +2746,9 @@ class MockHouse:
                 pct = max(0.0, min(100.0, float(data["percentage"])))
                 state["attributes"]["percentage"] = pct
                 state["state"] = "on" if pct else "off"
+            elif service == "set_preset_mode" and data.get("preset_mode"):
+                state["attributes"]["preset_mode"] = str(data["preset_mode"])
+                state["state"] = "on"
         elif domain == "switch":
             if service == "turn_on":
                 state["state"] = "on"

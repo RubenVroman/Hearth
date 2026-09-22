@@ -575,6 +575,10 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         if spoken:
             return f"Done{mock}: {spoken}"
         return f"Done{mock}: {data.get('device')} {data.get('action')} on {data.get('entity_id')}."
+    if name == "tuya_lan_probe":
+        return str(data.get("speak") or f"Tuya LAN check{mock}.")
+    if name == "ha_discover_entities":
+        return str(data.get("speak") or f"No house device entities found{mock}.")
     if name == "chief_of_staff":
         if data.get("configured") is False:
             return str(data.get("error") or "Chief of Staff is not configured.")
@@ -1213,6 +1217,8 @@ def route_intent(text: str, *, jev_lane: str = "") -> dict[str, Any] | None:
         }
     if _FOOD.search(raw) or (_FOOD_CART.search(raw) and _FOOD_ORDER.search(raw)):
         return _food_plan(raw)
+    # Rituals, climate, feeder, purifier. voice_plan already falls through to
+    # the wider device phrases, so "zet de airco op 21" lands here too.
     house = voice_plan(raw)
     if house:
         return house
