@@ -49,8 +49,11 @@ class AgentLoop:
         recent: list[str],
         confirm: bool,
     ) -> dict[str, Any]:
-        if confirm and runtime.pending is not None:
-            pending = runtime.pending
+        # Claiming clears the pending atomically, so a double confirm cannot run
+        # the same destructive tool twice. An expired one falls through and the
+        # message is read fresh.
+        pending = runtime.claim_pending() if confirm else None
+        if pending is not None:
             args = dict(pending.args)
             args["confirm"] = True
             args["dry_run"] = False

@@ -58,6 +58,7 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "jev_tool_allow_threshold", 0.35)
     monkeypatch.setattr(settings, "jev_tool_lane_confidence", 0.75)
     monkeypatch.setattr(settings, "jev_risk_confidence", 0.60)
+    monkeypatch.setattr(settings, "confirm_ttl_seconds", 300.0)
     monkeypatch.setattr(settings, "auth_db_path", tmp_path / "hearth-auth.db")
     monkeypatch.setattr(settings, "memory_db_path", tmp_path / "hearth-memory.db")
     monkeypatch.setattr(settings, "memory_enabled", True)

@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     token: str = Field(default="", alias="HEARTH_TOKEN")
     mock_if_unconfigured: bool = Field(default=True, alias="HEARTH_MOCK_IF_UNCONFIGURED")
 
+    # How long an armed confirm stays answerable. A "yes" that arrives well after
+    # its preview is not an answer to it, so the turn is re-read instead of
+    # firing a stale paid or destructive tool. 0 disables expiry.
+    confirm_ttl_seconds: float = Field(
+        default=300.0,
+        ge=0.0,
+        alias="HEARTH_CONFIRM_TTL_SECONDS",
+    )
+
     workspace_path: Path = Field(default=Path("./workspace"), alias="WORKSPACE_PATH")
     auth_db_path: Path = Field(default=Path("./data/hearth-auth.db"), alias="HEARTH_AUTH_DB")
     memory_db_path: Path = Field(default=Path("./data/hearth-memory.db"), alias="HEARTH_MEMORY_DB")

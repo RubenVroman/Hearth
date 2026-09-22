@@ -439,6 +439,14 @@ High-risk / irreversible / paid actions **default to dry-run** until `confirm=tr
 - `workspace_delete` — irreversible sandbox delete
 - `docker_stop` — stops a house container
 - `memory_forget` / `memory_export` / `memory_purge`
+- Anything Jev scores `needs_confirm` for this turn, even if it normally auto-runs
+
+An armed confirm is **claimed atomically**, so a double-tap — or a browser and a
+voice session confirming at once — runs the paid tool once, not twice. It also
+expires after `HEARTH_CONFIRM_TTL_SECONDS` (default 300): a "yes" that arrives
+long after its preview is read as a fresh message rather than firing a stale
+destructive tool. The Plex "Try again" loop re-arms its own pending, so waiting
+for a client to come online is unaffected.
 
 Read-only / inspect:
 

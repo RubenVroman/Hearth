@@ -16,7 +16,7 @@ import hashlib
 import logging
 import math
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from hearth.config import settings
 from hearth.jev import (
@@ -28,6 +28,9 @@ from hearth.jev import (
     noul_high,
     tool_turn,
 )
+
+if TYPE_CHECKING:  # pragma: no cover
+    from hearth.jev.tools import ToolDecision
 from hearth.telegram.callbacks import (
     ACTION_DISMISS,
     ACTION_MORE,
@@ -2402,7 +2405,7 @@ class TelegramMediaBot:
         said: str,
         tmdb_id: int,
         media_type: str,
-    ) -> Any | None:
+    ) -> ToolDecision | None:
         """Jev gate for the one Telegram action that spends the house's bandwidth.
 
         Get taps and typed yeses are already explicit confirms, so only Jev's

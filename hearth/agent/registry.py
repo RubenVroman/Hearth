@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from hearth.runtime import PendingConfirm, runtime
 from hearth import widgets as widget_bus
+
+if TYPE_CHECKING:  # pragma: no cover — avoids a jev <-> registry import cycle
+    from hearth.jev.tools import ToolDecision
 
 log = logging.getLogger("hearth.tools")
 
@@ -139,7 +142,7 @@ class ToolRegistry:
             )
             return _finish_tool(result)
 
-        decision = None
+        decision: ToolDecision | None = None
         if gate:
             decision = await _jev_decision(
                 name,
@@ -297,7 +300,7 @@ async def _jev_decision(
     *,
     said: str,
     explicit_confirm: bool,
-) -> Any | None:
+) -> ToolDecision | None:
     """Ask the Jev tool gate about this call. ``None`` means "no opinion, run it"."""
     from hearth.config import settings
 
