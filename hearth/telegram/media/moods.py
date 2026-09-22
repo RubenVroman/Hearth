@@ -638,12 +638,15 @@ def detect_mood(text: str) -> MoodSpec | None:
             pass
         elif words > 4 or words <= 2:
             return None
-        elif not _MOVIE_HINT.search(raw) and not _TV_HINT.search(raw):
-            # Three or four title-cased words with no media noun is how people
-            # write film names ("American Horror Story", "Cowboys & Aliens"),
-            # not how they describe a vibe ("funny and light").
-            if _looks_title_cased(raw):
-                return None
+        # Three or four title-cased words with no media noun is how people write
+        # film names ("American Horror Story", "Cowboys & Aliens"), not how they
+        # describe a vibe ("funny and light").
+        elif (
+            _looks_title_cased(raw)
+            and not _MOVIE_HINT.search(raw)
+            and not _TV_HINT.search(raw)
+        ):
+            return None
 
     media_type = "tv" if _TV_HINT.search(raw) and not _MOVIE_HINT.search(raw) else "movie"
 

@@ -65,11 +65,7 @@ from hearth.telegram.media import (
 from hearth.telegram.media.memory import speaker_scope, storage_key
 from hearth.telegram.media.phrases import is_known_franchise
 from hearth.telegram.media.play import looks_like_play_command, play_lane_enabled, play_on_tv
-from hearth.telegram.media.watch_next import (
-    WatchNext,
-    looks_like_continue_pack,
-    pick_next_in_order,
-)
+from hearth.telegram.media.watch_next import WatchNext, pick_next_in_order
 
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
 from hearth.telegram.house import house_control_reply, looks_like_house_control
