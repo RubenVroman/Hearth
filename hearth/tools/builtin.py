@@ -831,7 +831,9 @@ def register_builtin_tools() -> None:
                     },
                     "fan_mode": {
                         "type": "string",
-                        "description": "Fan speed for action=fan_mode, e.g. low, medium, high, auto.",
+                        "description": (
+                            "Fan speed for action=fan_mode, e.g. low, medium, high, auto."
+                        ),
                     },
                     "entity": {"type": "string", "description": "Optional climate entity_id."},
                     "said": {

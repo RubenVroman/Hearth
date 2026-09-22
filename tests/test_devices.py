@@ -112,7 +112,12 @@ async def test_discovery_resolves_each_role_on_the_fixture_house() -> None:
     assert roles["airco"]["resolved_entity_id"] == "climate.living_room"
     assert roles["air_purifier"]["resolved_entity_id"] == "fan.air_purifier"
     assert all(info["status"] == "ready" for info in roles.values())
-    assert result.data["env_suggestions"]["HA_AIRCO_ENTITIES"] == "climate.living_room"
+    # Once a role resolves, suggest the single-id pin rather than a candidate list.
+    assert result.data["env_suggestions"] == {
+        "HA_FEEDER_ENTITY": "button.pet_feeder",
+        "HA_CLIMATE_ENTITY": "climate.living_room",
+        "HA_PURIFIER_ENTITY": "fan.air_purifier",
+    }
 
 
 async def test_discovery_excludes_feeder_companions_from_the_feed_control() -> None:
@@ -178,7 +183,7 @@ async def test_discovery_separates_no_such_domain_from_nothing_matching(ruben_ha
     # Switches exist, but none of them is a feeder.
     assert roles["pet_feeder"]["status"] == "not_paired"
     assert roles["pet_feeder"]["entities_in_domains"] == 10
-    assert "HA_PET_FEEDER_ENTITIES" in roles["pet_feeder"]["next_step"]
+    assert "HA_FEEDER_ENTITY" in roles["pet_feeder"]["next_step"]
 
 
 async def test_discovery_invents_nothing_when_the_house_is_empty(ruben_ha) -> None:
@@ -243,7 +248,7 @@ async def test_ambiguous_match_lists_candidates_instead_of_picking_one(
     assert result.ok
     role = result.data["roles"]["air_purifier"]
     assert role["status"] == "ambiguous"
-    assert "HA_AIR_PURIFIER_ENTITIES" in role["next_step"]
+    assert "HA_PURIFIER_ENTITY" in role["next_step"]
 
 
 async def test_a_single_climate_entity_is_the_airco_whatever_it_is_called(

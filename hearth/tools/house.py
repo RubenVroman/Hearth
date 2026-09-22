@@ -180,6 +180,11 @@ async def climate_control(
     fresh = await ha.get_state(entity_id)
     state = fresh.get("state") if fresh.get("ok") else chosen
     speak = _climate_sentence(_name(state or chosen), state or chosen)
+    if verb in {"fan_mode", "set_fan_mode", "fan"}:
+        # Confirm what was actually asked for, not just the temperature.
+        current_fan = ((state or chosen).get("attributes") or {}).get("fan_mode")
+        if current_fan:
+            speak = f"{speak.rstrip('.')}, fan {current_fan}."
     if any(step.get("ok") is False for step in steps):
         speak = f"{speak} Home Assistant did not take every step."
     return _finish(
@@ -370,10 +375,21 @@ async def purifier_control(
             ),
         }
     fresh = await ha.get_state(entity_id)
-    state = (fresh.get("state") or {}).get("state") if fresh.get("ok") else None
+    row = fresh.get("state") if fresh.get("ok") else None
+    state = (row or {}).get("state")
     label = state or ("on" if verb in {"on", "turn_on", "toggle"} else "off")
+    # Confirm the thing that was asked for. "Air purifier is on" in answer to
+    # "purifier 40%" reads like the speed was ignored.
+    attrs = (row or {}).get("attributes") or {}
+    detail = ""
+    if verb in {"set_speed", "speed", "set_percentage", "percentage"}:
+        shown = attrs.get("percentage", percentage)
+        detail = f" at {shown:g}%" if isinstance(shown, (int, float)) else ""
+    elif verb in {"set_mode", "mode", "preset", "preset_mode", "set_preset_mode"}:
+        shown = attrs.get("preset_mode") or preset_mode
+        detail = f" in {shown} mode" if shown else ""
     speak = (
-        f"{_name(chosen)} is {label}."
+        f"{_name(chosen)} is {label}{detail}."
         if step.get("ok")
         else f"Could not change {_name(chosen)}."
     )

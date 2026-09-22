@@ -62,6 +62,8 @@ class DeviceRole:
     # Companion entities that share the device name but are not the control.
     exclude: tuple[str, ...] = ()
     env_var: str = ""
+    # The single-id setting to pin once discovery has found the real entity.
+    pin_var: str = ""
     pairing_hint: str = ""
 
     def configured(self) -> list[str]:
@@ -90,6 +92,7 @@ ROLES: dict[str, DeviceRole] = {
             "led",
         ),
         env_var="HA_PET_FEEDER_ENTITIES",
+        pin_var="HA_FEEDER_ENTITY",
         pairing_hint=(
             "Pair the PetZero feeder in Home Assistant (Tuya Local on the LAN, "
             "or the Tuya cloud integration), then set HA_PET_FEEDER_ENTITIES to "
@@ -104,6 +107,7 @@ ROLES: dict[str, DeviceRole] = {
         weak=("ac", "climate", "cool", "koel", "heat_pump", "hvac", "split"),
         exclude=("water_heater", "boiler", "floor_heating"),
         env_var="HA_AIRCO_ENTITIES",
+        pin_var="HA_CLIMATE_ENTITY",
         pairing_hint=(
             "Pair the air conditioner in Home Assistant (Tuya Local exposes it "
             "as a climate entity), then set HA_AIRCO_ENTITIES to its entity id."
@@ -117,6 +121,7 @@ ROLES: dict[str, DeviceRole] = {
         weak=("kpt", "hepa", "ionizer", "air", "filter"),
         exclude=("child_lock", "buzzer", "led", "light", "filter_reset", "indicator"),
         env_var="HA_AIR_PURIFIER_ENTITIES",
+        pin_var="HA_PURIFIER_ENTITY",
         pairing_hint=(
             "Pair the KPT air purifier in Home Assistant (Tuya Local usually "
             "exposes it as a fan entity), then set HA_AIR_PURIFIER_ENTITIES."
@@ -447,9 +452,12 @@ async def discover_entities(
             if any(str(row.get("entity_id") or "").lower() == entity_id.lower() for row in rows)
         ]
         resolved = await resolve_role(key, states=rows)
-        suggestion = present or [str(c["entity_id"]) for c in candidates[:3]]
-        if suggestion:
-            env_suggestions[role.env_var] = ",".join(suggestion)
+        if resolved.get("ok"):
+            env_suggestions[role.pin_var] = str(resolved["entity_id"])
+        else:
+            suggestion = present or [str(c["entity_id"]) for c in candidates[:3]]
+            if suggestion:
+                env_suggestions[role.env_var] = ",".join(suggestion)
         in_domains = [
             row
             for row in rows
@@ -460,7 +468,7 @@ async def discover_entities(
         elif resolved.get("ambiguous"):
             status = "ambiguous"
             next_step = (
-                f"Set {role.env_var} to whichever of these is the "
+                f"Set {role.pin_var} to whichever of these is the "
                 f"{role.label.lower()}."
             )
         elif not in_domains:
@@ -476,7 +484,7 @@ async def discover_entities(
             next_step = (
                 f"Home Assistant has {len(in_domains)} "
                 f"{' / '.join(role.domains)} entity(ies), but none look like the "
-                f"{role.label.lower()}. Set {role.env_var} if one of them is."
+                f"{role.label.lower()}. Set {role.pin_var} if one of them is."
             )
         roles[key] = {
             "label": role.label,
