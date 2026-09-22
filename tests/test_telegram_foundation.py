@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from hearth.config import settings
 from hearth.telegram.client import TelegramBotClient
 from hearth.telegram.house import TELEGRAM_COMMANDS
 from hearth.telegram.progress import ProgressTracker
@@ -107,7 +108,143 @@ async def test_client_never_retries_ambiguous_transport_failure() -> None:
 
     assert result["ok"] is False
     assert "transport error" in result["error"]
+    assert result["outcome_unknown"] is True
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_client_retries_a_transport_blip_on_get_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One blip on the uplink must not end the long-poll cycle."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise httpx.ConnectError("network down", request=request)
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    monkeypatch.setattr(settings, "telegram_retry_attempts", 3)
+    monkeypatch.setattr("hearth.telegram.client.asyncio.sleep", AsyncMock())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await TelegramBotClient("123:test", client=http).get_updates()
+
+    assert result["ok"] is True
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_client_retries_a_server_error_on_get_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                502,
+                json={"ok": False, "error_code": 502, "description": "Bad Gateway"},
+            )
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    monkeypatch.setattr("hearth.telegram.client.asyncio.sleep", AsyncMock())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await TelegramBotClient("123:test", client=http).get_updates()
+
+    assert result["ok"] is True
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_client_never_retries_a_server_error_on_a_write() -> None:
+    """A 5xx on a send may still have posted the message; do not repeat it."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            502,
+            json={"ok": False, "error_code": 502, "description": "Bad Gateway"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await TelegramBotClient("123:test", client=http).send_message(1, "Dune")
+
+    assert result["ok"] is False
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_client_reports_the_real_reason_when_retries_run_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("network down", request=request)
+
+    monkeypatch.setattr(settings, "telegram_retry_attempts", 2)
+    monkeypatch.setattr("hearth.telegram.client.asyncio.sleep", AsyncMock())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await TelegramBotClient("123:test", client=http).get_updates()
+
+    assert result["ok"] is False
+    assert "transport error" in result["error"]
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_client_caps_a_punitive_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A long advertised delay must not park the poller for minutes."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests",
+                "parameters": {"retry_after": 600},
+            },
+        )
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(settings, "telegram_max_retry_after_seconds", 30.0)
+    monkeypatch.setattr(settings, "telegram_retry_attempts", 1)
+    monkeypatch.setattr("hearth.telegram.client.asyncio.sleep", sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await TelegramBotClient("123:test", client=http).get_updates()
+
+    assert result["ok"] is False
+    assert result["error_code"] == 429
+    sleep.assert_awaited_once_with(30.0)
+
+
+@pytest.mark.asyncio
+async def test_client_never_logs_the_bot_token(caplog: pytest.LogCaptureFixture) -> None:
+    token = "123456:super-secret-bot-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"ok": False, "error_code": 403, "description": f"blocked {token}"},
+        )
+
+    with caplog.at_level("INFO", logger="hearth.telegram"):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            result = await TelegramBotClient(token, client=http).send_message(1, "Dune")
+
+    assert result["ok"] is False
+    assert token not in result["error"]
+    assert "[REDACTED]" in result["error"]
+    assert token not in caplog.text
 
 
 def test_store_offset_is_explicit_and_monotonic(tmp_path: Path) -> None:
