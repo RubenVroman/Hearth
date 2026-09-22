@@ -433,13 +433,6 @@ def play_needs_title() -> str:
     )
 
 
-def play_nothing_to_play() -> str:
-    return (
-        "Nothing on screen to play. Search a title first — I'll offer Play on "
-        "anything that's already on Plex."
-    )
-
-
 def play_not_on_plex(label: str) -> str:
     return f"{label} isn't on Plex yet, so there's nothing to play. Tap Get and I'll fetch it."
 
@@ -469,7 +462,6 @@ __all__ = [
     "play_failed",
     "play_needs_title",
     "play_not_on_plex",
-    "play_nothing_to_play",
     "status_ack",
     "watch_next_nudge",
     "watch_next_offer",

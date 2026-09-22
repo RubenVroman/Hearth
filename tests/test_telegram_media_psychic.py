@@ -455,7 +455,7 @@ async def test_play_on_tv_text_plays_the_card_on_screen(
     assert reply is not None
     assert played and played[0]["title"] == "Dune"
     assert played[0]["tmdb_id"] == 438631
-    assert "Dune" in reply.text
+    assert reply.text == "Playing", "the play path's own outcome is the honest answer"
 
 
 async def test_play_on_tv_text_is_honest_when_it_is_not_on_plex(
@@ -485,7 +485,7 @@ async def test_play_on_tv_text_with_nothing_on_screen_says_so(bot_factory) -> No
     reply = await bot.handle_message(_message("play it on the TV"))
 
     assert reply is not None
-    assert "Nothing on screen" in reply.text
+    assert "don't have a title in this thread" in reply.text
 
 
 async def test_play_button_survives_an_expired_chat_context(

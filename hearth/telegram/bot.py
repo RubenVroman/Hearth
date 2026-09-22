@@ -364,12 +364,6 @@ class TelegramMediaBot:
                 )
             )
 
-        # "Play it on the TV" refers to whatever is on screen, so it resolves
-        # against the thread rather than the catalog — searching those words as
-        # a title is a guaranteed miss.
-        if looks_like_play_command(view.text):
-            return await self._play_text_reply(view)
-
         # New search/guess replaces any sticky yes/no offer.
         self._clear_pending_guess(view.chat_id)
 
@@ -414,6 +408,10 @@ class TelegramMediaBot:
             names = ", ".join(hit.label for hit in context.hits[:4])
             return BotReply(f"Which one should I put on the TV? {names}.")
         hit = context.hits[0]
+        if hit.media_status != 5:
+            # Only Plex can play it and it is not there yet. Saying so beats
+            # handing Infuse a title it will never find and reporting its error.
+            return BotReply(voice.play_not_on_plex(_display_title(hit.title, hit.year)))
         outcome = await play_on_tv(
             title=hit.title,
             tmdb_id=hit.tmdb_id,
@@ -1765,27 +1763,6 @@ class TelegramMediaBot:
             log.exception("telegram refine action %s failed", action.action)
             return BotReply(voice.lane_failed(), edit_message_id=message_id)
         return BotReply(voice.lost_context(), edit_message_id=message_id)
-
-    async def _play_text_reply(self, view: MessageView) -> BotReply:
-        """"Play it on the TV" for the card on screen — honest about every miss."""
-        context = self.memory.load(view.chat_id)
-        top = context.top if context is not None else None
-        if top is None:
-            return BotReply(voice.play_nothing_to_play())
-        label = _display_title(top.title, top.year)
-        if top.media_status != 5:
-            # Only Plex can play it, and it is not there yet. Saying so beats
-            # handing Infuse a title it will never find.
-            return BotReply(voice.play_not_on_plex(label))
-        outcome = await play_on_tv(
-            title=top.title,
-            tmdb_id=top.tmdb_id,
-            media_type=top.media_type,
-            year=top.year,
-        )
-        if outcome.ok:
-            return BotReply(voice.play_started(label))
-        return BotReply(voice.play_failed(label, reason=outcome.message))
 
     async def _title_correction_reply(
         self,
