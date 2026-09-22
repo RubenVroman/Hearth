@@ -171,9 +171,10 @@ class Settings(BaseSettings):
     thuisbezorgd_password: str = Field(default="", alias="THUISBEZORGD_PASSWORD")
     thuisbezorgd_session_token: str = Field(default="", alias="THUISBEZORGD_SESSION_TOKEN")
 
-    # Deterministic Telegram media bot. Overseerr is the sole search/request
-    # backend; Radarr/Sonarr are observed only for download progress. The bot is
-    # off unless its token and at least one allowlisted chat are configured.
+    # Telegram house bot. Routine HA commands share the normal tool/Jev path;
+    # Overseerr remains the sole media search/request backend, while
+    # Radarr/Sonarr are observed only for download progress. The bot is off
+    # unless its token and at least one allowlisted chat are configured.
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_ids: str = Field(default="", alias="TELEGRAM_CHAT_IDS")
     # Optional comma-separated Telegram user ids (house members). Empty = any

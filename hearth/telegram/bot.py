@@ -1,4 +1,4 @@
-"""Overseerr-first Telegram media bot.
+"""Telegram house bot with Overseerr-first media handling.
 
 **Jev-first media router:** every media-ish turn hits TypeSafe System One
 (Choice/Noul/Score) to pick a lane — exact title, known franchise, series-all,
@@ -35,6 +35,7 @@ from hearth.telegram.heuristics import (
     looks_like_confirm_no,
     looks_like_confirm_yes,
 )
+from hearth.telegram.house import TelegramHouseCommands
 from hearth.telegram.media import (
     MAX_RESULTS,
     SERIES_MAX_RESULTS,
@@ -81,12 +82,15 @@ from hearth.tools.arr import OverseerrError, overseerr
 log = logging.getLogger("hearth.telegram")
 
 HELP_TEXT = (
-    "Send a title and I’ll find it. I also do franchises (“all Harry Potters”), "
+    "House: /house, /lights, /lights <name> on|off|toggle|0-100, /scenes, "
+    "/scene <name>, /covers, /cover <name> open|close|stop|0-100. "
+    "If a name is unclear, list that device type first and use the exact name. "
+    "Media: send a title and I’ll find it. I also do franchises (“all Harry Potters”), "
     "editions (“LOTR extended”), people (“anything with Florence Pugh”), vibes "
     "(“scary under 2 hours”), lookalikes (“something like Arrival”), and several "
     "at once (“grab Inception and Interstellar”). Follow-ups work too: “the "
     "sequel”, “all of them”, “more like that”. Tap Get to request — I never "
-    "queue from chat alone. Commands: /search <title>, /status, /help."
+    "queue from chat alone. Media commands: /search <title>, /status. Help: /help."
 )
 _PENDING_GUESS_PREFIX = "guess:"
 
@@ -113,12 +117,14 @@ class TelegramMediaBot:
         *,
         overseerr_client: Any | None = None,
         progress: ProgressTracker | None = None,
+        house_commands: TelegramHouseCommands | None = None,
     ) -> None:
         self.store = store
         self.overseerr = overseerr_client or overseerr
         self.progress = progress or ProgressTracker(overseerr_client=self.overseerr)
         self.catalog = CatalogSearch(self.overseerr)
         self.memory = MediaMemory(store)
+        self.house = house_commands or TelegramHouseCommands()
         self.rate = RateLimiter()
         self.bot_user_id: int | None = None
         self._codec: CallbackCodec | None = None
@@ -202,6 +208,12 @@ class TelegramMediaBot:
         view = MessageView.from_telegram(message)
         if view is None or not self._authorized(view.chat_id, view.user_id):
             return None
+
+        house_reply = await self.house.handle(view.text)
+        if house_reply is not None:
+            # A new explicit house command supersedes any stale media yes/no offer.
+            self._clear_pending_guess(view.chat_id)
+            return house_reply
 
         pending = self._get_pending_guess(view.chat_id)
         regex_yes = looks_like_confirm_yes(view.text)

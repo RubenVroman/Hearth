@@ -13,6 +13,7 @@ from hearth.config import settings
 from hearth.memory.redact import redact
 from hearth.telegram.bot import TelegramMediaBot
 from hearth.telegram.client import TelegramBotClient
+from hearth.telegram.house import TELEGRAM_COMMANDS
 from hearth.telegram.models import BotReply
 from hearth.telegram.progress import (
     format_done,
@@ -219,6 +220,10 @@ class TelegramBotService:
         deleted = await self.client.delete_webhook(drop_pending_updates=False)
         if not deleted.get("ok"):
             self.last_error = str(deleted.get("error") or "deleteWebhook failed")
+            return False
+        commands = await self.client.set_my_commands(TELEGRAM_COMMANDS)
+        if not commands.get("ok"):
+            self.last_error = str(commands.get("error") or "setMyCommands failed")
             return False
         self._bot_ready = True
         self.last_error = ""

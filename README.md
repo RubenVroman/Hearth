@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, Infuse play on ATV, *arr/Overseerr grab/request, deterministic Telegram media bot, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, Infuse play on ATV, *arr/Overseerr grab/request, Telegram house bot, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -185,9 +185,11 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 
 **Do it yourself**
 
-- Lights, scenes → Home Assistant tools
+- Lights, scenes, and covers → Home Assistant tools
+- Whole-house snapshot → `house_status` / `GET /api/house/status`; one HA read reports what is
+  on, climate and cover state, unavailable entities, and feeder last-fed only when HA exposes it
 - Everything HA represents on the house network → `house_network` / `GET /api/network`; reports reachability, unavailable entities, domains, and explicit Denon/LG/Apple TV links
-- Any routine HA entity by friendly name → `ha_device_control` (lights, switches, fans, covers, climate, scenes, scripts, buttons, vacuums); ambiguous matches are returned instead of guessed
+- Any routine HA entity by friendly name → `ha_device_control` (lights, switches, fans, covers, climate, scenes, scripts, buttons, vacuums); covers support open/close/stop/position, and ambiguous matches are returned instead of guessed
 - LG TV / Denon AVR / Apple TV power, volume, source, transport → `ha_media_control` (prefer over raw `ha_call_service`)
 - Receiver-centric “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; orders Denon → LG → Denon source → Apple TV and reports every failed step
 - **Videoland on the LG** → `videoland_play` (Dutch/English: “zet B&B Vol Liefde aan op Videoland”, “open Videoland”, “open het profiel Parel”). HA can **launch** the Videoland app via `media_player.select_source`; it **cannot** start a named title or select an in-app profile. See [Videoland on LG webOS](#videoland-on-lg-webos).
@@ -201,7 +203,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
-- **Telegram media bot** → deterministic Overseerr search, signed exact-id requests, and quiet *arr progress in the group (see below)
+- **Telegram house bot** → lights/scenes/covers/status plus deterministic Overseerr search, signed exact-id requests, and quiet *arr progress in the group (see below)
 - Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
 - Weather outside → `get_weather` (Open-Meteo; no API key)
 - Live web (news, current events, where-to-watch / streaming) → `web_search` (OpenAI hosted web search by default; optional Brave; DuckDuckGo HTML lite last resort). Search results only — Hearth does not fetch arbitrary pages. Follow with `suggest_titles` when movie/TV ideas should appear as overlay cards.
@@ -453,9 +455,9 @@ For LAN discovery (Cast, some TVs), you may want host networking on the HA servi
 
 Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve → the app). Do not document or use `:8443` / `:8787` in the UI. Do **not** enable Tailscale Funnel. Hearth stays Tailscale-only; bind the app to LAN/Tailscale (or localhost behind Serve), never a WAN port-forward.
 
-## Telegram media bot
+## Telegram house bot
 
-A dedicated house Telegram group can search and request movies and series through **Overseerr**. Every media-ish turn is classified first by **Jev** (TypeSafe System One Choice/Noul/Score), which picks a lane: exact title, known franchise, series-all, edition-aware, person filmography, mood/vibe, "something like X", a multi-title batch, an in-thread follow-up, a descriptive riddle, or chat-about. Every lane except the last two answers straight from Overseerr/TMDB with no LLM prose; gpt-4o runs only when Jev says a riddle or `needs_llm` (or on fail-open). Hearth shows ranked matches with signed **Get** buttons; pressing a button (or explicit yes on a single pending guess) requests that exact TMDB id — confirming never re-searches by title. Chat alone never queues. Radarr/Sonarr are observed only for progress on requests made by this bot.
+A dedicated house Telegram group can control routine Home Assistant devices and search/request movies and series through **Overseerr**. Explicit house commands run through the same Jev decision gate and shared tool registry as chat; enforce-mode cancel/refuse verdicts stop the tool call. Media classification remains on its existing Jev-first path. Hearth shows ranked matches with signed **Get** buttons; pressing a button (or explicit yes on a single pending guess) requests that exact TMDB id — confirming never re-searches by title. Chat alone never queues. Radarr/Sonarr are observed only for progress on requests made by this bot.
 
 ### Setup (Ruben)
 
@@ -482,6 +484,10 @@ A dedicated house Telegram group can search and request movies and series throug
 
 ### Behavior
 
+- **House commands:** `/house`; `/lights`; `/lights <name> on|off|toggle|0-100`;
+  `/scenes`; `/scene <name>`; `/covers`; `/cover <name> open|close|stop|0-100`.
+  List first when a friendly name is unclear. Hearth returns actionable HA recovery copy instead
+  of claiming a failed write worked. The command menu is published with `setMyCommands` on startup.
 - **Jev media router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics that route the same lanes. See `docs/jev.md`.
 - `/search <title>`, a plain title, franchise seed (`Harry Potter`), series-all (`Harry Potter, all movies`), edition (`Lord of the Rings extended edition`), plot/riddle, or typed TMDB movie/TV link. A year or season marker narrows results. Overseerr requests whole seasons, so `S02E03` is rejected. `/help` and `/status` as before.
 - **Intent beats the literal string.** A sentence is never searched verbatim when a human would know better:
@@ -535,7 +541,7 @@ The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MA
 | `/ws/voice` text fallback | Live protocol; not the disabled beta websocket |
 | Whisper/TTS on fallback | Live when a key is set but Realtime is down |
 | HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
-| Telegram media bot | Live when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` are set; one long-poller inside Hearth, Overseerr-only search/request. Otherwise off. |
+| Telegram house bot | Live when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` are set; one long-poller inside Hearth, HA house commands plus Overseerr-only media search/request. Otherwise off. |
 | Thuisbezorgd / Just Eat Takeaway NL | Fixtures + confirm/dry-run always. Live paid submit needs partner `THUISBEZORGD_API_KEY` + session (no public consumer OAuth; no scrape). |
 | Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |
 | HA onboarding, TV/AVR pairing | Yours — service is included unconfigured |
