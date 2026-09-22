@@ -24,6 +24,7 @@ from hearth.telegram.callbacks import ACTION_CODES, ACTION_TITLE, CallbackCodec
 from hearth.telegram.media.cards import CardRenderer
 from hearth.telegram.media.classify import classify_media_ask_sync
 from hearth.telegram.media.compound import split_compound_ask
+from hearth.telegram.media.memory import speaker_scope
 from hearth.telegram.media.moods import detect_mood, looks_like_vague_ask, names_one_release
 from hearth.telegram.media.people import detect_person_ask
 from hearth.telegram.media.play import PlayOutcome
@@ -510,7 +511,8 @@ async def test_play_button_survives_an_expired_chat_context(
     play_button = next(b for b in _buttons(shown) if "Play" in b["text"])
 
     # The card is still on screen, but the thread context has aged out.
-    bot.memory.forget(CHAT_ID)
+    with speaker_scope(CHAT_ID, USER_ID):
+        bot.memory.forget(CHAT_ID)
 
     reply = await bot.handle_callback(_callback(play_button["callback_data"]))
 
@@ -555,7 +557,10 @@ async def test_play_button_without_a_known_title_refuses_instead_of_guessing(
     assert shown is not None
     play_button = next(b for b in _buttons(shown) if "Play" in b["text"])
 
-    bot.memory.forget(CHAT_ID)
+    # Group threads are scoped per speaker, so reach into memory the same way
+    # the handler does rather than under the bare chat key.
+    with speaker_scope(CHAT_ID, USER_ID):
+        bot.memory.forget(CHAT_ID)
     bot.store.clear_callback_media(play_button["callback_data"])
 
     reply = await bot.handle_callback(_callback(play_button["callback_data"]))
@@ -748,22 +753,26 @@ async def test_next_after_a_queue_continues_the_pack(
     bot = bot_factory(overseerr)
 
     await bot.handle_message(_message("Harry Potter"))
-    bot.memory.remember_watch_next(
-        CHAT_ID,
-        media_type="movie",
-        tmdb_id=672,
-        title="Harry Potter and the Chamber of Secrets",
-        year=2002,
-        from_title="Harry Potter and the Philosopher's Stone",
-        from_tmdb_id=671,
-    )
+    # Group threads are scoped per speaker, so arm the watch-next the same way
+    # a real queue would — inside this speaker's scope.
+    with speaker_scope(CHAT_ID, USER_ID):
+        bot.memory.remember_watch_next(
+            CHAT_ID,
+            media_type="movie",
+            tmdb_id=672,
+            title="Harry Potter and the Chamber of Secrets",
+            year=2002,
+            from_title="Harry Potter and the Philosopher's Stone",
+            from_tmdb_id=671,
+        )
 
     reply = await bot.handle_message(_message("next", message_id=2))
 
     assert reply is not None
     assert "Chamber of Secrets" in reply.text
     # And the offer is consumed, so a second "next" pages normally again.
-    assert bot.memory.load(CHAT_ID).watch_next() is None
+    with speaker_scope(CHAT_ID, USER_ID):
+        assert bot.memory.load(CHAT_ID).watch_next() is None
 
 
 def test_an_unresolvable_lane_falls_back_to_search_not_to_prose() -> None:
