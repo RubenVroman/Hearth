@@ -236,6 +236,7 @@ async def test_evaluate_telegram_media_uses_media_router_questions(
     assert "media_ask" in questions
     assert "needs_llm" in questions
     assert "domain" not in questions
+    assert "butler_ask" not in questions
 
 
 @pytest.mark.asyncio
@@ -259,5 +260,105 @@ async def test_http_client_posts_bearer_without_logging_key() -> None:
     assert seen["authorization"] == "Bearer ts-secret-should-not-leak"
     assert seen["body"]["model"] == "jev-latest"
     assert "domain" in seen["body"]["questions"]
+    assert "butler_ask" in seen["body"]["questions"]
     assert answers.domain is not None
     assert answers.domain.choice == "lights"
+
+
+def _butler_payload(choice: str, *, confidence: float = 0.93, **kwargs: Any) -> dict[str, Any]:
+    payload = _payload(**kwargs)
+    payload["answers"]["butler_ask"] = {
+        "type": "choice",
+        "choice": choice,
+        "confidence": confidence,
+        "probabilities": {choice: confidence},
+    }
+    return payload
+
+
+def test_parse_answers_reads_butler_ask() -> None:
+    answers = parse_answers(_butler_payload("quiet_hours", confidence=0.81))
+    assert answers.butler_ask is not None
+    assert answers.butler_ask.choice == "quiet_hours"
+    assert answers.butler_ask.confidence == pytest.approx(0.81)
+    assert parse_answers(_payload()).butler_ask is None
+
+
+def test_llm_tool_lists_omit_butler_tools() -> None:
+    from hearth.agent.registry import registry
+    from hearth.butler.decision import hide_from_llm
+
+    chat_names = {
+        str((tool.get("function") or tool).get("name") or "")
+        for tool in hide_from_llm(registry.openai_chat_tools())
+    }
+    realtime_names = {
+        str(tool.get("name") or "") for tool in hide_from_llm(registry.openai_realtime_tools())
+    }
+    assert "house_shelf" not in chat_names
+    assert "house_scene" not in chat_names
+    assert "house_shelf" not in realtime_names
+    assert "house_scene" not in realtime_names
+    assert "end_call" in realtime_names
+    assert "web_search" in realtime_names
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_jev_butler_skips_openai(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test-not-real")
+    fake = FakeSystemOne(_butler_payload("shelf"))
+    set_client(fake)
+
+    def boom(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("OpenAI client must not be constructed")
+
+    monkeypatch.setattr("openai.AsyncOpenAI", boom)
+    out = await AgentLoop().run("what's on tonight")
+    assert out["mode"] == "jev_butler"
+    assert out["tools"][0]["name"] == "house_shelf"
+    assert "The Bear" in out["reply"]
+    assert fake.calls
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_jev_other_holds_the_scene(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hearth.tools.ha import _mock
+
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    set_client(FakeSystemOne(_butler_payload("other", confidence=0.96)))
+    _mock.reset()
+    out = await AgentLoop().run("quiet hours")
+    assert out["tools"] == []
+    assert "left it alone" in out["reply"]
+    living = _mock.get_state("light.living_room")
+    assert living["attributes"]["brightness"] == 180
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_missing_butler_ask_fail_opens(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    set_client(FakeSystemOne(_payload(domain="media")))
+    out = await AgentLoop().run("what's on tonight")
+    assert out["mode"] == "local"
+    assert out["tools"][0]["name"] == "house_shelf"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_low_confidence_butler_fail_opens(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test-key-not-real")
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    set_client(FakeSystemOne(_butler_payload("shelf", confidence=0.2)))
+    out = await AgentLoop().run("what's on tonight")
+    assert out["mode"] == "local"
+    assert out["tools"][0]["name"] == "house_shelf"

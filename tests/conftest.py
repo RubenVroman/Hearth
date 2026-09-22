@@ -69,7 +69,10 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "admin_email", TEST_ADMIN_EMAIL)
     monkeypatch.setattr(settings, "admin_password", TEST_ADMIN_PASSWORD)
     from hearth.fixtures import mock_thuisbezorgd
+    from hearth.tools.ha import _mock
     from hearth.tools.thuisbezorgd import thuisbezorgd
+
+    _mock.reset()
 
     mock_thuisbezorgd.clear_cart()
     mock_thuisbezorgd.orders.clear()

@@ -9,8 +9,10 @@ the last ask.
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol
+from typing import Any, Iterator, Mapping, Protocol
 
 from hearth.config import settings
 from hearth.telegram.models import MediaHit
@@ -18,6 +20,33 @@ from hearth.telegram.models import MediaHit
 _CONTEXT_PREFIX = "mediactx:"
 _MAX_REMEMBERED_HITS = 8
 _MAX_SHOWN_IDS = 40
+
+# Group chats (negative id) keep a thread per speaker. None means the shared
+# chat key — private DMs, and callers that never bound a speaker.
+_SPEAKER: ContextVar[int | None] = ContextVar("hearth_tg_media_speaker", default=None)
+
+
+def storage_key(prefix: str, chat_id: int) -> str:
+    """Chat key, or chat+user when a group speaker is bound."""
+    chat = int(chat_id)
+    user = _SPEAKER.get()
+    if chat < 0 and user is not None:
+        return f"{prefix}{chat}:u{int(user)}"
+    return f"{prefix}{chat}"
+
+
+@contextmanager
+def speaker_scope(chat_id: int, user_id: int | None) -> Iterator[int | None]:
+    """Bind follow-ups and pending guesses to this person inside a group."""
+    if int(chat_id) < 0:
+        scoped: int | None = int(user_id) if user_id is not None else 0
+    else:
+        scoped = None
+    token: Token[int | None] = _SPEAKER.set(scoped)
+    try:
+        yield scoped
+    finally:
+        _SPEAKER.reset(token)
 
 
 class ContextStore(Protocol):
@@ -284,7 +313,7 @@ class MediaMemory:
 
     @staticmethod
     def _key(chat_id: int) -> str:
-        return f"{_CONTEXT_PREFIX}{int(chat_id)}"
+        return storage_key(_CONTEXT_PREFIX, chat_id)
 
     @property
     def ttl_seconds(self) -> int:
@@ -443,4 +472,11 @@ class MediaMemory:
         )
         return context
 
-__all__ = ["ChatContext", "ContextStore", "MediaMemory", "RememberedHit"]
+__all__ = [
+    "ChatContext",
+    "ContextStore",
+    "MediaMemory",
+    "RememberedHit",
+    "speaker_scope",
+    "storage_key",
+]

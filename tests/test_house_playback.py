@@ -294,6 +294,7 @@ async def test_telegram_put_it_on_tv_uses_thread_context(
 ) -> None:
     from hearth.telegram import bot as bot_module
     from hearth.telegram.bot import TelegramMediaBot
+    from hearth.telegram.media.memory import speaker_scope
     from hearth.telegram.store import TelegramStore
 
     chat_id = -10042
@@ -304,21 +305,22 @@ async def test_telegram_put_it_on_tv_uses_thread_context(
     monkeypatch.setattr(settings, "telegram_play_lane", True)
     store = TelegramStore(tmp_path / "telegram-house-play.db")
     bot = TelegramMediaBot(store, overseerr_client=object())
-    bot.memory.remember(
-        chat_id,
-        hits=[
-            MediaHit(
-                media_type="movie",
-                tmdb_id=430231,
-                title="The Endless",
-                year=2017,
-                media_status=5,
-            )
-        ],
-        ask_kind="exact_title",
-        ask_text="The Endless",
-        search_title="The Endless",
-    )
+    with speaker_scope(chat_id, user_id):
+        bot.memory.remember(
+            chat_id,
+            hits=[
+                MediaHit(
+                    media_type="movie",
+                    tmdb_id=430231,
+                    title="The Endless",
+                    year=2017,
+                    media_status=5,
+                )
+            ],
+            ask_kind="exact_title",
+            ask_text="The Endless",
+            search_title="The Endless",
+        )
 
     async def play(**kwargs: Any) -> PlayOutcome:
         assert kwargs["title"] == "The Endless"

@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator
 from hearth.agent.prompts import SYSTEM_PROMPT, compose_system_prompt_async
 from hearth.agent.registry import ToolRegistry, registry
 from hearth.config import settings
+from hearth.butler.decision import decide_butler_tool, hide_from_llm, is_butler_phrase
 from hearth.jev import evaluate_message, log_shadow_outcome
 from hearth.memory import store as memory_store
 from hearth.memory.summarize import maybe_summarize
@@ -107,6 +108,64 @@ class AgentLoop:
                 out["widgets"] = runtime.list_widgets()
                 return out
 
+            # Jev chooses shelf and scene-preset tools. Phrases the playback
+            # and device routers already own (movie night, lights down, covers)
+            # stay on those routes. The OpenAI tool loop never sees shelf/scene.
+            routed = route_intent(text)
+            butler_turn = routed is None or str(routed.get("tool") or "") in {
+                "house_shelf",
+                "house_scene",
+            }
+            decision = decide_butler_tool(text, jev_verdict)
+            if butler_turn and decision.run:
+                runtime.set_status("tool")
+                result = await self.tools.call(decision.tool, decision.as_args())
+                used = [result.as_dict()]
+                reply = _format_tool_reply(used)
+                runtime.note("assistant", reply)
+                mode = "jev_butler" if decision.source == "jev" else "local"
+                out = {
+                    "reply": reply,
+                    "mode": mode,
+                    "tools": used,
+                    "jev": jev_verdict.as_log_dict(),
+                }
+                await _after_turn(text, out, channel="chat")
+                log_shadow_outcome(
+                    jev_verdict,
+                    channel="chat",
+                    tools=[decision.tool],
+                    outcome=mode,
+                )
+                runtime.set_status("idle")
+                widget_bus.finish_turn(ok=True, detail="Butler tool.")
+                out["widgets"] = runtime.list_widgets()
+                return out
+            if butler_turn and decision.blocked_by_jev and is_butler_phrase(text):
+                reply = (
+                    "Okay — I won't run that."
+                    if decision.source == "jev_cancel"
+                    else "That doesn't sound like the shelf or a house scene, so I left it alone."
+                )
+                runtime.note("assistant", reply)
+                out = {
+                    "reply": reply,
+                    "mode": "jev_butler",
+                    "tools": [],
+                    "jev": jev_verdict.as_log_dict(),
+                }
+                await _after_turn(text, out, channel="chat")
+                log_shadow_outcome(
+                    jev_verdict,
+                    channel="chat",
+                    tools=[],
+                    outcome=decision.source,
+                )
+                runtime.set_status("idle")
+                widget_bus.finish_turn(ok=True, detail="Butler tool held.")
+                out["widgets"] = runtime.list_widgets()
+                return out
+
             if settings.openai_configured:
                 try:
                     out = await self._run_openai(text)
@@ -180,7 +239,7 @@ class AgentLoop:
             {"role": "user", "content": user_text},
         ]
         used: list[dict[str, Any]] = []
-        tools = self.tools.openai_chat_tools()
+        tools = hide_from_llm(self.tools.openai_chat_tools())
 
         for _ in range(MAX_TURNS):
             kwargs: dict[str, Any] = {
@@ -434,6 +493,13 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         state = state if isinstance(state, dict) else {}
         entity = state.get("entity_id") or data.get("entity_id") or "the device"
         return f"Done{mock}: {entity} is {state.get('state', 'updated')}."
+    if name in {"house_shelf", "house_scene"}:
+        spoken = str(data.get("speak") or "")
+        if not spoken:
+            return f"{name}{mock}."
+        if mock and "(mock)" not in spoken:
+            return spoken.rstrip(".") + f"{mock}."
+        return spoken
     if name == "house_media":
         return str(data.get("speak") or f"House media{mock}.")
     if name == "house_status":
@@ -720,7 +786,7 @@ _MEDIA_ACTIVITY = re.compile(
     re.I,
 )
 _MOVIE_NIGHT = re.compile(
-    r"^\s*(?:(?:set|start|prepare|activate|it'?s)\s+)?"
+    r"^\s*(?:(?:set|start|prepare|it'?s)\s+)?"
     r"(?:movie|film|cinema)\s+night(?:\s+mode)?\s*[.!?]*\s*$",
     re.I,
 )
@@ -995,11 +1061,76 @@ _COS = re.compile(
 )
 
 
+def _playback_scene_route(raw: str) -> dict[str, Any] | None:
+    """Playback chain and explicit device routes that outrank butler presets."""
+    # Explicit activate/start/turn on is the scene command. Bare movie night
+    # stays the receiver-centric activity, checked just below.
+    scene = _SCENE_ACTIVATE.search(raw)
+    if scene:
+        target = next((group for group in scene.groups() if group), "")
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": target.strip(" ."),
+                "domain": "scene",
+                "action": "activate",
+            },
+        }
+    if _MOVIE_NIGHT.search(raw):
+        return {"tool": "media_activity", "args": {"activity": "movie_night"}}
+    if _LIGHTS_DOWN.search(raw):
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": settings.ha_movie_night_scene.strip() or "Movie night",
+                "domain": "scene",
+                "action": "activate",
+            },
+        }
+    light_brightness = _LIGHT_BRIGHTNESS.search(raw)
+    if light_brightness:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": light_brightness.group(1).strip(" ."),
+                "domain": "light",
+                "action": "brightness",
+                "value": int(light_brightness.group(2)),
+            },
+        }
+    cover_position = _COVER_POSITION.search(raw)
+    if cover_position:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cover_position.group(1).strip(" ."),
+                "domain": "cover",
+                "action": "set_position",
+                "value": int(cover_position.group(2)),
+            },
+        }
+    cover_action = _COVER_ACTION.search(raw)
+    if cover_action:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cover_action.group(2).strip(" ."),
+                "domain": "cover",
+                "action": cover_action.group(1).lower(),
+            },
+        }
+    return None
+
+
 def route_intent(text: str) -> dict[str, Any] | None:
     """Tiny local router so the runtime is useful before an API key is set."""
     raw = text.strip()
     if not raw:
         return None
+    # Movie night, lights down, and covers stay on the playback/device routes.
+    owned = _playback_scene_route(raw)
+    if owned is not None:
+        return owned
 
     if _COS.search(raw):
         return {
@@ -1017,6 +1148,10 @@ def route_intent(text: str) -> dict[str, Any] | None:
     house = voice_plan(raw)
     if house:
         return house
+    # Shelf and unclaimed scene presets belong to the Jev gate, so they do
+    # not become now-playing or a recommendation search.
+    if is_butler_phrase(raw):
+        return None
     if _MEMORY_LIST.search(raw):
         return {"tool": "memory_list", "args": {"kind": "preferences"}}
     if _MEMORY_SEARCH.search(raw):
@@ -1048,30 +1183,6 @@ def route_intent(text: str) -> dict[str, Any] | None:
         return {"tool": "house_status", "args": {}}
     if _NETWORK_STATUS.search(raw):
         return {"tool": "house_network", "args": {}}
-    # Explicit "activate/start/turn on movie night" is the scene command from
-    # house controls. Bare "movie night" stays the receiver-centric activity.
-    scene = _SCENE_ACTIVATE.search(raw)
-    if scene:
-        target = next((group for group in scene.groups() if group), "")
-        return {
-            "tool": "ha_device_control",
-            "args": {
-                "device": target.strip(" ."),
-                "domain": "scene",
-                "action": "activate",
-            },
-        }
-    if _MOVIE_NIGHT.search(raw):
-        return {"tool": "media_activity", "args": {"activity": "movie_night"}}
-    if _LIGHTS_DOWN.search(raw):
-        return {
-            "tool": "ha_device_control",
-            "args": {
-                "device": settings.ha_movie_night_scene.strip() or "Movie night",
-                "domain": "scene",
-                "action": "activate",
-            },
-        }
     videoland_plan = _videoland_plan(raw)
     if videoland_plan is not None:
         return videoland_plan
@@ -1162,38 +1273,6 @@ def route_intent(text: str) -> dict[str, Any] | None:
                 "device": device,
                 "action": "select_source",
                 "source": source.group(2).strip(" ."),
-            },
-        }
-    light_brightness = _LIGHT_BRIGHTNESS.search(raw)
-    if light_brightness:
-        return {
-            "tool": "ha_device_control",
-            "args": {
-                "device": light_brightness.group(1).strip(" ."),
-                "domain": "light",
-                "action": "brightness",
-                "value": int(light_brightness.group(2)),
-            },
-        }
-    cover_position = _COVER_POSITION.search(raw)
-    if cover_position:
-        return {
-            "tool": "ha_device_control",
-            "args": {
-                "device": cover_position.group(1).strip(" ."),
-                "domain": "cover",
-                "action": "set_position",
-                "value": int(cover_position.group(2)),
-            },
-        }
-    cover_action = _COVER_ACTION.search(raw)
-    if cover_action:
-        return {
-            "tool": "ha_device_control",
-            "args": {
-                "device": cover_action.group(2).strip(" ."),
-                "domain": "cover",
-                "action": cover_action.group(1).lower(),
             },
         }
     m = _TURN_ON.search(raw)

@@ -11,7 +11,10 @@ import httpx
 from hearth.config import settings
 from hearth.fixtures import (
     MOCK_PLEX_CLIENTS,
+    MOCK_PLEX_HISTORY,
     MOCK_PLEX_LIBRARY,
+    MOCK_PLEX_ON_DECK,
+    MOCK_PLEX_RECENTLY_ADDED,
     MOCK_PLEX_SECTIONS,
     MOCK_PLEX_SESSIONS,
 )
@@ -113,6 +116,62 @@ class Plex:
                     "mode": "mock",
                     "error": str(exc),
                     "sessions": _sessions(MOCK_PLEX_SESSIONS),
+                }
+            raise
+
+    async def on_deck(self, limit: int = 8) -> dict[str, Any]:
+        """In-progress titles from Plex On Deck (`/library/onDeck`)."""
+        return await self._shelf_collection(
+            "/library/onDeck",
+            mock_payload=MOCK_PLEX_ON_DECK,
+            limit=limit,
+        )
+
+    async def recently_added(self, limit: int = 8) -> dict[str, Any]:
+        """Titles already in the library (`/library/recentlyAdded`)."""
+        return await self._shelf_collection(
+            "/library/recentlyAdded",
+            mock_payload=MOCK_PLEX_RECENTLY_ADDED,
+            limit=limit,
+        )
+
+    async def play_history(self, limit: int = 5) -> dict[str, Any]:
+        """Recently finished plays (`/status/sessions/history/all`)."""
+        return await self._shelf_collection(
+            "/status/sessions/history/all",
+            params={"sort": "viewedAt:desc", "limit": max(1, int(limit))},
+            mock_payload=MOCK_PLEX_HISTORY,
+            limit=limit,
+        )
+
+    async def _shelf_collection(
+        self,
+        path: str,
+        *,
+        mock_payload: dict[str, Any],
+        limit: int,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        cap = max(1, int(limit))
+        if not self.live:
+            return {
+                "mode": "mock",
+                "items": [_shelf_item(row) for row in _metadata_rows(mock_payload)][:cap],
+            }
+        client = await self._http()
+        try:
+            response = await client.get(path, params=params)
+            response.raise_for_status()
+            return {
+                "mode": "live",
+                "items": [_shelf_item(row) for row in _metadata_rows(response.json())][:cap],
+            }
+        except Exception as exc:  # noqa: BLE001
+            if settings.mock_if_unconfigured:
+                return {
+                    "mode": "mock",
+                    "error": str(exc),
+                    "items": [_shelf_item(row) for row in _metadata_rows(mock_payload)][:cap],
                 }
             raise
 
@@ -986,6 +1045,59 @@ def _tmdb_from_guids(raw: Any) -> int | None:
             if digits:
                 return int(digits)
     return None
+
+
+def _metadata_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = (payload.get("MediaContainer") or {}).get("Metadata") or []
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return [row for row in raw if isinstance(row, dict)]
+    return []
+
+
+def _shelf_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Normalize an On Deck, recently-added, or history row."""
+    summary = _item_summary(item)
+    duration = int(item.get("duration") or 0)
+    offset = int(item.get("viewOffset") or 0)
+    percent: int | None = None
+    if duration > 0 and offset > 0:
+        percent = max(1, min(99, int(round(100 * offset / duration))))
+    show = item.get("grandparentTitle") or None
+    episode_title = summary.get("title")
+    label = str(episode_title or "Untitled")
+    if item.get("type") == "episode" and show:
+        season = item.get("parentIndex")
+        episode = item.get("index")
+        code = ""
+        if season is not None and episode is not None:
+            try:
+                code = f" S{int(season):02d}E{int(episode):02d}"
+            except (TypeError, ValueError):
+                code = ""
+        label = f"{show}{code}"
+        if episode_title and str(episode_title) != str(show):
+            label = f"{label} · {episode_title}"
+    viewed = item.get("viewedAt") or item.get("lastViewedAt")
+    added = item.get("addedAt")
+
+    def _ts(value: Any) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        **summary,
+        "show": show,
+        "label": label,
+        "progress_ms": offset,
+        "duration_ms": duration,
+        "progress_pct": percent,
+        "viewed_at": _ts(viewed),
+        "added_at": _ts(added),
+    }
 
 
 def _sessions(payload: dict[str, Any]) -> list[dict[str, Any]]:
