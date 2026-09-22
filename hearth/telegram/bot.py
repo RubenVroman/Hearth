@@ -1760,6 +1760,14 @@ class TelegramMediaBot:
                 )
         except CatalogUnavailable as exc:
             return BotReply(str(getattr(exc, "message", exc)), edit_message_id=message_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # A tap is unambiguously addressed to me. Retrying an unexpected
+            # refine failure three times only delays the same outcome behind a
+            # card that never changes.
+            log.exception("telegram refine action %s failed", action.action)
+            return BotReply(voice.lane_failed(), edit_message_id=message_id)
         return BotReply(voice.lost_context(), edit_message_id=message_id)
 
     async def _play_text_reply(self, view: MessageView) -> BotReply:

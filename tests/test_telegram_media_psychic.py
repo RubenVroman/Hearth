@@ -586,6 +586,31 @@ async def test_an_unexpected_lane_failure_still_answers(
     assert "nothing was queued" in reply.text
 
 
+async def test_an_unexpected_refine_failure_still_edits_the_card(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tap is unambiguously addressed to the bot, so it must answer."""
+    overseerr = FakeOverseerr(results=[DATE_NIGHT], discover_results=SCARY_PICKS)
+    bot = bot_factory(overseerr)
+
+    shown = await bot.handle_message(_message("Date Night"))
+    assert shown is not None
+    chip = next(b for b in _buttons(shown) if "🎬" in b["text"])
+
+    async def _explode(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("catalog client blew up in an unexpected way")
+
+    monkeypatch.setattr(bot.catalog, "hits", _explode)
+
+    reply = await bot.handle_callback(_callback(chip["callback_data"]))
+
+    assert reply is not None
+    assert reply.text.strip()
+    assert reply.edit_message_id == 1
+    assert "nothing was queued" in reply.text
+
+
 async def test_a_rate_limited_ask_is_echoed_back(
     bot_factory,
     monkeypatch: pytest.MonkeyPatch,
