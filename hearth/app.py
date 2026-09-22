@@ -200,6 +200,26 @@ async def now_playing() -> dict[str, Any]:
     return await plex.now_playing()
 
 
+@app.get("/api/house/pulse")
+async def house_pulse() -> dict[str, Any]:
+    """Shelf, last play, and which scene presets Home Assistant can run."""
+    from hearth.butler.shelf import house_pulse as build_pulse
+
+    return await build_pulse()
+
+
+class SceneBody(BaseModel):
+    preset: str = Field(min_length=1, max_length=40)
+
+
+@app.post("/api/house/scene")
+async def house_scene(body: SceneBody) -> dict[str, Any]:
+    """Activate movie night, quiet hours, or good night when the scene exists."""
+    from hearth.butler.scenes import activate_preset
+
+    return await activate_preset(body.preset)
+
+
 @app.get("/api/plex/genres")
 async def plex_genres(type: str = Query(default="movie")) -> dict[str, Any]:
     """List genres for the Plex movie or show library. Token stays server-side."""

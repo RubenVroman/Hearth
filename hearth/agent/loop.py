@@ -434,6 +434,13 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         state = state if isinstance(state, dict) else {}
         entity = state.get("entity_id") or data.get("entity_id") or "the device"
         return f"Done{mock}: {entity} is {state.get('state', 'updated')}."
+    if name in {"house_shelf", "house_scene"}:
+        spoken = str(data.get("speak") or "")
+        if not spoken:
+            return f"{name}{mock}."
+        if mock and "(mock)" not in spoken:
+            return spoken.rstrip(".") + f"{mock}."
+        return spoken
     if name == "house_media":
         return str(data.get("speak") or f"House media{mock}.")
     if name == "house_status":
@@ -1196,6 +1203,11 @@ def route_intent(text: str) -> dict[str, Any] | None:
                 "action": cover_action.group(1).lower(),
             },
         }
+    from hearth.butler.phrases import house_route
+
+    butler = house_route(raw)
+    if butler is not None:
+        return butler
     m = _TURN_ON.search(raw)
     if m:
         return _turn_plan(m.group(1), on=True)

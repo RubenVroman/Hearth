@@ -59,11 +59,20 @@
 
     <main class="stage">
       <aside class="rail rail-media is-empty" id="rail-media">
+        <div id="house-fault" class="house-fault" hidden>
+          <p id="house-fault-copy">Part of the house didn’t answer.</p>
+          <button type="button" id="house-fault-retry">Retry</button>
+        </div>
+        <div id="house-chips" class="house-chips" aria-label="House status"></div>
         <div class="rail-block is-empty" id="now-playing-block">
           <p class="kicker">Now playing</p>
           <article class="card film" id="now-playing">
             <p class="muted">Nothing on the wire.</p>
           </article>
+        </div>
+        <div class="rail-block is-empty" id="shelf-block">
+          <p class="kicker rest">On the shelf</p>
+          <div id="shelf-list" class="stack shelf-list"></div>
         </div>
         <div class="rail-block is-empty" id="media-block">
           <p class="kicker rest">AVR · TV</p>
@@ -147,6 +156,15 @@
         <div class="rail-block is-empty" id="lights-block">
           <p class="kicker">Lights</p>
           <div id="lights" class="tiles"></div>
+        </div>
+        <div class="rail-block" id="presets-block">
+          <p class="kicker">House scenes</p>
+          <div id="scene-presets" class="stack">
+            <button type="button" class="preset" data-preset="movie_night">Movie night</button>
+            <button type="button" class="preset" data-preset="quiet_hours">Quiet hours</button>
+            <button type="button" class="preset" data-preset="good_night">Good night</button>
+          </div>
+          <p id="preset-note" class="preset-note" hidden></p>
         </div>
         <div class="rail-block is-empty" id="scenes-block">
           <p class="kicker rest">Scenes</p>
