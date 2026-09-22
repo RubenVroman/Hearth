@@ -684,7 +684,7 @@ _HOUSE_STATUS = re.compile(
     r"(?:house|home)\s+(?:status|snapshot|check)|"
     r"status\s+of\s+(?:the\s+)?(?:house|home)|"
     r"how(?:'s| is)\s+(?:the\s+)?(?:house|home)|"
-    r"what(?:'s| is)\s+on\s+(?:in|around)\s+(?:the\s+)?(?:house|home)"
+    r"what(?:'s| is)\s+on\s+(?:in|around|at)\s+(?:the\s+)?(?:house|home)"
     r")\b",
     re.I,
 )
@@ -1586,6 +1586,18 @@ def _turn_plan(phrase: str, *, on: bool) -> dict[str, Any]:
         return {
             "tool": "ha_media_control",
             "args": {"device": device, "action": "turn_on" if on else "turn_off"},
+        }
+    if re.search(
+        r"\b(cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters)\b",
+        cleaned,
+    ):
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cleaned,
+                "domain": "cover",
+                "action": "open" if on else "close",
+            },
         }
     return {
         "tool": "ha_device_control",

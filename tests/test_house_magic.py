@@ -230,6 +230,14 @@ def test_local_router_handles_house_status_and_covers() -> None:
             "value": 30,
         },
     }
+    assert route_intent("turn off the living room blind") == {
+        "tool": "ha_device_control",
+        "args": {
+            "device": "living room blind",
+            "domain": "cover",
+            "action": "close",
+        },
+    }
 
 
 @pytest.mark.parametrize(
