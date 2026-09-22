@@ -4,6 +4,7 @@ Jev is **not** an LLM and does not generate text. It returns typed **Choice / No
 
 1. A cheap gate **before** the OpenAI agent tool loop (cancel / CoS / refuse).
 2. The **first-class Telegram media intent router** — every media-ish Telegram turn hits Jev first, which picks one of eleven lanes; OpenAI is only called when Jev says `descriptive_riddle` / `needs_llm` (or confidence is too low).
+3. The **gate in front of physical house hardware** — pet feeder, airco, air purifier. See [devices.md](devices.md).
 
 ## Defaults (safe)
 
@@ -50,6 +51,16 @@ Missing key, disabled Jev, API errors, or low confidence → **fail open** to lo
 - **Shadow** (`HEARTH_JEV_ENABLED=true`, `HEARTH_JEV_SHADOW=true`): cancel/confirm/CoS stay advisory (logged). Telegram **media_ask routing still applies** when confidence clears the media threshold — that is the product differentiator.
 - **Enforce** (`HEARTH_JEV_SHADOW=false`): high-confidence cancel → do not run queue tools; high-confidence `escalate_cos` → Chief of Staff; API errors / low confidence → fail open.
 - Telegram: never invents a queue without a pending guess or Get tap. Enforce may treat high-confidence Jev confirm/cancel like yes/nah.
+
+## House-device gate (`device_ask`)
+
+Tools registered with `jev_gated=True` — `pet_feeder_feed`, `pet_feeder_schedule`, `airco_control`, `air_purifier_control` — are gated inside the **tool registry**, so chat, voice, Telegram and `POST /api/invoke` share one decision rather than each surface writing its own guard.
+
+`house_device_system_one_questions()` asks the `device_ask` Choice (`feed_pets`, `feeder_schedule`, `airco`, `air_purifier`, `device_status`, `discover_entities`, `not_house_device`) plus the usual confirm / cancel / risk questions. It deliberately omits the media router: a feeder turn is never an Overseerr ask.
+
+In enforce mode a high-confidence `is_cancel` (≥ `HEARTH_JEV_CANCEL_THRESHOLD`) or a `do_not_auto_run` risk level above `HEARTH_JEV_DEVICE_CONFIDENCE` blocks the call; the result carries `blocked_by: "jev"` and Home Assistant is never touched. Everything else fails open — a flaky System One call must not leave the pets unfed.
+
+Surfaces publish the sentence they received (`set_utterance`, or a `said` argument) so the gate judges what was actually said rather than the arguments a model flattened it into.
 
 ## Ops
 

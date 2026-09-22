@@ -4,6 +4,9 @@
 #   - Denon AVR (HEOS / Network receivers) for AVR-X3700H
 #   - Apple TV integration (pyatv) — pair the living-room ATV for Infuse deep links
 #   - your lights (Hue, ZHA, Matter, …)
+#   - Tuya Local for the PetZero pet feeder, the airco, and the KPT Air
+#     Purifier (LAN control; the Tuya cloud integration also works). Ask Hearth
+#     for the resulting entity ids with ha_discover_entities — see docs/devices.md
 #
 # HA is the device layer. Hearth talks to HA over the REST API; it does not
 # speak webOS, Denon, or Infuse protocol itself. Infuse launches as:
@@ -19,6 +22,11 @@
 #   HA_APPLE_TV_ENTITY=media_player.<your_apple_tv>
 #   HA_TOKEN=<long-lived token from Profile → Security>
 #   HEARTH_APPLE_TV_PLAYER=infuse
+#
+# And for the non-media devices (each is a candidate list, not one id):
+#   HA_PET_FEEDER_ENTITIES=button.<your_feeder>_feed
+#   HA_AIRCO_ENTITIES=climate.<your_airco>
+#   HA_AIR_PURIFIER_ENTITIES=fan.<your_purifier>
 
 default_config:
 

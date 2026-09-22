@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, Infuse play on ATV, *arr/Overseerr grab/request, deterministic Telegram media bot, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, PetZero feeder + Tuya airco/air purifier, Infuse play on ATV, *arr/Overseerr grab/request, deterministic Telegram media bot, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -85,6 +85,14 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HA_APPLE_TV_ENTITY` | Apple TV `media_player` (HA apple_tv / pyatv). Default `media_player.apple_tv`. Required for Infuse. |
 | `HA_REQUEST_RETRIES` / `HA_RETRY_BASE_SECONDS` | Transient HA retry policy. Defaults `3` / `0.25`. Transport failures force a fresh connection. |
 | `HA_VERIFY_TIMEOUT_SECONDS` / `HA_VERIFY_POLL_INTERVAL` | Observe device state after writes instead of trusting HTTP acceptance alone. Defaults `6` / `0.4`. |
+| `HA_PET_FEEDER_ENTITIES` | PetZero manual-feed candidates (comma-separated). Hearth takes the first one HA has, else discovers by keyword. See [docs/devices.md](docs/devices.md). |
+| `HA_PET_FEEDER_PORTION_ENTITIES` / `HA_PET_FEEDER_SCHEDULE_ENTITIES` | Optional feeder portion `number` and schedule `switch` candidates. |
+| `HA_PET_FEEDER_COOLDOWN_SECONDS` | Anti-double-feed window. Default `600`. A repeat inside it needs “feed them anyway”. |
+| `HA_PET_FEEDER_DEFAULT_PORTIONS` / `HA_PET_FEEDER_MAX_PORTIONS` | Portions per feed and the cap. Defaults `1` / `6`. |
+| `HA_AIRCO_ENTITIES` | Tuya air-conditioning `climate` candidates. |
+| `HA_AIRCO_DEFAULT_MODE` | Which hvac mode “airco on” picks. Default `cool`. |
+| `HA_AIRCO_MIN_TEMPERATURE` / `HA_AIRCO_MAX_TEMPERATURE` | Guardrails for misheard numbers. Defaults `16` / `30`; the unit's own range also applies. |
+| `HA_AIR_PURIFIER_ENTITIES` | KPT Air Purifier candidates (`fan`, sometimes `humidifier` or `switch`). |
 | `HEARTH_RECEIVER_CENTRIC` | Default `true`. Media activities route through the Denon; TV/Apple-TV volume requests control the receiver. |
 | `HA_AVR_APPLE_TV_SOURCE` / `HA_AVR_TV_SOURCE` | Denon source names for the Apple TV and TV Audio activities. Defaults `Media Player` / `TV Audio`. |
 | `HEARTH_APPLE_TV_PLAYER` | `infuse` (default) or `plex`. Prefer Infuse over the Plex tvOS app for Apple TV. |
@@ -450,6 +458,16 @@ Hearth will not talk webOS, Denon, or Infuse protocol itself. After HA is on:
    recreate the hearth container.
 
 For LAN discovery (Cast, some TVs), you may want host networking on the HA service — see comments in `docker-compose.yml`. Hearth itself stays on the `hearth` bridge.
+
+### Pet feeder, airco, air purifier
+
+The PetZero feeders and the Tuya OEM hardware (KPT Air Purifier, air conditioning) go through the same device layer. Pair them with **Tuya Local** so control is a LAN call rather than a cloud round trip; the Tuya cloud integration also works and produces the same entity domains.
+
+Tuya entity ids depend on how a device was paired, so nothing is hardcoded. Each role reads a comma-separated candidate list from `.env`, falls back to keyword discovery over live HA state, and reports the matches when several entities fit rather than switching a random relay. After pairing, ask Hearth for the real ids — “tuya devices” in chat, `/devices` on Telegram, or the `ha_discover_entities` tool — and paste its `env_suggestions` into the host `.env`.
+
+Then it answers to phrases in English and Dutch: “feed the cats”, “geef de katten eten”, “airco 21”, “zet de airco uit”, “purifier on”, “luchtreiniger op auto”, “is the airco on”. Telegram adds `/feed`, `/airco`, `/purifier`, `/devices`.
+
+Two things worth knowing: dispensed food cannot be recalled, so a repeat feed inside `HA_PET_FEEDER_COOLDOWN_SECONDS` is refused until you say “feed them anyway”; and every device tool call passes through the shared Jev gate in the tool registry, so chat, voice, Telegram, and `/api/invoke` are governed by one decision. Full pairing guide, tool reference, and troubleshooting: [docs/devices.md](docs/devices.md).
 
 Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve → the app). Do not document or use `:8443` / `:8787` in the UI. Do **not** enable Tailscale Funnel. Hearth stays Tailscale-only; bind the app to LAN/Tailscale (or localhost behind Serve), never a WAN port-forward.
 
