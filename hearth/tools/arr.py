@@ -99,6 +99,32 @@ def _overseerr_base_url(value: str) -> str:
     return _rewrite_host_docker_internal(base)
 
 
+def overseerr_request_error_text(
+    label: str,
+    *,
+    reason: str = "",
+    already: bool = False,
+) -> str:
+    """One sentence per Overseerr rejection code — the only copy of this taxonomy.
+
+    The gateway phrases rejections with whatever title it was given; callers with
+    a richer label (Telegram knows the year and season) pass that instead.
+    """
+    subject = (label or "").strip() or "that title"
+    if already or reason == "already_requested":
+        return f"{subject} is already requested in Overseerr."
+    if reason == "no_seasons":
+        return f"Overseerr has no requestable seasons for {subject}."
+    if reason == "forbidden":
+        return (
+            f"Overseerr rejected {subject}. Check the API key, request permission, "
+            "quota, and blocklist."
+        )
+    if reason == "invalid_request":
+        return f"Overseerr could not accept the request for {subject}."
+    return f"Overseerr did not accept the request for {subject}."
+
+
 def _overseerr_error(operation: str, exc: Exception) -> OverseerrError:
     status = None
     if isinstance(exc, httpx.HTTPStatusError):
@@ -1393,7 +1419,10 @@ class StarrClient:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 headers={"X-Api-Key": self.api_key, "Accept": "application/json"},
-                timeout=12.0,
+                timeout=httpx.Timeout(
+                    float(settings.arr_timeout_seconds),
+                    connect=float(settings.arr_connect_timeout_seconds),
+                ),
             )
         return self._client
 
@@ -2608,7 +2637,10 @@ class Overseerr:
             self._client = httpx.AsyncClient(
                 base_url=signature[0],
                 headers={"X-Api-Key": signature[1], "Accept": "application/json"},
-                timeout=httpx.Timeout(12.0, connect=5.0),
+                timeout=httpx.Timeout(
+                    float(settings.overseerr_timeout_seconds),
+                    connect=float(settings.arr_connect_timeout_seconds),
+                ),
             )
             self._client_signature = signature
         return self._client
@@ -3147,9 +3179,9 @@ class Overseerr:
                     "reason": "no_seasons",
                     "status_code": 202,
                     **fields,
-                    "speak": (
-                        "Overseerr has no requestable seasons for "
-                        f"{query or pick.get('title') or 'that show'}."
+                    "speak": overseerr_request_error_text(
+                        query or str(pick.get("title") or ""),
+                        reason="no_seasons",
                     ),
                 }
             if response.status_code == 409:
@@ -3164,7 +3196,10 @@ class Overseerr:
                     "already_queued": True,
                     "status_code": 409,
                     **fields,
-                    "speak": f"{query or pick.get('title') or 'That title'} is already requested.",
+                    "speak": overseerr_request_error_text(
+                        query or str(pick.get("title") or ""),
+                        already=True,
+                    ),
                 }
             if response.status_code in {400, 403, 422}:
                 payload = _json_object(response)
@@ -3177,11 +3212,9 @@ class Overseerr:
                     "reason": "forbidden" if forbidden else "invalid_request",
                     "status_code": response.status_code,
                     **fields,
-                    "speak": (
-                        "Overseerr rejected this request. Check the API key, user permissions, "
-                        "quota, and blocklist."
-                        if forbidden
-                        else "Overseerr could not accept that media request."
+                    "speak": overseerr_request_error_text(
+                        query or str(pick.get("title") or ""),
+                        reason="forbidden" if forbidden else "invalid_request",
                     ),
                 }
             response.raise_for_status()
@@ -3566,6 +3599,7 @@ class Overseerr:
         merged: list[dict[str, Any]] = []
         seen: set[int] = {mid}
         errors = 0
+        last_error: Exception | None = None
         for path in paths:
             try:
                 response = await client.get(path, params={"page": 1})
@@ -3574,6 +3608,7 @@ class Overseerr:
             except Exception as exc:  # noqa: BLE001
                 # One thin list must not sink the lane; both failing is an error.
                 errors += 1
+                last_error = exc
                 log.warning(
                     "Overseerr neighbours lookup failed for %s: %s", path, type(exc).__name__
                 )
@@ -3590,10 +3625,9 @@ class Overseerr:
                 seen.add(tid)
                 merged.append({**row, "mediaType": _row_media_type(row) or kind})
         if errors == len(paths):
-            raise OverseerrError(
-                "Overseerr neighbours lookup failed",
-                operation="neighbours",
-            )
+            # Same construction as every other Overseerr failure so the log line
+            # and the status suffix stay consistent across operations.
+            raise _overseerr_error("neighbours", last_error or RuntimeError("all paths failed"))
         return {
             "ok": True,
             "mode": "live",

@@ -17,6 +17,7 @@ import re
 
 from hearth.config import settings
 from hearth.jev import (
+    adopt_verdict,
     evaluate_telegram_media,
     log_shadow_outcome,
     media_ask_choice,
@@ -509,11 +510,15 @@ async def classify_media_ask(
     if local.note in {"confirm_token", "list_ask"}:
         return local
 
-    if not settings.jev_enabled:
+    # jev_enabled without a key is a no-op; don't spend a turn discovering that.
+    if not settings.jev_active:
         return local
 
     try:
         verdict = await evaluate_telegram_media(text, recent=recent)
+        # Share the call with the tool gate so the queue/play chokepoints below
+        # decide from this same answer set instead of paying for another.
+        adopt_verdict(verdict)
         log_shadow_outcome(
             verdict,
             channel="telegram_media_router",

@@ -1387,6 +1387,12 @@ def _media_queue_plan(raw: str) -> dict[str, Any] | None:
     query = _media_query(raw)
     if len(query) < 2:
         return None
+    # A queue needs something title-shaped. Without a grab verb or a media noun,
+    # a long sentence is prose, not a title, and searching it would only miss.
+    if len(query.split()) > 4 and not (
+        _GRAB.search(raw) or _MOVIE.search(raw) or _SERIES.search(raw) or _OVERSEERR.search(raw)
+    ):
+        return None
     if _OVERSEERR.search(raw):
         return {"tool": "overseerr_request", "args": {"query": query}}
     if _SERIES.search(raw) and not _MOVIE.search(raw):

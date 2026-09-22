@@ -190,8 +190,26 @@ _DENY_TEXT: dict[str, str] = {
 
 
 def lane_for_tool(tool: str) -> str:
-    """Lane label for a registry tool, or ``""`` when it is not classified."""
-    return _TOOL_TO_LANE.get(str(tool or "").strip(), "")
+    """Lane label for a registry tool, or ``""`` when it is not classified.
+
+    Workspace skills are registered at runtime from ``workspace/skills/``, so
+    they are resolved through the registry rather than the static map.
+    """
+    name = str(tool or "").strip()
+    lane = _TOOL_TO_LANE.get(name)
+    if lane is not None:
+        return lane
+    if not name:
+        return ""
+    try:
+        from hearth.agent.registry import registry
+
+        spec = registry.get(name)
+    except Exception:  # noqa: BLE001 — classification must not raise into a call
+        return ""
+    if spec is not None and str(getattr(spec, "source", "")).startswith("workspace:"):
+        return "files"
+    return ""
 
 
 def tools_for_lane(lane: str) -> tuple[str, ...]:

@@ -19,7 +19,15 @@ from collections.abc import Mapping
 from typing import Any
 
 from hearth.config import settings
-from hearth.jev import evaluate_message, evaluate_telegram_media, log_shadow_outcome, noul_high
+from hearth.jev import (
+    adopt_verdict,
+    authorize_tool,
+    evaluate_message,
+    evaluate_telegram_media,
+    log_shadow_outcome,
+    noul_high,
+    tool_turn,
+)
 from hearth.telegram.callbacks import (
     ACTION_DISMISS,
     ACTION_MORE,
@@ -83,7 +91,7 @@ from hearth.butler.nudge import queue_shelf_aside
 from hearth.butler.phrases import classify_house_phrase
 from hearth.butler.scenes import activate_preset
 from hearth.butler.shelf import shelf_snapshot
-from hearth.tools.arr import OverseerrError, overseerr
+from hearth.tools.arr import OverseerrError, overseerr, overseerr_request_error_text
 
 log = logging.getLogger("hearth.telegram")
 
@@ -257,7 +265,16 @@ class TelegramMediaBot:
         view = MessageView.from_telegram(message)
         if view is None or not self._authorized(view.chat_id, view.user_id):
             return None
+        # One Jev scope per Telegram turn: the media router's verdict is reused
+        # by the tool gate, so routing and authorization share a single call.
+        with tool_turn(view.text, channel="telegram"):
+            return await self._handle_message(view, message)
 
+    async def _handle_message(
+        self,
+        view: MessageView,
+        message: dict[str, Any],
+    ) -> BotReply | None:
         house_reply = await self.house.handle(view.text)
         if house_reply is not None:
             # A new explicit house command supersedes any stale media yes/no offer.
@@ -270,8 +287,9 @@ class TelegramMediaBot:
 
         # Pending-guess confirm/cancel: Jev may sharpen yes/nah in enforce mode.
         # Never invent a queue without a pending guess (Overseerr confirm rule).
-        if pending is not None and settings.jev_enabled:
+        if pending is not None and settings.jev_active:
             jev_verdict = await evaluate_telegram_media(view.text)
+            adopt_verdict(jev_verdict)
             log_shadow_outcome(
                 jev_verdict,
                 channel="telegram_pending_guess",
@@ -1473,6 +1491,16 @@ class TelegramMediaBot:
         if media_type == "tv":
             seasons = [season] if season is not None else "all"
 
+        # The typed yes is the confirm, so only Jev's hard stops apply here.
+        decision = await self._authorize_queue(
+            said=view.text,
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+        )
+        if decision is not None and decision.denied:
+            self._clear_pending_guess(view.chat_id)
+            return BotReply(decision.message)
+
         try:
             result = await self.overseerr.request(
                 query=title,
@@ -1481,16 +1509,10 @@ class TelegramMediaBot:
                 seasons=seasons,
             )
         except OverseerrError:
-            return BotReply(
-                f"The request outcome for {label} is uncertain because Overseerr did "
-                "not answer. Check Overseerr before trying again."
-            )
+            return BotReply(self._uncertain_request_text(label, answered=False))
         except Exception:  # noqa: BLE001
             log.exception("telegram pending-guess request failed")
-            return BotReply(
-                f"The request outcome for {label} is uncertain. Check Overseerr before "
-                "trying again."
-            )
+            return BotReply(self._uncertain_request_text(label, answered=True))
 
         self._clear_pending_guess(view.chat_id)
         if not result.get("ok"):
@@ -1892,6 +1914,19 @@ class TelegramMediaBot:
                 voice.play_needs_title(),
                 edit_message_id=message_id,
             )
+        try:
+            decision = await authorize_tool(
+                "plex_play",
+                {"query": title, "media_type": media_type},
+                said=(context.ask_text if context is not None else "") or f"play {title}",
+                channel="telegram_play",
+                explicit_confirm=True,
+            )
+        except Exception:  # noqa: BLE001 — never block a tapped Play on the gate
+            log.warning("jev play gate failed open", exc_info=True)
+            decision = None
+        if decision is not None and decision.denied:
+            return BotReply(decision.message, edit_message_id=message_id)
         outcome = await play_on_tv(
             title=title,
             tmdb_id=tmdb_id,
@@ -2050,6 +2085,11 @@ class TelegramMediaBot:
 
     @_with_speaker
     async def handle_callback(self, callback: dict[str, Any]) -> BotReply | None:
+        # One Jev scope per tap so the gate's decisions land in one log line.
+        with tool_turn("", channel="telegram_callback"):
+            return await self._handle_callback(callback)
+
+    async def _handle_callback(self, callback: dict[str, Any]) -> BotReply | None:
         message = callback.get("message")
         message = message if isinstance(message, Mapping) else {}
         chat = message.get("chat")
@@ -2148,6 +2188,17 @@ class TelegramMediaBot:
         if request.media_type == "tv":
             seasons = [request.season] if request.season is not None else "all"
 
+        # A Get tap is the confirm, so only Jev's hard stops apply. The claim is
+        # released so a denied tap can be retried once the ask is clearer.
+        decision = await self._authorize_queue(
+            said=str(metadata.get("ask_text") or title),
+            tmdb_id=request.tmdb_id,
+            media_type=request.media_type,
+        )
+        if decision is not None and decision.denied:
+            self.store.finish_callback(digest, state="failed", error=decision.reason)
+            return BotReply(decision.message, edit_message_id=message_id)
+
         try:
             result = await self.overseerr.request(
                 query=title,
@@ -2158,16 +2209,14 @@ class TelegramMediaBot:
         except OverseerrError as exc:
             self.store.finish_callback(digest, state="uncertain", error=str(exc))
             return BotReply(
-                f"The request outcome for {label} is uncertain because Overseerr did "
-                "not answer. Check Overseerr before trying again.",
+                self._uncertain_request_text(label, answered=False),
                 edit_message_id=message_id,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("telegram Overseerr request failed")
             self.store.finish_callback(digest, state="uncertain", error=type(exc).__name__)
             return BotReply(
-                f"The request outcome for {label} is uncertain. Check Overseerr before "
-                "trying again.",
+                self._uncertain_request_text(label, answered=True),
                 edit_message_id=message_id,
             )
 
@@ -2347,32 +2396,51 @@ class TelegramMediaBot:
             "mediaStatus": media_status,
         }
 
+    async def _authorize_queue(
+        self,
+        *,
+        said: str,
+        tmdb_id: int,
+        media_type: str,
+    ) -> Any | None:
+        """Jev gate for the one Telegram action that spends the house's bandwidth.
+
+        Get taps and typed yeses are already explicit confirms, so only Jev's
+        hard stops (refuse / do-not-auto-run) can block them. ``None`` means the
+        gate had no opinion and the request proceeds.
+        """
+        try:
+            return await authorize_tool(
+                "overseerr_request",
+                {"media_id": tmdb_id, "media_type": media_type},
+                said=said or None,
+                channel="telegram_queue",
+                explicit_confirm=True,
+            )
+        except Exception:  # noqa: BLE001 — the gate must never block a confirmed Get
+            log.warning("jev queue gate failed open", exc_info=True)
+            return None
+
+    @staticmethod
+    def _uncertain_request_text(label: str, *, answered: bool) -> str:
+        """One sentence for a request whose provider outcome Hearth cannot confirm."""
+        because = "" if answered else " because Overseerr did not answer"
+        return (
+            f"The request outcome for {label} is uncertain{because}. "
+            "Check Overseerr before trying again."
+        )
+
     @staticmethod
     def _request_error_text(label: str, result: Mapping[str, Any]) -> str:
-        reason = str(result.get("reason") or "")
-        if result.get("already") or reason == "already_requested":
-            return (
-                f"{label} is already requested in Overseerr. "
-                "Say “what’s on tonight” if you want something already on the shelf."
-            )
-        if reason == "no_seasons":
-            return (
-                f"Overseerr has no requestable seasons for {label}. "
-                "I didn’t queue it — name a season, or send the title again."
-            )
-        if reason == "forbidden":
-            return (
-                f"Overseerr rejected {label}. I didn’t queue it. Check the API key, "
-                "request permission, quota, and blocklist, then tap Get again."
-            )
-        if reason == "invalid_request":
-            return (
-                f"Overseerr could not accept the request for {label}. "
-                "Nothing was queued — search again and tap Get."
-            )
-        return (
-            f"Overseerr did not accept the request for {label}. "
-            "Nothing was queued. Search again, or say “what’s on tonight”."
+        """Phrase an Overseerr rejection using Telegram's richer label.
+
+        The taxonomy lives once, in ``hearth.tools.arr``; only the subject
+        differs here because Telegram knows the year and season.
+        """
+        return overseerr_request_error_text(
+            label,
+            reason=str(result.get("reason") or ""),
+            already=bool(result.get("already")),
         )
 
     @staticmethod
