@@ -27,6 +27,7 @@ from hearth.telegram.callbacks import (
     ACTION_SERIES,
     ACTION_SIMILAR,
     ACTION_STATUS,
+    ACTION_TITLE,
     CallbackCodec,
     CallbackError,
     is_action_callback,
@@ -366,6 +367,12 @@ class TelegramMediaBot:
                 )
             )
 
+        # "Play it on the TV" refers to whatever is on screen, so it resolves
+        # against the thread rather than the catalog — searching those words as
+        # a title is a guaranteed miss.
+        if looks_like_play_command(view.text):
+            return await self._play_text_reply(view)
+
         # New search/guess replaces any sticky yes/no offer.
         self._clear_pending_guess(view.chat_id)
 
@@ -575,6 +582,7 @@ class TelegramMediaBot:
         offer_series: bool = False,
         offer_more: bool = False,
         offer_dismiss: bool = False,
+        title_chip: str = "",
         page: int = 1,
         accumulate_shown: bool = True,
     ) -> BotReply:
@@ -592,6 +600,7 @@ class TelegramMediaBot:
             series_anchor=top if (offer_series and top is not None) else None,
             offer_more=offer_more,
             offer_dismiss=offer_dismiss,
+            title_chip=title_chip,
         )
         self.memory.remember(
             chat_id,
@@ -951,6 +960,9 @@ class TelegramMediaBot:
             ask_text=intent.raw_text or view.text,
             media_type=spec.media_type,
             offer_more=True,
+            # "Date Night" is both a vibe and a film. Answer as the vibe, but
+            # leave the correction one tap away instead of guessing silently.
+            title_chip=spec.ambiguous_title,
             page=page,
         )
 
@@ -1667,6 +1679,8 @@ class TelegramMediaBot:
         # reaches Infuse as "TMDB 603" and cannot possibly succeed.
         stored = self.store.get_callback_media(data) or {}
         try:
+            if action.action == ACTION_TITLE:
+                return await self._title_correction_reply(view, stored)
             if action.action == ACTION_SIMILAR and action.tmdb_id:
                 anchor_label = ""
                 if context is not None:
@@ -1718,6 +1732,45 @@ class TelegramMediaBot:
         except CatalogUnavailable as exc:
             return BotReply(str(getattr(exc, "message", exc)), edit_message_id=message_id)
         return BotReply(voice.lost_context(), edit_message_id=message_id)
+
+    async def _play_text_reply(self, view: MessageView) -> BotReply:
+        """"Play it on the TV" for the card on screen — honest about every miss."""
+        context = self.memory.load(view.chat_id)
+        top = context.top if context is not None else None
+        if top is None:
+            return BotReply(voice.play_nothing_to_play())
+        label = _display_title(top.title, top.year)
+        if top.media_status != 5:
+            # Only Plex can play it, and it is not there yet. Saying so beats
+            # handing Infuse a title it will never find.
+            return BotReply(voice.play_not_on_plex(label))
+        outcome = await play_on_tv(
+            title=top.title,
+            tmdb_id=top.tmdb_id,
+            media_type=top.media_type,
+            year=top.year,
+        )
+        if outcome.ok:
+            return BotReply(voice.play_started(label))
+        return BotReply(voice.play_failed(label, reason=outcome.message))
+
+    async def _title_correction_reply(
+        self,
+        view: MessageView,
+        stored: Mapping[str, Any],
+    ) -> BotReply:
+        """"I meant the title" — re-run the ambiguous vibe ask as an exact search."""
+        title = str(stored.get("title") or "").strip()
+        if not title:
+            return BotReply(voice.lost_context(), edit_message_id=view.message_id)
+        query = MediaQuery(
+            action="search",
+            title=title,
+            reason="title_correction",
+            raw_text=title,
+        )
+        reply = await self._search_reply(view, query)
+        return BotReply(reply.text, reply.reply_markup, edit_message_id=view.message_id)
 
     async def _offer_watch_next(
         self,

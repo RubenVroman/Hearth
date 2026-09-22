@@ -432,6 +432,10 @@ def play_nothing_to_play() -> str:
     )
 
 
+def play_not_on_plex(label: str) -> str:
+    return f"{label} isn't on Plex yet, so there's nothing to play. Tap Get and I'll fetch it."
+
+
 def status_ack(label: str, *, state: str) -> str:
     if state == "pending":
         return f"{label} is still waiting for approval — nothing to Get again."
@@ -456,6 +460,7 @@ __all__ = [
     "play_started",
     "play_failed",
     "play_needs_title",
+    "play_not_on_plex",
     "play_nothing_to_play",
     "status_ack",
     "watch_next_nudge",

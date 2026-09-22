@@ -31,6 +31,7 @@ ACTION_DISMISS = "n"  # nah, drop the offer
 ACTION_SERIES = "a"  # all of them (franchise expand)
 ACTION_PLAY = "p"  # play available title on the TV (never queues)
 ACTION_STATUS = "s"  # acknowledge pending/downloading (never queues)
+ACTION_TITLE = "x"  # "I meant the title" — re-run the ask as an exact search
 ACTION_CODES = frozenset(
     {
         ACTION_SIMILAR,
@@ -39,6 +40,7 @@ ACTION_CODES = frozenset(
         ACTION_SERIES,
         ACTION_PLAY,
         ACTION_STATUS,
+        ACTION_TITLE,
     }
 )
 
