@@ -106,6 +106,33 @@ async def test_play_media_distinguishes_launch_from_playback(
     assert result["playback_confirmed"] is False
 
 
+async def test_device_discovery_does_not_use_remote_as_play_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = HomeAssistant()
+
+    async def entities() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "states": [
+                {
+                    "entity_id": "remote.apple_tv",
+                    "state": "on",
+                    "attributes": {"friendly_name": "Apple TV"},
+                },
+                {
+                    "entity_id": "media_player.lg_tv",
+                    "state": "on",
+                    "attributes": {"friendly_name": "LG TV"},
+                },
+            ],
+        }
+
+    monkeypatch.setattr(client, "list_media_entities", entities)
+
+    assert await client._find_by_hint("apple_tv") is None
+
+
 async def test_infuse_reports_partial_media_path_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -136,7 +163,7 @@ async def test_infuse_reports_partial_media_path_failure(
             "playback_confirmed": True,
         }
 
-    from hearth.tools import infuse as infuse_module
+    import hearth.tools.infuse as infuse_module
 
     monkeypatch.setattr(client, "resolve_play", plan)
     monkeypatch.setattr(infuse_module.ha, "activate_media_path", activity)
@@ -150,7 +177,11 @@ async def test_infuse_reports_partial_media_path_failure(
     assert "living-room path is not ready" in result["speak"]
 
 
-async def test_movie_night_activates_scene_and_media_path() -> None:
+async def test_movie_night_activates_scene_and_media_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ha_movie_night_scene", "")
+    monkeypatch.setattr(settings, "receiver_centric", True)
     result = await registry.call("media_activity", {"activity": "movie_night"})
 
     assert result.ok

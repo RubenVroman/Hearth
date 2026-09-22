@@ -344,7 +344,13 @@ class HomeAssistant:
 
     async def _find_by_hint(self, device: str) -> dict[str, Any] | None:
         media = await self.list_media_entities()
-        states = media.get("states") or []
+        # Device roles must resolve to media_player entities. A matching
+        # remote.apple_tv is a power-command fallback, not a valid play target.
+        states = [
+            row
+            for row in media.get("states") or []
+            if _domain(str(row.get("entity_id") or "")) == "media_player"
+        ]
         role = self._device_role(device)
         scored = sorted(
             ((self._media_match_score(role, row), row) for row in states),
