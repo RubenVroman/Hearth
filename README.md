@@ -420,7 +420,7 @@ hearth/jev/      TypeSafe Jev (System One) decision gate — see docs/jev.md
 hearth/ui/       Static command center (no Node build)
 workspace/       Sandboxed files + skills
 ha/              Home Assistant config (onboarding still required)
-docs/            Operator notes (Jev sandbox, …)
+docs/            Operator notes (Jev sandbox, Telegram media smoke script, …)
 data/            Auth + memory SQLite (compose bind-mount; gitignores *.db)
 docker-compose.yml
 Dockerfile
@@ -552,6 +552,8 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
 - Progress checks Radarr/Sonarr only for titles this bot queued.
 
 The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, `TELEGRAM_DB_PATH`, the lane switches (`HEARTH_TELEGRAM_MOOD_LANE`, `HEARTH_TELEGRAM_PERSON_LANE`, `HEARTH_TELEGRAM_SIMILAR_LANE`, `HEARTH_TELEGRAM_BATCH_LANE`, `HEARTH_TELEGRAM_BATCH_MAX_ITEMS`, `HEARTH_TELEGRAM_CONTEXT_TTL_SECONDS`, `HEARTH_TELEGRAM_BUTLER_VOICE` — all default on), plus the Jev variables in `docs/jev.md`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.
+
+After a deploy, walk [docs/telegram-media-smoke.md](docs/telegram-media-smoke.md): a few minutes of real messages that prove status truth, the house-night / person / similar lanes, plans, follow-ups, watch-next, Play on the TV, and the never-silent and mediaId-confirm boundaries.
 
 ### Media modules
 
