@@ -82,6 +82,9 @@ def test_device_phrases_map_to_tool_plans(text: str, tool: str, args: dict[str, 
         "Air",
         "grab Interstellar",
         "play Dune on the Apple TV",
+        # A year is not a temperature or a fan speed.
+        "airco 2024",
+        "air purifier 2019",
         # Other house domains must keep their existing routing.
         "turn on the TV",
         "turn off the kitchen lights",

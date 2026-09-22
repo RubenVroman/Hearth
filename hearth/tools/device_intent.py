@@ -107,9 +107,11 @@ _AIRCO_STATUS = re.compile(
     rf"|\b{_AIRCO}\s+(?:status|state)\b)",
     re.I,
 )
+# (?!\d) keeps a four-digit year out: "airco 2024" is not 20 degrees.
 _AIRCO_TEMPERATURE = re.compile(
-    rf"(?:\b{_AIRCO}\s*(?:to|op|naar|at|@)?\s*(\d{{1,2}})(?:\s*(?:°|degrees?|graden|deg|c\b))?"
-    rf"|\b(?:set|zet|put)\s+(?:the\s+|de\s+)?{_AIRCO}\s+(?:to|op|naar|at)\s+(\d{{1,2}}))",
+    rf"(?:\b{_AIRCO}\s*(?:to|op|naar|at|@)?\s*(\d{{1,2}})(?!\d)"
+    r"(?:\s*(?:°|degrees?|graden|deg|c\b))?"
+    rf"|\b(?:set|zet|put)\s+(?:the\s+|de\s+)?{_AIRCO}\s+(?:to|op|naar|at)\s+(\d{{1,2}})(?!\d))",
     re.I,
 )
 _AIRCO_FAN = re.compile(
@@ -139,7 +141,7 @@ _PURIFIER_STATUS = re.compile(
     re.I,
 )
 _PURIFIER_SPEED = re.compile(
-    rf"\b{_PURIFIER}\s*(?:to|op|at|speed|snelheid|@)?\s*(\d{{1,3}})\s*%?",
+    rf"\b{_PURIFIER}\s*(?:to|op|at|speed|snelheid|@)?\s*(\d{{1,3}})(?!\d)\s*%?",
     re.I,
 )
 _PURIFIER_PRESET = re.compile(
