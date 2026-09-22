@@ -95,7 +95,10 @@ class Settings(BaseSettings):
     # into "which entity did you mean" rather than controlling the wrong device.
     # Run the ha_discover_entities tool after pairing and paste the real ids here.
     ha_pet_feeder_entities: str = Field(
-        default="button.pet_feeder_feed,button.petzero_feed,switch.pet_feeder_feed,switch.pet_feeder",
+        default=(
+            "button.pet_feeder_feed,button.petzero_feed,"
+            "switch.pet_feeder_feed,switch.pet_feeder"
+        ),
         alias="HA_PET_FEEDER_ENTITIES",
     )
     # Tuya feeders usually expose portions as a number entity rather than as
@@ -126,7 +129,10 @@ class Settings(BaseSettings):
         alias="HA_PET_FEEDER_COOLDOWN_SECONDS",
     )
     ha_airco_entities: str = Field(
-        default="climate.airco,climate.air_conditioner,climate.airconditioner,climate.living_room_ac",
+        default=(
+            "climate.airco,climate.air_conditioner,"
+            "climate.airconditioner,climate.living_room_ac"
+        ),
         alias="HA_AIRCO_ENTITIES",
     )
     ha_airco_default_temperature: float = Field(

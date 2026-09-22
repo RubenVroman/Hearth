@@ -359,6 +359,31 @@ async def test_airco_mode_accepts_dutch_and_reports_the_real_list() -> None:
     assert "Available: off, cool, heat, dry, fan_only" in missing.data["speak"]
 
 
+async def test_a_mode_given_alongside_a_temperature_is_not_dropped() -> None:
+    """"airco 19 op verwarmen" has to change both, whether or not it was off."""
+    await registry.call("airco_control", {"action": "on"})
+    result = await registry.call(
+        "airco_control",
+        {"action": "set_temperature", "temperature": 19, "mode": "heat"},
+    )
+    assert result.ok
+    state = (await ha.get_state("climate.airco"))["state"]
+    assert state["state"] == "heat"
+    assert state["attributes"]["temperature"] == 19
+
+
+async def test_powering_on_with_a_mode_does_not_set_it_twice() -> None:
+    result = await registry.call("airco_control", {"action": "on", "mode": "dry"})
+    assert result.ok
+    hvac_calls = [
+        step
+        for step in result.data["steps"]
+        if step.get("service") == "climate.set_hvac_mode"
+    ]
+    assert len(hvac_calls) == 1
+    assert (await ha.get_state("climate.airco"))["state"]["state"] == "dry"
+
+
 async def test_airco_fan_speed_is_verified_in_state() -> None:
     result = await registry.call("airco_control", {"action": "set_fan_mode", "fan_mode": "high"})
     assert result.ok

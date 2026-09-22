@@ -745,7 +745,9 @@ def register_builtin_tools() -> None:
                     },
                     "domain": {
                         "type": "string",
-                        "description": "Optional HA domain filter: climate, fan, switch, button, …",
+                        "description": (
+                            "Optional HA domain filter: climate, fan, switch, button, …"
+                        ),
                     },
                     "limit": {"type": "integer", "description": "Max rows per group (default 40)."},
                 },
@@ -769,7 +771,10 @@ def register_builtin_tools() -> None:
                 "properties": {
                     "portions": {
                         "type": "integer",
-                        "description": "How many portions (default 1, capped by HA_PET_FEEDER_MAX_PORTIONS).",
+                        "description": (
+                            "How many portions (default 1, capped by "
+                            "HA_PET_FEEDER_MAX_PORTIONS)."
+                        ),
                     },
                     "feeder": {
                         "type": "string",
@@ -842,7 +847,9 @@ def register_builtin_tools() -> None:
                     "fan_mode": {"type": "string", "description": "low, medium, high, auto, …"},
                     "target": {
                         "type": "string",
-                        "description": "Optional entity/room name when there is more than one unit.",
+                        "description": (
+                            "Optional entity/room name when there is more than one unit."
+                        ),
                     },
                     "said": {
                         "type": "string",
@@ -882,7 +889,9 @@ def register_builtin_tools() -> None:
                     },
                     "target": {
                         "type": "string",
-                        "description": "Optional entity/room name when there is more than one unit.",
+                        "description": (
+                            "Optional entity/room name when there is more than one unit."
+                        ),
                     },
                     "said": {
                         "type": "string",

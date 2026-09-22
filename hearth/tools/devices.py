@@ -248,7 +248,12 @@ async def _snapshot(states: list[dict[str, Any]] | None) -> dict[str, Any]:
     return await ha.list_states()
 
 
-def _pairing_error(role: DeviceRole, mode: str, *, matches: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _pairing_error(
+    role: DeviceRole,
+    mode: str,
+    *,
+    matches: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     configured = role.configured()
     if matches:
         names = ", ".join(str(m.get("entity_id")) for m in matches[:6])
@@ -373,7 +378,11 @@ async def resolve_role(
     # A house with exactly one climate entity has exactly one airco, whatever
     # the installer named it. Only safe for single-domain roles.
     if len(role.domains) == 1:
-        only = [row for row in rows if _domain_of(str(row.get("entity_id") or "")) == role.domains[0]]
+        only = [
+            row
+            for row in rows
+            if _domain_of(str(row.get("entity_id") or "")) == role.domains[0]
+        ]
         if len(only) == 1:
             row = only[0]
             return {
@@ -515,7 +524,12 @@ def _expect_on() -> Callable[[dict[str, Any]], bool]:
     return lambda state: str(state.get("state") or "").lower() not in (_UNREACHABLE | {"off"})
 
 
-def _expect_attr(name: str, value: Any, *, tolerance: float = 0.0) -> Callable[[dict[str, Any]], bool]:
+def _expect_attr(
+    name: str,
+    value: Any,
+    *,
+    tolerance: float = 0.0,
+) -> Callable[[dict[str, Any]], bool]:
     def check(state: dict[str, Any]) -> bool:
         actual = (state.get("attributes") or {}).get(name)
         if actual is None:
@@ -528,6 +542,17 @@ def _expect_attr(name: str, value: Any, *, tolerance: float = 0.0) -> Callable[[
         return _slug(str(actual)) == _slug(str(value))
 
     return check
+
+
+def _refuse(role: str, entity_id: str, message: str) -> dict[str, Any]:
+    """A tool-shaped 'no' that speaks for itself."""
+    return {
+        "ok": False,
+        "role": role,
+        "entity_id": entity_id,
+        "error": message,
+        "speak": message,
+    }
 
 
 def _attr(state: dict[str, Any] | None, name: str, default: Any = None) -> Any:
@@ -866,10 +891,12 @@ async def climate_control(
     if temperature is not None and wanted in {"on", "turn_on"}:
         wanted = "set_temperature"
     if wanted in {"temperature", "set_temperature", "temp", "set_temp"} and temperature is None:
-        message = "Give me a temperature, for example airco 21."
-        return {"ok": False, "role": "airco", "entity_id": entity_id, "error": message, "speak": message}
+        return _refuse("airco", entity_id, "Give me a temperature, for example airco 21.")
 
     steps: list[dict[str, Any]] = []
+    # Set by the power-on step when it already put the unit in the asked-for mode,
+    # so "airco 21 on heat" does not send set_hvac_mode twice.
+    powered_mode = ""
     if wanted in {"off", "turn_off", "stop"}:
         result = await ha.call_and_verify(
             "climate",
@@ -887,6 +914,8 @@ async def climate_control(
     ):
         power = await _airco_power_on(entity_id, state, requested_mode=mode)
         steps.append(power)
+        if mode and power.get("ok"):
+            powered_mode = str(power.get("applied_mode") or "")
         if not power.get("ok"):
             return _climate_result(
                 label,
@@ -898,15 +927,22 @@ async def climate_control(
             )
         if wanted in {"on", "turn_on"} and temperature is None and not fan_mode:
             after = power.get("state") or {}
-            return _climate_result(label, entity_id, mode_name, "turn_on", steps, _speak_climate(label, after))
+            return _climate_result(
+                label, entity_id, mode_name, "turn_on", steps, _speak_climate(label, after)
+            )
 
-    if wanted in {"mode", "set_mode", "hvac_mode", "set_hvac_mode"} or (mode and wanted != "set_temperature"):
+    wants_mode = wanted in {"mode", "set_mode", "hvac_mode", "set_hvac_mode"}
+    if wants_mode or (mode and not powered_mode):
         requested = mode or action
-        chosen = _match_option(requested, _attr(state, "hvac_modes", []) or [])
+        modes = _attr(state, "hvac_modes", []) or []
+        chosen = _match_option(requested, modes)
         if not chosen:
-            available = ", ".join(str(m) for m in _attr(state, "hvac_modes", []) or []) or "none reported"
-            message = f"{label} has no {requested!r} mode. Available: {available}."
-            return {"ok": False, "role": "airco", "entity_id": entity_id, "error": message, "speak": message}
+            available = ", ".join(str(m) for m in modes) or "none reported"
+            return _refuse(
+                "airco",
+                entity_id,
+                f"{label} has no {requested!r} mode. Available: {available}.",
+            )
         result = await ha.call_and_verify(
             "climate",
             "set_hvac_mode",
@@ -915,9 +951,14 @@ async def climate_control(
             expect=_expect_state(chosen),
         )
         steps.append(result)
-        if wanted not in {"set_temperature"} and temperature is None and not fan_mode:
+        if wanted != "set_temperature" and temperature is None and not fan_mode:
             return _climate_result(
-                label, entity_id, mode_name, "set_mode", steps, _speak_climate(label, result.get("state"))
+                label,
+                entity_id,
+                mode_name,
+                "set_mode",
+                steps,
+                _speak_climate(label, result.get("state")),
             )
 
     if temperature is not None:
@@ -938,11 +979,15 @@ async def climate_control(
         )
 
     if fan_mode:
-        chosen = _match_option(fan_mode, _attr(state, "fan_modes", []) or [])
+        fan_modes = _attr(state, "fan_modes", []) or []
+        chosen = _match_option(fan_mode, fan_modes)
         if not chosen:
-            available = ", ".join(str(m) for m in _attr(state, "fan_modes", []) or []) or "none reported"
-            message = f"{label} has no {fan_mode!r} fan speed. Available: {available}."
-            return {"ok": False, "role": "airco", "entity_id": entity_id, "error": message, "speak": message}
+            available = ", ".join(str(m) for m in fan_modes) or "none reported"
+            return _refuse(
+                "airco",
+                entity_id,
+                f"{label} has no {fan_mode!r} fan speed. Available: {available}.",
+            )
         result = await ha.call_and_verify(
             "climate",
             "set_fan_mode",
@@ -957,13 +1002,19 @@ async def climate_control(
 
     if steps:
         return _climate_result(
-            label, entity_id, mode_name, wanted, steps, _speak_climate(label, steps[-1].get("state"))
+            label,
+            entity_id,
+            mode_name,
+            wanted,
+            steps,
+            _speak_climate(label, steps[-1].get("state")),
         )
-    message = (
+    return _refuse(
+        "airco",
+        entity_id,
         f"Unknown airco action {action!r}; use status, on, off, set_temperature, "
-        "set_mode, or set_fan_mode."
+        "set_mode, or set_fan_mode.",
     )
-    return {"ok": False, "role": "airco", "entity_id": entity_id, "error": message, "speak": message}
 
 
 async def _airco_power_on(
@@ -990,13 +1041,14 @@ async def _airco_power_on(
     if not chosen:
         # No mode list published — fall back to the plain climate.turn_on service.
         return await ha.call_and_verify("climate", "turn_on", entity_id, expect=_expect_on())
-    return await ha.call_and_verify(
+    result = await ha.call_and_verify(
         "climate",
         "set_hvac_mode",
         entity_id,
         {"hvac_mode": chosen},
         expect=_expect_state(chosen),
     )
+    return {**result, "applied_mode": chosen}
 
 
 def _climate_result(
@@ -1099,7 +1151,9 @@ async def purifier_control(
         wanted = "set_mode"
 
     if wanted in {"on", "turn_on", "off", "turn_off", "toggle"}:
-        service = {"on": "turn_on", "turn_on": "turn_on", "toggle": "toggle"}.get(wanted, "turn_off")
+        service = "toggle" if wanted == "toggle" else (
+            "turn_on" if wanted in {"on", "turn_on"} else "turn_off"
+        )
         expect = (
             _expect_state("off")
             if service == "turn_off"
@@ -1115,26 +1169,18 @@ async def purifier_control(
 
     if wanted in {"speed", "set_speed", "percentage", "set_percentage"}:
         if percentage is None:
-            message = "Give me a speed percentage, for example purifier 40%."
-            return {
-                "ok": False,
-                "role": "air_purifier",
-                "entity_id": entity_id,
-                "error": message,
-                "speak": message,
-            }
-        if domain != "fan":
-            message = (
-                f"{label} is a {domain} entity in Home Assistant, so it only does on and off. "
-                "Re-pair it with Tuya Local to get fan speeds."
+            return _refuse(
+                "air_purifier",
+                entity_id,
+                "Give me a speed percentage, for example purifier 40%.",
             )
-            return {
-                "ok": False,
-                "role": "air_purifier",
-                "entity_id": entity_id,
-                "error": message,
-                "speak": message,
-            }
+        if domain != "fan":
+            return _refuse(
+                "air_purifier",
+                entity_id,
+                f"{label} is a {domain} entity in Home Assistant, so it only does on "
+                "and off. Re-pair it with Tuya Local to get fan speeds.",
+            )
         value = max(0.0, min(100.0, float(percentage)))
         result = await ha.call_and_verify(
             "fan",
@@ -1152,26 +1198,20 @@ async def purifier_control(
 
     if wanted in {"mode", "set_mode", "preset", "preset_mode", "set_preset_mode"}:
         if not preset_mode:
-            message = "Which mode? For example auto, sleep, or turbo."
-            return {
-                "ok": False,
-                "role": "air_purifier",
-                "entity_id": entity_id,
-                "error": message,
-                "speak": message,
-            }
+            return _refuse(
+                "air_purifier",
+                entity_id,
+                "Which mode? For example auto, sleep, or turbo.",
+            )
         available = _attr(state, "preset_modes", []) or []
         chosen = _match_option(preset_mode, available)
         if not chosen:
             names = ", ".join(str(m) for m in available) or "none reported"
-            message = f"{label} has no {preset_mode!r} mode. Available: {names}."
-            return {
-                "ok": False,
-                "role": "air_purifier",
-                "entity_id": entity_id,
-                "error": message,
-                "speak": message,
-            }
+            return _refuse(
+                "air_purifier",
+                entity_id,
+                f"{label} has no {preset_mode!r} mode. Available: {names}.",
+            )
         result = await ha.call_and_verify(
             domain,
             "set_preset_mode",
@@ -1186,10 +1226,11 @@ async def purifier_control(
         )
         return _purifier_result(label, entity_id, mode_name, "set_preset_mode", result, speak)
 
-    message = (
-        f"Unknown purifier action {action!r}; use status, on, off, set_speed, or set_mode."
+    return _refuse(
+        "air_purifier",
+        entity_id,
+        f"Unknown purifier action {action!r}; use status, on, off, set_speed, or set_mode.",
     )
-    return {"ok": False, "role": "air_purifier", "entity_id": entity_id, "error": message, "speak": message}
 
 
 def _purifier_result(

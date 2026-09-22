@@ -18,7 +18,10 @@ from typing import Any
 
 _PET = r"(?:cats?|kittens?|kitt(?:y|ies)|pets?|animals?|katten|kat|poezen|poes|dieren|beesten)"
 # Bare "ac" is left out on purpose — "AC/DC" is a band, not the air conditioning.
-_AIRCO = r"(?:airco(?:s)?|aircon(?:ditioning|ditioner)?|air[\s-]?co(?:nditioning|nditioner)?|a/c|klimaat)"
+_AIRCO = (
+    r"(?:airco(?:s)?|aircon(?:ditioning|ditioner)?"
+    r"|air[\s-]?co(?:nditioning|nditioner)?|a/c|klimaat)"
+)
 _PURIFIER = r"(?:air[\s-]?purifier|purifier|air[\s-]?cleaner|luchtreiniger|luchtfilter)"
 
 _ON = r"(?:on|aan)"
