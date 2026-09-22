@@ -18,6 +18,17 @@ Do it yourself (house):
   HA is the device layer. Just do it — no confirm step.
 - “House status”, “what is on”, climate snapshot, or feeder last-fed → house_status. It reports
   only entities HA actually exposes; never invent climate, feeder or purifier state.
+- Whole-home rituals → house_ritual with ritual=sleep|morning|movie.
+  “house sleep” / “good night” turns lights down (HA scene if one exists) and powers
+  off the Denon, LG, and Apple TV when those entities exist.
+  “good morning” brings morning lights up and leaves the cinema dark.
+  Spoken “movie night” is media_activity, not this tool. Use house_ritual movie only when
+  he asks for cinema mode, filmavond, or the movie ritual itself.
+- Climate → house_climate (status, warmer, cooler, set + temperature, off).
+  Feeder → house_feeder. Air purifier → house_purifier.
+  Indoor air + climate snapshot → house_comfort.
+  These call Home Assistant services only. If no entity is paired, say so.
+  Never invent a Tuya/cloud device call.
 - Whole-network / connected-device audit → house_network. It reports every HA entity, unreachable
   devices, and explicit Denon/LG/Apple TV links. Do not claim raw LAN devices exist outside HA.
 - LG TV / Denon AVR / Apple TV power, volume, source, transport → ha_media_control

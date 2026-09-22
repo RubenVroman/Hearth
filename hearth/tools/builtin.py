@@ -9,6 +9,13 @@ from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.cos import cos_configured, escalate, not_configured_message
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.house import (
+    climate_control,
+    comfort_snapshot,
+    feeder_control,
+    purifier_control,
+    run_ritual,
+)
 from hearth.tools.infuse import infuse
 from hearth.tools.media import house_media_inventory, media_activity, media_control
 from hearth.tools.plex import plex
@@ -72,6 +79,47 @@ async def _ha_device_control(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _media_activity(args: dict[str, Any]) -> dict[str, Any]:
     return await media_activity(str(args.get("activity") or ""))
+
+
+async def _house_ritual(args: dict[str, Any]) -> dict[str, Any]:
+    return await run_ritual(str(args.get("ritual") or ""))
+
+
+async def _house_climate(args: dict[str, Any]) -> dict[str, Any]:
+    temperature = args.get("temperature")
+    try:
+        parsed = float(temperature) if temperature is not None and temperature != "" else None
+    except (TypeError, ValueError):
+        parsed = None
+    return await climate_control(
+        str(args.get("action") or "status"),
+        temperature=parsed,
+        entity=str(args.get("entity") or "") or None,
+    )
+
+
+async def _house_feeder(args: dict[str, Any]) -> dict[str, Any]:
+    return await feeder_control(
+        str(args.get("action") or "feed"),
+        entity=str(args.get("entity") or "") or None,
+    )
+
+
+async def _house_purifier(args: dict[str, Any]) -> dict[str, Any]:
+    percentage = args.get("percentage")
+    try:
+        parsed = float(percentage) if percentage is not None and percentage != "" else None
+    except (TypeError, ValueError):
+        parsed = None
+    return await purifier_control(
+        str(args.get("action") or "status"),
+        entity=str(args.get("entity") or "") or None,
+        percentage=parsed,
+    )
+
+
+async def _house_comfort(_args: dict[str, Any]) -> dict[str, Any]:
+    return await comfort_snapshot()
 
 
 async def _ha_media(args: dict[str, Any]) -> dict[str, Any]:
@@ -666,6 +714,109 @@ def register_builtin_tools() -> None:
                 "required": ["activity"],
             },
             handler=_media_activity,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_ritual",
+            description=(
+                "Whole-home ritual: sleep (lights down + cinema off), morning (lights up, "
+                "cinema stays dark), or movie (dim lights + Denon/LG/Apple TV path). "
+                "Uses a matching Home Assistant scene when one exists, otherwise lights "
+                "and the existing media chain. Runs immediately."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "ritual": {
+                        "type": "string",
+                        "enum": ["sleep", "morning", "movie"],
+                        "description": (
+                            "sleep = house sleep / good night, morning = good morning, "
+                            "movie = movie night."
+                        ),
+                    }
+                },
+                "required": ["ritual"],
+            },
+            handler=_house_ritual,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_climate",
+            description=(
+                "Read or adjust a Home Assistant climate entity (setpoint, warmer, cooler, "
+                "hvac mode). Discovers climate.* unless HA_CLIMATE_ENTITY is set. "
+                "No Tuya client — HA services only. Runs immediately."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "status, warmer, cooler, set, off, heat, cool, auto",
+                    },
+                    "temperature": {
+                        "type": "number",
+                        "description": "Setpoint in °C for action=set.",
+                    },
+                    "entity": {"type": "string", "description": "Optional climate entity_id."},
+                },
+                "required": ["action"],
+            },
+            handler=_house_climate,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_feeder",
+            description=(
+                "Press the pet feeder through Home Assistant (button.press or switch.turn_on). "
+                "Discovers feeder/voeder entities unless HA_FEEDER_ENTITY is set. "
+                "Runs immediately."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "feed or status"},
+                    "entity": {"type": "string", "description": "Optional feeder entity_id."},
+                },
+            },
+            handler=_house_feeder,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_purifier",
+            description=(
+                "Switch the air purifier through Home Assistant (fan or switch). "
+                "Discovers purifier entities unless HA_PURIFIER_ENTITY is set. "
+                "Runs immediately."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "status, on, off, or toggle"},
+                    "entity": {"type": "string"},
+                    "percentage": {
+                        "type": "number",
+                        "description": "Optional fan percentage when turning on.",
+                    },
+                },
+            },
+            handler=_house_purifier,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_comfort",
+            description=(
+                "Snapshot of Home Assistant climate and indoor air quality "
+                "(PM2.5, CO₂, AQI, and similar sensors), plus purifier and feeder state."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_house_comfort,
         )
     )
     registry.register(

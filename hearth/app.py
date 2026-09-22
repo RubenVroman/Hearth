@@ -31,6 +31,7 @@ from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.builtin import register_builtin_tools
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.house import comfort_snapshot
 from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
 from hearth.tools.thuisbezorgd import thuisbezorgd
@@ -231,6 +232,12 @@ async def network_inventory(limit: int = Query(default=250, ge=1, le=1000)) -> d
 async def house_status() -> dict[str, Any]:
     """One coherent HA snapshot: what is on, climate, covers, and optional last-fed."""
     return await ha.house_status()
+
+
+@app.get("/api/comfort")
+async def comfort() -> dict[str, Any]:
+    """Climate, indoor air, purifier, and feeder chips for the command center."""
+    return await comfort_snapshot()
 
 
 @app.get("/api/rooms")

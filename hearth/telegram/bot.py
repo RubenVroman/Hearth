@@ -68,6 +68,7 @@ from hearth.telegram.media.watch_next import (
 )
 
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
+from hearth.telegram.house import house_control_reply, looks_like_house_control
 from hearth.telegram.parse import parse_message
 from hearth.telegram.progress import (
     ProgressTracker,
@@ -92,7 +93,9 @@ HELP_TEXT = (
     "(“scary under 2 hours”), lookalikes (“something like Arrival”), and several "
     "at once (“grab Inception and Interstellar”). Follow-ups work too: “the "
     "sequel”, “all of them”, “more like that”. Tap Get to request — I never "
-    "queue from chat alone. Media commands: /search <title>, /status. Help: /help."
+    "queue from chat alone. House controls, when Home Assistant has them: "
+    "house sleep, good morning, movie night mode, climate, feeder, purifier. "
+    "Media commands: /search <title>, /status. Help: /help."
 )
 _PENDING_GUESS_PREFIX = "guess:"
 
@@ -283,6 +286,13 @@ class TelegramMediaBot:
         # Durable update ids in TelegramStore own transport deduplication. Do
         # not mark a message seen before its reply has actually been delivered:
         # a transient send failure must be able to replay the search.
+        # Explicit house control (rituals, climate, feeder, purifier). This
+        # sits above the chatter ignore list so "good morning" can run, and
+        # above the media router so it never becomes a title search. Bare
+        # "movie night" is still a catalog vibe and is not matched here.
+        if looks_like_house_control(view.text):
+            self._clear_pending_guess(view.chat_id)
+            return await house_control_reply(view.text)
         if query.action == "ignore":
             return None
         if query.action == "help":

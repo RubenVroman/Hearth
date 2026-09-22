@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     # Optional exact scene id for "movie night" / "lights down". Empty asks HA
     # to resolve the friendly name "Movie night", avoiding install-specific ids.
     ha_movie_night_scene: str = Field(default="", alias="HA_MOVIE_NIGHT_SCENE")
+    # Optional comfort devices. Empty = discover climate / purifier / feeder in HA.
+    ha_climate_entity: str = Field(default="", alias="HA_CLIMATE_ENTITY")
+    ha_purifier_entity: str = Field(default="", alias="HA_PURIFIER_ENTITY")
+    ha_feeder_entity: str = Field(default="", alias="HA_FEEDER_ENTITY")
     # Live HA calls are retried and writes are verified. These deliberately live
     # in Hearth rather than relying only on TCP retries: an accepted service call
     # can still leave a slow TV/receiver in the old state for a few seconds.

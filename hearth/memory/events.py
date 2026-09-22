@@ -17,6 +17,10 @@ _NOTABLE = {
     "ha_device_control",
     "ha_media_control",
     "media_activity",
+    "house_ritual",
+    "house_climate",
+    "house_feeder",
+    "house_purifier",
     "radarr_add",
     "sonarr_add",
     "overseerr_request",
@@ -65,7 +69,7 @@ def on_tool_result(spec: ToolSpec, result: ToolResult) -> None:
 
 
 def _kind(name: str) -> str:
-    if name.startswith("ha_"):
+    if name.startswith("ha_") or name.startswith("house_"):
         return "ha"
     if name in {"radarr_add", "sonarr_add", "overseerr_request"}:
         return "media"

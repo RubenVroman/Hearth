@@ -1,4 +1,10 @@
-"""Deterministic Telegram commands for routine Home Assistant control."""
+"""Telegram house commands and comfort quick replies.
+
+Slash and natural commands cover lights, scenes, covers, and house status.
+Ritual, climate, feeder, and purifier phrases use a one-tap reply keyboard
+when Home Assistant actually has those devices. Bare "movie night" stays
+with the media bot. Jev gates every house call before a service runs.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,13 @@ from typing import Any, Literal
 from hearth.agent.registry import ToolRegistry, registry
 from hearth.jev import evaluate_message, log_shadow_outcome
 from hearth.telegram.models import BotReply
+from hearth.tools.house import (
+    climate_control,
+    comfort_snapshot,
+    feeder_control,
+    purifier_control,
+    run_ritual,
+)
 
 HouseCommandKind = Literal[
     "house_status",
@@ -339,6 +352,11 @@ class TelegramHouseCommands:
         self.tools = tools or registry
 
     async def handle(self, text: str) -> BotReply | None:
+        # Rituals, climate, feeder, and purifier before slash/scene parsing.
+        # Bare "movie night" is not a house-control phrase, so the media bot
+        # still owns that vibe.
+        if looks_like_house_control(text):
+            return await house_control_reply(text)
         command = parse_house_command(text)
         if command is None:
             return None
@@ -543,5 +561,161 @@ __all__ = [
     "HouseCommand",
     "TELEGRAM_COMMANDS",
     "TelegramHouseCommands",
+    "house_control_reply",
+    "looks_like_house_control",
     "parse_house_command",
+    "telegram_plan",
 ]
+
+
+def looks_like_house_control(text: str) -> bool:
+    return telegram_plan(text) is not None
+
+
+def telegram_plan(text: str) -> dict[str, Any] | None:
+    """Parse a house-control phrase. None means leave it to the media bot."""
+    raw = _clean(text)
+    if not raw:
+        return None
+    if raw in {
+        "house sleep",
+        "good night",
+        "goodnight",
+        "lights out",
+        "welterusten",
+        "put the house to sleep",
+        "time for bed",
+    }:
+        return {"tool": "house_ritual", "args": {"ritual": "sleep"}}
+    if raw in {"good morning", "goedemorgen"}:
+        return {"tool": "house_ritual", "args": {"ritual": "morning"}}
+    # Bare "movie night" is a catalog vibe. Require an explicit control shape.
+    if raw in {
+        "movie night mode",
+        "cinema mode",
+        "filmavond",
+        "start movie night",
+        "set movie night",
+        "house movie night",
+    }:
+        return {"tool": "house_ritual", "args": {"ritual": "movie"}}
+    if raw in {"warmer", "make it warmer", "turn the heat up"}:
+        return {"tool": "house_climate", "args": {"action": "warmer"}}
+    if raw in {"cooler", "make it cooler", "turn the heat down"}:
+        return {"tool": "house_climate", "args": {"action": "cooler"}}
+    if raw in {"climate off", "turn the heat off", "thermostat off", "heating off"}:
+        return {"tool": "house_climate", "args": {"action": "off"}}
+    if raw in {"what's the climate", "how's the heat", "how's the heating", "climate status"}:
+        return {"tool": "house_climate", "args": {"action": "status"}}
+    setpoint = re.fullmatch(
+        r"(?:set )?(?:the )?(?:heat|heating|thermostat|climate) to (\d{1,2}(?:\.\d)?)",
+        raw,
+    )
+    if setpoint:
+        return {
+            "tool": "house_climate",
+            "args": {"action": "set", "temperature": float(setpoint.group(1))},
+        }
+    if raw in {"feed", "feeder", "voeder", "voeren"} or re.fullmatch(
+        r"feed the (?:cat|cats|dog|dogs|pets|feeder)",
+        raw,
+    ):
+        return {"tool": "house_feeder", "args": {"action": "feed"}}
+    if raw in {
+        "purifier on",
+        "air purifier on",
+        "turn the purifier on",
+        "turn the air purifier on",
+    }:
+        return {"tool": "house_purifier", "args": {"action": "on"}}
+    if raw in {
+        "purifier off",
+        "air purifier off",
+        "turn the purifier off",
+        "turn the air purifier off",
+    }:
+        return {"tool": "house_purifier", "args": {"action": "off"}}
+    if raw in {"purifier", "air purifier", "luchtreiniger", "purifier status"}:
+        return {"tool": "house_purifier", "args": {"action": "status"}}
+    if raw in {
+        "house",
+        "house controls",
+        "control the house",
+        "control everything",
+        "comfort",
+        "how's the air",
+        "air quality",
+        "what's the air quality",
+    }:
+        return {"tool": "house_comfort", "args": {}}
+    return None
+
+
+async def house_control_reply(text: str) -> BotReply:
+    """Run one house tool after the Jev gate, then offer a one-tap keyboard."""
+    verdict = await evaluate_message(text)
+    plan = telegram_plan(text) or {"tool": "house_comfort", "args": {}}
+    log_shadow_outcome(
+        verdict,
+        channel="telegram_house",
+        tools=[str(plan.get("tool") or "")],
+        outcome=verdict.action,
+    )
+    if verdict.action == "block_cancel":
+        return BotReply("Okay — leaving the house as it is.")
+    if verdict.action == "escalate_cos":
+        return BotReply("That's outside the house controls I can run from here.")
+
+    result = await _run(plan)
+    speak = str(result.get("speak") or result.get("error") or "Done.")
+    keyboard = await _quick_keyboard()
+    return BotReply(speak, keyboard)
+
+
+async def _run(plan: dict[str, Any]) -> dict[str, Any]:
+    tool = str(plan.get("tool") or "")
+    args = plan.get("args") if isinstance(plan.get("args"), dict) else {}
+    if tool == "house_ritual":
+        return await run_ritual(str(args.get("ritual") or ""))
+    if tool == "house_climate":
+        temperature = args.get("temperature")
+        return await climate_control(
+            str(args.get("action") or "status"),
+            temperature=float(temperature) if temperature is not None else None,
+        )
+    if tool == "house_feeder":
+        return await feeder_control(str(args.get("action") or "feed"))
+    if tool == "house_purifier":
+        return await purifier_control(str(args.get("action") or "status"))
+    return await comfort_snapshot()
+
+
+async def _quick_keyboard() -> dict[str, Any]:
+    """Reply keyboard — only rows whose Home Assistant path actually exists."""
+    snapshot = await comfort_snapshot()
+    rows: list[list[str]] = [["House sleep", "Good morning", "Movie night mode"]]
+    if snapshot.get("climate"):
+        rows.append(["Warmer", "Cooler", "Climate off"])
+    device_row: list[str] = []
+    if snapshot.get("feeders"):
+        device_row.append("Feed")
+    purifiers = snapshot.get("purifiers") or []
+    if purifiers:
+        state = str(purifiers[0].get("state") or "").lower()
+        device_row.append("Purifier off" if state == "on" else "Purifier on")
+    if device_row:
+        rows.append(device_row)
+    return {
+        "keyboard": rows,
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+        "is_persistent": False,
+        "input_field_placeholder": "House, climate, or a title",
+    }
+
+
+def _clean(text: str) -> str:
+    raw = re.sub(r"\s+", " ", (text or "").strip().lower())
+    raw = raw.strip(" .!?")
+    raw = re.sub(r"^(please |can you |could you )", "", raw)
+    return raw
