@@ -17,6 +17,7 @@
 #   HA_TV_ENTITY=media_player.<your_lg>
 #   HA_AVR_ENTITY=media_player.<your_denon>
 #   HA_APPLE_TV_ENTITY=media_player.<your_apple_tv>
+#   HA_MOVIE_NIGHT_SCENE=scene.<your_movie_night>  # optional; friendly-name fallback otherwise
 #   HA_TOKEN=<long-lived token from Profile → Security>
 #   HEARTH_APPLE_TV_PLAYER=infuse
 

@@ -79,6 +79,9 @@ class Settings(BaseSettings):
         default="media_player.apple_tv",
         alias="HA_APPLE_TV_ENTITY",
     )
+    # Optional exact scene id for "movie night" / "lights down". Empty asks HA
+    # to resolve the friendly name "Movie night", avoiding install-specific ids.
+    ha_movie_night_scene: str = Field(default="", alias="HA_MOVIE_NIGHT_SCENE")
     # Live HA calls are retried and writes are verified. These deliberately live
     # in Hearth rather than relying only on TCP retries: an accepted service call
     # can still leave a slow TV/receiver in the old state for a few seconds.
@@ -112,6 +115,16 @@ class Settings(BaseSettings):
     # When play/confirm finds no clients, re-poll /clients for this long (seconds).
     plex_client_wait_seconds: float = Field(default=12.0, alias="PLEX_CLIENT_WAIT_SECONDS")
     plex_client_poll_interval: float = Field(default=1.5, alias="PLEX_CLIENT_POLL_INTERVAL")
+    # A playMedia HTTP 2xx only means PMS accepted the command. Observe a matching
+    # playing session before telling the house that playback actually started.
+    plex_play_verify_timeout_seconds: float = Field(
+        default=6.0,
+        alias="PLEX_PLAY_VERIFY_TIMEOUT_SECONDS",
+    )
+    plex_play_verify_poll_interval: float = Field(
+        default=0.5,
+        alias="PLEX_PLAY_VERIFY_POLL_INTERVAL",
+    )
 
     radarr_url: str = Field(default="http://host.docker.internal:7878", alias="RADARR_URL")
     radarr_api_key: str = Field(default="", alias="RADARR_API_KEY")

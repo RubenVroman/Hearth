@@ -124,6 +124,7 @@ async def house_media_inventory() -> dict[str, Any]:
             "tv": settings.ha_tv_entity,
             "avr": settings.ha_avr_entity,
             "apple_tv": settings.ha_apple_tv_entity,
+            "movie_night_scene": settings.ha_movie_night_scene or None,
         },
         "speak": " ".join(speak_parts),
     }
@@ -190,12 +191,60 @@ async def media_activity(activity: str) -> dict[str, Any]:
     key = (activity or "").strip().lower().replace("-", "_").replace(" ", "_")
     if key in {"off", "power_off", "all_off", "good_night"}:
         return await ha.power_off_media_path()
+    if key in {"movie_night", "film_night", "cinema", "cinema_night"}:
+        return await _movie_night_activity()
     if key in {"apple_tv", "appletv", "atv", "infuse", "watch_apple_tv"}:
         return await ha.activate_media_path("apple_tv")
     if key in {"tv", "watch_tv", "television", "lg"}:
         return await ha.activate_media_path("tv")
     return {
         "ok": False,
-        "error": "activity must be apple_tv, tv, or off",
-        "speak": "I can prepare Apple TV, television, or turn the media chain off.",
+        "error": "activity must be movie_night, apple_tv, tv, or off",
+        "speak": (
+            "I can set movie night, prepare Apple TV or television, "
+            "or turn the media chain off."
+        ),
+    }
+
+
+async def _movie_night_activity() -> dict[str, Any]:
+    """Activate the configured HA scene, then prepare the Apple TV path."""
+    scene_hint = settings.ha_movie_night_scene.strip() or "Movie night"
+    scene = await ha.control_entity(
+        scene_hint,
+        "activate",
+        domain="scene",
+    )
+    path = await ha.activate_media_path("apple_tv")
+    scene_step = {"step": "movie_night_scene", **scene}
+    path_step = {"step": "media_path", **path}
+    failed = [step for step in (scene_step, path_step) if step.get("ok") is False]
+    errors: list[str] = []
+    if scene_step.get("ok") is False:
+        errors.append(
+            "movie-night scene: "
+            + str(scene_step.get("error") or f"no HA scene matched {scene_hint!r}")
+        )
+    if path_step.get("ok") is False:
+        errors.append(
+            "media path: " + str(path_step.get("error") or "one or more devices did not respond")
+        )
+    error = "; ".join(errors) or None
+    return {
+        "ok": not failed,
+        "activity": "movie_night",
+        "receiver_centric": settings.receiver_centric,
+        "scene": {
+            "requested": scene_hint,
+            "entity_id": scene.get("entity_id"),
+            "resolved": scene.get("resolved"),
+        },
+        "steps": [scene_step, path_step],
+        "failed_steps": len(failed),
+        "error": error,
+        "speak": (
+            "Movie night is ready: the lights are down and the Apple TV path is ready."
+            if not failed
+            else f"Movie night is only partly ready: {error}."
+        ),
     }

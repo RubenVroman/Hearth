@@ -1577,6 +1577,7 @@ async def test_plex_play_live_proxies_play_media(monkeypatch):
     class FakeAsyncClient:
         def __init__(self, *args, **kwargs):
             self.headers = kwargs.get("headers") or {}
+            self.playing = False
 
         async def get(self, path, params=None, headers=None):
             calls.append({"method": "GET", "path": path, "params": params, "headers": headers})
@@ -1586,7 +1587,17 @@ async def test_plex_play_live_proxies_play_media(monkeypatch):
                     {"MediaContainer": {"machineIdentifier": "server-abc", "port": 32400}},
                 )
             if path == "/status/sessions":
-                return FakeResponse(200, {"MediaContainer": {"Metadata": []}})
+                metadata = []
+                if self.playing:
+                    metadata = [
+                        {
+                            "title": "The Endless",
+                            "type": "movie",
+                            "ratingKey": "2042",
+                            "Player": {"title": "Apple TV", "state": "playing"},
+                        }
+                    ]
+                return FakeResponse(200, {"MediaContainer": {"Metadata": metadata}})
             if path == "/clients":
                 return FakeResponse(
                     200,
@@ -1624,6 +1635,7 @@ async def test_plex_play_live_proxies_play_media(monkeypatch):
                     },
                 )
             if path == "/player/playback/playMedia":
+                self.playing = True
                 return FakeResponse(200, text="OK")
             return FakeResponse(404, {})
 

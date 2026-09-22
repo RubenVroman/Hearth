@@ -378,7 +378,13 @@ class HomeAssistant:
 
     async def _find_by_hint(self, device: str) -> dict[str, Any] | None:
         media = await self.list_media_entities()
-        states = media.get("states") or []
+        # Device roles must resolve to media_player entities. A matching
+        # remote.apple_tv is a power-command fallback, not a valid play target.
+        states = [
+            row
+            for row in media.get("states") or []
+            if _domain(str(row.get("entity_id") or "")) == "media_player"
+        ]
         role = self._device_role(device)
         scored = sorted(
             ((self._media_match_score(role, row), row) for row in states),
@@ -526,6 +532,9 @@ class HomeAssistant:
             "verified": verified,
             "attempts": result.get("attempts", 1),
         }
+        if service == "play_media":
+            out["launch_verified"] = _play_media_launch_verified(after, data)
+            out["playback_confirmed"] = _play_media_playback_confirmed(after, data)
         if fallback is not None:
             out["fallback"] = fallback
         if verified is False:
@@ -615,50 +624,81 @@ class HomeAssistant:
             return {"ok": False, "error": "activity target must be apple_tv or tv"}
         if not settings.receiver_centric:
             direct = await self.media_control(role, "turn_on")
+            ok = bool(direct.get("ok"))
+            error = str(direct.get("error") or f"could not turn on {_role_label(role)}")
             return {
-                "ok": bool(direct.get("ok")),
+                "ok": ok,
                 "activity": role,
                 "receiver_centric": False,
-                "steps": [direct],
-                "speak": f"Turned on the {_role_label(role)}.",
+                "steps": [{"step": f"{role}_power", **direct}],
+                "failed_steps": 0 if ok else 1,
+                "error": None if ok else error,
+                "speak": (
+                    f"Turned on the {_role_label(role)}."
+                    if ok
+                    else f"Couldn't turn on the {_role_label(role)}: {error}."
+                ),
             }
 
         steps: list[dict[str, Any]] = []
-        steps.append(await self.media_control("avr", "turn_on"))
-        steps.append(await self.media_control("tv", "turn_on"))
+        steps.append({"step": "avr_power", **await self.media_control("avr", "turn_on")})
+        steps.append({"step": "tv_power", **await self.media_control("tv", "turn_on")})
         requested_source = (
             settings.ha_avr_apple_tv_source if role == "apple_tv" else settings.ha_avr_tv_source
         ).strip()
+        selected_source: str | None = None
         if requested_source:
-            source = await self._resolve_avr_source(requested_source)
-            if source:
-                steps.append(await self.media_control("avr", "select_source", source=source))
+            source_result = await self._resolve_avr_source(requested_source)
+            if source_result.get("ok"):
+                selected_source = str(source_result["source"])
+                steps.append(
+                    {
+                        "step": "avr_source",
+                        "requested_source": requested_source,
+                        **await self.media_control(
+                            "avr",
+                            "select_source",
+                            source=selected_source,
+                        ),
+                    }
+                )
             else:
                 steps.append(
                     {
-                        "ok": True,
-                        "skipped": True,
+                        "ok": False,
+                        "step": "avr_source",
                         "action": "select_source",
-                        "warning": f"Receiver source {requested_source!r} is not in its source list",
+                        "requested_source": requested_source,
+                        "available_sources": source_result.get("available_sources") or [],
+                        "error": source_result.get("error")
+                        or f"Receiver source {requested_source!r} is unavailable",
                     }
                 )
         if role == "apple_tv":
-            steps.append(await self.media_control("apple_tv", "turn_on"))
+            steps.append(
+                {
+                    "step": "apple_tv_power",
+                    **await self.media_control("apple_tv", "turn_on"),
+                }
+            )
         if self.live and settings.ha_media_settle_seconds > 0:
-            await asyncio.sleep(min(3.0, settings.ha_media_settle_seconds))
+            await asyncio.sleep(float(settings.ha_media_settle_seconds))
 
         failed = [step for step in steps if step.get("ok") is False]
+        error = _activity_error(failed)
         return {
             "ok": not failed,
             "activity": role,
             "receiver_centric": True,
-            "source": requested_source or None,
+            "source": selected_source,
+            "requested_source": requested_source or None,
             "steps": steps,
             "failed_steps": len(failed),
+            "error": error,
             "speak": (
                 f"The Denon, LG TV, and {_role_label(role)} path are ready."
                 if not failed
-                else f"The {_role_label(role)} path is only partly ready; {len(failed)} step failed."
+                else f"The {_role_label(role)} path is not ready: {error}."
             ),
         }
 
@@ -666,35 +706,48 @@ class HomeAssistant:
         """Stop the living-room chain in source-to-screen-to-receiver order."""
         steps: list[dict[str, Any]] = []
         for role in ("apple_tv", "tv", "avr"):
-            steps.append(await self.media_control(role, "turn_off"))
+            steps.append(
+                {
+                    "step": f"{role}_power_off",
+                    **await self.media_control(role, "turn_off"),
+                }
+            )
         failed = [step for step in steps if step.get("ok") is False]
+        error = _activity_error(failed)
         return {
             "ok": not failed,
             "activity": "off",
             "receiver_centric": settings.receiver_centric,
             "steps": steps,
             "failed_steps": len(failed),
+            "error": error,
             "speak": (
                 "The Apple TV, LG TV, and Denon are off."
                 if not failed
-                else f"The media chain is only partly off; {len(failed)} step failed."
+                else f"The media chain is only partly off: {error}."
             ),
         }
 
-    async def _resolve_avr_source(self, requested: str) -> str | None:
+    async def _resolve_avr_source(self, requested: str) -> dict[str, Any]:
         avr = await self.resolve_device_state("avr")
+        if not avr.get("ok"):
+            return {
+                "ok": False,
+                "error": avr.get("error") or "Denon receiver is unavailable",
+                "available_sources": [],
+            }
         attrs = ((avr.get("state") or {}).get("attributes") or {})
         sources = [str(source) for source in attrs.get("source_list") or []]
         if not sources:
-            return requested
+            return {"ok": True, "source": requested, "available_sources": []}
         needle = _slug(requested)
         for source in sources:
             if _slug(source) == needle:
-                return source
+                return {"ok": True, "source": source, "available_sources": sources}
         for source in sources:
             source_slug = _slug(source)
             if needle in source_slug or source_slug in needle:
-                return source
+                return {"ok": True, "source": source, "available_sources": sources}
         aliases = {
             "media_player": ("apple_tv", "appletv", "player"),
             "tv_audio": ("tv", "arc", "earc"),
@@ -702,8 +755,15 @@ class HomeAssistant:
         for alias in aliases.get(needle, ()):
             for source in sources:
                 if alias in _slug(source):
-                    return source
-        return None
+                    return {"ok": True, "source": source, "available_sources": sources}
+        return {
+            "ok": False,
+            "error": (
+                f"Receiver source {requested!r} is not in the Denon source list "
+                f"({', '.join(sources)})"
+            ),
+            "available_sources": sources,
+        }
 
     async def network_inventory(self, *, limit: int = 250) -> dict[str, Any]:
         """Inventory everything represented in HA, including unavailable entities."""
@@ -1052,11 +1112,67 @@ def _matches_service_state(state: dict[str, Any], service: str, data: dict[str, 
     if service == "media_stop":
         return status in {"idle", "off", "standby"}
     if service == "play_media":
-        content = str(data.get("media_content_id") or "")
-        return status in {"playing", "buffering", "on", "idle"} or (
-            content and str(attrs.get("media_content_id") or "") == content
+        return _play_media_launch_verified(state, data) or _play_media_playback_confirmed(
+            state,
+            data,
         )
     return True
+
+
+def _play_media_launch_verified(
+    state: dict[str, Any] | None,
+    data: dict[str, Any],
+) -> bool:
+    """Prove that HA opened the requested content/app without claiming playback."""
+    if not state:
+        return False
+    attrs = state.get("attributes") or {}
+    requested = str(data.get("media_content_id") or "")
+    actual = str(attrs.get("media_content_id") or "")
+    if requested and actual == requested:
+        return True
+    app_name = _slug(str(attrs.get("app_name") or ""))
+    return requested.lower().startswith("infuse://") and app_name == "infuse"
+
+
+def _play_media_playback_confirmed(
+    state: dict[str, Any] | None,
+    data: dict[str, Any],
+) -> bool:
+    """Require content-specific playing evidence; ``on``/``idle`` are not playing."""
+    if not state:
+        return False
+    status = str(state.get("state") or "").lower()
+    if status not in {"playing", "buffering"}:
+        return False
+    attrs = state.get("attributes") or {}
+    requested = str(data.get("media_content_id") or "")
+    actual = str(attrs.get("media_content_id") or "")
+    if requested and actual:
+        return actual == requested
+    if requested.lower().startswith("infuse://"):
+        return _slug(str(attrs.get("app_name") or "")) == "infuse"
+    return False
+
+
+def _activity_error(failed: list[dict[str, Any]]) -> str | None:
+    if not failed:
+        return None
+    labels = {
+        "avr_power": "Denon power",
+        "tv_power": "LG TV power",
+        "avr_source": "Denon source",
+        "apple_tv_power": "Apple TV power",
+        "apple_tv_power_off": "Apple TV power off",
+        "tv_power_off": "LG TV power off",
+        "avr_power_off": "Denon power off",
+    }
+    details: list[str] = []
+    for step in failed:
+        key = str(step.get("step") or step.get("action") or "step")
+        reason = str(step.get("error") or step.get("warning") or "command was not verified")
+        details.append(f"{labels.get(key, key.replace('_', ' '))}: {reason.rstrip('.')}")
+    return "; ".join(details)
 
 
 def _entity_match_score(query: str, row: dict[str, Any]) -> int:

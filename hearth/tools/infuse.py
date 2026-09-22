@@ -195,28 +195,67 @@ class Infuse:
             media_content_id=deep_link,
             media_content_type="url",
         )
+        command_accepted = bool(result.get("accepted", result.get("ok")))
+        launched = bool(result.get("launch_verified"))
+        playback_confirmed = bool(result.get("playback_confirmed"))
+        activity_ok = bool(activity.get("ok"))
+        activity_error = str(activity.get("error") or "one or more media-path steps failed")
         if result.get("ok") is False:
+            play_error = str(result.get("error") or "HA play_media failed")
+            error = (
+                play_error
+                if activity_ok
+                else f"{play_error}; living-room path: {activity_error}"
+            )
+            path_note = (
+                ""
+                if activity_ok
+                else f" The living-room path also failed: {activity_error}."
+            )
             return {
                 "ok": False,
                 "mode": result.get("mode"),
-                "error": result.get("error") or "HA play_media failed",
+                "played": False,
+                "launched": launched,
+                "command_accepted": command_accepted,
+                "playback_confirmed": False,
+                "error": error,
                 "item": item,
                 "deep_link": deep_link,
                 "entity_id": entity_id,
                 "activity": activity,
                 "speak": (
-                    f"Couldn't open Infuse on the Apple TV: {result.get('error')}. "
-                    "Check HA_APPLE_TV_ENTITY and that the Apple TV is awake."
+                    f"Couldn't verify that Infuse opened on the Apple TV: {play_error}."
+                    f"{path_note} Check HA_APPLE_TV_ENTITY and that the Apple TV is awake."
                 ),
             }
 
-        speak = f"Opening {title} in Infuse on the Apple TV."
+        if playback_confirmed:
+            speak = f"Playing {title} in Infuse on the Apple TV."
+        elif launched:
+            speak = (
+                f"Opened {title} in Infuse on the Apple TV; "
+                "Home Assistant has not confirmed playback."
+            )
+        else:
+            speak = (
+                f"Home Assistant accepted the Infuse command for {title}, "
+                "but did not confirm that the app opened."
+            )
+        if not activity_ok:
+            speak = (
+                f"{speak.rstrip('.')} The living-room path is not ready: "
+                f"{activity_error}."
+            )
         if result.get("mode") == "mock":
-            speak = f"Opening {title} in Infuse on the Apple TV (mock)."
+            speak = f"{speak.rstrip('.')} (mock)."
         return {
-            "ok": True,
+            "ok": activity_ok,
             "mode": result.get("mode") or plan.get("mode"),
-            "played": True,
+            "played": playback_confirmed,
+            "launched": launched,
+            "command_accepted": command_accepted,
+            "playback_confirmed": playback_confirmed,
             "player": "infuse",
             "item": item,
             "tmdbId": plan.get("tmdbId"),
@@ -225,6 +264,7 @@ class Infuse:
             "entity_id": entity_id,
             "activity": activity,
             "result": result,
+            "error": None if activity_ok else activity_error,
             "speak": speak,
         }
 

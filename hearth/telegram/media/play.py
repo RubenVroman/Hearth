@@ -119,7 +119,7 @@ async def _play_infuse(
             f"Infuse returned nothing useful for {label}.",
             path="infuse",
         )
-    if result.get("ok"):
+    if result.get("ok") and result.get("played"):
         target = (
             str(result.get("entity_id") or "")
             or "Apple TV"
@@ -130,10 +130,17 @@ async def _play_infuse(
             path="infuse",
             detail=result,
         )
+    if result.get("ok") and result.get("launched"):
+        return PlayOutcome(
+            ok=True,
+            message=str(result.get("speak") or f"Opened {label} in Infuse."),
+            path="infuse",
+            detail=result,
+        )
     error = str(result.get("error") or result.get("speak") or "unknown error")
     return PlayOutcome(
         ok=False,
-        message=f"Couldn't start {label} on Infuse — {error}",
+        message=str(result.get("speak") or f"Couldn't start {label} on Infuse — {error}"),
         path="infuse",
         detail=result,
     )

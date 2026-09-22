@@ -694,14 +694,44 @@ class Plex:
             # Proxy through PMS (same path python-plexapi uses) so Hearth need not
             # reach the client's LAN IP from the Docker bridge.
             response = await client.get("/player/playback/playMedia", params=params, headers=headers)
-            # Some clients return empty / "OK" bodies with odd status; accept 2xx and empty OK.
+            # Some clients return empty / "OK" bodies. A 2xx only proves PMS
+            # accepted the command; observe the target session before saying
+            # the title is playing.
             if response.status_code >= 400:
                 response.raise_for_status()
+            verification = await self._verify_playback(item, client_row)
+            if not verification.get("ok"):
+                error = str(
+                    verification.get("error")
+                    or "Plex accepted playMedia, but no matching playing session appeared"
+                )
+                return {
+                    "ok": False,
+                    "mode": "live",
+                    "accepted": True,
+                    "played": False,
+                    "verified": False,
+                    "error": error,
+                    "item": item,
+                    "client": client_row,
+                    "resolved": plan.get("resolved"),
+                    "offset_ms": offset,
+                    "playQueueID": play_queue_id,
+                    "already_playing": plan.get("already_playing"),
+                    "waited_s": plan.get("waited_s") or 0,
+                    "verification": verification,
+                    "speak": (
+                        f"Plex accepted {item.get('title')} for {client_row.get('name')}, "
+                        "but I couldn't confirm that playback started."
+                    ),
+                }
             speak = f"Playing {item.get('title')} on {client_row.get('name')}."
             return {
                 "ok": True,
                 "mode": "live",
+                "accepted": True,
                 "played": True,
+                "verified": True,
                 "item": item,
                 "client": client_row,
                 "resolved": plan.get("resolved"),
@@ -709,26 +739,16 @@ class Plex:
                 "playQueueID": play_queue_id,
                 "already_playing": plan.get("already_playing"),
                 "waited_s": plan.get("waited_s") or 0,
+                "verification": verification,
                 "speak": speak,
             }
         except Exception as exc:  # noqa: BLE001
-            if settings.mock_if_unconfigured:
-                speak = (
-                    f"Could not reach the Plex client ({exc}); "
-                    f"fixture says playing {item.get('title')} on {client_row.get('name')}."
-                )
-                return {
-                    "ok": True,
-                    "mode": "mock",
-                    "played": True,
-                    "error": str(exc),
-                    "item": item,
-                    "client": client_row,
-                    "speak": speak,
-                }
             return {
                 "ok": False,
                 "mode": "live",
+                "accepted": False,
+                "played": False,
+                "verified": False,
                 "error": str(exc),
                 "item": item,
                 "client": client_row,
@@ -736,6 +756,55 @@ class Plex:
                     f"Couldn't start {item.get('title')} on {client_row.get('name')}: {exc}."
                 ),
             }
+
+    async def _verify_playback(
+        self,
+        item: dict[str, Any],
+        client_row: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Poll PMS until the requested title is playing on the target client."""
+        timeout = max(0.0, float(settings.plex_play_verify_timeout_seconds))
+        interval = max(0.0, float(settings.plex_play_verify_poll_interval))
+        started = time.monotonic()
+        latest_sessions: list[dict[str, Any]] = []
+        latest_error: str | None = None
+
+        while True:
+            try:
+                playing = await self.now_playing()
+                if self.live and playing.get("mode") != "live":
+                    latest_error = str(
+                        playing.get("error")
+                        or "Plex session check fell back to fixtures while live playback was configured"
+                    )
+                else:
+                    latest_sessions = playing.get("sessions") or []
+                    matched = _matching_playback_session(latest_sessions, client_row, item)
+                    if matched is not None:
+                        return {
+                            "ok": True,
+                            "waited_s": time.monotonic() - started,
+                            "session": matched,
+                        }
+            except Exception as exc:  # noqa: BLE001
+                latest_error = str(exc) or exc.__class__.__name__
+
+            elapsed = time.monotonic() - started
+            remaining = timeout - elapsed
+            if remaining <= 0 or interval <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+
+        return {
+            "ok": False,
+            "waited_s": time.monotonic() - started,
+            "sessions": latest_sessions,
+            "error": latest_error
+            or (
+                f"No matching playing session for {item.get('title') or 'the requested title'} "
+                f"on {client_row.get('name') or 'the target client'}"
+            ),
+        }
 
     async def _resolve_item(
         self,
@@ -1107,6 +1176,31 @@ def _session_on_client(
                 "state": session.get("state"),
                 "player": session.get("player"),
             }
+    return None
+
+
+def _matching_playback_session(
+    sessions: list[dict[str, Any]],
+    client: dict[str, Any],
+    item: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return content-specific proof that playMedia took on the target client."""
+    expected_key = str(item.get("ratingKey") or "").strip()
+    expected_title = str(item.get("title") or "").strip().casefold()
+    for session in sessions:
+        if str(session.get("state") or "").lower() not in {"playing", "buffering"}:
+            continue
+        player_name = str(session.get("player") or "").strip()
+        if not player_name or not _client_matches(client, player_name.lower()):
+            continue
+        actual_key = str(session.get("ratingKey") or "").strip()
+        if expected_key and actual_key:
+            if expected_key == actual_key:
+                return session
+            continue
+        actual_title = str(session.get("title") or "").strip().casefold()
+        if expected_title and actual_title == expected_title:
+            return session
     return None
 
 
