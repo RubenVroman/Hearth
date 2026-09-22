@@ -96,11 +96,13 @@ class Settings(BaseSettings):
     ha_entity_cache_seconds: float = Field(default=45.0, alias="HA_ENTITY_CACHE_SECONDS")
 
     # --- House devices beyond media: PetZero feeders + Tuya OEM (Smart Life) ---
-    # Tuya entity ids are pairing-specific, so every role is a comma-separated
-    # candidate list instead of one id. Hearth tries each candidate against live
-    # HA state and falls back to keyword discovery, so a wrong default degrades
-    # into "which entity did you mean" rather than controlling the wrong device.
-    # Run the ha_discover_entities tool after pairing and paste the real ids here.
+    # HA_CLIMATE_ENTITY / HA_PURIFIER_ENTITY / HA_FEEDER_ENTITY pin one id per
+    # role. The lists below are the search order used when nothing is pinned:
+    # commonly seen Tuya naming, not ids observed on this house. A candidate is
+    # only ever used when Home Assistant actually has it, and keyword discovery
+    # takes over otherwise, so a wrong guess degrades into "which entity did you
+    # mean" rather than controlling the wrong device. Run ha_discover_entities
+    # after pairing and paste the real ids here.
     ha_pet_feeder_entities: str = Field(
         default=(
             "button.pet_feeder_feed,button.petzero_feed,"
@@ -141,10 +143,6 @@ class Settings(BaseSettings):
             "climate.airconditioner,climate.living_room_ac"
         ),
         alias="HA_AIRCO_ENTITIES",
-    )
-    ha_airco_default_temperature: float = Field(
-        default=21.0,
-        alias="HA_AIRCO_DEFAULT_TEMPERATURE",
     )
     # "Airco on" has to pick a real hvac mode; an air conditioner cools by default.
     ha_airco_default_mode: str = Field(default="cool", alias="HA_AIRCO_DEFAULT_MODE")

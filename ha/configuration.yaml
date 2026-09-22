@@ -5,8 +5,10 @@
 #   - Apple TV integration (pyatv) — pair the living-room ATV for Infuse deep links
 #   - your lights (Hue, ZHA, Matter, …)
 #   - Tuya Local for the PetZero pet feeder, the airco, and the KPT Air
-#     Purifier (LAN control; the Tuya cloud integration also works). Ask Hearth
-#     for the resulting entity ids with ha_discover_entities — see docs/devices.md
+#     Purifier. HACS only copies the files onto disk — each device still has to
+#     be added under Settings > Devices & Services > Add Integration > Tuya
+#     Local before HA creates any entity. Exact steps: docs/devices.md. Then ask
+#     Hearth for the resulting entity ids with ha_discover_entities.
 #
 # HA is the device layer. Hearth talks to HA over the REST API; it does not
 # speak webOS, Denon, or Infuse protocol itself. Infuse launches as:
@@ -24,10 +26,10 @@
 #   HA_TOKEN=<long-lived token from Profile → Security>
 #   HEARTH_APPLE_TV_PLAYER=infuse
 #
-# And for the non-media devices (each is a candidate list, not one id):
-#   HA_PET_FEEDER_ENTITIES=button.<your_feeder>_feed
-#   HA_AIRCO_ENTITIES=climate.<your_airco>
-#   HA_AIR_PURIFIER_ENTITIES=fan.<your_purifier>
+# And for the non-media devices, once tuya_local has actually adopted them:
+#   HA_FEEDER_ENTITY=button.<your_feeder>
+#   HA_CLIMATE_ENTITY=climate.<your_airco>
+#   HA_PURIFIER_ENTITY=fan.<your_purifier>
 
 default_config:
 

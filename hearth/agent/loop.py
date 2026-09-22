@@ -454,16 +454,6 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         if spoken:
             return f"Done{mock}: {spoken}"
         return f"Done{mock}: {data.get('device')} {data.get('action')} on {data.get('entity_id')}."
-    if name in {
-        "house_devices",
-        "pet_feeder_feed",
-        "pet_feeder_schedule",
-        "airco_control",
-        "air_purifier_control",
-    }:
-        # These tools already speak for themselves, including their refusals
-        # (unpaired entity, feed cooldown, unsupported mode).
-        return str(data.get("speak") or data.get("error") or f"House devices{mock}.")
     if name == "ha_discover_entities":
         return str(data.get("speak") or f"No house device entities found{mock}.")
     if name == "chief_of_staff":
