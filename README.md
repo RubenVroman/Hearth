@@ -200,6 +200,10 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Receiver-centric “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; orders Denon → LG → Denon source → Apple TV and reports every failed step
 - **Videoland on the LG** → `videoland_play` (Dutch/English: “zet B&B Vol Liefde aan op Videoland”, “open Videoland”, “open het profiel Parel”). HA can **launch** the Videoland app via `media_player.select_source`; it **cannot** start a named title or select an in-app profile. See [Videoland on LG webOS](#videoland-on-lg-webos).
 - House media snapshot (TV + AVR + Apple TV + Plex) → `house_media` or `GET /api/media`
+- **Feed the cats** (PetZero) → `pet_feeder_feed`; scheduled feeding → `pet_feeder_schedule`. Food cannot be un-dispensed, so a repeat inside the cooldown needs “feed them anyway”.
+- **Airco** (Tuya) → `airco_control`; “airco 21” sets 21 °C and starts a unit that is off
+- **KPT air purifier** (Tuya) → `air_purifier_control` (power, speed, preset)
+- Non-media device snapshot → `house_devices` or `GET /api/devices`; “which entity is my feeder”, Tuya wiring → `ha_discover_entities`. See [docs/devices.md](docs/devices.md).
 - What's playing on Plex → `plex_now_playing` (Infuse has **no** now-playing API)
 - Browse Plex library **by genre** (Animation, Science Fiction, …) → `plex_browse_genre` / `GET /api/plex/library?genre=Science%20Fiction`. Speakable count + short title list; glass overlay shows tappable genre category chips from real Plex metadata. `GET /api/plex/genres` / “list plex genres” opens the category picker.
 - Recommend / suggest movies or shows (or “show them on the UI”) → `suggest_titles` / `POST /api/media/suggest` (same glass media overlay; metadata resolved server-side)
@@ -374,6 +378,9 @@ Routine house actions **run immediately** — no second “confirm” step:
 
 - `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG, Apple TV)
 - `ha_media_control` — LG TV / Denon AVR / Apple TV turn_on/off, volume, source, play_media, transport
+- `pet_feeder_feed` / `pet_feeder_schedule` / `airco_control` / `air_purifier_control` — the PetZero
+  feeder and the Tuya airco / purifier. No confirm chip, but the feeder enforces its own
+  anti-double-feed cooldown, and all four pass the shared Jev gate before reaching HA.
 - `videoland_play` — open Videoland on the LG (honest: cannot start titles or select profiles)
 - `infuse_play` — open a library title in Infuse on the Apple TV (HA deep link)
 - `infuse_transport` — pause / play / stop / skip via HA Apple TV remote
@@ -394,6 +401,8 @@ High-risk / irreversible / paid actions **default to dry-run** until `confirm=tr
 Read-only / inspect:
 
 - `house_media` — speakable TV + AVR + Apple TV + Plex inventory (`GET /api/media`)
+- `house_devices` — pet feeder + airco + air purifier snapshot (`GET /api/devices`)
+- `ha_discover_entities` — candidate HA entities per device role, plus ready-to-paste `.env` lines
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`, `plex_clients`, `plex_browse_genre`
 - `radarr_search`, `sonarr_search`, `overseerr_search`
@@ -419,7 +428,7 @@ hearth/jev/      TypeSafe Jev (System One) decision gate — see docs/jev.md
 hearth/ui/       Static command center (no Node build)
 workspace/       Sandboxed files + skills
 ha/              Home Assistant config (onboarding still required)
-docs/            Operator notes (Jev sandbox, …)
+docs/            Operator notes (Jev sandbox, house device pairing, …)
 data/            Auth + memory SQLite (compose bind-mount; gitignores *.db)
 docker-compose.yml
 Dockerfile

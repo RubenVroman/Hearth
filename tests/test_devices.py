@@ -680,3 +680,33 @@ async def test_ungated_tools_skip_the_gate_entirely(jev_enforcing) -> None:
     result = await registry.call("house_devices", {})
     assert result.ok
     assert fake.calls == []
+
+
+# --------------------------------------------------------------------------
+# HTTP surface
+# --------------------------------------------------------------------------
+
+
+def test_devices_endpoint_reports_the_resolved_entities(client) -> None:
+    response = client.get("/api/devices")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["devices"]["airco"]["entity_id"] == "climate.airco"
+    assert body["devices"]["air_purifier"]["entity_id"] == "fan.air_purifier"
+
+
+def test_devices_endpoint_needs_a_session(client) -> None:
+    response = client.get("/api/devices", headers={"X-Auth-Token": ""})
+    assert response.status_code in {401, 403}
+
+
+async def test_invoke_endpoint_runs_a_device_tool_through_the_registry(client) -> None:
+    response = client.post(
+        "/api/invoke",
+        json={"tool": "airco_control", "args": {"action": "set_temperature", "temperature": 19}},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["data"]["temperature"] == 19

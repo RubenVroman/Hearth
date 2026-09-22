@@ -31,6 +31,7 @@ from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.builtin import register_builtin_tools
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.devices import house_devices_status
 from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
 from hearth.tools.thuisbezorgd import thuisbezorgd
@@ -224,6 +225,12 @@ async def media_inventory() -> dict[str, Any]:
 async def network_inventory(limit: int = Query(default=250, ge=1, le=1000)) -> dict[str, Any]:
     """All HA-represented network entities plus reachability and key media links."""
     return await ha.network_inventory(limit=limit)
+
+
+@app.get("/api/devices")
+async def devices_inventory() -> dict[str, Any]:
+    """Pet feeder + airco + air purifier: resolved entity, state, and wiring gaps."""
+    return await house_devices_status()
 
 
 @app.get("/api/rooms")
