@@ -7,6 +7,7 @@ escalate_cos prefers Chief of Staff; API errors and low confidence fail open.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -44,6 +45,11 @@ def set_client(client: SystemOneClient | None) -> None:
     """Inject a mock client for tests."""
     global _client
     _client = client
+
+
+def _gate_deadline() -> float:
+    """Wall-clock ceiling for one System One call, including transport."""
+    return max(0.5, float(settings.jev_timeout_seconds))
 
 
 def build_state(user_text: str, *, recent: list[str] | None = None) -> dict[str, Any]:
@@ -137,11 +143,14 @@ async def evaluate_message(
 
     try:
         active = client or get_client()
-        answers = await active.system_one(
-            state=build_state(text, recent=recent),
-            questions=questions or hearth_system_one_questions(),
-            model=settings.jev_model,
-        )
+        # The client has its own HTTP timeout, but an injected or SDK client may
+        # not. A cheap gate must never be what makes a house turn hang.
+        async with asyncio.timeout(_gate_deadline()):
+            answers = await active.system_one(
+                state=build_state(text, recent=recent),
+                questions=questions or hearth_system_one_questions(),
+                model=settings.jev_model,
+            )
         suggested, reason = suggest_action(answers)
         action: EnforceAction = suggested if (enabled and not shadow) else "continue"
         verdict = JevVerdict(
@@ -155,6 +164,17 @@ async def evaluate_message(
         )
         log.info("jev.gate %s", verdict.as_log_dict())
         return verdict
+    except TimeoutError:
+        log.warning("jev.gate fail-open: timeout after %.1fs", _gate_deadline())
+        return JevVerdict(
+            enabled=True,
+            shadow=shadow,
+            ok=False,
+            suggested="continue",
+            action="continue",
+            reason="timeout",
+            error="TimeoutError",
+        )
     except Exception as exc:  # noqa: BLE001 — fail open to today's behavior
         log.warning("jev.gate fail-open: %s", type(exc).__name__)
         return JevVerdict(

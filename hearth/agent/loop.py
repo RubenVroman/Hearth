@@ -8,7 +8,7 @@ from hearth.agent.prompts import SYSTEM_PROMPT, compose_system_prompt_async
 from hearth.agent.registry import ToolRegistry, registry
 from hearth.config import settings
 from hearth.butler.decision import decide_butler_tool, hide_from_llm, is_butler_phrase
-from hearth.jev import evaluate_message, log_shadow_outcome
+from hearth.jev import adopt_verdict, evaluate_message, log_shadow_outcome, tool_turn, turn_lane
 from hearth.memory import store as memory_store
 from hearth.memory.summarize import maybe_summarize
 from hearth.runtime import runtime
@@ -31,186 +31,210 @@ class AgentLoop:
         runtime.note("user", user_text)
         widget_bus.start_turn(user_text)
         text = user_text.strip()
-        jev_verdict = None
+        recent = _recent_turns()
         try:
-            if confirm and runtime.pending is not None:
-                pending = runtime.pending
-                args = dict(pending.args)
-                args["confirm"] = True
-                args["dry_run"] = False
-                result = await self.tools.call(pending.tool, args)
-                reply = _format_tool_reply([result.as_dict()])
-                runtime.note("assistant", reply)
-                out = {
-                    "reply": reply,
-                    "mode": "confirm",
-                    "tools": [result.as_dict()],
-                }
-                await _after_turn(text or pending.tool, out, channel="chat")
-                runtime.set_status("idle")
-                widget_bus.finish_turn(ok=True, detail="Confirmed.")
-                out["widgets"] = runtime.list_widgets()
-                return out
-
-            # Cheap typed gate before OpenAI / local tool routing (shadow by default).
-            recent = [
-                line.text
-                for line in list(runtime.transcript)[-4:]
-                if getattr(line, "role", "") in {"user", "assistant"} and line.text
-            ]
-            jev_verdict = await evaluate_message(text, recent=recent)
-            if jev_verdict.action == "block_cancel":
-                reply = (
-                    "Okay — I won't queue or run that. Say what you'd like instead, "
-                    "or confirm explicitly if you meant to proceed."
-                )
-                runtime.note("assistant", reply)
-                out = {
-                    "reply": reply,
-                    "mode": "jev_cancel",
-                    "tools": [],
-                    "jev": jev_verdict.as_log_dict(),
-                }
-                await _after_turn(text, out, channel="chat")
-                log_shadow_outcome(
-                    jev_verdict,
-                    channel="chat",
-                    tools=[],
-                    outcome="blocked_cancel",
-                )
-                runtime.set_status("idle")
-                widget_bus.finish_turn(ok=True, detail="Cancelled (Jev).")
-                out["widgets"] = runtime.list_widgets()
-                return out
-            if jev_verdict.action == "escalate_cos":
-                result = await self.tools.call(
-                    "chief_of_staff",
-                    {"task": text, "said": text, "repo": settings.cos_repo},
-                )
-                used = [result.as_dict()]
-                reply = _format_tool_reply(used)
-                runtime.note("assistant", reply)
-                out = {
-                    "reply": reply,
-                    "mode": "jev_cos",
-                    "tools": used,
-                    "jev": jev_verdict.as_log_dict(),
-                }
-                await _after_turn(text, out, channel="chat")
-                log_shadow_outcome(
-                    jev_verdict,
-                    channel="chat",
-                    tools=["chief_of_staff"],
-                    outcome="escalated_cos",
-                )
-                runtime.set_status("idle")
-                widget_bus.finish_turn(ok=True, detail="Escalated (Jev).")
-                out["widgets"] = runtime.list_widgets()
-                return out
-
-            # Jev chooses shelf and scene-preset tools. Phrases the playback
-            # and device routers already own (movie night, lights down, covers)
-            # stay on those routes. The OpenAI tool loop never sees shelf/scene.
-            routed = route_intent(text)
-            butler_turn = routed is None or str(routed.get("tool") or "") in {
-                "house_shelf",
-                "house_scene",
-            }
-            decision = decide_butler_tool(text, jev_verdict)
-            if butler_turn and decision.run:
-                runtime.set_status("tool")
-                result = await self.tools.call(decision.tool, decision.as_args())
-                used = [result.as_dict()]
-                reply = _format_tool_reply(used)
-                runtime.note("assistant", reply)
-                mode = "jev_butler" if decision.source == "jev" else "local"
-                out = {
-                    "reply": reply,
-                    "mode": mode,
-                    "tools": used,
-                    "jev": jev_verdict.as_log_dict(),
-                }
-                await _after_turn(text, out, channel="chat")
-                log_shadow_outcome(
-                    jev_verdict,
-                    channel="chat",
-                    tools=[decision.tool],
-                    outcome=mode,
-                )
-                runtime.set_status("idle")
-                widget_bus.finish_turn(ok=True, detail="Butler tool.")
-                out["widgets"] = runtime.list_widgets()
-                return out
-            if butler_turn and decision.blocked_by_jev and is_butler_phrase(text):
-                reply = (
-                    "Okay — I won't run that."
-                    if decision.source == "jev_cancel"
-                    else "That doesn't sound like the shelf or a house scene, so I left it alone."
-                )
-                runtime.note("assistant", reply)
-                out = {
-                    "reply": reply,
-                    "mode": "jev_butler",
-                    "tools": [],
-                    "jev": jev_verdict.as_log_dict(),
-                }
-                await _after_turn(text, out, channel="chat")
-                log_shadow_outcome(
-                    jev_verdict,
-                    channel="chat",
-                    tools=[],
-                    outcome=decision.source,
-                )
-                runtime.set_status("idle")
-                widget_bus.finish_turn(ok=True, detail="Butler tool held.")
-                out["widgets"] = runtime.list_widgets()
-                return out
-
-            if settings.openai_configured:
-                try:
-                    out = await self._run_openai(text)
-                    if jev_verdict is not None:
-                        out["jev"] = jev_verdict.as_log_dict()
-                        log_shadow_outcome(
-                            jev_verdict,
-                            channel="chat",
-                            tools=[
-                                str(t.get("name") or "")
-                                for t in (out.get("tools") or [])
-                                if isinstance(t, dict)
-                            ],
-                            outcome=str(out.get("mode") or "openai"),
-                        )
-                    await _after_turn(text, out, channel="chat")
-                    runtime.set_status("idle")
-                    widget_bus.finish_turn(ok=True, detail="Done.")
-                    out["widgets"] = runtime.list_widgets()
-                    return out
-                except Exception as exc:  # noqa: BLE001
-                    runtime.note("system", f"OpenAI path failed, using local router: {exc}", kind="status")
-                    runtime.flash_error("Model call failed")
-
-            out = await self._run_local(text)
-            if jev_verdict is not None:
-                out["jev"] = jev_verdict.as_log_dict()
-                log_shadow_outcome(
-                    jev_verdict,
-                    channel="chat",
-                    tools=[
-                        str(t.get("name") or "")
-                        for t in (out.get("tools") or [])
-                        if isinstance(t, dict)
-                    ],
-                    outcome=str(out.get("mode") or "local"),
-                )
-            await _after_turn(text, out, channel="chat")
-            runtime.set_status("idle")
-            widget_bus.finish_turn(ok=True, detail="Done.")
-            out["widgets"] = runtime.list_widgets()
-            return out
+            # One Jev scope per turn. Every tool call underneath is decided from
+            # the same typed answer set, so an eight-tool OpenAI turn still costs
+            # exactly one System One call.
+            with tool_turn(text, channel="chat", recent=recent):
+                return await self._run_turn(text, recent=recent, confirm=confirm)
         except Exception:
             widget_bus.finish_turn(ok=False, detail="Failed.")
             raise
+
+    async def _run_turn(
+        self,
+        text: str,
+        *,
+        recent: list[str],
+        confirm: bool,
+    ) -> dict[str, Any]:
+        if confirm and runtime.pending is not None:
+            pending = runtime.pending
+            args = dict(pending.args)
+            args["confirm"] = True
+            args["dry_run"] = False
+            # The user already confirmed this exact call; only Jev's hard
+            # stops (refuse / do-not-auto-run) may still block it.
+            result = await self.tools.call(
+                pending.tool,
+                args,
+                said=text or pending.tool,
+                explicit_confirm=True,
+            )
+            reply = _format_tool_reply([result.as_dict()])
+            runtime.note("assistant", reply)
+            out = {
+                "reply": reply,
+                "mode": "confirm",
+                "tools": [result.as_dict()],
+            }
+            await _after_turn(text or pending.tool, out, channel="chat")
+            runtime.set_status("idle")
+            widget_bus.finish_turn(ok=True, detail="Confirmed.")
+            out["widgets"] = runtime.list_widgets()
+            return out
+
+        # Cheap typed gate before OpenAI / local tool routing (shadow by
+        # default). The tool gate reuses this verdict for the whole turn.
+        jev_verdict = await evaluate_message(text, recent=recent)
+        adopt_verdict(jev_verdict)
+        if jev_verdict.action == "block_cancel":
+            reply = (
+                "Okay — I won't queue or run that. Say what you'd like instead, "
+                "or confirm explicitly if you meant to proceed."
+            )
+            runtime.note("assistant", reply)
+            out = {
+                "reply": reply,
+                "mode": "jev_cancel",
+                "tools": [],
+                "jev": jev_verdict.as_log_dict(),
+            }
+            await _after_turn(text, out, channel="chat")
+            log_shadow_outcome(
+                jev_verdict,
+                channel="chat",
+                tools=[],
+                outcome="blocked_cancel",
+            )
+            runtime.set_status("idle")
+            widget_bus.finish_turn(ok=True, detail="Cancelled (Jev).")
+            out["widgets"] = runtime.list_widgets()
+            return out
+        if jev_verdict.action == "escalate_cos":
+            # Jev already chose this tool this turn; don't ask it again.
+            result = await self.tools.call(
+                "chief_of_staff",
+                {"task": text, "said": text, "repo": settings.cos_repo},
+                said=text,
+                gate=False,
+            )
+            used = [result.as_dict()]
+            reply = _format_tool_reply(used)
+            runtime.note("assistant", reply)
+            out = {
+                "reply": reply,
+                "mode": "jev_cos",
+                "tools": used,
+                "jev": jev_verdict.as_log_dict(),
+            }
+            await _after_turn(text, out, channel="chat")
+            log_shadow_outcome(
+                jev_verdict,
+                channel="chat",
+                tools=["chief_of_staff"],
+                outcome="escalated_cos",
+            )
+            runtime.set_status("idle")
+            widget_bus.finish_turn(ok=True, detail="Escalated (Jev).")
+            out["widgets"] = runtime.list_widgets()
+            return out
+
+        # Jev chooses shelf and scene-preset tools. Phrases the playback
+        # and device routers already own (movie night, lights down, covers)
+        # stay on those routes. The OpenAI tool loop never sees shelf/scene.
+        routed = route_intent(text)
+        butler_turn = routed is None or str(routed.get("tool") or "") in {
+            "house_shelf",
+            "house_scene",
+        }
+        decision = decide_butler_tool(text, jev_verdict)
+        if butler_turn and decision.run:
+            runtime.set_status("tool")
+            result = await self.tools.call(
+                decision.tool,
+                decision.as_args(),
+                said=text,
+            )
+            used = [result.as_dict()]
+            reply = _format_tool_reply(used)
+            runtime.note("assistant", reply)
+            mode = "jev_butler" if decision.source == "jev" else "local"
+            out = {
+                "reply": reply,
+                "mode": mode,
+                "tools": used,
+                "jev": jev_verdict.as_log_dict(),
+            }
+            await _after_turn(text, out, channel="chat")
+            log_shadow_outcome(
+                jev_verdict,
+                channel="chat",
+                tools=[decision.tool],
+                outcome=mode,
+            )
+            runtime.set_status("idle")
+            widget_bus.finish_turn(ok=True, detail="Butler tool.")
+            out["widgets"] = runtime.list_widgets()
+            return out
+        if butler_turn and decision.blocked_by_jev and is_butler_phrase(text):
+            reply = (
+                "Okay — I won't run that."
+                if decision.source == "jev_cancel"
+                else "That doesn't sound like the shelf or a house scene, so I left it alone."
+            )
+            runtime.note("assistant", reply)
+            out = {
+                "reply": reply,
+                "mode": "jev_butler",
+                "tools": [],
+                "jev": jev_verdict.as_log_dict(),
+            }
+            await _after_turn(text, out, channel="chat")
+            log_shadow_outcome(
+                jev_verdict,
+                channel="chat",
+                tools=[],
+                outcome=decision.source,
+            )
+            runtime.set_status("idle")
+            widget_bus.finish_turn(ok=True, detail="Butler tool held.")
+            out["widgets"] = runtime.list_widgets()
+            return out
+
+        if settings.openai_configured:
+            try:
+                out = await self._run_openai(text)
+                if jev_verdict is not None:
+                    out["jev"] = jev_verdict.as_log_dict()
+                    log_shadow_outcome(
+                        jev_verdict,
+                        channel="chat",
+                        tools=[
+                            str(t.get("name") or "")
+                            for t in (out.get("tools") or [])
+                            if isinstance(t, dict)
+                        ],
+                        outcome=str(out.get("mode") or "openai"),
+                    )
+                await _after_turn(text, out, channel="chat")
+                runtime.set_status("idle")
+                widget_bus.finish_turn(ok=True, detail="Done.")
+                out["widgets"] = runtime.list_widgets()
+                return out
+            except Exception as exc:  # noqa: BLE001
+                runtime.note("system", f"OpenAI path failed, using local router: {exc}", kind="status")
+                runtime.flash_error("Model call failed")
+
+        out = await self._run_local(text)
+        if jev_verdict is not None:
+            out["jev"] = jev_verdict.as_log_dict()
+            log_shadow_outcome(
+                jev_verdict,
+                channel="chat",
+                tools=[
+                    str(t.get("name") or "")
+                    for t in (out.get("tools") or [])
+                    if isinstance(t, dict)
+                ],
+                outcome=str(out.get("mode") or "local"),
+            )
+        await _after_turn(text, out, channel="chat")
+        runtime.set_status("idle")
+        widget_bus.finish_turn(ok=True, detail="Done.")
+        out["widgets"] = runtime.list_widgets()
+        return out
 
     async def iter_events(self, user_text: str, *, confirm: bool = False) -> AsyncIterator[dict[str, Any]]:
         """Yield protocol events while running a turn (used by the voice fallback)."""
@@ -282,7 +306,13 @@ class AgentLoop:
                     if tc.function.name == "chief_of_staff":
                         args.setdefault("said", user_text)
                         args.setdefault("task", user_text)
-                    result = await self.tools.call(tc.function.name, args)
+                    # Every model-chosen tool still passes the Jev gate; a deny
+                    # comes back as a tool result the model can react to.
+                    result = await self.tools.call(
+                        tc.function.name,
+                        args,
+                        said=user_text,
+                    )
                     used.append(result.as_dict())
                     messages.append(
                         {
@@ -305,7 +335,7 @@ class AgentLoop:
         return {"reply": reply, "mode": "openai", "tools": used}
 
     async def _run_local(self, user_text: str) -> dict[str, Any]:
-        plan = route_intent(user_text)
+        plan = route_intent(user_text, jev_lane=_jev_lane())
         used: list[dict[str, Any]] = []
         if plan is None:
             reply = (
@@ -323,11 +353,32 @@ class AgentLoop:
             return {"reply": reply, "mode": "local", "tools": used}
 
         runtime.set_status("tool")
-        result = await self.tools.call(plan["tool"], plan.get("args") or {})
+        result = await self.tools.call(
+            plan["tool"],
+            plan.get("args") or {},
+            said=user_text,
+        )
         used.append(result.as_dict())
         reply = _format_tool_reply(used)
         runtime.note("assistant", reply)
         return {"reply": reply, "mode": "local", "tools": used}
+
+
+def _recent_turns(limit: int = 4) -> list[str]:
+    """A few words of recent chat so Jev can read follow-ups (typed short state)."""
+    return [
+        line.text
+        for line in list(runtime.transcript)[-limit:]
+        if getattr(line, "role", "") in {"user", "assistant"} and line.text
+    ]
+
+
+def _jev_lane() -> str:
+    """Jev's tool lane for the open turn, or ``""`` when it should not steer."""
+    if not settings.jev_route_local_tools:
+        return ""
+    picked = turn_lane()
+    return picked[0] if picked else ""
 
 
 async def _after_turn(user_text: str, out: dict[str, Any], *, channel: str) -> None:
@@ -1122,8 +1173,13 @@ def _playback_scene_route(raw: str) -> dict[str, Any] | None:
     return None
 
 
-def route_intent(text: str) -> dict[str, Any] | None:
-    """Tiny local router so the runtime is useful before an API key is set."""
+def route_intent(text: str, *, jev_lane: str = "") -> dict[str, Any] | None:
+    """Tiny local router so the runtime is useful before an API key is set.
+
+    ``jev_lane`` is the tool family Jev picked for this turn. When it is set and
+    the text can substantiate it, Jev's choice wins over regex precedence; when
+    it cannot, routing falls through to the chain below unchanged.
+    """
     raw = text.strip()
     if not raw:
         return None
@@ -1131,6 +1187,11 @@ def route_intent(text: str) -> dict[str, Any] | None:
     owned = _playback_scene_route(raw)
     if owned is not None:
         return owned
+
+    if jev_lane:
+        planned = _plan_for_lane(raw, jev_lane)
+        if planned is not None:
+            return planned
 
     if _COS.search(raw):
         return {
@@ -1191,6 +1252,45 @@ def route_intent(text: str) -> dict[str, Any] | None:
         reference_plan = _play_reference_plan(play_reference.group(1))
         if reference_plan is not None:
             return reference_plan
+    playback = _playback_plan(raw)
+    if playback is not None:
+        return playback
+    if _PLEX_CLIENTS.search(raw):
+        return {"tool": "plex_clients", "args": {}}
+    genre_plan = _plex_genre_plan(raw)
+    if genre_plan is not None:
+        return genre_plan
+    suggest_plan = _suggest_titles_plan(raw)
+    if suggest_plan is not None:
+        return suggest_plan
+    if _MEDIA_STATUS.search(raw):
+        return {"tool": "house_media", "args": {}}
+    device = _device_plan(raw)
+    if device is not None:
+        return device
+    m = _INSPECT.search(raw)
+    if m:
+        return {"tool": "docker_inspect", "args": {"container": m.group(1)}}
+    if _PLAYING.search(raw) or (_PLEX_ONLY.search(raw) and not _GRAB.search(raw)):
+        return {"tool": "plex_now_playing", "args": {}}
+    if _WEB_SEARCH.search(raw) and not _WEATHER.search(raw):
+        return {"tool": "web_search", "args": {"query": _web_search_query(raw)}}
+    if _WEATHER.search(raw):
+        return {"tool": "get_weather", "args": {}}
+    about = _about_media_plan(raw)
+    if about is not None:
+        return about
+    if _DOCKER.search(raw):
+        return {"tool": "docker_ps", "args": {}}
+    if _WORKSPACE.search(raw):
+        return {"tool": "workspace_list", "args": {}}
+    if _LIGHTS.search(raw):
+        return {"tool": "ha_list_entities", "args": {}}
+    return None
+
+
+def _playback_plan(raw: str) -> dict[str, Any] | None:
+    """Media-chain activity, Apple TV transport, and play-a-title routing."""
     activity = _MEDIA_ACTIVITY.search(raw)
     if activity:
         lower_activity = raw.lower()
@@ -1229,16 +1329,11 @@ def route_intent(text: str) -> dict[str, Any] | None:
             if prefer_infuse_for_apple_tv(None):
                 return {"tool": "infuse_play", "args": {"query": title}}
             return {"tool": "plex_play", "args": {"query": title}}
-    if _PLEX_CLIENTS.search(raw):
-        return {"tool": "plex_clients", "args": {}}
-    genre_plan = _plex_genre_plan(raw)
-    if genre_plan is not None:
-        return genre_plan
-    suggest_plan = _suggest_titles_plan(raw)
-    if suggest_plan is not None:
-        return suggest_plan
-    if _MEDIA_STATUS.search(raw):
-        return {"tool": "house_media", "args": {}}
+    return None
+
+
+def _device_plan(raw: str) -> dict[str, Any] | None:
+    """Mute / volume / source on the AVR or TV, and named turn on/off."""
     mute = _MUTE.search(raw)
     if mute:
         device = _media_device(mute.group(2))
@@ -1281,24 +1376,115 @@ def route_intent(text: str) -> dict[str, Any] | None:
     m = _TURN_OFF.search(raw)
     if m:
         return _turn_plan(m.group(1), on=False)
-    m = _INSPECT.search(raw)
-    if m:
-        return {"tool": "docker_inspect", "args": {"container": m.group(1)}}
-    if _PLAYING.search(raw) or (_PLEX_ONLY.search(raw) and not _GRAB.search(raw)):
-        return {"tool": "plex_now_playing", "args": {}}
-    if _WEB_SEARCH.search(raw) and not _WEATHER.search(raw):
-        return {"tool": "web_search", "args": {"query": _web_search_query(raw)}}
-    if _WEATHER.search(raw):
-        return {"tool": "get_weather", "args": {}}
+    return None
+
+
+def _media_queue_plan(raw: str) -> dict[str, Any] | None:
+    """Grab / request routing for the media_queue lane."""
+    retry = _download_retry_plan(raw)
+    if retry is not None:
+        return retry
+    query = _media_query(raw)
+    if len(query) < 2:
+        return None
+    if _OVERSEERR.search(raw):
+        return {"tool": "overseerr_request", "args": {"query": query}}
+    if _SERIES.search(raw) and not _MOVIE.search(raw):
+        return {"tool": "sonarr_add", "args": {"query": query}}
+    if _MOVIE.search(raw):
+        return {"tool": "radarr_add", "args": {"query": query}}
+    return {"tool": "overseerr_request", "args": {"query": query}}
+
+
+def _media_library_plan(raw: str) -> dict[str, Any] | None:
+    """Read-only library / suggestion routing for the media_library lane."""
+    if _PLEX_CLIENTS.search(raw):
+        return {"tool": "plex_clients", "args": {}}
+    genre = _plex_genre_plan(raw)
+    if genre is not None:
+        return genre
+    suggest = _suggest_titles_plan(raw)
+    if suggest is not None:
+        return suggest
+    if _MEDIA_STATUS.search(raw):
+        return {"tool": "house_media", "args": {}}
     about = _about_media_plan(raw)
     if about is not None:
         return about
+    if _PLAYING.search(raw) or _PLEX_ONLY.search(raw):
+        return {"tool": "plex_now_playing", "args": {}}
+    return None
+
+
+def _files_plan(raw: str) -> dict[str, Any] | None:
+    """Docker / workspace routing for the files lane."""
+    inspect = _INSPECT.search(raw)
+    if inspect:
+        return {"tool": "docker_inspect", "args": {"container": inspect.group(1)}}
     if _DOCKER.search(raw):
         return {"tool": "docker_ps", "args": {}}
     if _WORKSPACE.search(raw):
         return {"tool": "workspace_list", "args": {}}
-    if _LIGHTS.search(raw):
-        return {"tool": "ha_list_entities", "args": {}}
+    return None
+
+
+def _memory_write_plan(raw: str) -> dict[str, Any] | None:
+    forget = _FORGET_FACT.search(raw)
+    if forget:
+        rest = forget.group(1).strip(" .?!")
+        return {"tool": "memory_forget", "args": {"key": rest, "text": rest}}
+    remember = _REMEMBER_FACT.search(raw)
+    if remember:
+        rest = remember.group(1).strip(" .?!")
+        return {"tool": "memory_remember", "args": {"text": rest, "value": rest, "key": rest}}
+    return None
+
+
+def _plan_for_lane(raw: str, lane: str) -> dict[str, Any] | None:
+    """Build a plan inside the tool lane Jev picked for this turn.
+
+    Jev chooses the lane; the arguments are still derived deterministically from
+    the text, never from prose. Returning ``None`` means the message cannot
+    substantiate the lane, so :func:`route_intent` falls through to its own
+    precedence chain — the fail-open path.
+    """
+    if lane in {"", "no_tool"}:
+        return None
+    if lane == "escalate_cos":
+        return {
+            "tool": "chief_of_staff",
+            "args": {"task": raw, "said": raw, "repo": settings.cos_repo},
+        }
+    if lane == "weather":
+        return {"tool": "get_weather", "args": {}}
+    if lane == "network":
+        return {"tool": "house_network", "args": {}}
+    if lane == "web":
+        return {"tool": "web_search", "args": {"query": _web_search_query(raw)}}
+    if lane == "food":
+        if _FOOD.search(raw) or _FOOD_CART.search(raw) or _FOOD_ORDER.search(raw):
+            return _food_plan(raw)
+        return None
+    if lane == "memory_read":
+        if _MEMORY_LIST.search(raw):
+            return {"tool": "memory_list", "args": {"kind": "preferences"}}
+        return {"tool": "memory_search", "args": {"query": raw}}
+    if lane == "memory_write":
+        return _memory_write_plan(raw)
+    if lane == "media_queue":
+        return _media_queue_plan(raw)
+    if lane == "media_status":
+        return _download_progress_plan(raw) or {"tool": "radarr_queue", "args": {}}
+    if lane == "media_playback":
+        return _videoland_plan(raw) or _playback_plan(raw) or _device_plan(raw)
+    if lane == "media_library":
+        return _media_library_plan(raw)
+    if lane == "lights":
+        return _device_plan(raw) or (
+            {"tool": "ha_list_entities", "args": {}} if _LIGHTS.search(raw) else None
+        )
+    if lane == "files":
+        return _files_plan(raw)
     return None
 
 

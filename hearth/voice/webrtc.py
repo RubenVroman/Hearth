@@ -23,9 +23,9 @@ from websockets.asyncio.client import connect as ws_connect
 
 from hearth.agent.prompts import compose_system_prompt, compose_system_prompt_async
 from hearth.agent.registry import registry
-from hearth.butler.decision import JEV_GATED_TOOL_NAMES, decide_butler_tool, hide_from_llm
+from hearth.butler.decision import hide_from_llm
 from hearth.config import settings
-from hearth.jev import evaluate_message, log_shadow_outcome
+from hearth.jev import tool_turn
 from hearth.memory import store as memory_store
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
@@ -75,7 +75,8 @@ def session_config(*, query: str | None = None, instructions: str | None = None)
         "instructions": text,
         "output_modalities": ["audio"],
         "audio": {
-            "input": audio_input_config(),            "output": {
+            "input": audio_input_config(),
+            "output": {
                 "voice": settings.openai_tts_voice,
             },
         },
@@ -104,25 +105,10 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
     payload = dict(args or {})
     if name == "chief_of_staff":
         payload.setdefault("said", said or json.dumps(payload))
-    if name in JEV_GATED_TOOL_NAMES:
-        uttered = (said or runtime.latest_user() or "").strip()
-        verdict = await evaluate_message(uttered or name)
-        decision = decide_butler_tool(uttered, verdict)
-        log_shadow_outcome(
-            verdict,
-            channel="voice",
-            tools=[decision.tool] if decision.run else [],
-            outcome=decision.source,
-        )
-        if not decision.run or decision.tool != name:
-            return {
-                "ok": False,
-                "name": name,
-                "speak": "Jev didn't clear that, so I left it alone.",
-                "jev": verdict.as_log_dict(),
-            }
-        payload = decision.as_args()
-    result = await registry.call(name, payload)
+    # Voice tool calls pass the same Jev gate as chat and Telegram. Without a
+    # transcript there is no state to gate on, and the gate fails open.
+    with tool_turn(said, channel="voice"):
+        result = await registry.call(name, payload, said=said)
     return result.as_dict()
 
 

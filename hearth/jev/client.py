@@ -40,13 +40,13 @@ class HttpSystemOneClient:
         api_key: str | None = None,
         model: str | None = None,
         base_url: str = SYSTEM_ONE_URL,
-        timeout: float = 8.0,
+        timeout: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._api_key = (api_key if api_key is not None else settings.typesafe_api_key).strip()
         self._model = (model or settings.jev_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         self._base_url = base_url.rstrip("/")
-        self._timeout = timeout
+        self._timeout = _timeout_seconds(timeout)
         self._transport = transport
 
     async def system_one(
@@ -67,7 +67,8 @@ class HttpSystemOneClient:
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
+        timeout = httpx.Timeout(self._timeout, connect=min(5.0, self._timeout))
+        async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
             response = await client.post(self._base_url, json=body, headers=headers)
         if response.status_code >= 400:
             # Never include Authorization or raw body secrets in logs.
@@ -88,11 +89,11 @@ class SdkSystemOneClient:
         *,
         api_key: str | None = None,
         model: str | None = None,
-        timeout: float = 8.0,
+        timeout: float | None = None,
     ) -> None:
         self._api_key = (api_key if api_key is not None else settings.typesafe_api_key).strip()
         self._model = (model or settings.jev_model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-        self._timeout = timeout
+        self._timeout = _timeout_seconds(timeout)
 
     async def system_one(
         self,
@@ -205,6 +206,12 @@ def _sdk_answer_dict(value: Any, default_type: str) -> dict[str, Any]:
         if hasattr(value, attr):
             data[attr] = getattr(value, attr)
     return data
+
+
+def _timeout_seconds(override: float | None) -> float:
+    """Resolve the per-call HTTP budget from the override or HEARTH_JEV_TIMEOUT_SECONDS."""
+    value = float(settings.jev_timeout_seconds) if override is None else float(override)
+    return max(0.5, value)
 
 
 def _clip(text: str, limit: int = 240) -> str:
