@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from hearth.telegram.client import TelegramBotClient
+from hearth.telegram.house import TELEGRAM_COMMANDS
 from hearth.telegram.progress import ProgressTracker
 from hearth.telegram.safeguards import RateLimiter
 from hearth.telegram.store import TelegramStore
@@ -41,8 +42,9 @@ async def test_client_uses_bounded_updates_and_modern_message_fields() -> None:
             reply_markup={"inline_keyboard": []},
         )
         await client.edit_message_text(-1001, 8, "Updated")
+        await client.set_my_commands(TELEGRAM_COMMANDS)
 
-    poll, send, edit = (_json_request(request) for request in requests)
+    poll, send, edit, commands = (_json_request(request) for request in requests)
     assert poll == {
         "timeout": 25,
         "limit": 100,
@@ -58,6 +60,8 @@ async def test_client_uses_bounded_updates_and_modern_message_fields() -> None:
     assert "disable_web_page_preview" not in send
     assert "reply_to_message_id" not in send
     assert edit["link_preview_options"] == {"is_disabled": True}
+    command_names = {row["command"] for row in commands["commands"]}
+    assert {"house", "lights", "scenes", "scene", "covers", "cover"} <= command_names
 
 
 @pytest.mark.asyncio

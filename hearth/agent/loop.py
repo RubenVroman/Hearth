@@ -249,7 +249,8 @@ class AgentLoop:
         used: list[dict[str, Any]] = []
         if plan is None:
             reply = (
-                "I can drive the house — lights, Denon, LG TV, play titles in Infuse on the "
+                "I can drive the house — lights, scenes, covers, house status, Denon, LG TV, "
+                "play titles in Infuse on the "
                 "Apple TV (or Plex on LG), grab movies in Radarr or shows in Sonarr, check "
                 "download progress, request "
                 "via Overseerr, suggest movie cards on the glass UI, order food on Thuisbezorgd, "
@@ -416,10 +417,14 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         names = [c.get("name") or c.get("id") for c in containers]
         return f"Containers{mock}: " + ", ".join(str(n) for n in names)
     if name == "ha_call_service":
-        entity = (data.get("entity") or {}).get("entity_id") or data.get("entity")
-        return f"Done{mock}: {entity} is {(data.get('entity') or {}).get('state', 'updated')}."
+        state = data.get("entity") or data.get("state") or {}
+        state = state if isinstance(state, dict) else {}
+        entity = state.get("entity_id") or data.get("entity_id") or "the device"
+        return f"Done{mock}: {entity} is {state.get('state', 'updated')}."
     if name == "house_media":
         return str(data.get("speak") or f"House media{mock}.")
+    if name == "house_status":
+        return str(data.get("speak") or f"House status{mock}: {data.get('health', 'unknown')}.")
     if name == "house_network":
         return str(data.get("speak") or f"House network{mock}: {data.get('health', 'unknown')}.")
     if name == "media_activity":
@@ -676,6 +681,15 @@ _NETWORK_STATUS = re.compile(
     r"check (?:all )?(?:the )?(?:devices?|connections?))\b",
     re.I,
 )
+_HOUSE_STATUS = re.compile(
+    r"\b(?:"
+    r"(?:house|home)\s+(?:status|snapshot|check)|"
+    r"status\s+of\s+(?:the\s+)?(?:house|home)|"
+    r"how(?:'s| is)\s+(?:the\s+)?(?:house|home)|"
+    r"what(?:'s| is)\s+on\s+(?:in|around|at)\s+(?:the\s+)?(?:house|home)"
+    r")\b",
+    re.I,
+)
 _MEDIA_ACTIVITY = re.compile(
     r"\b(?:watch|use|start|prepare|switch to)\s+(?:the\s+)?(apple\s*tv|atv|tv|television)\b"
     r"|\b(?:turn|switch|power)\s+(?:the\s+)?(?:whole\s+)?(?:media|tv)\s+(chain\s+)?off\b",
@@ -772,6 +786,30 @@ _VOLUME = re.compile(
 _MUTE = re.compile(r"\b(un)?mute\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\b", re.I)
 _SOURCE = re.compile(
     r"\b(?:set|switch)\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\s+(?:to\s+|source\s+|input\s+)(.+)$",
+    re.I,
+)
+_LIGHT_BRIGHTNESS = re.compile(
+    r"\b(?:dim|set)\s+(?:the\s+)?(.+?\blights?)\s+"
+    r"(?:to|at)\s+(\d{1,3})%?\s*[.?!]*$",
+    re.I,
+)
+_SCENE_ACTIVATE = re.compile(
+    r"\b(?:activate|run|start|turn\s+on)\s+(?:the\s+)?(?:"
+    r"scene\s+(.+?)|(.+?)\s+scene|"
+    r"(movie\s+night|good\s+night)"
+    r")\s*[.?!]*$",
+    re.I,
+)
+_COVER_ACTION = re.compile(
+    r"\b(open|close|stop)\s+(?:the\s+)?"
+    r"(.+?(?:cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters))"
+    r"\s*[.?!]*$",
+    re.I,
+)
+_COVER_POSITION = re.compile(
+    r"\b(?:set|move)\s+(?:the\s+)?"
+    r"(.+?(?:cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters))"
+    r"\s+(?:to\s+)?(\d{1,3})%?\s*[.?!]*$",
     re.I,
 )
 # Videoland on LG — before generic play/plex so Dutch "zet … aan op Videoland" stays house-local.
@@ -964,6 +1002,8 @@ def route_intent(text: str) -> dict[str, Any] | None:
         if _MOVIE.search(raw):
             return {"tool": "radarr_add", "args": {"query": query or raw}}
         return {"tool": "overseerr_request", "args": {"query": query or raw}}
+    if _HOUSE_STATUS.search(raw):
+        return {"tool": "house_status", "args": {}}
     if _NETWORK_STATUS.search(raw):
         return {"tool": "house_network", "args": {}}
     videoland_plan = _videoland_plan(raw)
@@ -1040,6 +1080,49 @@ def route_intent(text: str) -> dict[str, Any] | None:
                 "device": device,
                 "action": "select_source",
                 "source": source.group(2).strip(" ."),
+            },
+        }
+    light_brightness = _LIGHT_BRIGHTNESS.search(raw)
+    if light_brightness:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": light_brightness.group(1).strip(" ."),
+                "domain": "light",
+                "action": "brightness",
+                "value": int(light_brightness.group(2)),
+            },
+        }
+    scene = _SCENE_ACTIVATE.search(raw)
+    if scene:
+        target = next((group for group in scene.groups() if group), "")
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": target.strip(" ."),
+                "domain": "scene",
+                "action": "activate",
+            },
+        }
+    cover_position = _COVER_POSITION.search(raw)
+    if cover_position:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cover_position.group(1).strip(" ."),
+                "domain": "cover",
+                "action": "set_position",
+                "value": int(cover_position.group(2)),
+            },
+        }
+    cover_action = _COVER_ACTION.search(raw)
+    if cover_action:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cover_action.group(2).strip(" ."),
+                "domain": "cover",
+                "action": cover_action.group(1).lower(),
             },
         }
     m = _TURN_ON.search(raw)
@@ -1540,36 +1623,22 @@ def _turn_plan(phrase: str, *, on: bool) -> dict[str, Any]:
             "tool": "ha_media_control",
             "args": {"device": device, "action": "turn_on" if on else "turn_off"},
         }
+    if re.search(
+        r"\b(cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters)\b",
+        cleaned,
+    ):
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cleaned,
+                "domain": "cover",
+                "action": "open" if on else "close",
+            },
+        }
     return {
         "tool": "ha_device_control",
         "args": {"device": cleaned, "action": "turn_on" if on else "turn_off"},
     }
-
-
-def _guess_entity(phrase: str, *, on: bool) -> dict[str, Any]:
-    name = re.sub(r"^(the|my|our)\s+", "", phrase.strip(), flags=re.I).lower().rstrip(".")
-    mapping = {
-        "living room": "light.living_room",
-        "living room lights": "light.living_room",
-        "kitchen": "light.kitchen",
-        "kitchen lights": "light.kitchen",
-        "office": "light.office",
-        "movie night": "scene.movie_night",
-        "good night": "scene.good_night",
-        "tv": "media_player.lg_webos_tv",
-        "lg": "media_player.lg_webos_tv",
-        "denon": "media_player.denon_avr_x3700h",
-        "avr": "media_player.denon_avr_x3700h",
-    }
-    entity = mapping.get(name, f"light.{name.replace(' ', '_')}")
-    domain = entity.split(".", 1)[0]
-    if domain == "scene":
-        service = "turn_on"
-    elif domain == "media_player":
-        service = "turn_on" if on else "turn_off"
-    else:
-        service = "turn_on" if on else "turn_off"
-    return {"domain": domain, "service": service, "entity_id": entity}
 
 
 _MEDIA_NOISE = re.compile(
