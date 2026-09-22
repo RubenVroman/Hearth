@@ -974,11 +974,15 @@ def test_catalog_reads_are_not_classified_as_writes() -> None:
 
 
 def test_the_telegram_surface_has_no_second_gate() -> None:
-    """Every Jev entry point under telegram/ is the shared one.
+    """Every named tool path under telegram/ uses the shared authorize_tool gate.
 
     Two things would fork the gate: calling System One directly, or reaching
     for the coarse ``evaluate_message`` governance gate to decide a tool that
     the caller can already name. Both are failures, not style.
+
+    ``bot.py`` still calls ``evaluate_message`` once for #86 butler_ask tool
+    picking in ``_house_aside`` — that is shelf/scene choice, not a second
+    authorize path for an already-named tool. Everything else must stay clean.
     """
     root = Path(__file__).resolve().parents[1] / "hearth" / "telegram"
     direct_client: list[str] = []
@@ -988,12 +992,16 @@ def test_the_telegram_surface_has_no_second_gate() -> None:
         where = str(path.relative_to(root))
         if "system_one(" in text or "SystemOneClient(" in text:
             direct_client.append(where)
-        if "evaluate_message(" in text:
+        if "evaluate_message(" in text and where != "bot.py":
             coarse_gate.append(where)
     assert direct_client == [], f"telegram must not call System One directly: {direct_client}"
     assert coarse_gate == [], (
         "telegram tool paths must use authorize_tool, not the coarse gate: "
         f"{coarse_gate}"
+    )
+    bot_src = (root / "bot.py").read_text(encoding="utf-8")
+    assert bot_src.count("evaluate_message(") == 1, (
+        "bot.py may keep one evaluate_message for butler_ask; do not add more"
     )
 
 
