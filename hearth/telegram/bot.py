@@ -35,6 +35,7 @@ from hearth.telegram.heuristics import (
     looks_like_confirm_no,
     looks_like_confirm_yes,
 )
+from hearth.telegram.house import HOUSE_HELP, detect_house_device, run_house_device
 from hearth.telegram.media import (
     MAX_RESULTS,
     SERIES_MAX_RESULTS,
@@ -86,7 +87,8 @@ HELP_TEXT = (
     "(“scary under 2 hours”), lookalikes (“something like Arrival”), and several "
     "at once (“grab Inception and Interstellar”). Follow-ups work too: “the "
     "sequel”, “all of them”, “more like that”. Tap Get to request — I never "
-    "queue from chat alone. Commands: /search <title>, /status, /help."
+    "queue from chat alone. Commands: /search <title>, /status, /help.\n\n"
+    f"{HOUSE_HELP}"
 )
 _PENDING_GUESS_PREFIX = "guess:"
 
@@ -257,6 +259,14 @@ class TelegramMediaBot:
             if len(context.hits) == 1:
                 return await self._confirm_context_pick(view, context, index=1)
             return BotReply(voice.which_one())
+
+        # House hardware (pet feeder, airco, purifier) before the catalog parser:
+        # these phrases would otherwise be searched for as film titles. Runs after
+        # the pending-guess block so a media confirm still wins, and executes
+        # through the tool registry so the shared Jev gate applies.
+        device = detect_house_device(view.text)
+        if device is not None:
+            return await run_house_device(device, view.text)
 
         _, query = parse_message(
             message,

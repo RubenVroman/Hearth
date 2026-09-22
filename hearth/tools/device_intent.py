@@ -159,6 +159,26 @@ _DEVICE_STATUS = re.compile(
     re.I,
 )
 
+# Telegram affordances. Expanded into the plain phrases above so the slash and
+# spoken forms cannot drift apart.
+_SLASH = re.compile(r"^/(feed|airco|purifier|devices)(?:@[\w_]+)?\b\s*(.*)$", re.I | re.S)
+
+
+def _expand_slash(raw: str) -> str | None:
+    match = _SLASH.match(raw)
+    if match is None:
+        return None
+    command = match.group(1).lower()
+    rest = (match.group(2) or "").strip()
+    if command == "devices":
+        return "house devices"
+    if command == "feed":
+        if rest.isdigit():
+            return f"feed the cats {rest} portions"
+        return f"feed the cats {rest}".strip()
+    return f"{command} {rest}" if rest else f"{command} status"
+
+
 _MODE_CANONICAL = {
     "cooling": "cool",
     "koel": "cool",
@@ -206,6 +226,7 @@ def match_device_phrase(text: str) -> DevicePlan | None:
     raw = (text or "").strip()
     if not raw:
         return None
+    raw = _expand_slash(raw) or raw
 
     if _DISCOVER.search(raw):
         return DevicePlan(tool="ha_discover_entities", kind="discover_entities", args={})
