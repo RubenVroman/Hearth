@@ -19,6 +19,7 @@ from hearth.config import settings
 from hearth.jev import reset_client, set_client
 from hearth.jev.schema import parse_answers
 from hearth.telegram.bot import TelegramMediaBot
+from hearth.telegram.media.memory import speaker_scope
 from hearth.telegram.models import MediaHit
 from hearth.telegram.store import TelegramStore
 
@@ -156,11 +157,14 @@ def _enforce(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _arm_pending(bot: TelegramMediaBot) -> None:
-    bot._set_pending_guess(
-        CHAT_ID,
-        MediaHit(media_type="movie", tmdb_id=438631, title="Dune", year=2021),
-        season=None,
-    )
+    # Group chats key pending guesses per speaker (#86). Arm under the same
+    # scope handle_message binds, or a typed yes will miss the offer.
+    with speaker_scope(CHAT_ID, USER_ID):
+        bot._set_pending_guess(
+            CHAT_ID,
+            MediaHit(media_type="movie", tmdb_id=438631, title="Dune", year=2021),
+            season=None,
+        )
 
 
 async def _get_button(bot: TelegramMediaBot) -> str:

@@ -23,9 +23,9 @@ from websockets.asyncio.client import connect as ws_connect
 
 from hearth.agent.prompts import compose_system_prompt, compose_system_prompt_async
 from hearth.agent.registry import registry
-from hearth.butler.decision import hide_from_llm
+from hearth.butler.decision import JEV_GATED_TOOL_NAMES, decide_butler_tool, hide_from_llm
 from hearth.config import settings
-from hearth.jev import tool_turn
+from hearth.jev import adopt_verdict, evaluate_message, log_shadow_outcome, tool_turn
 from hearth.memory import store as memory_store
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
@@ -105,9 +105,32 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
     payload = dict(args or {})
     if name == "chief_of_staff":
         payload.setdefault("said", said or json.dumps(payload))
+    # Shelf/scene stay Jev-chosen even if a client names them. The registry gate
+    # still wraps the call for allow/deny; butler_ask picks which tool may run.
+    butler_verdict = None
+    if name in JEV_GATED_TOOL_NAMES:
+        uttered = (said or runtime.latest_user() or "").strip()
+        butler_verdict = await evaluate_message(uttered or name)
+        decision = decide_butler_tool(uttered, butler_verdict)
+        log_shadow_outcome(
+            butler_verdict,
+            channel="voice",
+            tools=[decision.tool] if decision.run else [],
+            outcome=decision.source,
+        )
+        if not decision.run or decision.tool != name:
+            return {
+                "ok": False,
+                "name": name,
+                "speak": "Jev didn't clear that, so I left it alone.",
+                "jev": butler_verdict.as_log_dict(),
+            }
+        payload = decision.as_args()
     # Voice tool calls pass the same Jev gate as chat and Telegram. Without a
     # transcript there is no state to gate on, and the gate fails open.
     with tool_turn(said, channel="voice"):
+        if butler_verdict is not None:
+            adopt_verdict(butler_verdict)
         result = await registry.call(name, payload, said=said)
     return result.as_dict()
 
