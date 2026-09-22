@@ -2143,6 +2143,17 @@ class TelegramMediaBot:
                 edit_message_id=message_id,
             )
 
+        # Gate before claiming. A tap is a confirm, so only Jev's hard stops can
+        # block it — and leaving the action unclaimed means a refused button is
+        # still there rather than permanently spent.
+        decision = await self._authorize_queue(
+            said=str(metadata.get("title") or f"TMDB {request.tmdb_id}"),
+            tmdb_id=request.tmdb_id,
+            media_type=request.media_type,
+        )
+        if decision is not None and decision.denied:
+            return BotReply(decision.message, edit_message_id=message_id)
+
         callback_id = str(callback.get("id") or "")
         digest = hashlib.sha256(f"{chat_id}:{message_id}:{data}".encode()).hexdigest()[:32]
         season_key = "all" if request.season is None else str(request.season)
@@ -2190,17 +2201,6 @@ class TelegramMediaBot:
         seasons: list[int] | str | None = None
         if request.media_type == "tv":
             seasons = [request.season] if request.season is not None else "all"
-
-        # A Get tap is the confirm, so only Jev's hard stops apply. The claim is
-        # released so a denied tap can be retried once the ask is clearer.
-        decision = await self._authorize_queue(
-            said=str(metadata.get("ask_text") or title),
-            tmdb_id=request.tmdb_id,
-            media_type=request.media_type,
-        )
-        if decision is not None and decision.denied:
-            self.store.finish_callback(digest, state="failed", error=decision.reason)
-            return BotReply(decision.message, edit_message_id=message_id)
 
         try:
             result = await self.overseerr.request(
@@ -2411,6 +2411,10 @@ class TelegramMediaBot:
         Get taps and typed yeses are already explicit confirms, so only Jev's
         hard stops (refuse / do-not-auto-run) can block them. ``None`` means the
         gate had no opinion and the request proceeds.
+
+        For a tap, ``said`` is the title rather than the original sentence: the
+        only question left is whether *this title* is something the house should
+        decline to fetch, and the sentence that found it was answered already.
         """
         try:
             return await authorize_tool(

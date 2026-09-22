@@ -171,7 +171,7 @@ WRITE_TOOLS = frozenset(
 
 # Reads that must never be gated away, even when a tool is not in TOOL_LANES.
 READ_ONLY_TOOLS = frozenset(
-    tool for lane, tools in TOOL_LANES.items() for tool in tools if tool not in WRITE_TOOLS
+    tool for tools in TOOL_LANES.values() for tool in tools if tool not in WRITE_TOOLS
 )
 
 _DENY_TEXT: dict[str, str] = {

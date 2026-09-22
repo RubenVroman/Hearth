@@ -431,6 +431,10 @@ def _format_tool_reply(tools: list[dict[str, Any]]) -> str:
             continue
         if not tool.get("ok"):
             data = tool.get("data") or {}
+            if data.get("denied") and data.get("speak"):
+                # A governance refusal says why in the house voice, not in a code.
+                parts.append(str(data["speak"]))
+                continue
             if name == "chief_of_staff" and data.get("error"):
                 parts.append(str(data["error"]))
                 continue

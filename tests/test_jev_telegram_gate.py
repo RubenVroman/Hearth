@@ -299,6 +299,29 @@ async def test_hard_stop_blocks_a_get_tap_without_queueing(
 
 
 @pytest.mark.asyncio
+async def test_a_denied_get_button_is_not_spent(
+    bot_and_overseerr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused tap must leave the button usable, not brick it forever."""
+    bot, provider = bot_and_overseerr
+    _enforce(monkeypatch)
+    set_client(FakeSystemOne(_payload(domain="refuse", domain_conf=0.96)))
+    data = await _get_button(bot)
+
+    denied = await bot.handle_callback(_callback(data))
+    assert denied is not None
+    assert provider.requests == []
+
+    # Jev changes its mind; the same button still works.
+    set_client(FakeSystemOne(_payload()))
+    allowed = await bot.handle_callback(_callback(data))
+
+    assert allowed is not None
+    assert "already handled" not in allowed.text
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_low_tool_allow_never_blocks_a_tapped_get(
     bot_and_overseerr, monkeypatch: pytest.MonkeyPatch
 ) -> None:
