@@ -1510,7 +1510,7 @@ def _plex_player_hint(phrase: str | None) -> str:
         return "tv"
     if "infuse" in name or "firecore" in name:
         return "Infuse"
-    if "apple" in name:
+    if "apple" in name or name in {"atv", "appletv"}:
         return "Apple TV"
     if "lg" in name or "webos" in name:
         return "LG"
