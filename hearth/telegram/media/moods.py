@@ -9,7 +9,9 @@ maps house language onto the genre / runtime / era filters that
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
+from hearth.telegram.heuristics import looks_like_concrete_title
 from hearth.telegram.media.types import MoodSpec
 
 # TMDB movie genres.
@@ -249,6 +251,84 @@ def looks_like_riddle(text: str) -> bool:
     """
     return bool(_RIDDLE_FRAME.search((text or "").strip()))
 
+
+# Hard evidence that a phrase names one release rather than describing a vibe.
+# "Scary Movie (2000)" and "Scary Movie 3" are catalog entries; only explicit
+# vibe framing ("something scary from 2000") may override them.
+_RELEASE_YEAR = re.compile(r"\(\s*(?:19|20)\d{2}\s*\)")
+_SEQUEL_NUMBER = re.compile(
+    r"\b\w.*?\s(?:\d{1,2}|i{1,3}|iv|vi{0,3}|ix|xi{0,2})\s*$",
+    re.I,
+)
+_QUOTED = re.compile(r"^\s*[\"“”'‘’]\s*\S.*\S\s*[\"“”'‘’]\s*$")
+_THE_MOVIE_SUFFIX = re.compile(r",\s*(?:the\s+)?(?:movie|film|series|serie)\s*[.!?]*\s*$", re.I)
+
+
+def names_one_release(text: str) -> bool:
+    """True when the text carries hard evidence of a specific catalog title.
+
+    A release year, a sequel number, quotes, or a ", the movie" disambiguator
+    are all things a person writes about *one title* and never about a vibe.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _QUOTED.match(raw) or _RELEASE_YEAR.search(raw) or _THE_MOVIE_SUFFIX.search(raw):
+        return True
+    return bool(_SEQUEL_NUMBER.match(raw))
+
+
+# Soft ambiguity: a bare noun phrase that reads as both a vibe and a catalog
+# title ("Date Night", "American Horror Story"). The vibe lane still answers,
+# but the card offers a one-tap "I meant the title" correction.
+_QUANTIFIER_LEAD = re.compile(
+    r"^\s*(?:any|some|a\s+few|more|another|got|give|show|find|need|want|looking|best|top)\b",
+    re.I,
+)
+_PLURAL_MEDIA_TAIL = re.compile(r"\b(?:movies|films|shows|series|flicks|picks)\s*[.!?]*$", re.I)
+_PHRASE_GLUE = re.compile(
+    r"\b(?:for|while|during|about|from|under|over|than|please|tonight|vanavond)\b",
+    re.I,
+)
+
+
+# Joiners a title leaves lower-case ("Crouching Tiger, Hidden Dragon").
+_TITLE_JOINERS = frozenset(
+    {"a", "an", "the", "and", "or", "of", "in", "on", "to", "for", "with", "at", "by", "from", "&"}
+)
+
+
+def _looks_title_cased(text: str) -> bool:
+    """True when every significant word is capitalised, the way titles are written."""
+    words = [word for word in re.split(r"[\s]+", (text or "").strip()) if word]
+    if len(words) < 2:
+        return False
+    significant = 0
+    for index, word in enumerate(words):
+        core = word.strip("\"“”'‘’(),.:;!?-–—")
+        if not core or not core[0].isalpha():
+            continue
+        if index and core.casefold() in _TITLE_JOINERS:
+            continue
+        significant += 1
+        if not core[0].isupper():
+            return False
+    return significant >= 2
+
+
+def _ambiguous_title(raw: str, *, framed: bool) -> str:
+    """The catalog title this vibe ask might really be, or "" when it isn't one."""
+    if framed:
+        return ""
+    phrase = raw.strip(" .!?")
+    if not phrase or len(phrase.split()) > 5:
+        return ""
+    if _QUANTIFIER_LEAD.match(phrase) or _PLURAL_MEDIA_TAIL.search(phrase):
+        return ""
+    if _PHRASE_GLUE.search(phrase):
+        return ""
+    return phrase if looks_like_concrete_title(phrase) else ""
+
 _RUNTIME_HOURS = re.compile(
     r"\b(?:under|below|less\s+than|shorter\s+than|max(?:imum)?|within|no\s+more\s+than|"
     r"onder|minder\s+dan|korter\s+dan)\s+"
@@ -476,6 +556,9 @@ def detect_house_night(text: str) -> MoodSpec | None:
     raw = (text or "").strip()
     if not raw:
         return None
+    if names_one_release(raw) and not _VIBE_FRAME.search(raw):
+        # "Date Night (2010)" is the film, not Friday-night framing.
+        return None
     for key, label, pattern, include, exclude, runtime_lte in _HOUSE_NIGHT_RULES:
         if not pattern.search(raw):
             continue
@@ -519,9 +602,14 @@ def detect_mood(text: str) -> MoodSpec | None:
     if not raw:
         return None
 
+    framed_ask = bool(_VIBE_FRAME.search(raw))
+    if names_one_release(raw) and not framed_ask:
+        # "Scary Movie (2000)" / "Scary Movie 3" name a release, not a vibe.
+        return None
+
     house = detect_house_night(raw)
     if house is not None:
-        return house
+        return replace(house, ambiguous_title=_ambiguous_title(raw, framed=framed_ask))
 
     matched: list[tuple[str, str, tuple[int, ...], tuple[int, ...]]] = []
     for key, label, pattern, include, exclude in _MOOD_RULES:
@@ -550,6 +638,12 @@ def detect_mood(text: str) -> MoodSpec | None:
             pass
         elif words > 4 or words <= 2:
             return None
+        elif not _MOVIE_HINT.search(raw) and not _TV_HINT.search(raw):
+            # Three or four title-cased words with no media noun is how people
+            # write film names ("American Horror Story", "Cowboys & Aliens"),
+            # not how they describe a vibe ("funny and light").
+            if _looks_title_cased(raw):
+                return None
 
     media_type = "tv" if _TV_HINT.search(raw) and not _MOVIE_HINT.search(raw) else "movie"
 
@@ -598,6 +692,7 @@ def detect_mood(text: str) -> MoodSpec | None:
         release_date_gte=era_floor,
         release_date_lte=era_ceiling,
         sort_by="vote_average.desc" if acclaimed else "popularity.desc",
+        ambiguous_title=_ambiguous_title(raw, framed=framed),
     )
 
 
@@ -615,12 +710,26 @@ def house_pick_spec(*, media_type: str = "movie") -> MoodSpec:
     )
 
 
+# "Something Wild" and "Something's Gotta Give" open with the vibe word but are
+# films. A vague ask always has more request language than the bare pronoun.
+_BARE_SOMETHING_LEAD = re.compile(r"^\s*(?:something|somethin|anything|iets)\b", re.I)
+
+
 def looks_like_vague_ask(text: str) -> bool:
     """True for "what should we watch?" style asks with no vibe attached."""
     raw = (text or "").strip()
     if not raw:
         return False
-    return bool(_VIBE_FRAME.search(raw)) and detect_mood(raw) is None
+    if not _VIBE_FRAME.search(raw) or detect_mood(raw) is not None:
+        return False
+    if names_one_release(raw):
+        return False
+    # Only a leading "something"/"anything" and nothing else vibe-ish: a title
+    # is by far the more likely reading.
+    remainder = _BARE_SOMETHING_LEAD.sub("", raw, count=1)
+    if remainder != raw and not _VIBE_FRAME.search(remainder):
+        return not looks_like_concrete_title(raw)
+    return True
 
 
 __all__ = [
@@ -629,4 +738,5 @@ __all__ = [
     "house_pick_spec",
     "looks_like_riddle",
     "looks_like_vague_ask",
+    "names_one_release",
 ]
