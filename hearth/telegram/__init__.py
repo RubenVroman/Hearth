@@ -1,4 +1,4 @@
-"""Deterministic Overseerr media bot over Telegram long polling."""
+"""House control and deterministic Overseerr media over Telegram long polling."""
 
 from __future__ import annotations
 

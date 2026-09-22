@@ -5,6 +5,8 @@ Jev is **not** an LLM and does not generate text. It returns typed **Choice / No
 1. A cheap gate **before** the OpenAI agent tool loop (cancel / CoS / refuse).
 2. The **first-class Telegram media intent router** — every media-ish Telegram turn hits Jev first, which picks one of eleven lanes; OpenAI is only called when Jev says `descriptive_riddle` / `needs_llm` (or confidence is too low).
 3. The shared **tool execution gate** — every registry invocation asks `allow_tool` and `which_tool`; Telegram Play uses the same gate to choose Infuse or Plex before either backend is called.
+4. The same gate protects Telegram house commands (slash commands and strict
+   natural light/scene/cover/status forms) before they call Home Assistant.
 
 ## Defaults (safe)
 
@@ -63,7 +65,8 @@ Telegram Play deliberately gives Jev only `infuse_play` and `plex_play` as choic
 
 - **Shadow** (`HEARTH_JEV_ENABLED=true`, `HEARTH_JEV_SHADOW=true`): cancel/confirm/CoS stay advisory (logged). Telegram `media_ask` and shared tool `allow_tool` / `which_tool` routing still apply when their thresholds clear.
 - **Enforce** (`HEARTH_JEV_SHADOW=false`): high-confidence cancel → do not run queue tools; high-confidence `escalate_cos` → Chief of Staff; API errors / low confidence → fail open.
-- Telegram: never invents a queue without a pending guess or Get tap. Enforce may treat high-confidence Jev confirm/cancel like yes/nah.
+- Telegram media: never invents a queue without a pending guess or Get tap. Enforce may treat high-confidence Jev confirm/cancel like yes/nah.
+- Telegram house: shadow logs the intended HA tool; enforce blocks the tool on a high-confidence cancel/refuse verdict. API errors still fail open.
 
 ## Ops
 

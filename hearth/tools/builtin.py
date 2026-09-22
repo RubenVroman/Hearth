@@ -45,6 +45,10 @@ async def _house_media(_args: dict[str, Any]) -> dict[str, Any]:
     return await house_media_inventory()
 
 
+async def _house_status(_args: dict[str, Any]) -> dict[str, Any]:
+    return await ha.house_status()
+
+
 async def _house_network(args: dict[str, Any]) -> dict[str, Any]:
     try:
         limit = int(args.get("limit") or 250)
@@ -560,8 +564,6 @@ def register_builtin_tools() -> None:
                     },
                     "entity_id": {"type": "string"},
                     "data": {"type": "object", "description": "Extra service data (brightness, volume_level, source)"},
-                    "confirm": {"type": "boolean"},
-                    "dry_run": {"type": "boolean"},
                 },
                 "required": ["domain", "service", "entity_id"],
             },
@@ -578,6 +580,19 @@ def register_builtin_tools() -> None:
             ),
             parameters={"type": "object", "properties": {}},
             handler=_house_media,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_status",
+            description=(
+                "One coherent Home Assistant snapshot of the house: which lights, switches, "
+                "fans and media players are on; climate readings; cover positions; unavailable "
+                "entities; and feeder last-fed only when HA exposes a matching entity. "
+                "Use for 'house status', 'what is on', or 'how is the house'."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_house_status,
         )
     )
     registry.register(
@@ -616,7 +631,8 @@ def register_builtin_tools() -> None:
                         "type": "string",
                         "description": (
                             "turn_on, turn_off, toggle, brightness, open, close, stop, "
-                            "set_temperature, set_percentage, activate, press, start, return_to_base"
+                            "set_position, set_temperature, set_percentage, activate, press, "
+                            "start, return_to_base"
                         ),
                     },
                     "domain": {"type": "string", "description": "Optional domain disambiguation."},
@@ -682,8 +698,6 @@ def register_builtin_tools() -> None:
                     "media_content_id": {"type": "string"},
                     "media_content_type": {"type": "string"},
                     "is_volume_muted": {"type": "boolean"},
-                    "confirm": {"type": "boolean"},
-                    "dry_run": {"type": "boolean"},
                 },
                 "required": ["device", "action"],
             },

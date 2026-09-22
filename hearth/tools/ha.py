@@ -53,10 +53,22 @@ _KEEP_ATTRS = (
     "supported_features",
     "temperature",
     "current_temperature",
+    "target_temp_low",
+    "target_temp_high",
+    "temperature_unit",
+    "unit_of_measurement",
     "hvac_action",
+    "preset_mode",
+    "fan_mode",
+    "humidity",
+    "current_humidity",
     "percentage",
     "current_position",
     "battery_level",
+    "last_fed",
+    "last_feed",
+    "last_feeding",
+    "last_feeding_time",
 )
 
 
@@ -245,18 +257,40 @@ class HomeAssistant:
         payload = {"entity_id": entity_id, **(data or {})}
         if not self.live:
             result = _mock.call_service(domain, service, entity_id, data)
-            return {"mode": "mock", "attempts": 1, **result}
+            state = result.get("entity") if isinstance(result.get("entity"), dict) else None
+            return {
+                "mode": "mock",
+                "attempts": 1,
+                **result,
+                "entity_id": entity_id,
+                "state": state,
+            }
         try:
             response, attempts = await self._request(
                 "POST", f"/api/services/{domain}/{service}", json=payload
             )
-            return {
+            changed = response.json()
+            state = _state_from_service_response(changed, entity_id)
+            state_result: dict[str, Any] = {}
+            if state is None:
+                state_result = await self.get_state(entity_id)
+                state = state_result.get("state") if state_result.get("ok") else None
+            result: dict[str, Any] = {
                 "mode": "live",
                 "ok": True,
                 "accepted": True,
                 "attempts": attempts,
-                "changed": response.json(),
+                "entity_id": entity_id,
+                "changed": changed,
+                "state": state,
             }
+            # Keep the historical ``entity`` key for UI/memory consumers while
+            # exposing the clearer ``state`` key used by newer control tools.
+            if state is not None:
+                result["entity"] = state
+            elif state_result.get("error"):
+                result["state_warning"] = str(state_result["error"])
+            return result
         except Exception as exc:  # noqa: BLE001
             return {
                 "mode": "live",
@@ -804,6 +838,119 @@ class HomeAssistant:
             "speak": speak,
         }
 
+    async def house_status(self) -> dict[str, Any]:
+        """Return one coherent, speakable snapshot of the non-media house.
+
+        The snapshot is deliberately entity-driven: climate and feeder details
+        appear only when Home Assistant exposes matching entities. Hearth does
+        not own or configure those integrations here.
+        """
+        result = await self.list_states()
+        mode = str(result.get("mode") or ("live" if self.live else "mock"))
+        if not result.get("ok"):
+            error = str(result.get("error") or "Home Assistant did not answer")
+            return {
+                "ok": False,
+                "mode": mode,
+                "health": "offline",
+                "error": error,
+                "summary": {
+                    "entities": 0,
+                    "reachable": 0,
+                    "unavailable": 0,
+                    "lights_on": 0,
+                },
+                "what_is_on": {
+                    "count": 0,
+                    "lights": [],
+                    "switches": [],
+                    "fans": [],
+                    "media_players": [],
+                },
+                "lights": [],
+                "scenes": [],
+                "covers": [],
+                "climate": [],
+                "media_players": [],
+                "feeder": None,
+                "unavailable_entities": [],
+                "speak": (
+                    "I couldn't read the house because Home Assistant is unreachable. "
+                    "Check Home Assistant, then try again."
+                ),
+            }
+
+        rows = [row for row in (result.get("states") or []) if isinstance(row, dict)]
+        by_domain: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_domain.setdefault(_domain(str(row.get("entity_id") or "")), []).append(row)
+        for domain_rows in by_domain.values():
+            domain_rows.sort(key=_entity_sort_key)
+
+        lights = [_light_snapshot(row) for row in by_domain.get("light", [])]
+        scenes = [_simple_snapshot(row) for row in by_domain.get("scene", [])]
+        covers = [_cover_snapshot(row) for row in by_domain.get("cover", [])]
+        climate = [_climate_snapshot(row) for row in by_domain.get("climate", [])]
+        media_players = list(by_domain.get("media_player", []))
+        switches_on = [
+            _simple_snapshot(row)
+            for row in by_domain.get("switch", [])
+            if _is_on(row)
+        ]
+        fans_on = [
+            _simple_snapshot(row)
+            for row in by_domain.get("fan", [])
+            if _is_on(row)
+        ]
+        media_on = [
+            _simple_snapshot(row)
+            for row in media_players
+            if _media_is_on(row)
+        ]
+        lights_on = [row for row in lights if row.get("state") == "on"]
+        unavailable = [row for row in rows if not _state_reachable(row)]
+        feeder = _feeder_snapshot(rows)
+        what_is_on = {
+            "count": len(lights_on) + len(switches_on) + len(fans_on) + len(media_on),
+            "lights": lights_on,
+            "switches": switches_on,
+            "fans": fans_on,
+            "media_players": media_on,
+        }
+        health = "healthy" if not unavailable else "degraded"
+        return {
+            "ok": True,
+            "mode": mode,
+            "health": health,
+            "summary": {
+                "entities": len(rows),
+                "reachable": len(rows) - len(unavailable),
+                "unavailable": len(unavailable),
+                "lights_on": len(lights_on),
+                "lights_total": len(lights),
+                "covers": len(covers),
+                "climate": len(climate),
+            },
+            "what_is_on": what_is_on,
+            "lights": lights,
+            "scenes": scenes,
+            "covers": covers,
+            "climate": climate,
+            "media_players": media_players,
+            "feeder": feeder,
+            "unavailable_entities": unavailable,
+            "speak": _house_status_speak(
+                lights=lights,
+                switches_on=switches_on,
+                fans_on=fans_on,
+                media_on=media_on,
+                covers=covers,
+                climate=climate,
+                feeder=feeder,
+                unavailable_count=len(unavailable),
+            ),
+        }
+
     async def control_entity(
         self,
         device: str,
@@ -910,6 +1057,11 @@ def _generic_service(
         return ("press" if domain == "button" else "turn_on"), data, None
     if domain == "cover" and action in {"open", "close", "stop"}:
         return f"{action}_cover", data, None
+    if domain == "cover" and action in {"position", "set_position", "set_cover_position"}:
+        if value is None:
+            return "", data, "cover position required (0–100)"
+        data["position"] = max(0, min(100, int(float(value))))
+        return "set_cover_position", data, None
     if domain == "climate" and action in {"temperature", "set_temperature", "heat_to"}:
         if value is None:
             return "", data, "temperature value required"
@@ -1063,6 +1215,225 @@ def _state_reachable(state: dict[str, Any]) -> bool:
     return str(state.get("state") or "").lower() not in _UNREACHABLE_STATES
 
 
+def _friendly_name(state: dict[str, Any]) -> str:
+    attrs = state.get("attributes") or {}
+    return str(attrs.get("friendly_name") or state.get("entity_id") or "Unknown")
+
+
+def _entity_sort_key(state: dict[str, Any]) -> tuple[str, str]:
+    return (_friendly_name(state).casefold(), str(state.get("entity_id") or ""))
+
+
+def _simple_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "entity_id": state.get("entity_id"),
+        "name": _friendly_name(state),
+        "state": state.get("state"),
+        "reachable": _state_reachable(state),
+        "last_changed": state.get("last_changed"),
+    }
+
+
+def _light_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    attrs = state.get("attributes") or {}
+    brightness_pct = attrs.get("brightness_pct")
+    if brightness_pct is None and attrs.get("brightness") is not None:
+        try:
+            brightness_pct = round(float(attrs["brightness"]) / 255.0 * 100)
+        except (TypeError, ValueError):
+            brightness_pct = None
+    return {
+        **_simple_snapshot(state),
+        "brightness_pct": brightness_pct,
+    }
+
+
+def _cover_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    attrs = state.get("attributes") or {}
+    return {
+        **_simple_snapshot(state),
+        "position": attrs.get("current_position"),
+    }
+
+
+def _climate_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    attrs = state.get("attributes") or {}
+    return {
+        **_simple_snapshot(state),
+        "current_temperature": attrs.get("current_temperature"),
+        "target_temperature": attrs.get("temperature"),
+        "target_low": attrs.get("target_temp_low"),
+        "target_high": attrs.get("target_temp_high"),
+        "hvac_action": attrs.get("hvac_action"),
+        "preset_mode": attrs.get("preset_mode"),
+        "humidity": attrs.get("current_humidity", attrs.get("humidity")),
+        "unit": attrs.get("temperature_unit") or attrs.get("unit_of_measurement") or "°C",
+    }
+
+
+def _is_on(state: dict[str, Any]) -> bool:
+    return _state_reachable(state) and str(state.get("state") or "").casefold() == "on"
+
+
+def _media_is_on(state: dict[str, Any]) -> bool:
+    return _state_reachable(state) and str(state.get("state") or "").casefold() not in {
+        "",
+        "off",
+        "idle",
+        "standby",
+    }
+
+
+def _feeder_snapshot(states: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Find a read-only last-fed signal without assuming a feeder integration."""
+    attribute_names = ("last_fed", "last_feed", "last_feeding", "last_feeding_time")
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for state in states:
+        attrs = state.get("attributes") or {}
+        entity_id = str(state.get("entity_id") or "")
+        name = _friendly_name(state)
+        tokens = set(_slug(f"{entity_id} {name}").split("_"))
+        attribute = next(
+            (
+                key
+                for key in attribute_names
+                if _meaningful_value(attrs.get(key))
+            ),
+            None,
+        )
+        looks_like_last_feed = bool(
+            tokens.intersection({"feed", "fed", "feeding", "feeder"})
+            and tokens.intersection({"last", "latest", "recent"})
+        )
+        if attribute is None and not looks_like_last_feed:
+            continue
+        value = attrs.get(attribute) if attribute is not None else state.get("state")
+        if not _meaningful_value(value):
+            continue
+        score = (100 if attribute is not None else 0) + (40 if "last" in tokens else 0)
+        if _domain(entity_id) in {"sensor", "input_datetime"}:
+            score += 20
+        candidates.append(
+            (
+                score,
+                {
+                    "entity_id": entity_id,
+                    "name": name,
+                    "last_fed": value,
+                    "source": f"attribute:{attribute}" if attribute else "state",
+                    "last_changed": state.get("last_changed"),
+                    "reachable": _state_reachable(state),
+                },
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            item[0],
+            str(item[1].get("last_changed") or ""),
+        ),
+        reverse=True,
+    )
+    return candidates[0][1]
+
+
+def _meaningful_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().casefold() not in {"", "unknown", "unavailable"}
+    return True
+
+
+def _join_names(names: list[str]) -> str:
+    clean = [name for name in names if name]
+    if len(clean) < 2:
+        return clean[0] if clean else ""
+    if len(clean) == 2:
+        return f"{clean[0]} and {clean[1]}"
+    return f"{', '.join(clean[:-1])}, and {clean[-1]}"
+
+
+def _house_status_speak(
+    *,
+    lights: list[dict[str, Any]],
+    switches_on: list[dict[str, Any]],
+    fans_on: list[dict[str, Any]],
+    media_on: list[dict[str, Any]],
+    covers: list[dict[str, Any]],
+    climate: list[dict[str, Any]],
+    feeder: dict[str, Any] | None,
+    unavailable_count: int,
+) -> str:
+    parts: list[str] = []
+    lights_on = [row for row in lights if row.get("state") == "on"]
+    if lights:
+        if lights_on:
+            parts.append(
+                f"{len(lights_on)} of {len(lights)} lights are on: "
+                f"{_join_names([str(row.get('name') or '') for row in lights_on])}."
+            )
+        else:
+            parts.append(f"All {len(lights)} lights are off.")
+    else:
+        parts.append("No lights are exposed by Home Assistant.")
+
+    other_on = switches_on + fans_on
+    if other_on:
+        parts.append(
+            "Also on: "
+            + _join_names([str(row.get("name") or "") for row in other_on])
+            + "."
+        )
+    if media_on:
+        parts.append(
+            "Active media: "
+            + _join_names([str(row.get("name") or "") for row in media_on])
+            + "."
+        )
+
+    climate_bits: list[str] = []
+    for row in climate[:3]:
+        current = row.get("current_temperature")
+        target = row.get("target_temperature")
+        unit = str(row.get("unit") or "°C")
+        detail = str(row.get("name") or row.get("entity_id") or "Climate")
+        if current is not None:
+            detail += f" {current}{unit}"
+        if target is not None:
+            detail += f", set to {target}{unit}"
+        action = str(row.get("hvac_action") or "")
+        if action and action not in {"idle", "off"}:
+            detail += f" ({action})"
+        climate_bits.append(detail)
+    if climate_bits:
+        parts.append("Climate: " + "; ".join(climate_bits) + ".")
+
+    open_covers = [
+        row
+        for row in covers
+        if str(row.get("state") or "").casefold() in {"open", "opening"}
+        or (
+            isinstance(row.get("position"), (int, float))
+            and float(row["position"]) > 0
+        )
+    ]
+    if open_covers:
+        parts.append(
+            "Open covers: "
+            + _join_names([str(row.get("name") or "") for row in open_covers])
+            + "."
+        )
+    if feeder is not None:
+        parts.append(
+            f"{feeder.get('name') or 'Feeder'} last fed: {feeder.get('last_fed')}."
+        )
+    if unavailable_count:
+        parts.append(f"{unavailable_count} Home Assistant entities are unavailable.")
+    return " ".join(parts)
+
+
 def _error_text(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
         return f"Home Assistant HTTP {exc.response.status_code}"
@@ -1071,6 +1442,31 @@ def _error_text(exc: Exception) -> str:
 
 def _role_label(role: str) -> str:
     return "Apple TV" if role == "apple_tv" else "LG TV"
+
+
+def _state_from_service_response(
+    payload: Any,
+    entity_id: str,
+) -> dict[str, Any] | None:
+    """Extract HA's changed-state row before spending another REST round-trip."""
+    rows: list[Any]
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        nested = payload.get("changed_states") or payload.get("states")
+        rows = nested if isinstance(nested, list) else [payload]
+    else:
+        return None
+    match = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("entity_id") or "").casefold() == entity_id.casefold()
+        ),
+        None,
+    )
+    return _summarize_one(match) if match is not None else None
 
 
 def _summarize(states: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1085,6 +1481,8 @@ def _summarize_one(state: dict[str, Any]) -> dict[str, Any]:
         "state": state.get("state"),
         "reachable": str(state.get("state") or "").lower() not in _UNREACHABLE_STATES,
         "attributes": keep,
+        "last_changed": state.get("last_changed"),
+        "last_updated": state.get("last_updated"),
     }
 
 

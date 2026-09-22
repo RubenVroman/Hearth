@@ -37,6 +37,7 @@ _HA_TOOLS = frozenset(
         "ha_device_control",
         "ha_media_control",
         "media_activity",
+        "house_status",
         "house_media",
         "house_network",
         "videoland_play",

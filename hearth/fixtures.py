@@ -37,6 +37,26 @@ MOCK_HA_STATES: list[dict[str, Any]] = [
         "attributes": {"friendly_name": "Good night"},
     },
     {
+        "entity_id": "cover.living_room_blind",
+        "state": "open",
+        "attributes": {
+            "friendly_name": "Living room blind",
+            "current_position": 65,
+        },
+    },
+    {
+        "entity_id": "climate.living_room",
+        "state": "heat",
+        "attributes": {
+            "friendly_name": "Living room climate",
+            "current_temperature": 20.5,
+            "temperature": 21.0,
+            "temperature_unit": "°C",
+            "hvac_action": "heating",
+            "humidity": 48,
+        },
+    },
+    {
         "entity_id": "media_player.denon_avr_x3700h",
         "state": "playing",
         "attributes": {
@@ -2462,11 +2482,16 @@ class MockHouse:
                 state["state"] = "on"
                 if "brightness" in data:
                     state["attributes"]["brightness"] = data["brightness"]
+                elif "brightness_pct" in data:
+                    percent = max(0.0, min(100.0, float(data["brightness_pct"])))
+                    state["attributes"]["brightness"] = round(percent / 100.0 * 255)
+                    state["attributes"]["brightness_pct"] = percent
                 elif not state["attributes"].get("brightness"):
                     state["attributes"]["brightness"] = 180
             elif service == "turn_off":
                 state["state"] = "off"
                 state["attributes"]["brightness"] = 0
+                state["attributes"]["brightness_pct"] = 0
             elif service == "toggle":
                 state["state"] = "off" if state["state"] == "on" else "on"
         elif domain == "scene" and service == "turn_on":
@@ -2478,6 +2503,21 @@ class MockHouse:
             elif entity_id == "scene.good_night":
                 for light in ("light.living_room", "light.kitchen", "light.office"):
                     self._set_light(light, "off", 0)
+        elif domain == "cover":
+            if service == "open_cover":
+                state["state"] = "open"
+                state["attributes"]["current_position"] = 100
+            elif service == "close_cover":
+                state["state"] = "closed"
+                state["attributes"]["current_position"] = 0
+            elif service == "stop_cover":
+                state["state"] = "open" if state["attributes"].get("current_position") else "closed"
+            elif service == "set_cover_position":
+                position = max(0, min(100, int(data.get("position") or 0)))
+                state["attributes"]["current_position"] = position
+                state["state"] = "closed" if position == 0 else "open"
+        elif domain == "climate" and service == "set_temperature":
+            state["attributes"]["temperature"] = float(data.get("temperature"))
         elif domain == "media_player":
             if service == "volume_set" and "volume_level" in data:
                 state["attributes"]["volume_level"] = float(data["volume_level"])
@@ -2536,3 +2576,4 @@ class MockHouse:
             return
         state["state"] = on_off
         state["attributes"]["brightness"] = brightness
+        state["attributes"]["brightness_pct"] = round(brightness / 255.0 * 100)

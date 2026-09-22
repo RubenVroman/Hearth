@@ -12,7 +12,10 @@ from typing import Any, Literal
 
 # Choice options for house routing (cheap triage before gpt/tools).
 DOMAIN_CRITERIA: dict[str, str] = {
-    "lights": "Home Assistant lights, scenes, or room device on/off (not media).",
+    "lights": (
+        "Home Assistant lights, scenes, covers/blinds, or routine room device "
+        "control/status (not media)."
+    ),
     "media": (
         "Play/pause, TV/AVR/Apple TV/Infuse/Plex/Videoland, house media status, "
         "or browsing the library — not a new download request."
