@@ -24,6 +24,7 @@ from websockets.asyncio.client import connect as ws_connect
 from hearth.agent.prompts import compose_system_prompt, compose_system_prompt_async
 from hearth.agent.registry import registry
 from hearth.config import settings
+from hearth.jev import DEVICE_TOOLS, current_utterance, set_utterance
 from hearth.memory import store as memory_store
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
@@ -102,6 +103,12 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
     payload = dict(args or {})
     if name == "chief_of_staff":
         payload.setdefault("said", said or json.dumps(payload))
+    elif name in DEVICE_TOOLS:
+        # Physical hardware: carry the spoken words so the shared Jev gate has a
+        # sentence to judge instead of only the flattened arguments.
+        spoken = said or current_utterance()
+        if spoken:
+            payload.setdefault("said", spoken)
     result = await registry.call(name, payload)
     return result.as_dict()
 
@@ -215,6 +222,9 @@ class Sideband:
             if text:
                 runtime.note("user", text)
                 _persist_voice_turn("user", text)
+                # Give the registry's Jev gate the spoken sentence before the
+                # model turns it into tool arguments.
+                set_utterance(text)
                 await self._refresh_memory(text)
         elif etype == "response.function_call_arguments.done":
             await self._run_function_call(

@@ -7,8 +7,9 @@ from typing import Any, AsyncIterator
 from hearth.agent.prompts import SYSTEM_PROMPT, compose_system_prompt_async
 from hearth.agent.registry import ToolRegistry, registry
 from hearth.config import settings
-from hearth.jev import evaluate_message, log_shadow_outcome
+from hearth.jev import evaluate_message, log_shadow_outcome, set_utterance
 from hearth.memory import store as memory_store
+from hearth.tools.device_intent import match_device_phrase
 from hearth.memory.summarize import maybe_summarize
 from hearth.runtime import runtime
 from hearth import widgets as widget_bus
@@ -29,6 +30,9 @@ class AgentLoop:
         runtime.note("user", user_text)
         widget_bus.start_turn(user_text)
         text = user_text.strip()
+        # Publish the sentence so the registry's Jev gate judges what was said,
+        # not the arguments an LLM flattened it into.
+        set_utterance(text)
         jev_verdict = None
         try:
             if confirm and runtime.pending is not None:
@@ -433,6 +437,18 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         if spoken:
             return f"Done{mock}: {spoken}"
         return f"Done{mock}: {data.get('device')} {data.get('action')} on {data.get('entity_id')}."
+    if name in {
+        "house_devices",
+        "pet_feeder_feed",
+        "pet_feeder_schedule",
+        "airco_control",
+        "air_purifier_control",
+    }:
+        # These tools already speak for themselves, including their refusals
+        # (unpaired entity, feed cooldown, unsupported mode).
+        return str(data.get("speak") or data.get("error") or f"House devices{mock}.")
+    if name == "ha_discover_entities":
+        return str(data.get("speak") or f"No house device entities found{mock}.")
     if name == "chief_of_staff":
         if data.get("configured") is False:
             return str(data.get("error") or "Chief of Staff is not configured.")
@@ -935,6 +951,12 @@ def route_intent(text: str) -> dict[str, Any] | None:
             "tool": "chief_of_staff",
             "args": {"task": raw, "said": raw, "repo": "RubenVroman/Hearth"},
         }
+    # Pet feeder / airco / purifier before the generic routers: "turn off the
+    # airco" must not become a media power command, and "geef de katten eten"
+    # must not become a food order.
+    device = match_device_phrase(raw)
+    if device is not None:
+        return device.as_plan(raw)
     if _FOOD.search(raw) or (_FOOD_CART.search(raw) and _FOOD_ORDER.search(raw)):
         return _food_plan(raw)
     if _MEMORY_LIST.search(raw):
