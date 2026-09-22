@@ -102,6 +102,54 @@ BUTLER_ASK_CRITERIA: dict[str, str] = {
 }
 
 BUTLER_ASK_KINDS = tuple(BUTLER_ASK_CRITERIA.keys())
+# Tool lanes for Jev-routed tool calling. One label per family of house tools so
+# the Choice stays small and cheap; the lane payload is always derived locally.
+TOOL_LANE_CRITERIA: dict[str, str] = {
+    "lights": (
+        "Home Assistant lights, scenes, or a room device on/off — not a TV, "
+        "receiver, or anything that plays media."
+    ),
+    "media_playback": (
+        "Start, stop, pause, or switch playback: play a title on the TV / Apple "
+        "TV / Infuse / Plex / Videoland, transport control, volume, input, or "
+        "waking the media chain."
+    ),
+    "media_library": (
+        "Look at what the house already has or could watch: Plex search, "
+        "now-playing, clients, genre browse, media inventory, or on-screen "
+        "suggestions. Read-only."
+    ),
+    "media_queue": (
+        "Add or re-grab a title the house does not have yet: Overseerr request, "
+        "Radarr/Sonarr add, retry a failed download, or grab a different release."
+    ),
+    "media_status": (
+        "Check an existing download or catalog entry: queue progress, "
+        "Radarr/Sonarr/Overseerr search, or available alternate releases. Read-only."
+    ),
+    "food": "Thuisbezorgd / Just Eat browse, menu, cart, or placing a food order.",
+    "weather": "Local weather or forecast.",
+    "web": "Live web search or current events outside the house stack.",
+    "files": (
+        "Workspace files and skills, or Docker container list/inspect/stop on VAULT."
+    ),
+    "memory_read": "Recall what the house remembers: list or search stored memory.",
+    "memory_write": (
+        "Change what the house remembers: store a preference, forget a row, "
+        "export a snapshot, or purge memory."
+    ),
+    "network": "House network / Home Assistant device inventory and reachability.",
+    "escalate_cos": (
+        "Repo/PR/code, GitHub/GitLab, Gridways, Discord, calendar, or anything "
+        "Hearth cannot do — escalate to Chief of Staff."
+    ),
+    "no_tool": (
+        "No house tool belongs here: ordinary conversation, a clarification, a "
+        "cancel, or something Hearth should decline."
+    ),
+}
+
+TOOL_LANES = tuple(TOOL_LANE_CRITERIA.keys())
 
 RISK_LEVELS = (
     "harmless",  # routine read / chat
@@ -122,6 +170,26 @@ Domain = Literal[
 ]
 
 EnforceAction = Literal["continue", "block_cancel", "escalate_cos"]
+
+# What the tool gate may do with one specific tool call.
+ToolAction = Literal["allow", "deny", "confirm"]
+
+ToolLane = Literal[
+    "lights",
+    "media_playback",
+    "media_library",
+    "media_queue",
+    "media_status",
+    "food",
+    "weather",
+    "web",
+    "files",
+    "memory_read",
+    "memory_write",
+    "network",
+    "escalate_cos",
+    "no_tool",
+]
 
 # Tools that queue / grab media — blocked on high-confidence cancel in enforce.
 QUEUE_TOOLS = frozenset(
@@ -180,6 +248,77 @@ def _confirm_cancel_risk_questions() -> dict[str, dict[str, Any]]:
     }
 
 
+def _needs_llm_question() -> dict[str, dict[str, Any]]:
+    """Shared Noul: does this turn need a generative hop before a tool can run?"""
+    return {
+        "needs_llm": {
+            "type": "noul",
+            "instructions": (
+                "Does resolving this message into catalog title(s) require a generative "
+                "LLM (gpt) hop, rather than a direct TMDB/Overseerr title search?"
+            ),
+            "criteria": {
+                "true": (
+                    "Plot/riddle/description guess, or the media_ask is "
+                    "descriptive_riddle / chat_about_title with unclear title."
+                ),
+                "false": (
+                    "Exact title, franchise seed, series-all, edition-aware, person, "
+                    "mood, similar-to, batch, or follow-up ask that can be answered "
+                    "from Overseerr/TMDB routes directly."
+                ),
+            },
+        },
+    }
+
+
+def _tool_allow_question() -> dict[str, dict[str, Any]]:
+    """Shared Noul: may Hearth run a state-changing house tool for this message?"""
+    return {
+        "tool_allow": {
+            "type": "noul",
+            "instructions": (
+                "May Hearth run a house tool that changes state, spends money, or "
+                "queues a download for this message, without asking the user again?"
+            ),
+            "criteria": {
+                "true": (
+                    "The user clearly asked the house to do something now, or "
+                    "confirmed a pending action."
+                ),
+                "false": (
+                    "Question, chatter, cancel, hypothetical, complaint, or an ask "
+                    "too vague to act on — answer first instead of acting."
+                ),
+            },
+        },
+    }
+
+
+def _tool_lane_question(lanes: tuple[str, ...] | None = None) -> dict[str, dict[str, Any]]:
+    """Choice over house tool families. ``no_tool`` is always offered."""
+    if lanes is None:
+        criteria = dict(TOOL_LANE_CRITERIA)
+    else:
+        criteria = {
+            name: TOOL_LANE_CRITERIA[name] for name in lanes if name in TOOL_LANE_CRITERIA
+        }
+        criteria["no_tool"] = TOOL_LANE_CRITERIA["no_tool"]
+    return {
+        "tool_lane": {
+            "type": "choice",
+            "instructions": (
+                "Which family of Hearth house tools should serve this message? "
+                "Separate looking things up (media_library, media_status, "
+                "memory_read) from changing them (media_playback, media_queue, "
+                "memory_write, lights, food, files). Pick no_tool when the right "
+                "move is to answer, ask, or decline instead of running a tool."
+            ),
+            "criteria": criteria,
+        },
+    }
+
+
 def _media_router_questions() -> dict[str, dict[str, Any]]:
     """First-class Telegram media intent router (Choice + needs_llm Noul)."""
     return {
@@ -201,24 +340,7 @@ def _media_router_questions() -> dict[str, dict[str, Any]]:
             ),
             "criteria": dict(MEDIA_ASK_CRITERIA),
         },
-        "needs_llm": {
-            "type": "noul",
-            "instructions": (
-                "Does resolving this message into catalog title(s) require a generative "
-                "LLM (gpt) hop, rather than a direct TMDB/Overseerr title search?"
-            ),
-            "criteria": {
-                "true": (
-                    "Plot/riddle/description guess, or the media_ask is "
-                    "descriptive_riddle / chat_about_title with unclear title."
-                ),
-                "false": (
-                    "Exact title, franchise seed, series-all, edition-aware, person, "
-                    "mood, similar-to, batch, or follow-up ask that can be answered "
-                    "from Overseerr/TMDB routes directly."
-                ),
-            },
-        },
+        **_needs_llm_question(),
         "multi_item": {
             "type": "noul",
             "instructions": (
@@ -234,7 +356,13 @@ def _media_router_questions() -> dict[str, dict[str, Any]]:
 
 
 def hearth_system_one_questions() -> dict[str, dict[str, Any]]:
-    """Raw question map for POST /v1/systemone (also used to build SDK objects)."""
+    """Raw question map for POST /v1/systemone (also used to build SDK objects).
+
+    One parallel call per chat turn answers everything the turn needs: the house
+    domain, the media lane, **which tool family should run and whether a
+    state-changing tool may run at all**, and the confirm/cancel/risk signals.
+    Every tool call in that turn is then decided from this single answer set.
+    """
     return {
         "domain": {
             "type": "choice",
@@ -255,18 +383,38 @@ def hearth_system_one_questions() -> dict[str, dict[str, Any]]:
             "criteria": dict(BUTLER_ASK_CRITERIA),
         },
         **_media_router_questions(),
+        **_tool_lane_question(),
+        **_tool_allow_question(),
         **_confirm_cancel_risk_questions(),
     }
 
 
 def telegram_media_system_one_questions() -> dict[str, dict[str, Any]]:
-    """Telegram-first System One map: media router + confirm/cancel (no house domain).
+    """Telegram-first System One map: media router + tool allow + confirm/cancel.
 
     Used on every media-ish Telegram turn so Jev classifies intent in one parallel
-    call before any OpenAI prose or Overseerr search strategy is chosen.
+    call before any OpenAI prose or Overseerr search strategy is chosen. There is
+    no ``tool_lane`` here on purpose: on Telegram ``media_ask`` *is* the lane
+    choice, and ``tool_allow`` is what gates the queue/play tools.
     """
     return {
         **_media_router_questions(),
+        **_tool_allow_question(),
+        **_confirm_cancel_risk_questions(),
+    }
+
+
+def tool_gate_questions(lanes: tuple[str, ...] | None = None) -> dict[str, dict[str, Any]]:
+    """Standalone tool-gate map for callers without a turn verdict.
+
+    Covers the four things the gate needs — which lane, whether a state-changing
+    tool may run, whether a generative hop is needed first, and how risky
+    auto-running is — plus the confirm/cancel signals.
+    """
+    return {
+        **_tool_lane_question(lanes),
+        **_tool_allow_question(),
+        **_needs_llm_question(),
         **_confirm_cancel_risk_questions(),
     }
 
@@ -311,6 +459,8 @@ class JevAnswers:
     domain: ChoiceAnswer | None = None
     butler_ask: ChoiceAnswer | None = None
     media_ask: ChoiceAnswer | None = None
+    tool_lane: ChoiceAnswer | None = None
+    tool_allow: NoulAnswer | None = None
     needs_llm: NoulAnswer | None = None
     multi_item: NoulAnswer | None = None
     wants_queue: NoulAnswer | None = None
@@ -319,6 +469,11 @@ class JevAnswers:
     risk: ScoreAnswer | None = None
     model: str = ""
     raw: dict[str, Any] = field(default_factory=dict, hash=False, compare=False)
+
+    @property
+    def gates_tools(self) -> bool:
+        """True when this answer set can decide a tool call on its own."""
+        return self.tool_lane is not None or self.tool_allow is not None
 
     def as_log_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"model": self.model}
@@ -346,6 +501,16 @@ class JevAnswers:
                     k: round(v, 4) for k, v in self.media_ask.probabilities.items()
                 },
             }
+        if self.tool_lane is not None:
+            out["tool_lane"] = {
+                "choice": self.tool_lane.choice,
+                "confidence": round(self.tool_lane.confidence, 4),
+                "probabilities": {
+                    k: round(v, 4) for k, v in self.tool_lane.probabilities.items()
+                },
+            }
+        if self.tool_allow is not None:
+            out["tool_allow"] = round(self.tool_allow.noul, 4)
         if self.needs_llm is not None:
             out["needs_llm"] = round(self.needs_llm.noul, 4)
         if self.multi_item is not None:
@@ -417,6 +582,8 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
     domain = _parse_choice(answers.get("domain"))
     butler_ask = _parse_choice(answers.get("butler_ask"))
     media_ask = _parse_choice(answers.get("media_ask"))
+    tool_lane = _parse_choice(answers.get("tool_lane"))
+    tool_allow = _parse_noul(answers.get("tool_allow"))
     needs_llm = _parse_noul(answers.get("needs_llm"))
     multi_item = _parse_noul(answers.get("multi_item"))
     wants_queue = _parse_noul(answers.get("wants_queue"))
@@ -427,6 +594,8 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
         domain=domain,
         butler_ask=butler_ask,
         media_ask=media_ask,
+        tool_lane=tool_lane,
+        tool_allow=tool_allow,
         needs_llm=needs_llm,
         multi_item=multi_item,
         wants_queue=wants_queue,
@@ -521,6 +690,8 @@ __all__ = [
     "DOMAIN_CRITERIA",
     "MEDIA_ASK_CRITERIA",
     "MEDIA_ASK_KINDS",
+    "TOOL_LANES",
+    "TOOL_LANE_CRITERIA",
     "Domain",
     "EnforceAction",
     "JevAnswers",
@@ -530,7 +701,10 @@ __all__ = [
     "ChoiceAnswer",
     "NoulAnswer",
     "ScoreAnswer",
+    "ToolAction",
+    "ToolLane",
     "hearth_system_one_questions",
     "parse_answers",
     "telegram_media_system_one_questions",
+    "tool_gate_questions",
 ]

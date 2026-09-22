@@ -25,7 +25,7 @@ from hearth.agent.prompts import compose_system_prompt, compose_system_prompt_as
 from hearth.agent.registry import registry
 from hearth.butler.decision import JEV_GATED_TOOL_NAMES, decide_butler_tool, hide_from_llm
 from hearth.config import settings
-from hearth.jev import evaluate_message, log_shadow_outcome
+from hearth.jev import adopt_verdict, evaluate_message, log_shadow_outcome, tool_turn
 from hearth.memory import store as memory_store
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
@@ -75,7 +75,8 @@ def session_config(*, query: str | None = None, instructions: str | None = None)
         "instructions": text,
         "output_modalities": ["audio"],
         "audio": {
-            "input": audio_input_config(),            "output": {
+            "input": audio_input_config(),
+            "output": {
                 "voice": settings.openai_tts_voice,
             },
         },
@@ -104,12 +105,15 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
     payload = dict(args or {})
     if name == "chief_of_staff":
         payload.setdefault("said", said or json.dumps(payload))
+    # Shelf/scene stay Jev-chosen even if a client names them. The registry gate
+    # still wraps the call for allow/deny; butler_ask picks which tool may run.
+    butler_verdict = None
     if name in JEV_GATED_TOOL_NAMES:
         uttered = (said or runtime.latest_user() or "").strip()
-        verdict = await evaluate_message(uttered or name)
-        decision = decide_butler_tool(uttered, verdict)
+        butler_verdict = await evaluate_message(uttered or name)
+        decision = decide_butler_tool(uttered, butler_verdict)
         log_shadow_outcome(
-            verdict,
+            butler_verdict,
             channel="voice",
             tools=[decision.tool] if decision.run else [],
             outcome=decision.source,
@@ -119,10 +123,15 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
                 "ok": False,
                 "name": name,
                 "speak": "Jev didn't clear that, so I left it alone.",
-                "jev": verdict.as_log_dict(),
+                "jev": butler_verdict.as_log_dict(),
             }
         payload = decision.as_args()
-    result = await registry.call(name, payload)
+    # Voice tool calls pass the same Jev gate as chat and Telegram. Without a
+    # transcript there is no state to gate on, and the gate fails open.
+    with tool_turn(said, channel="voice"):
+        if butler_verdict is not None:
+            adopt_verdict(butler_verdict)
+        result = await registry.call(name, payload, said=said)
     return result.as_dict()
 
 

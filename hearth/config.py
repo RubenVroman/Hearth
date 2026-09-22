@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     token: str = Field(default="", alias="HEARTH_TOKEN")
     mock_if_unconfigured: bool = Field(default=True, alias="HEARTH_MOCK_IF_UNCONFIGURED")
 
+    # How long an armed confirm stays answerable. A "yes" that arrives well after
+    # its preview is not an answer to it, so the turn is re-read instead of
+    # firing a stale paid or destructive tool. 0 disables expiry.
+    confirm_ttl_seconds: float = Field(
+        default=300.0,
+        ge=0.0,
+        alias="HEARTH_CONFIRM_TTL_SECONDS",
+    )
+
     workspace_path: Path = Field(default=Path("./workspace"), alias="WORKSPACE_PATH")
     auth_db_path: Path = Field(default=Path("./data/hearth-auth.db"), alias="HEARTH_AUTH_DB")
     memory_db_path: Path = Field(default=Path("./data/hearth-memory.db"), alias="HEARTH_MEMORY_DB")
@@ -114,6 +123,20 @@ class Settings(BaseSettings):
 
     plex_url: str = Field(default="http://host.docker.internal:32400", alias="PLEX_URL")
     plex_token: str = Field(default="", alias="PLEX_TOKEN")
+    # Explicit read/connect budgets. A Synology waking a spun-down disk can be
+    # slow to answer, but a house turn must never hang on it.
+    plex_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0.0,
+        le=120.0,
+        alias="PLEX_TIMEOUT_SECONDS",
+    )
+    plex_connect_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=60.0,
+        alias="PLEX_CONNECT_TIMEOUT_SECONDS",
+    )
     # Optional default Plex client name / substring (e.g. "Apple TV", "LG", "Living Room").
     plex_default_player: str = Field(default="", alias="PLEX_DEFAULT_PLAYER")
     # When play/confirm finds no clients, re-poll /clients for this long (seconds).
@@ -136,6 +159,26 @@ class Settings(BaseSettings):
     sonarr_api_key: str = Field(default="", alias="SONARR_API_KEY")
     overseerr_url: str = Field(default="http://host.docker.internal:5055", alias="OVERSEERR_URL")
     overseerr_api_key: str = Field(default="", alias="OVERSEERR_API_KEY")
+    overseerr_timeout_seconds: float = Field(
+        default=12.0,
+        gt=0.0,
+        le=120.0,
+        alias="OVERSEERR_TIMEOUT_SECONDS",
+    )
+    arr_timeout_seconds: float = Field(
+        default=12.0,
+        gt=0.0,
+        le=120.0,
+        alias="ARR_TIMEOUT_SECONDS",
+    )
+    # Shared connect budget for Overseerr / Radarr / Sonarr. A refused or
+    # black-holed TCP connect should surface fast, not eat the read budget.
+    arr_connect_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=60.0,
+        alias="ARR_CONNECT_TIMEOUT_SECONDS",
+    )
     # Failed/stalled grab: blocklist + alternate *arr release (not Overseerr re-POST).
     download_max_retries: int = Field(default=3, alias="HEARTH_DOWNLOAD_MAX_RETRIES")
     # Zero-progress "downloading" for this long → treat as stalled (seconds).
@@ -210,6 +253,29 @@ class Settings(BaseSettings):
         alias="TELEGRAM_PROGRESS_INTERVAL_SECONDS",
     )
     telegram_concurrency: int = Field(default=4, ge=1, le=32, alias="TELEGRAM_CONCURRENCY")
+    # Retries for *retry-safe* Bot API calls only (getMe / getUpdates /
+    # deleteWebhook / answerCallbackQuery). Sends and edits are never retried
+    # after an ambiguous transport failure — see hearth/telegram/client.py.
+    telegram_retry_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=8,
+        alias="TELEGRAM_RETRY_ATTEMPTS",
+    )
+    telegram_retry_base_seconds: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=30.0,
+        alias="TELEGRAM_RETRY_BASE_SECONDS",
+    )
+    # Cap on an advertised 429 retry_after so a punitive delay cannot park the
+    # poller for minutes. Longer waits are reported instead of slept through.
+    telegram_max_retry_after_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=300.0,
+        alias="TELEGRAM_MAX_RETRY_AFTER_SECONDS",
+    )
     telegram_callback_ttl_seconds: int = Field(
         default=6 * 60 * 60,
         ge=60,
@@ -252,12 +318,26 @@ class Settings(BaseSettings):
     # Remote Play button / "put it on the TV" via Infuse or Plex.
     telegram_play_lane: bool = Field(default=True, alias="HEARTH_TELEGRAM_PLAY_LANE")
 
-    # TypeSafe Jev (System One) — cheap typed decision gate before gpt/tools.
-    # Off by default. When enabled, shadow mode logs only (does not enforce).
+    # TypeSafe Jev (System One) — the typed decision gate in front of every
+    # house tool call. On by default so VAULT gets Jev routing as soon as a key
+    # is present; without TYPESAFE_API_KEY nothing is called and every path
+    # fails open to today's heuristics. Shadow stays on so enforcement is opt-in.
     # API key stays on the VAULT host .env; never log it.
     typesafe_api_key: str = Field(default="", alias="TYPESAFE_API_KEY")
-    jev_enabled: bool = Field(default=False, alias="HEARTH_JEV_ENABLED")
+    jev_enabled: bool = Field(default=True, alias="HEARTH_JEV_ENABLED")
     jev_shadow: bool = Field(default=True, alias="HEARTH_JEV_SHADOW")
+    # Gate every ToolRegistry.call() (and the Telegram queue/play chokepoints)
+    # on a Jev decision. Shadow mode logs the decision without changing it.
+    jev_tool_gate: bool = Field(default=True, alias="HEARTH_JEV_TOOL_GATE")
+    # Let a confident Jev tool_lane pick the tool in the local (no-OpenAI) router.
+    jev_route_local_tools: bool = Field(default=True, alias="HEARTH_JEV_ROUTE_LOCAL_TOOLS")
+    # Hard ceiling on one System One call so a slow gate can never stall a turn.
+    jev_timeout_seconds: float = Field(
+        default=8.0,
+        gt=0.0,
+        le=60.0,
+        alias="HEARTH_JEV_TIMEOUT_SECONDS",
+    )
     # Pin with e.g. jev-1.13.0 once thresholds are tuned; alias moves with releases.
     jev_model: str = Field(default="jev-latest", alias="HEARTH_JEV_MODEL")
     jev_domain_confidence: float = Field(
@@ -296,6 +376,28 @@ class Settings(BaseSettings):
         le=1.0,
         alias="HEARTH_JEV_MULTI_ITEM_THRESHOLD",
     )
+    # Tool gate thresholds. Deliberately fail-open biased: a state-changing tool
+    # is only denied when Jev is *clearly* against it, never on a coin flip.
+    jev_tool_allow_threshold: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_TOOL_ALLOW_THRESHOLD",
+    )
+    # Min tool_lane Choice confidence to let Jev pick / veto the tool family.
+    jev_tool_lane_confidence: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_TOOL_LANE_CONFIDENCE",
+    )
+    # Min risk Score confidence before do_not_auto_run / needs_confirm bites.
+    jev_risk_confidence: float = Field(
+        default=0.60,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_RISK_CONFIDENCE",
+    )
 
     @property
     def openai_configured(self) -> bool:
@@ -304,6 +406,26 @@ class Settings(BaseSettings):
     @property
     def typesafe_configured(self) -> bool:
         return bool(self.typesafe_api_key.strip())
+
+    @property
+    def jev_active(self) -> bool:
+        """True when a Jev call would actually reach System One.
+
+        Hot paths check this before building state: ``jev_enabled`` without a key
+        is a no-op that must not cost a turn anything.
+        """
+        return bool(self.jev_enabled and self.typesafe_configured)
+
+    @property
+    def jev_enforcing(self) -> bool:
+        return bool(self.jev_enabled and not self.jev_shadow)
+
+    @property
+    def jev_mode(self) -> str:
+        """``off`` / ``shadow`` / ``enforce`` — one word for logs and readiness."""
+        if not self.jev_enabled:
+            return "off"
+        return "shadow" if self.jev_shadow else "enforce"
 
     @property
     def openai_admin_configured(self) -> bool:

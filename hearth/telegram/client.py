@@ -2,9 +2,24 @@
 
 The client deliberately does not raise API or transport errors into the update
 loop. Every call returns Telegram's familiar ``{"ok": ...}`` envelope with a
-sanitised ``error`` value on failure. Writes are never retried after an
-ambiguous transport failure; only an explicit HTTP 429 is retried once using
-Telegram's advertised ``retry_after`` delay.
+sanitised ``error`` value on failure.
+
+Retries split on one question: *if this call already reached Telegram, does
+repeating it change the house?*
+
+* **Retry-safe** calls (``getMe``, ``getUpdates``, ``deleteWebhook``,
+  ``answerCallbackQuery``) are idempotent, so transport failures and 5xx
+  responses are retried with exponential backoff. Without this a single blip on
+  the VAULT uplink ends the long-poll cycle and the bot goes quiet.
+* **Writes** (``sendMessage``, ``editMessageText``, ``editMessageReplyMarkup``)
+  are never retried after an ambiguous failure — a duplicated send is a worse
+  outcome than a missing one, and the caller is told the outcome is unknown.
+
+A confirmed HTTP 429 is retried for either kind, because Telegram has told us it
+rejected the call. The advertised ``retry_after`` is capped so a punitive delay
+cannot park the poller.
+
+Nothing here logs a URL: Bot API URLs contain the bot token.
 """
 
 from __future__ import annotations
@@ -23,6 +38,12 @@ log = logging.getLogger("hearth.telegram")
 
 API_ROOT = "https://api.telegram.org"
 MAX_MESSAGE_LENGTH = 4096
+
+# Bot API methods that are safe to repeat: re-reading updates or re-acking a
+# callback cannot double-post anything into a chat.
+RETRY_SAFE_METHODS = frozenset(
+    {"getMe", "getUpdates", "deleteWebhook", "answerCallbackQuery"}
+)
 
 
 class TelegramBotClient:
@@ -109,6 +130,28 @@ class TelegramBotClient:
             return None
         return max(0, delay)
 
+    @staticmethod
+    def _attempts(method: str) -> int:
+        """How many times this method may be sent. Writes always get exactly one."""
+        if method not in RETRY_SAFE_METHODS:
+            return 2  # the single send, plus one retry after a confirmed 429
+        return max(1, int(settings.telegram_retry_attempts)) + 1
+
+    @staticmethod
+    def _backoff(attempt: int) -> float:
+        base = max(0.0, float(settings.telegram_retry_base_seconds))
+        return base * (2**attempt)
+
+    @staticmethod
+    def _capped_retry_after(delay: int) -> float:
+        return min(float(delay), max(0.0, float(settings.telegram_max_retry_after_seconds)))
+
+    def _log_retry(self, method: str, *, attempt: int, wait: float, why: str) -> None:
+        log.warning(
+            "telegram retry %s",
+            {"method": method, "attempt": attempt + 1, "wait_s": round(wait, 2), "why": why},
+        )
+
     async def _call(
         self,
         method: str,
@@ -122,7 +165,12 @@ class TelegramBotClient:
 
         client = await self._http()
         timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=15.0, pool=5.0)
-        for attempt in range(2):
+        attempts = self._attempts(method)
+        retry_safe = method in RETRY_SAFE_METHODS
+        # Set whenever a retryable failure is swallowed, so an exhausted budget
+        # reports the real reason instead of a generic one.
+        last: dict[str, Any] | None = None
+        for attempt in range(attempts):
             try:
                 response = await client.post(
                     f"{self._base()}/{method}",
@@ -130,13 +178,29 @@ class TelegramBotClient:
                     timeout=timeout,
                 )
             except Exception as exc:  # noqa: BLE001 - keep the polling loop alive
-                # Whether Telegram received a POST is unknown, so never retry it.
+                # For a write, whether Telegram received the POST is unknown, so
+                # it is never repeated. Reads are safe to try again.
                 error = self._failure(
                     f"telegram transport error: {exc}",
                     outcome_unknown=ambiguous_write,
                 )
-                log.warning("telegram %s transport error: %s", method, error["error"])
-                return error
+                log.warning(
+                    "telegram transport error %s",
+                    {
+                        "method": method,
+                        "attempt": attempt + 1,
+                        "retry_safe": retry_safe,
+                        "error": error["error"],
+                    },
+                )
+                if not retry_safe or attempt + 1 >= attempts:
+                    return error
+                wait = self._backoff(attempt)
+                self._log_retry(method, attempt=attempt, wait=wait, why="transport")
+                last = error
+                if wait:
+                    await asyncio.sleep(wait)
+                continue
 
             try:
                 data = response.json()
@@ -148,14 +212,28 @@ class TelegramBotClient:
                     error_code=response.status_code,
                     outcome_unknown=ambiguous_write,
                 )
-                log.warning("telegram %s returned non-JSON response", method)
-                return error
+                log.warning(
+                    "telegram non-JSON response %s",
+                    {"method": method, "status": response.status_code, "attempt": attempt + 1},
+                )
+                if not retry_safe or attempt + 1 >= attempts:
+                    return error
+                wait = self._backoff(attempt)
+                self._log_retry(method, attempt=attempt, wait=wait, why="non_json")
+                last = error
+                if wait:
+                    await asyncio.sleep(wait)
+                continue
 
             # A confirmed HTTP 429 is safe to retry according to the Bot API.
             retry_after = self._retry_after(data)
-            if response.status_code == 429 and attempt == 0 and retry_after is not None:
-                log.info("telegram %s rate limited; retrying in %ss", method, retry_after)
-                await asyncio.sleep(retry_after)
+            if response.status_code == 429 and attempt + 1 < attempts and retry_after is not None:
+                wait = self._capped_retry_after(retry_after)
+                log.info(
+                    "telegram rate limited %s",
+                    {"method": method, "retry_after_s": retry_after, "wait_s": wait},
+                )
+                await asyncio.sleep(wait)
                 continue
 
             if not data.get("ok"):
@@ -168,10 +246,24 @@ class TelegramBotClient:
                     error_code=error_code,
                     retry_after=retry_after,
                 )
-                log.warning("telegram %s rejected: %s", method, error["error"])
+                log.warning(
+                    "telegram rejected %s",
+                    {"method": method, "error_code": error_code, "error": error["error"]},
+                )
+                # Telegram answered, so a read may simply be having a bad minute.
+                if retry_safe and error_code >= 500 and attempt + 1 < attempts:
+                    wait = self._backoff(attempt)
+                    self._log_retry(method, attempt=attempt, wait=wait, why="server_error")
+                    last = error
+                    if wait:
+                        await asyncio.sleep(wait)
+                    continue
                 return error
             return data
 
+        if last is not None:
+            return last
+        # Every attempt was a confirmed 429.
         return self._failure("telegram rate limit retry exhausted", error_code=429)
 
     async def get_me(self) -> dict[str, Any]:

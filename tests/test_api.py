@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from hearth.config import settings
+
+
 def test_health_and_chat_calls_plex_tool(client):
     health = client.get("/health")
     assert health.status_code == 200
@@ -18,6 +23,59 @@ def test_health_and_chat_calls_plex_tool(client):
 
     playing = client.get("/api/now-playing")
     assert playing.json()["sessions"][0]["title"] == "Dune: Part Two"
+
+
+def test_readyz_is_public_and_reports_deploy_markers(client):
+    from fastapi.testclient import TestClient
+
+    from hearth.app import app
+
+    # Deploy verification must work before anyone logs in.
+    with TestClient(app) as anonymous:
+        response = anonymous.get("/readyz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    assert body["checks"]["tools"]["count"] > 0
+    assert body["checks"]["auth_db"]["ok"] is True
+    assert body["jev_mode"] in {"off", "shadow", "enforce"}
+    # Unconfigured integrations are degraded, not unready.
+    assert "overseerr:unconfigured" in body["degraded"]
+
+
+def test_readyz_flags_jev_enabled_without_a_key(client, monkeypatch):
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "")
+
+    body = client.get("/readyz").json()
+
+    assert body["ready"] is True
+    assert "jev:no_api_key" in body["degraded"]
+    assert body["checks"]["jev"]["active"] is False
+
+
+def test_readyz_is_not_ready_without_a_tool_registry(client, monkeypatch):
+    monkeypatch.setattr("hearth.app.registry.names", lambda: [])
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["ready"] is False
+
+
+def test_status_reports_the_jev_gate_without_the_key(client, monkeypatch):
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-secret-should-not-leak")
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+
+    body = client.get("/api/status").json()
+
+    assert body["jev"]["mode"] == "enforce"
+    assert body["jev"]["tool_gate"] is True
+    assert body["jev"]["key_configured"] is True
+    assert "media_queue" in body["jev"]["lanes"]
+    assert "ts-secret-should-not-leak" not in client.get("/api/status").text
 
 
 def test_chat_repo_work_calls_chief_of_staff_not_github(client):

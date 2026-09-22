@@ -261,6 +261,9 @@ async def test_http_client_posts_bearer_without_logging_key() -> None:
     assert seen["body"]["model"] == "jev-latest"
     assert "domain" in seen["body"]["questions"]
     assert "butler_ask" in seen["body"]["questions"]
+    # One call per turn also answers which tool may run.
+    assert "tool_lane" in seen["body"]["questions"]
+    assert "tool_allow" in seen["body"]["questions"]
     assert answers.domain is not None
     assert answers.domain.choice == "lights"
 
@@ -362,3 +365,42 @@ async def test_agent_loop_low_confidence_butler_fail_opens(monkeypatch: pytest.M
     out = await AgentLoop().run("what's on tonight")
     assert out["mode"] == "local"
     assert out["tools"][0]["name"] == "house_shelf"
+@pytest.mark.asyncio
+async def test_http_client_error_never_echoes_the_key_back() -> None:
+    """An auth failure often quotes the key; the exception must not carry it."""
+    key = "ts-secret-should-not-leak"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text=f"forbidden: key {key} is revoked")
+
+    client = HttpSystemOneClient(
+        api_key=key,
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        await client.system_one(state={"user_message": "kitchen lights on"})
+
+    message = str(excinfo.value)
+    assert key not in message
+    assert "[REDACTED]" in message
+    assert "403" in message
+
+
+@pytest.mark.asyncio
+async def test_gate_logs_only_the_exception_type_on_a_key_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    key = "ts-secret-should-not-leak"
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+    monkeypatch.setattr(settings, "typesafe_api_key", key)
+    set_client(FakeSystemOne(error=RuntimeError(f"HTTP 403: key {key} revoked")))
+
+    with caplog.at_level("INFO", logger="hearth.jev"):
+        verdict = await evaluate_message("grab Dune")
+
+    assert verdict.action == "continue"
+    assert verdict.error == "RuntimeError"
+    assert key not in caplog.text
+    assert key not in repr(verdict.as_log_dict())

@@ -70,7 +70,10 @@ class Plex:
                     "X-Plex-Product": "Hearth",
                     "X-Plex-Device-Name": "Hearth",
                 },
-                timeout=10.0,
+                timeout=httpx.Timeout(
+                    float(settings.plex_timeout_seconds),
+                    connect=float(settings.plex_connect_timeout_seconds),
+                ),
             )
         return self._client
 

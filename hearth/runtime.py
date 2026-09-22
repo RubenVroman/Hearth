@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -128,6 +129,11 @@ class PendingConfirm:
     ts: str = field(default_factory=_now)
     # "confirm" = normal dry-run; "awaiting_client" = plex_play waiting for Plex to open.
     reason: str = "confirm"
+    # Monotonic arming time, so age survives a clock step.
+    armed_at: float = field(default_factory=time.monotonic)
+
+    def age_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self.armed_at)
 
 
 @dataclass
@@ -194,6 +200,26 @@ class Runtime:
         self.openai_live: bool = False
         self._activity = Activity()
         self._error_until: float = 0.0
+        self._pending_lock = threading.Lock()
+
+    def claim_pending(self, *, ttl_seconds: float | None = None) -> PendingConfirm | None:
+        """Take the armed confirm and clear it in one step.
+
+        Two things this guards. Two confirms arriving together (a double-tap, or
+        a browser and a voice session at once) must not both execute the same
+        paid or destructive tool, so the claim is atomic. And a confirm that
+        arrives long after its preview is no longer an answer to it, so an
+        expired one is dropped and the turn is handled as a fresh message.
+        """
+        ttl = settings.confirm_ttl_seconds if ttl_seconds is None else float(ttl_seconds)
+        with self._pending_lock:
+            pending = self.pending
+            if pending is None:
+                return None
+            self.pending = None
+        if ttl > 0 and pending.age_seconds() > ttl:
+            return None
+        return pending
 
     def note(self, role: str, text: str, kind: str = "message") -> TranscriptLine:
         line = TranscriptLine(role=role, text=text, kind=kind)
