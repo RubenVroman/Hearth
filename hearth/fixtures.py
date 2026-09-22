@@ -74,6 +74,69 @@ MOCK_HA_STATES: list[dict[str, Any]] = [
             "volume_level": 0.4,
         },
     },
+    # PetZero feeder as Tuya Local exposes it: a manual-feed button, a portion
+    # number, a schedule switch, and read-only sensors.
+    {
+        "entity_id": "button.pet_feeder_feed",
+        "state": "unknown",
+        "attributes": {"friendly_name": "Pet feeder manual feed", "device_class": "restart"},
+    },
+    {
+        "entity_id": "number.pet_feeder_portion",
+        "state": "1",
+        "attributes": {
+            "friendly_name": "Pet feeder portion",
+            "min": 1,
+            "max": 12,
+            "step": 1,
+        },
+    },
+    {
+        "entity_id": "switch.pet_feeder_schedule",
+        "state": "on",
+        "attributes": {"friendly_name": "Pet feeder schedule"},
+    },
+    {
+        "entity_id": "sensor.pet_feeder_portions_today",
+        "state": "2",
+        "attributes": {"friendly_name": "Pet feeder portions today", "unit_of_measurement": "x"},
+    },
+    # Tuya air conditioner (Smart Life OEM) as a climate entity.
+    {
+        "entity_id": "climate.airco",
+        "state": "off",
+        "attributes": {
+            "friendly_name": "Airco",
+            "current_temperature": 24,
+            "temperature": 22,
+            "hvac_modes": ["off", "cool", "heat", "dry", "fan_only"],
+            "fan_mode": "auto",
+            "fan_modes": ["auto", "low", "medium", "high"],
+            "min_temp": 16,
+            "max_temp": 31,
+            "target_temp_step": 1,
+        },
+    },
+    # KPT Air Purifier (Tuya OEM) as a fan entity.
+    {
+        "entity_id": "fan.air_purifier",
+        "state": "off",
+        "attributes": {
+            "friendly_name": "KPT air purifier",
+            "percentage": 0,
+            "percentage_step": 25,
+            "preset_mode": None,
+            "preset_modes": ["auto", "sleep", "manual", "turbo"],
+            "pm25": 12,
+            "filter_life_remaining": 78,
+        },
+    },
+    # A second Tuya relay, so discovery has something to disambiguate against.
+    {
+        "entity_id": "switch.tuya_desk_plug",
+        "state": "off",
+        "attributes": {"friendly_name": "Tuya desk plug"},
+    },
 ]
 
 MOCK_PLEX_SESSIONS: dict[str, Any] = {
@@ -2433,6 +2496,12 @@ class MockHouse:
 
     def __init__(self) -> None:
         self.states: list[dict[str, Any]] = deepcopy(MOCK_HA_STATES)
+        self._press_seq = 0
+
+    def reset(self) -> None:
+        """Restore the fixture house (tests mutate it through tool calls)."""
+        self.states = deepcopy(MOCK_HA_STATES)
+        self._press_seq = 0
 
     def list_states(self, domain: str | None = None) -> list[dict[str, Any]]:
         if not domain:
@@ -2515,6 +2584,61 @@ class MockHouse:
                 if content.startswith("infuse://"):
                     state["attributes"]["app_name"] = "Infuse"
                     state["attributes"]["media_title"] = content.split("?")[0]
+        elif domain == "button" and service == "press":
+            # HA button entities report the last press as a timestamp.
+            self._press_seq += 1
+            state["state"] = f"2026-01-01T00:00:{self._press_seq:02d}+00:00"
+        elif domain in {"switch", "input_boolean"}:
+            if service == "turn_on":
+                state["state"] = "on"
+            elif service == "turn_off":
+                state["state"] = "off"
+            elif service == "toggle":
+                state["state"] = "off" if state["state"] == "on" else "on"
+        elif domain == "climate":
+            modes = [str(m) for m in state["attributes"].get("hvac_modes") or []]
+            if service == "set_hvac_mode" and "hvac_mode" in data:
+                state["state"] = str(data["hvac_mode"])
+            elif service == "set_temperature" and "temperature" in data:
+                state["attributes"]["temperature"] = float(data["temperature"])
+            elif service == "set_fan_mode" and "fan_mode" in data:
+                state["attributes"]["fan_mode"] = str(data["fan_mode"])
+            elif service == "set_preset_mode" and "preset_mode" in data:
+                state["attributes"]["preset_mode"] = str(data["preset_mode"])
+            elif service == "turn_on":
+                running = next((m for m in modes if m != "off"), "cool")
+                state["state"] = running if state["state"] == "off" else state["state"]
+            elif service == "turn_off":
+                state["state"] = "off"
+        elif domain in {"fan", "humidifier"}:
+            if service == "turn_on":
+                state["state"] = "on"
+                if domain == "fan" and not state["attributes"].get("percentage"):
+                    state["attributes"]["percentage"] = 100
+            elif service == "turn_off":
+                state["state"] = "off"
+                if domain == "fan":
+                    state["attributes"]["percentage"] = 0
+            elif service == "toggle":
+                state["state"] = "off" if state["state"] == "on" else "on"
+            elif service == "set_percentage" and "percentage" in data:
+                percentage = float(data["percentage"])
+                state["attributes"]["percentage"] = percentage
+                state["state"] = "on" if percentage > 0 else "off"
+            elif service in {"set_preset_mode", "set_mode"} and (
+                "preset_mode" in data or "mode" in data
+            ):
+                state["attributes"]["preset_mode"] = str(
+                    data.get("preset_mode") or data.get("mode")
+                )
+                state["state"] = "on"
+            elif service == "set_humidity" and "humidity" in data:
+                state["attributes"]["humidity"] = float(data["humidity"])
+        elif domain in {"number", "input_number"} and service == "set_value" and "value" in data:
+            value = float(data["value"])
+            state["state"] = str(int(value)) if value.is_integer() else str(value)
+        elif domain == "select" and service == "select_option" and "option" in data:
+            state["state"] = str(data["option"])
         elif domain == "webostv":
             # HA webostv.command / webostv.button target the media_player entity.
             # Mock accepts them so Videoland deep-link attempts stay fixture-safe.

@@ -7,6 +7,14 @@ from hearth.memory.tools import register_memory_tools
 from hearth.tools import files as workspace_files
 from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.cos import cos_configured, escalate, not_configured_message
+from hearth.tools.devices import (
+    climate_control,
+    discover_entities,
+    feed_pets,
+    feeder_schedule,
+    house_devices_status,
+    purifier_control,
+)
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
 from hearth.tools.infuse import infuse
@@ -63,6 +71,72 @@ async def _ha_device_control(args: dict[str, Any]) -> dict[str, Any]:
         action,
         domain=str(args.get("domain") or "") or None,
         value=args.get("value"),
+    )
+
+
+async def _house_devices(_args: dict[str, Any]) -> dict[str, Any]:
+    return await house_devices_status()
+
+
+async def _discover_entities(args: dict[str, Any]) -> dict[str, Any]:
+    keywords = args.get("keywords")
+    if isinstance(keywords, str):
+        keywords = [part for part in keywords.replace(";", ",").split(",") if part.strip()]
+    elif not isinstance(keywords, list):
+        keywords = None
+    try:
+        limit = int(args.get("limit") or 40)
+    except (TypeError, ValueError):
+        limit = 40
+    return await discover_entities(
+        str(args.get("kind") or ""),
+        keywords=keywords,
+        domain=str(args.get("domain") or ""),
+        limit=limit,
+    )
+
+
+def _optional_number(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _pet_feeder_feed(args: dict[str, Any]) -> dict[str, Any]:
+    portions = _optional_number(args.get("portions"))
+    return await feed_pets(
+        portions=int(portions) if portions is not None else None,
+        feeder=str(args.get("feeder") or ""),
+        force=bool(args.get("force")),
+    )
+
+
+async def _pet_feeder_schedule(args: dict[str, Any]) -> dict[str, Any]:
+    return await feeder_schedule(
+        str(args.get("action") or "status"),
+        feeder=str(args.get("feeder") or ""),
+    )
+
+
+async def _airco_control(args: dict[str, Any]) -> dict[str, Any]:
+    return await climate_control(
+        str(args.get("action") or "status"),
+        temperature=_optional_number(args.get("temperature")),
+        mode=str(args.get("mode") or ""),
+        fan_mode=str(args.get("fan_mode") or ""),
+        target=str(args.get("target") or ""),
+    )
+
+
+async def _air_purifier_control(args: dict[str, Any]) -> dict[str, Any]:
+    return await purifier_control(
+        str(args.get("action") or "status"),
+        percentage=_optional_number(args.get("percentage")),
+        preset_mode=str(args.get("preset_mode") or args.get("mode") or ""),
+        target=str(args.get("target") or ""),
     )
 
 
@@ -628,6 +702,196 @@ def register_builtin_tools() -> None:
                 "required": ["device", "action"],
             },
             handler=_ha_device_control,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_devices",
+            description=(
+                "Status of the non-media house hardware in one read: the PetZero pet "
+                "feeder, the airco, and the KPT air purifier. Reports which Home "
+                "Assistant entity each one resolved to and whether it is still "
+                "unpaired. Use for “is the airco on”, “is the purifier running”, "
+                "“did the cats get fed”."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_house_devices,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="ha_discover_entities",
+            description=(
+                "Find candidate Home Assistant entities for the pet feeder, airco, and "
+                "air purifier by domain and keyword, and report what .env currently "
+                "points at. Read-only wiring aid — use it before claiming a device is "
+                "missing, and to hand back real entity ids after pairing instead of "
+                "guessing them. kind=feeder|airco|purifier|tuya|all."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": (
+                            "feeder, airco, purifier, tuya, or all (default). Any other "
+                            "word is treated as a free-text keyword."
+                        ),
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Extra words to match against entity ids and names.",
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Optional HA domain filter: climate, fan, switch, button, …",
+                    },
+                    "limit": {"type": "integer", "description": "Max rows per group (default 40)."},
+                },
+            },
+            handler=_discover_entities,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="pet_feeder_feed",
+            description=(
+                "Dispense a meal now on the PetZero feeder via Home Assistant. Use for "
+                "“feed the cats”, “geef de katten eten”, “give them a portion”. Runs "
+                "immediately — no confirm step. Dispensed food cannot be taken back, so "
+                "a repeat inside the cooldown is refused unless force=true; pass force "
+                "only when the user clearly asked for a second portion. If the feeder is "
+                "not paired, say so and call ha_discover_entities — never pretend it fed."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "portions": {
+                        "type": "integer",
+                        "description": "How many portions (default 1, capped by HA_PET_FEEDER_MAX_PORTIONS).",
+                    },
+                    "feeder": {
+                        "type": "string",
+                        "description": "Optional feeder name when the house has more than one.",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Feed again inside the anti-double-feed cooldown.",
+                    },
+                    "said": {
+                        "type": "string",
+                        "description": "The user's verbatim words, so Jev can gate the request.",
+                    },
+                },
+            },
+            handler=_pet_feeder_feed,
+            jev_gated=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="pet_feeder_schedule",
+            description=(
+                "Read or switch the feeder's automatic feeding schedule, when Home "
+                "Assistant exposes one. action=status|on|off. Most Tuya feeders keep "
+                "meal times on the device — if the schedule is not exposed, say that "
+                "plainly instead of implying the timetable changed."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "status (default), on, or off"},
+                    "feeder": {"type": "string"},
+                    "said": {
+                        "type": "string",
+                        "description": "The user's verbatim words, so Jev can gate the request.",
+                    },
+                },
+            },
+            handler=_pet_feeder_schedule,
+            jev_gated=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="airco_control",
+            description=(
+                "Control the air conditioning through Home Assistant (Tuya climate "
+                "entity). action=status|on|off|set_temperature|set_mode|set_fan_mode. "
+                "“airco 21” is set_temperature with temperature=21 — that also starts a "
+                "unit that is off. Modes are matched against what the entity actually "
+                "reports (cool, heat, dry, fan_only, auto); an unsupported mode is "
+                "refused with the real list. Runs immediately — no confirm step."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "status, on, off, set_temperature, set_mode, set_fan_mode",
+                    },
+                    "temperature": {
+                        "type": "number",
+                        "description": "Target temperature in °C (clamped to the unit's range).",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "cool, heat, dry, fan_only, auto, or off.",
+                    },
+                    "fan_mode": {"type": "string", "description": "low, medium, high, auto, …"},
+                    "target": {
+                        "type": "string",
+                        "description": "Optional entity/room name when there is more than one unit.",
+                    },
+                    "said": {
+                        "type": "string",
+                        "description": "The user's verbatim words, so Jev can gate the request.",
+                    },
+                },
+            },
+            handler=_airco_control,
+            jev_gated=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="air_purifier_control",
+            description=(
+                "Control the KPT air purifier through Home Assistant (Tuya fan entity). "
+                "action=status|on|off|toggle|set_speed|set_mode. set_speed takes "
+                "percentage; set_mode takes preset_mode (auto, sleep, turbo, …) matched "
+                "against what the entity reports. If the purifier paired as a plain "
+                "switch it only does on and off — say so rather than faking a speed. "
+                "Runs immediately — no confirm step."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "status, on, off, toggle, set_speed, set_mode",
+                    },
+                    "percentage": {
+                        "type": "number",
+                        "description": "Fan speed 0–100 for set_speed.",
+                    },
+                    "preset_mode": {
+                        "type": "string",
+                        "description": "Preset name for set_mode, e.g. auto, sleep, turbo.",
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Optional entity/room name when there is more than one unit.",
+                    },
+                    "said": {
+                        "type": "string",
+                        "description": "The user's verbatim words, so Jev can gate the request.",
+                    },
+                },
+            },
+            handler=_air_purifier_control,
+            jev_gated=True,
         )
     )
     registry.register(

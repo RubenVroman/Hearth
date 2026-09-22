@@ -87,6 +87,63 @@ class Settings(BaseSettings):
     ha_verify_timeout_seconds: float = Field(default=6.0, alias="HA_VERIFY_TIMEOUT_SECONDS")
     ha_verify_poll_interval: float = Field(default=0.4, alias="HA_VERIFY_POLL_INTERVAL")
     ha_entity_cache_seconds: float = Field(default=45.0, alias="HA_ENTITY_CACHE_SECONDS")
+
+    # --- House devices beyond media: PetZero feeders + Tuya OEM (Smart Life) ---
+    # Tuya entity ids are pairing-specific, so every role is a comma-separated
+    # candidate list instead of one id. Hearth tries each candidate against live
+    # HA state and falls back to keyword discovery, so a wrong default degrades
+    # into "which entity did you mean" rather than controlling the wrong device.
+    # Run the ha_discover_entities tool after pairing and paste the real ids here.
+    ha_pet_feeder_entities: str = Field(
+        default="button.pet_feeder_feed,button.petzero_feed,switch.pet_feeder_feed,switch.pet_feeder",
+        alias="HA_PET_FEEDER_ENTITIES",
+    )
+    # Tuya feeders usually expose portions as a number entity rather than as
+    # service data on the feed button.
+    ha_pet_feeder_portion_entities: str = Field(
+        default="number.pet_feeder_portion,number.petzero_portion,number.pet_feeder_manual_feed",
+        alias="HA_PET_FEEDER_PORTION_ENTITIES",
+    )
+    ha_pet_feeder_schedule_entities: str = Field(
+        default="switch.pet_feeder_schedule,switch.petzero_schedule,switch.pet_feeder_auto_feed",
+        alias="HA_PET_FEEDER_SCHEDULE_ENTITIES",
+    )
+    ha_pet_feeder_default_portions: int = Field(
+        default=1,
+        ge=1,
+        alias="HA_PET_FEEDER_DEFAULT_PORTIONS",
+    )
+    ha_pet_feeder_max_portions: int = Field(
+        default=6,
+        ge=1,
+        alias="HA_PET_FEEDER_MAX_PORTIONS",
+    )
+    # Dispensed food cannot be undone, and voice/Telegram make a double-feed easy.
+    # A repeat inside this window needs force=true instead of a silent second meal.
+    ha_pet_feeder_cooldown_seconds: float = Field(
+        default=600.0,
+        ge=0.0,
+        alias="HA_PET_FEEDER_COOLDOWN_SECONDS",
+    )
+    ha_airco_entities: str = Field(
+        default="climate.airco,climate.air_conditioner,climate.airconditioner,climate.living_room_ac",
+        alias="HA_AIRCO_ENTITIES",
+    )
+    ha_airco_default_temperature: float = Field(
+        default=21.0,
+        alias="HA_AIRCO_DEFAULT_TEMPERATURE",
+    )
+    # "Airco on" has to pick a real hvac mode; an air conditioner cools by default.
+    ha_airco_default_mode: str = Field(default="cool", alias="HA_AIRCO_DEFAULT_MODE")
+    # Guardrails for spoken numbers: "airco 2" and "airco 45" are misheard, not requests.
+    ha_airco_min_temperature: float = Field(default=16.0, alias="HA_AIRCO_MIN_TEMPERATURE")
+    ha_airco_max_temperature: float = Field(default=30.0, alias="HA_AIRCO_MAX_TEMPERATURE")
+    # KPT Air Purifier is a fan in Tuya Local; some OEM builds expose it as a
+    # humidifier or a plain switch, so all three domains stay in the candidates.
+    ha_air_purifier_entities: str = Field(
+        default="fan.air_purifier,fan.kpt_air_purifier,humidifier.air_purifier,switch.air_purifier",
+        alias="HA_AIR_PURIFIER_ENTITIES",
+    )
     # The Denon is the switching/audio hub. Activity commands wake the chain in
     # order and route its input before playback is sent to the Apple TV.
     receiver_centric: bool = Field(default=True, alias="HEARTH_RECEIVER_CENTRIC")
@@ -266,6 +323,13 @@ class Settings(BaseSettings):
         le=1.0,
         alias="HEARTH_JEV_MEDIA_ASK_CONFIDENCE",
     )
+    # Confidence floor for the house-device router and the device tool gate.
+    jev_device_confidence: float = Field(
+        default=0.72,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_JEV_DEVICE_CONFIDENCE",
+    )
     jev_needs_llm_threshold: float = Field(
         default=0.55,
         ge=0.0,
@@ -331,6 +395,36 @@ class Settings(BaseSettings):
             and self.hearth_delivery_postcode.strip()
             and self.hearth_delivery_city.strip()
         )
+
+    @staticmethod
+    def _parse_entity_list(raw: str) -> list[str]:
+        """Split a comma/semicolon entity candidate list, preserving order."""
+        out: list[str] = []
+        for part in (raw or "").replace(";", ",").split(","):
+            entity_id = part.strip()
+            if entity_id and entity_id not in out:
+                out.append(entity_id)
+        return out
+
+    @property
+    def pet_feeder_entity_list(self) -> list[str]:
+        return self._parse_entity_list(self.ha_pet_feeder_entities)
+
+    @property
+    def pet_feeder_portion_entity_list(self) -> list[str]:
+        return self._parse_entity_list(self.ha_pet_feeder_portion_entities)
+
+    @property
+    def pet_feeder_schedule_entity_list(self) -> list[str]:
+        return self._parse_entity_list(self.ha_pet_feeder_schedule_entities)
+
+    @property
+    def airco_entity_list(self) -> list[str]:
+        return self._parse_entity_list(self.ha_airco_entities)
+
+    @property
+    def air_purifier_entity_list(self) -> list[str]:
+        return self._parse_entity_list(self.ha_air_purifier_entities)
 
     @staticmethod
     def _parse_id_list(raw: str) -> list[int]:

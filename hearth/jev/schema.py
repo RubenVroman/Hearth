@@ -13,6 +13,10 @@ from typing import Any, Literal
 # Choice options for house routing (cheap triage before gpt/tools).
 DOMAIN_CRITERIA: dict[str, str] = {
     "lights": "Home Assistant lights, scenes, or room device on/off (not media).",
+    "devices": (
+        "Physical house appliances on Home Assistant that are not lights or "
+        "media: the pet feeder, the air conditioning, or the air purifier."
+    ),
     "media": (
         "Play/pause, TV/AVR/Apple TV/Infuse/Plex/Videoland, house media status, "
         "or browsing the library — not a new download request."
@@ -85,6 +89,52 @@ MEDIA_ASK_CRITERIA: dict[str, str] = {
 
 MEDIA_ASK_KINDS = tuple(MEDIA_ASK_CRITERIA.keys())
 
+# House-device router. Feeding pets and running an air conditioner are physical,
+# so these get their own Choice rather than riding on the media question set.
+DEVICE_ASK_CRITERIA: dict[str, str] = {
+    "feed_pets": (
+        "Dispense food now from the pet feeder (e.g. 'feed the cats', "
+        "'geef de katten eten', 'give them a portion')."
+    ),
+    "feeder_schedule": (
+        "Turn the feeder's automatic/scheduled feeding on or off, or ask "
+        "whether it is on — not a request to dispense food right now."
+    ),
+    "airco": (
+        "Air conditioning: power, a target temperature, a mode (cool/heat/dry/"
+        "fan), or fan speed (e.g. 'airco 21', 'zet de airco uit')."
+    ),
+    "air_purifier": (
+        "Air purifier: power, fan speed, or preset mode "
+        "(e.g. 'purifier on', 'luchtreiniger op auto')."
+    ),
+    "device_status": (
+        "Ask how the feeder, airco, or purifier currently are — a read, not a change."
+    ),
+    "discover_entities": (
+        "Ask which Home Assistant entities exist for these devices, or how to "
+        "wire/pair them — a setup question, not a control command."
+    ),
+    "not_house_device": (
+        "Not a pet feeder / airco / air purifier ask — media, lights, food, "
+        "chatter, or anything else."
+    ),
+}
+
+DEVICE_ASK_KINDS = tuple(DEVICE_ASK_CRITERIA.keys())
+
+# Physical house-device tools. Every entry is registered with jev_gated=True so
+# the shared gate runs no matter which surface (chat, voice, Telegram, /api/invoke)
+# asked for it.
+DEVICE_TOOLS = frozenset(
+    {
+        "pet_feeder_feed",
+        "pet_feeder_schedule",
+        "airco_control",
+        "air_purifier_control",
+    }
+)
+
 RISK_LEVELS = (
     "harmless",  # routine read / chat
     "needs_confirm",  # paid, destructive, or queue-ish — confirm gate
@@ -93,6 +143,7 @@ RISK_LEVELS = (
 
 Domain = Literal[
     "lights",
+    "devices",
     "media",
     "food",
     "weather",
@@ -215,6 +266,36 @@ def _media_router_questions() -> dict[str, dict[str, Any]]:
     }
 
 
+def _device_router_questions() -> dict[str, dict[str, Any]]:
+    """House-device intent router (Choice) for feeder / airco / purifier turns."""
+    return {
+        "device_ask": {
+            "type": "choice",
+            "instructions": (
+                "Classify this house message for the Home Assistant device layer "
+                "(PetZero pet feeder, Tuya air conditioning, Tuya air purifier). "
+                "Messages may be English or Dutch. Use feed_pets only when the "
+                "user wants food dispensed now. Use device_status for read-only "
+                "questions and discover_entities for wiring/pairing questions. "
+                "Use not_house_device for anything else."
+            ),
+            "criteria": dict(DEVICE_ASK_CRITERIA),
+        },
+    }
+
+
+def house_device_system_one_questions() -> dict[str, dict[str, Any]]:
+    """Device router + confirm/cancel/risk — the gate in front of device tools.
+
+    Deliberately excludes the media router: a feeder or air conditioner turn is
+    never an Overseerr ask, and the extra questions would only add cost.
+    """
+    return {
+        **_device_router_questions(),
+        **_confirm_cancel_risk_questions(),
+    }
+
+
 def hearth_system_one_questions() -> dict[str, dict[str, Any]]:
     """Raw question map for POST /v1/systemone (also used to build SDK objects)."""
     return {
@@ -282,6 +363,7 @@ class ScoreAnswer:
 class JevAnswers:
     domain: ChoiceAnswer | None = None
     media_ask: ChoiceAnswer | None = None
+    device_ask: ChoiceAnswer | None = None
     needs_llm: NoulAnswer | None = None
     multi_item: NoulAnswer | None = None
     wants_queue: NoulAnswer | None = None
@@ -307,6 +389,14 @@ class JevAnswers:
                 "confidence": round(self.media_ask.confidence, 4),
                 "probabilities": {
                     k: round(v, 4) for k, v in self.media_ask.probabilities.items()
+                },
+            }
+        if self.device_ask is not None:
+            out["device_ask"] = {
+                "choice": self.device_ask.choice,
+                "confidence": round(self.device_ask.confidence, 4),
+                "probabilities": {
+                    k: round(v, 4) for k, v in self.device_ask.probabilities.items()
                 },
             }
         if self.needs_llm is not None:
@@ -379,6 +469,7 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
 
     domain = _parse_choice(answers.get("domain"))
     media_ask = _parse_choice(answers.get("media_ask"))
+    device_ask = _parse_choice(answers.get("device_ask"))
     needs_llm = _parse_noul(answers.get("needs_llm"))
     multi_item = _parse_noul(answers.get("multi_item"))
     wants_queue = _parse_noul(answers.get("wants_queue"))
@@ -388,6 +479,7 @@ def parse_answers(payload: dict[str, Any]) -> JevAnswers:
     return JevAnswers(
         domain=domain,
         media_ask=media_ask,
+        device_ask=device_ask,
         needs_llm=needs_llm,
         multi_item=multi_item,
         wants_queue=wants_queue,
@@ -477,6 +569,9 @@ def _parse_score(raw: Any) -> ScoreAnswer | None:
 
 
 __all__ = [
+    "DEVICE_ASK_CRITERIA",
+    "DEVICE_ASK_KINDS",
+    "DEVICE_TOOLS",
     "DOMAIN_CRITERIA",
     "MEDIA_ASK_CRITERIA",
     "MEDIA_ASK_KINDS",
@@ -490,6 +585,7 @@ __all__ = [
     "NoulAnswer",
     "ScoreAnswer",
     "hearth_system_one_questions",
+    "house_device_system_one_questions",
     "parse_answers",
     "telegram_media_system_one_questions",
 ]

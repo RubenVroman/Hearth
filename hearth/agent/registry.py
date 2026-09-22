@@ -29,6 +29,11 @@ class ToolSpec:
     # Optional: async resolve during destructive dry-run (e.g. plex_play plan).
     # Return ok=False to surface ambiguity/errors without a confirm button.
     preview_handler: Handler | None = None
+    # Physical house hardware (pet feeder, airco, air purifier). The shared Jev
+    # gate runs here rather than in each surface, so chat, voice, Telegram and
+    # /api/invoke are governed by one decision. No-ops while Jev is disabled or
+    # in shadow mode, which is the default.
+    jev_gated: bool = False
 
 
 @dataclass
@@ -120,6 +125,24 @@ class ToolRegistry:
                 data={"ok": False, "configured": False, "error": message},
             )
             return _finish_tool(result)
+
+        if spec.jev_gated:
+            gate = await _jev_gate(name, args)
+            if gate is not None and not gate.allowed:
+                result = ToolResult(
+                    name=name,
+                    ok=False,
+                    data={
+                        "ok": False,
+                        "blocked_by": "jev",
+                        "reason": gate.reason,
+                        "error": gate.message,
+                        "speak": gate.message,
+                        "jev": gate.as_log_dict(),
+                    },
+                )
+                # A governance refusal is a decision, not a backend failure.
+                return _finish_tool(result, flash_error=False)
 
         if spec.destructive:
             confirm = bool(args.get("confirm"))
@@ -241,6 +264,16 @@ class ToolRegistry:
         finished = _finish_tool(result)
         _offer_memory(spec, finished)
         return finished
+
+
+async def _jev_gate(name: str, args: dict[str, Any]) -> Any:
+    """Ask the shared Jev gate about a physical-device call (never raises)."""
+    try:
+        from hearth.jev import guard_tool_call
+
+        return await guard_tool_call(name, args)
+    except Exception:  # noqa: BLE001 — governance must fail open, not break tools
+        return None
 
 
 def _finish_tool(result: ToolResult, *, flash_error: bool = True) -> ToolResult:
