@@ -724,7 +724,7 @@ _MEDIA_ACTIVITY = re.compile(
     re.I,
 )
 _MOVIE_NIGHT = re.compile(
-    r"^\s*(?:(?:set|start|prepare|activate|it'?s)\s+)?"
+    r"^\s*(?:(?:set|start|prepare|it'?s)\s+)?"
     r"(?:movie|film|cinema)\s+night(?:\s+mode)?\s*[.!?]*\s*$",
     re.I,
 )
