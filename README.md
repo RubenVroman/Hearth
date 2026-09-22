@@ -10,7 +10,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 
 | Surface | Role |
 | --- | --- |
-| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, PetZero feeder + Tuya airco/air purifier, Infuse play on ATV, *arr/Overseerr grab/request, deterministic Telegram media bot, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
+| Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, Infuse play on ATV, *arr/Overseerr grab/request, Telegram house bot, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
@@ -83,16 +83,9 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HA_TV_ENTITY` | LG webOS `media_player` entity_id. Default `media_player.lg_webos_tv`. Set after HA pairing if different (e.g. `media_player.lg_webos_tv_oled65g1rla`). |
 | `HA_AVR_ENTITY` | Denon AVR entity_id. Default `media_player.denon_avr_x3700h`. |
 | `HA_APPLE_TV_ENTITY` | Apple TV `media_player` (HA apple_tv / pyatv). Default `media_player.apple_tv`. Required for Infuse. |
+| `HA_MOVIE_NIGHT_SCENE` | Optional exact HA scene id for “movie night” / “lights down”. Empty resolves the friendly name `Movie night`, so install-specific ids are not guessed. |
 | `HA_REQUEST_RETRIES` / `HA_RETRY_BASE_SECONDS` | Transient HA retry policy. Defaults `3` / `0.25`. Transport failures force a fresh connection. |
 | `HA_VERIFY_TIMEOUT_SECONDS` / `HA_VERIFY_POLL_INTERVAL` | Observe device state after writes instead of trusting HTTP acceptance alone. Defaults `6` / `0.4`. |
-| `HA_PET_FEEDER_ENTITIES` | PetZero manual-feed candidates (comma-separated). Hearth takes the first one HA has, else discovers by keyword. See [docs/devices.md](docs/devices.md). |
-| `HA_PET_FEEDER_PORTION_ENTITIES` / `HA_PET_FEEDER_SCHEDULE_ENTITIES` | Optional feeder portion `number` and schedule `switch` candidates. |
-| `HA_PET_FEEDER_COOLDOWN_SECONDS` | Anti-double-feed window. Default `600`. A repeat inside it needs “feed them anyway”. |
-| `HA_PET_FEEDER_DEFAULT_PORTIONS` / `HA_PET_FEEDER_MAX_PORTIONS` | Portions per feed and the cap. Defaults `1` / `6`. |
-| `HA_AIRCO_ENTITIES` | Tuya air-conditioning `climate` candidates. |
-| `HA_AIRCO_DEFAULT_MODE` | Which hvac mode “airco on” picks. Default `cool`. |
-| `HA_AIRCO_MIN_TEMPERATURE` / `HA_AIRCO_MAX_TEMPERATURE` | Guardrails for misheard numbers. Defaults `16` / `30`; the unit's own range also applies. |
-| `HA_AIR_PURIFIER_ENTITIES` | KPT Air Purifier candidates (`fan`, sometimes `humidifier` or `switch`). |
 | `HEARTH_RECEIVER_CENTRIC` | Default `true`. Media activities route through the Denon; TV/Apple-TV volume requests control the receiver. |
 | `HA_AVR_APPLE_TV_SOURCE` / `HA_AVR_TV_SOURCE` | Denon source names for the Apple TV and TV Audio activities. Defaults `Media Player` / `TV Audio`. |
 | `HEARTH_APPLE_TV_PLAYER` | `infuse` (default) or `plex`. Prefer Infuse over the Plex tvOS app for Apple TV. |
@@ -104,6 +97,7 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `PLEX_DEFAULT_PLAYER` | Optional default client name substring (e.g. `Apple TV`) when using the Plex-client path. |
 | `PLEX_CLIENT_WAIT_SECONDS` | On confirm/play with no online clients, re-poll `/clients` this long (default `12`). |
 | `PLEX_CLIENT_POLL_INTERVAL` | Seconds between client re-polls while waiting (default `1.5`). |
+| `PLEX_PLAY_VERIFY_TIMEOUT_SECONDS` / `PLEX_PLAY_VERIFY_POLL_INTERVAL` | After PMS accepts `playMedia`, wait for a matching playing session before reporting success. Defaults `6` / `0.5`. |
 | `RADARR_URL` / `RADARR_API_KEY` | **Live** movie search/add. Default URL `http://host.docker.internal:7878`. Empty key → fixtures. |
 | `SONARR_URL` / `SONARR_API_KEY` | **Live** series search/add. Default `http://host.docker.internal:8989`. |
 | `OVERSEERR_URL` / `OVERSEERR_API_KEY` | **Live** request front door. Default `http://host.docker.internal:5055`. |
@@ -193,17 +187,17 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 
 **Do it yourself**
 
-- Lights, scenes → Home Assistant tools
+- Lights, scenes, and covers → Home Assistant tools
+- Whole-house snapshot → `house_status` / `GET /api/house/status`; one HA read reports what is
+  on, climate and cover state, unavailable entities, and feeder last-fed only when HA exposes it
 - Everything HA represents on the house network → `house_network` / `GET /api/network`; reports reachability, unavailable entities, domains, and explicit Denon/LG/Apple TV links
-- Any routine HA entity by friendly name → `ha_device_control` (lights, switches, fans, covers, climate, scenes, scripts, buttons, vacuums); ambiguous matches are returned instead of guessed
+- Any routine HA entity by friendly name → `ha_device_control` (lights, switches, fans, covers, climate, scenes, scripts, buttons, vacuums); covers support open/close/stop/position, and ambiguous matches are returned instead of guessed
 - LG TV / Denon AVR / Apple TV power, volume, source, transport → `ha_media_control` (prefer over raw `ha_call_service`)
-- Receiver-centric “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; orders Denon → LG → Denon source → Apple TV and reports every failed step
+- Receiver-centric “movie night”, “watch Apple TV”, “watch TV”, and “media chain off” → `media_activity`; movie night activates the configured HA scene, then orders Denon → LG → Denon source → Apple TV and reports every failed step
+- Whole-home rituals → `house_ritual` (`sleep` / `morning` / `movie`). House sleep turns lights down (an HA scene when one matches, otherwise the lights themselves) and powers off the Denon, LG, and Apple TV when those entities exist. Good morning brings lights up and leaves the cinema dark. The movie ritual is the direct tool and the Telegram “movie night mode” control; the spoken “movie night” phrase stays on `media_activity`. Missing devices are skipped, not invented.
+- Climate, pet feeder, and air purifier → `house_climate` / `house_feeder` / `house_purifier`, all via Home Assistant services (no Tuya client). Optional `HA_CLIMATE_ENTITY`, `HA_PURIFIER_ENTITY`, `HA_FEEDER_ENTITY`; empty means discover by domain and name. `house_comfort` and `GET /api/comfort` feed the dashboard chips. Telegram offers a one-tap reply keyboard for those devices when HA actually has them. Jev still gates the natural-language call before any of these tools run.
 - **Videoland on the LG** → `videoland_play` (Dutch/English: “zet B&B Vol Liefde aan op Videoland”, “open Videoland”, “open het profiel Parel”). HA can **launch** the Videoland app via `media_player.select_source`; it **cannot** start a named title or select an in-app profile. See [Videoland on LG webOS](#videoland-on-lg-webos).
 - House media snapshot (TV + AVR + Apple TV + Plex) → `house_media` or `GET /api/media`
-- **Feed the cats** (PetZero) → `pet_feeder_feed`; scheduled feeding → `pet_feeder_schedule`. Food cannot be un-dispensed, so a repeat inside the cooldown needs “feed them anyway”.
-- **Airco** (Tuya) → `airco_control`; “airco 21” sets 21 °C and starts a unit that is off
-- **KPT air purifier** (Tuya) → `air_purifier_control` (power, speed, preset)
-- Non-media device snapshot → `house_devices` or `GET /api/devices`; “which entity is my feeder”, Tuya wiring → `ha_discover_entities`. See [docs/devices.md](docs/devices.md).
 - What's playing on Plex → `plex_now_playing` (Infuse has **no** now-playing API)
 - Browse Plex library **by genre** (Animation, Science Fiction, …) → `plex_browse_genre` / `GET /api/plex/library?genre=Science%20Fiction`. Speakable count + short title list; glass overlay shows tappable genre category chips from real Plex metadata. `GET /api/plex/genres` / “list plex genres” opens the category picker.
 - Recommend / suggest movies or shows (or “show them on the UI”) → `suggest_titles` / `POST /api/media/suggest` (same glass media overlay; metadata resolved server-side)
@@ -213,7 +207,7 @@ Hearth does the house itself. Everything else goes to Chief of Staff.
 - Download / grab a **movie** → Radarr (`radarr_search` / `radarr_add`)
 - Download / grab a **show** → Sonarr (`sonarr_search` / `sonarr_add`)
 - “Request X” → Overseerr (`overseerr_search` / `overseerr_request`), the request front door that feeds *arr
-- **Telegram media bot** → deterministic Overseerr search, signed exact-id requests, and quiet *arr progress in the group (see below)
+- **Telegram house bot** → lights/scenes/covers/status plus deterministic Overseerr search, signed exact-id requests, and quiet *arr progress in the group (see below)
 - Food / Thuisbezorgd → `thuisbezorgd_restaurants` → `thuisbezorgd_menu` → `thuisbezorgd_cart` → `thuisbezorgd_order` (confirm to place)
 - Weather outside → `get_weather` (Open-Meteo; no API key)
 - Live web (news, current events, where-to-watch / streaming) → `web_search` (OpenAI hosted web search by default; optional Brave; DuckDuckGo HTML lite last resort). Search results only — Hearth does not fetch arbitrary pages. Follow with `suggest_titles` when movie/TV ideas should appear as overlay cards.
@@ -349,7 +343,8 @@ Ruben plays movies on the living-room **Apple TV in Infuse** (Firecore), not the
 2. Read TMDB id from Plex `Guid` (`tmdb://…`). If missing, fall back to Radarr / Overseerr lookup.
 3. Build a Firecore deep link, e.g. `infuse://movie/430231?play` or `infuse://series/{id}-{season}-{episode}?play`.
 4. Call HA `media_player.play_media` on the Apple TV entity with `media_content_type: url` and that deep link (pyatv `apps.launch_app`).
-5. Pause / play / stop / skip use the same HA Apple TV `media_player` services. **Infuse exposes no playback-state API or webhooks** — Hearth will not invent now-playing inside Infuse.
+5. Distinguish command acceptance, app launch, and observed playback. `launched=true` does not become `played=true` unless HA reports content-specific playing/buffering evidence.
+6. Pause / play / stop / skip use the same HA Apple TV `media_player` services. **Infuse exposes no playback-state API or webhooks** — Hearth will not invent now-playing inside Infuse.
 
 Direct `infuse://x-callback-url/play?url=…` file URLs are a documented fallback only; they do **not** sync Plex watch state.
 
@@ -357,7 +352,8 @@ Direct `infuse://x-callback-url/play?url=…` file URLs are a documented fallbac
 
 | You say | Hearth does |
 | --- | --- |
-| “Play The Endless on the Apple TV” / “put it on Infuse” | Dry-run `infuse_play` → confirm → open Infuse deep link |
+| “Play The Endless on the Apple TV” / “put it on Infuse” | Runs `infuse_play` immediately and reports opened vs confirmed playing honestly |
+| “Put it on the TV” after a media card | Reuses the active server-side card (title/TMDB/rating key); never searches for a literal title named “it” |
 | “Play Heat on Infuse” | Same; asks which edition if ambiguous |
 | “Pause the Apple TV” / “skip on Infuse” | `infuse_transport` via HA remote |
 | “Play X on the LG” | Still `plex_play` (Plex client on webOS) |
@@ -367,6 +363,7 @@ If Apple TV isn’t paired in HA, Hearth fails clearly with the setup steps abov
 ### Limits
 
 - No Infuse now-playing / progress / webhook.
+- An accepted deep link can prove that Infuse opened without proving the first frame played; Hearth says exactly that.
 - Deep link needs a TMDB id; titles missing from Plex Guids and *arr will fail with a clear speak line.
 - tvOS may prompt once to open the Infuse URL the first time.
 
@@ -378,9 +375,6 @@ Routine house actions **run immediately** — no second “confirm” step:
 
 - `ha_call_service` — lights, scenes, raw `media_player` (Denon, LG, Apple TV)
 - `ha_media_control` — LG TV / Denon AVR / Apple TV turn_on/off, volume, source, play_media, transport
-- `pet_feeder_feed` / `pet_feeder_schedule` / `airco_control` / `air_purifier_control` — the PetZero
-  feeder and the Tuya airco / purifier. No confirm chip, but the feeder enforces its own
-  anti-double-feed cooldown, and all four pass the shared Jev gate before reaching HA.
 - `videoland_play` — open Videoland on the LG (honest: cannot start titles or select profiles)
 - `infuse_play` — open a library title in Infuse on the Apple TV (HA deep link)
 - `infuse_transport` — pause / play / stop / skip via HA Apple TV remote
@@ -401,8 +395,6 @@ High-risk / irreversible / paid actions **default to dry-run** until `confirm=tr
 Read-only / inspect:
 
 - `house_media` — speakable TV + AVR + Apple TV + Plex inventory (`GET /api/media`)
-- `house_devices` — pet feeder + airco + air purifier snapshot (`GET /api/devices`)
-- `ha_discover_entities` — candidate HA entities per device role, plus ready-to-paste `.env` lines
 - `ha_list_entities`, `ha_get_state`
 - `plex_now_playing`, `plex_search`, `plex_clients`, `plex_browse_genre`
 - `radarr_search`, `sonarr_search`, `overseerr_search`
@@ -428,7 +420,7 @@ hearth/jev/      TypeSafe Jev (System One) decision gate — see docs/jev.md
 hearth/ui/       Static command center (no Node build)
 workspace/       Sandboxed files + skills
 ha/              Home Assistant config (onboarding still required)
-docs/            Operator notes (Jev sandbox, house device pairing, …)
+docs/            Operator notes (Jev sandbox, …)
 data/            Auth + memory SQLite (compose bind-mount; gitignores *.db)
 docker-compose.yml
 Dockerfile
@@ -465,24 +457,49 @@ Hearth will not talk webOS, Denon, or Infuse protocol itself. After HA is on:
 6. Check Developer Tools → States for the real `media_player.*` entity_ids. If they differ from
    the defaults, set `HA_TV_ENTITY`, `HA_AVR_ENTITY`, and `HA_APPLE_TV_ENTITY` in `.env` and
    recreate the hearth container.
+7. Optional: create a scene whose friendly name is **Movie night**, or set its exact id in
+   `HA_MOVIE_NIGHT_SCENE`. “Lights down” activates only that scene; “movie night” also prepares
+   the Apple TV media path.
 
 For LAN discovery (Cast, some TVs), you may want host networking on the HA service — see comments in `docker-compose.yml`. Hearth itself stays on the `hearth` bridge.
 
-### Pet feeder, airco, air purifier
+### HA playback smoke test (Ruben)
 
-The PetZero feeders and the Tuya OEM hardware (KPT Air Purifier, air conditioning) go through the same device layer. Pair them with **Tuya Local** so control is a LAN call rather than a cloud round trip; the Tuya cloud integration also works and produces the same entity domains.
+After deploying the branch and applying the `.env` values, use the logged-in command-center
+composer (or the same phrases over voice):
 
-Tuya entity ids depend on how a device was paired, so nothing is hardcoded. Each role reads a comma-separated candidate list from `.env`, falls back to keyword discovery over live HA state, and reports the matches when several entities fit rather than switching a random relay. After pairing, ask Hearth for the real ids — “tuya devices” in chat, `/devices` on Telegram, or the `ha_discover_entities` tool — and paste its `env_suggestions` into the host `.env`.
+1. Say **“media status”**. Confirm the response names the configured Denon, LG TV, and Apple TV
+   entities; a missing entity must be reported, not replaced by a fixture.
+2. Say **“movie night”**. In the tool result, `steps` should contain
+   `movie_night_scene` followed by `media_path`. The nested media path should show
+   `avr_power`, `tv_power`, `avr_source`, `apple_tv_power`, all with `ok: true`.
+3. Say **“turn it down”**, then **“pause”**. Volume should target the Denon in receiver-centric
+   mode; pause should target the configured Apple TV entity.
+4. Show a title card, then say **“put it on the TV”**. For Infuse, inspect
+   `command_accepted`, `launched`, and `played`; Hearth only says “playing” when
+   `playback_confirmed` is true. For the Plex-client path, `played=true` requires a matching
+   `/status/sessions` row on the chosen client.
+5. Temporarily set `HA_AVR_APPLE_TV_SOURCE` to a name not present in the Denon `source_list` and
+   repeat **“prepare the Apple TV”**. The smoke test passes when `avr_source` is `ok: false`,
+   lists the available sources, and the overall activity is not reported ready. Restore the real
+   source name afterward.
 
-Then it answers to phrases in English and Dutch: “feed the cats”, “geef de katten eten”, “airco 21”, “zet de airco uit”, “purifier on”, “luchtreiniger op auto”, “is the airco on”. Telegram adds `/feed`, `/airco`, `/purifier`, `/devices`.
+For raw JSON, an optional machine token can call the same authenticated route without putting a
+secret in the URL:
 
-Two things worth knowing: dispensed food cannot be recalled, so a repeat feed inside `HA_PET_FEEDER_COOLDOWN_SECONDS` is refused until you say “feed them anyway”; and every device tool call passes through the shared Jev gate in the tool registry, so chat, voice, Telegram, and `/api/invoke` are governed by one decision. Full pairing guide, tool reference, and troubleshooting: [docs/devices.md](docs/devices.md).
+```bash
+curl -sS \
+  -H "X-Hearth-Token: $HEARTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tool":"media_activity","args":{"activity":"apple_tv"}}' \
+  https://vault.taileff393.ts.net/api/invoke | jq
+```
 
 Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve → the app). Do not document or use `:8443` / `:8787` in the UI. Do **not** enable Tailscale Funnel. Hearth stays Tailscale-only; bind the app to LAN/Tailscale (or localhost behind Serve), never a WAN port-forward.
 
-## Telegram media bot
+## Telegram house bot
 
-A dedicated house Telegram group can search and request movies and series through **Overseerr**. Every media-ish turn is classified first by **Jev** (TypeSafe System One Choice/Noul/Score), which picks a lane: exact title, known franchise, series-all, edition-aware, person filmography, mood/vibe, "something like X", a multi-title batch, an in-thread follow-up, a descriptive riddle, or chat-about. Every lane except the last two answers straight from Overseerr/TMDB with no LLM prose; gpt-4o runs only when Jev says a riddle or `needs_llm` (or on fail-open). Hearth shows ranked matches with signed **Get** buttons; pressing a button (or explicit yes on a single pending guess) requests that exact TMDB id — confirming never re-searches by title. Chat alone never queues. Radarr/Sonarr are observed only for progress on requests made by this bot.
+A dedicated house Telegram group can control routine Home Assistant devices and search/request movies and series through **Overseerr**. Explicit house commands run through the same Jev decision gate and shared tool registry as chat; enforce-mode cancel/refuse verdicts stop the tool call. Media classification remains on its existing Jev-first path. Hearth shows ranked matches with signed **Get** buttons; pressing a button (or explicit yes on a single pending guess) requests that exact TMDB id — confirming never re-searches by title. Chat alone never queues. Radarr/Sonarr are observed only for progress on requests made by this bot.
 
 ### Setup (Ruben)
 
@@ -509,6 +526,12 @@ A dedicated house Telegram group can search and request movies and series throug
 
 ### Behavior
 
+- **House commands:** `/house`; `/lights`; `/lights <name> on|off|toggle|0-100`;
+  `/scenes`; `/scene <name>`; `/covers`; `/cover <name> open|close|stop|0-100`.
+  Strict natural forms such as `turn off kitchen lights`, `activate movie night`,
+  `close the living room blind`, and `house status` take the same pre-media path.
+  List first when a friendly name is unclear. Hearth returns actionable HA recovery copy instead
+  of claiming a failed write worked. The command menu is published with `setMyCommands` on startup.
 - **Jev media router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics that route the same lanes. See `docs/jev.md`.
 - `/search <title>`, a plain title, franchise seed (`Harry Potter`), series-all (`Harry Potter, all movies`), edition (`Lord of the Rings extended edition`), plot/riddle, or typed TMDB movie/TV link. A year or season marker narrows results. Overseerr requests whole seasons, so `S02E03` is rejected. `/help` and `/status` as before.
 - **Intent beats the literal string.** A sentence is never searched verbatim when a human would know better:
@@ -562,7 +585,7 @@ The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MA
 | `/ws/voice` text fallback | Live protocol; not the disabled beta websocket |
 | Whisper/TTS on fallback | Live when a key is set but Realtime is down |
 | HA / Plex / *arr / Docker backends | Live with tokens/socket; otherwise fixtures |
-| Telegram media bot | Live when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` are set; one long-poller inside Hearth, Overseerr-only search/request. Otherwise off. |
+| Telegram house bot | Live when `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_IDS` are set; one long-poller inside Hearth, HA house commands plus Overseerr-only media search/request. Otherwise off. |
 | Thuisbezorgd / Just Eat Takeaway NL | Fixtures + confirm/dry-run always. Live paid submit needs partner `THUISBEZORGD_API_KEY` + session (no public consumer OAuth; no scrape). |
 | Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |
 | HA onboarding, TV/AVR pairing | Yours — service is included unconfigured |

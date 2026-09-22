@@ -31,7 +31,8 @@ from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.builtin import register_builtin_tools
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
-from hearth.tools.devices import house_devices_status
+from hearth.tools.devices import discover_entities
+from hearth.tools.house import comfort_snapshot
 from hearth.tools.media import house_media_inventory
 from hearth.tools.plex import plex
 from hearth.tools.thuisbezorgd import thuisbezorgd
@@ -141,6 +142,7 @@ async def status() -> dict[str, Any]:
             "tv_entity": settings.ha_tv_entity,
             "avr_entity": settings.ha_avr_entity,
             "apple_tv_entity": settings.ha_apple_tv_entity,
+            "movie_night_scene": settings.ha_movie_night_scene or "Movie night",
             "apple_tv_player": settings.apple_tv_player,
         },
         "plex": {"configured": settings.plex_configured},
@@ -227,26 +229,54 @@ async def network_inventory(limit: int = Query(default=250, ge=1, le=1000)) -> d
     return await ha.network_inventory(limit=limit)
 
 
-@app.get("/api/devices")
-async def devices_inventory() -> dict[str, Any]:
-    """Pet feeder + airco + air purifier: resolved entity, state, and wiring gaps."""
-    return await house_devices_status()
+@app.get("/api/house/status")
+async def house_status() -> dict[str, Any]:
+    """One coherent HA snapshot: what is on, climate, covers, and optional last-fed."""
+    return await ha.house_status()
+
+
+@app.get("/api/comfort")
+async def comfort() -> dict[str, Any]:
+    """Climate, indoor air, purifier, and feeder chips for the command center."""
+    return await comfort_snapshot()
+
+
+@app.get("/api/devices/discover")
+async def devices_discover(
+    kind: str = Query(default=""),
+    domain: str = Query(default=""),
+) -> dict[str, Any]:
+    """Wiring view: which HA entities could be the feeder / airco / purifier yet."""
+    return await discover_entities(kind, domain=domain)
 
 
 @app.get("/api/rooms")
 async def rooms() -> dict[str, Any]:
-    lights = await ha.list_states("light")
-    scenes = await ha.list_states("scene")
-    media = await ha.list_states("media_player")
+    snapshot = await ha.list_states()
+    rows = snapshot.get("states") or []
+
+    def _domain_rows(domain: str) -> list[dict[str, Any]]:
+        prefix = f"{domain}."
+        return [
+            row
+            for row in rows
+            if str(row.get("entity_id") or "").startswith(prefix)
+        ]
+
     return {
-        "lights": lights.get("states") or [],
-        "scenes": scenes.get("states") or [],
-        "media": media.get("states") or [],
-        "mode": lights.get("mode"),
+        "ok": bool(snapshot.get("ok")),
+        "lights": _domain_rows("light"),
+        "scenes": _domain_rows("scene"),
+        "covers": _domain_rows("cover"),
+        "climate": _domain_rows("climate"),
+        "media": _domain_rows("media_player"),
+        "mode": snapshot.get("mode"),
+        "error": snapshot.get("error"),
         "entities": {
             "tv": settings.ha_tv_entity,
             "avr": settings.ha_avr_entity,
             "apple_tv": settings.ha_apple_tv_entity,
+            "movie_night_scene": settings.ha_movie_night_scene or None,
         },
     }
 
@@ -486,9 +516,6 @@ async def memory_purge_api(body: MemoryPurgeBody) -> dict[str, Any]:
         house_events=kind in {"all", "events", "house", "house_events"},
         preferences=kind in {"all", "preferences", "prefs"},
     )
-
-
-@app.post("/api/realtime/client_secrets")
 
 
 @app.post("/api/realtime/client_secrets")

@@ -1,29 +1,38 @@
-"""Non-media house devices: PetZero pet feeders, Tuya airco, Tuya air purifier.
+"""Finding the house devices in Home Assistant: feeder, airco, air purifier.
 
-The house runs PetZero feeders plus Tuya OEM hardware (the My AI Apps / Smart
-Life stack, including the KPT Air Purifier and the air conditioner). Home
-Assistant stays the device layer — pair them with Tuya Local so control is a LAN
-call instead of a cloud round trip — and Hearth drives HA over REST exactly as
-it does for media.
+``hearth.tools.house`` controls these devices. This module answers the question
+that comes first and, on a half-built house, comes up constantly: *which Home
+Assistant entity is the thing you are talking about — and is it even there yet?*
 
-Nothing here hardcodes a single entity id. Tuya object ids depend on how a
-device was paired, so each role owns an ordered candidate list from ``.env``
-(``HA_PET_FEEDER_ENTITIES``, ``HA_AIRCO_ENTITIES``, ``HA_AIR_PURIFIER_ENTITIES``)
-and falls back to keyword discovery over live HA state. When discovery is
-ambiguous the tools say which entities matched instead of picking one:
-switching the wrong Tuya relay is worse than asking.
+Tuya object ids depend on how a device was paired, so nothing here hardcodes
+one. Each role owns an ordered candidate list from ``.env`` and falls back to
+keyword discovery over live HA state. When several entities fit, the answer is
+the list of candidates, never a guess: switching the wrong Tuya relay is worse
+than asking.
+
+The discovery report also separates the failure modes that look identical from
+the outside and need completely different fixes:
+
+* Home Assistant is unreachable.
+* ``tuya_local`` is not loaded — the files can be on disk via HACS, but no
+  device has been added, so HA has no entities to find.
+* The integration is loaded but this particular role is still unpaired.
+* Several entities match and Hearth needs to be told which one.
 """
 
 from __future__ import annotations
 
 import re
-import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from hearth.config import settings
 from hearth.tools.ha import ha
+
+# Custom integrations that actually adopt this hardware. Presence in HA's loaded
+# component list means at least one config entry exists.
+TUYA_INTEGRATIONS = ("tuya_local", "tuya", "localtuya", "smartlife")
 
 # Vendor fingerprints that show up in entity ids / friendly names once a Tuya
 # OEM device is adopted (Tuya cloud, Tuya Local, or a Smart Life rebadge).
@@ -39,23 +48,6 @@ _TUYA_MARKERS = (
 )
 
 _UNREACHABLE = frozenset({"unavailable", "unknown"})
-
-# Tuya aircos advertise wildly different mode spellings. Map what a human says
-# onto whatever the entity actually reports in hvac_modes.
-_HVAC_ALIASES: dict[str, tuple[str, ...]] = {
-    "cool": ("cool", "cooling", "koel", "koelen", "kouder", "ac"),
-    "heat": ("heat", "heating", "warm", "warmte", "verwarmen", "verwarming"),
-    "dry": ("dry", "dehumidify", "drogen", "ontvochtigen", "vocht"),
-    "fan_only": ("fan_only", "fan", "ventilate", "ventilator", "ventileren", "blow"),
-    "heat_cool": ("heat_cool", "auto_heat_cool", "range"),
-    "auto": ("auto", "automatic", "automatisch"),
-    "off": ("off", "uit", "stop"),
-}
-
-# Order Hearth reaches for when asked to simply turn the airco on and the
-# entity offers several running modes. Overridable with HA_AIRCO_DEFAULT_MODE.
-_HVAC_ON_PREFERENCE = ("cool", "heat_cool", "auto", "heat", "dry", "fan_only")
-
 
 @dataclass(frozen=True, slots=True)
 class DeviceRole:
@@ -132,10 +124,23 @@ ROLES: dict[str, DeviceRole] = {
     ),
 }
 
+def _candidates(pinned: str, fallback: list[str]) -> list[str]:
+    """A pinned HA_*_ENTITY wins; the candidate list is the search order after it."""
+    chosen = [entity_id for entity_id in [pinned.strip()] if entity_id]
+    for entity_id in fallback:
+        if entity_id not in chosen:
+            chosen.append(entity_id)
+    return chosen
+
+
 _ROLE_CONFIG: dict[str, Callable[[], list[str]]] = {
-    "pet_feeder": lambda: settings.pet_feeder_entity_list,
-    "airco": lambda: settings.airco_entity_list,
-    "air_purifier": lambda: settings.air_purifier_entity_list,
+    "pet_feeder": lambda: _candidates(
+        settings.ha_feeder_entity, settings.pet_feeder_entity_list
+    ),
+    "airco": lambda: _candidates(settings.ha_climate_entity, settings.airco_entity_list),
+    "air_purifier": lambda: _candidates(
+        settings.ha_purifier_entity, settings.air_purifier_entity_list
+    ),
 }
 
 _ROLE_ALIASES: dict[str, str] = {
@@ -156,16 +161,6 @@ _ROLE_ALIASES: dict[str, str] = {
     "luchtreiniger": "air_purifier",
     "kpt": "air_purifier",
 }
-
-# Dispensed food cannot be recalled, so the last successful feed per entity is
-# remembered in-process and a repeat inside the cooldown needs force=True.
-_FEED_HISTORY: dict[str, float] = {}
-
-
-def reset_feed_history() -> None:
-    """Drop the anti-double-feed cooldown (tests / restarts)."""
-    _FEED_HISTORY.clear()
-
 
 def _slug(value: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", (value or "").lower())).strip("_")
@@ -455,9 +450,39 @@ async def discover_entities(
         suggestion = present or [str(c["entity_id"]) for c in candidates[:3]]
         if suggestion:
             env_suggestions[role.env_var] = ",".join(suggestion)
+        in_domains = [
+            row
+            for row in rows
+            if _domain_of(str(row.get("entity_id") or "")) in role.domains
+        ]
+        if resolved.get("ok"):
+            status, next_step = "ready", ""
+        elif resolved.get("ambiguous"):
+            status = "ambiguous"
+            next_step = (
+                f"Set {role.env_var} to whichever of these is the "
+                f"{role.label.lower()}."
+            )
+        elif not in_domains:
+            # Nothing of the right kind exists at all — the device has not been
+            # added to Home Assistant, whatever is installed on disk.
+            status = "no_entities_in_domain"
+            next_step = (
+                f"Home Assistant has no {' / '.join(role.domains)} entity at all. "
+                f"{role.pairing_hint}"
+            )
+        else:
+            status = "not_paired"
+            next_step = (
+                f"Home Assistant has {len(in_domains)} "
+                f"{' / '.join(role.domains)} entity(ies), but none look like the "
+                f"{role.label.lower()}. Set {role.env_var} if one of them is."
+            )
         roles[key] = {
             "label": role.label,
+            "status": status,
             "domains": list(role.domains),
+            "entities_in_domains": len(in_domains),
             "env_var": role.env_var,
             "configured": configured,
             "configured_present": present,
@@ -465,6 +490,7 @@ async def discover_entities(
             "resolved_entity_id": resolved.get("entity_id") if resolved.get("ok") else None,
             "resolved_via": resolved.get("resolved") if resolved.get("ok") else None,
             "ambiguous": bool(resolved.get("ambiguous")),
+            "next_step": next_step,
             "pairing_hint": role.pairing_hint,
         }
 
@@ -485,19 +511,30 @@ async def discover_entities(
             if any(needle in _blob(row) for needle in needles)
         ][:cap]
 
+    integration = await _integration_status()
     found = [
         f"{info['label'].lower()} → {info['resolved_entity_id']}"
         for info in roles.values()
         if info["resolved_entity_id"]
     ]
-    missing = [info["label"].lower() for info in roles.values() if not info["resolved_entity_id"]]
+    unresolved = [info for info in roles.values() if not info["resolved_entity_id"]]
+
     parts: list[str] = []
     if found:
         parts.append("Resolved " + ", ".join(found) + ".")
-    if missing:
-        parts.append(
-            "Still unpaired or ambiguous: " + ", ".join(missing) + "."
-        )
+    if unresolved:
+        names = ", ".join(info["label"].lower() for info in unresolved)
+        ambiguous = [info for info in unresolved if info["status"] == "ambiguous"]
+        if ambiguous:
+            parts.append(f"More than one entity could be the {names} — tell me which.")
+        elif integration["adopted"]:
+            parts.append(f"Not on Home Assistant yet: {names}.")
+        else:
+            # The decisive case on a half-built house: the integration exists but
+            # has adopted nothing, so there is nothing for keywords to match.
+            parts.append(
+                f"Not on Home Assistant yet: {names}. {integration['speak']}"
+            )
     if want_tuya:
         parts.append(f"{len(tuya)} entity(ies) look like Tuya or Smart Life hardware.")
     if not parts:
@@ -507,815 +544,72 @@ async def discover_entities(
         "ok": True,
         "mode": mode,
         "total_entities": len(rows),
+        "domains": _domain_counts(rows),
+        "integration": integration,
         "roles": roles,
         "tuya": tuya,
         "keyword_matches": keyword_matches,
         "env_suggestions": env_suggestions,
+        "next_steps": [
+            info["next_step"] for info in roles.values() if info.get("next_step")
+        ],
         "speak": " ".join(parts),
     }
 
 
-def _expect_state(*values: str) -> Callable[[dict[str, Any]], bool]:
-    wanted = {value.lower() for value in values}
-    return lambda state: str(state.get("state") or "").lower() in wanted
+def _domain_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        domain = _domain_of(str(row.get("entity_id") or ""))
+        if domain:
+            counts[domain] = counts.get(domain, 0) + 1
+    return dict(sorted(counts.items()))
 
 
-def _expect_on() -> Callable[[dict[str, Any]], bool]:
-    return lambda state: str(state.get("state") or "").lower() not in (_UNREACHABLE | {"off"})
+async def _integration_status() -> dict[str, Any]:
+    """Has a Tuya integration actually adopted anything in Home Assistant?
 
-
-def _expect_attr(
-    name: str,
-    value: Any,
-    *,
-    tolerance: float = 0.0,
-) -> Callable[[dict[str, Any]], bool]:
-    def check(state: dict[str, Any]) -> bool:
-        actual = (state.get("attributes") or {}).get(name)
-        if actual is None:
-            return False
-        if tolerance and isinstance(value, (int, float)):
-            try:
-                return abs(float(actual) - float(value)) <= tolerance
-            except (TypeError, ValueError):
-                return False
-        return _slug(str(actual)) == _slug(str(value))
-
-    return check
-
-
-def _refuse(role: str, entity_id: str, message: str) -> dict[str, Any]:
-    """A tool-shaped 'no' that speaks for itself."""
-    return {
-        "ok": False,
-        "role": role,
-        "entity_id": entity_id,
-        "error": message,
-        "speak": message,
-    }
-
-
-def _attr(state: dict[str, Any] | None, name: str, default: Any = None) -> Any:
-    if not state:
-        return default
-    value = (state.get("attributes") or {}).get(name)
-    return default if value is None else value
-
-
-def _match_option(requested: str, options: Iterable[Any]) -> str:
-    """Pick the entity's own spelling for a requested mode / speed."""
-    available = [str(option) for option in options or []]
-    if not available:
-        return requested
-    needle = _slug(requested)
-    for option in available:
-        if _slug(option) == needle:
-            return option
-    canonical = ""
-    for name, aliases in _HVAC_ALIASES.items():
-        if needle == name or needle in {_slug(alias) for alias in aliases}:
-            canonical = name
-            break
-    if canonical:
-        for option in available:
-            if _slug(option) == canonical:
-                return option
-        for option in available:
-            if _slug(option) in {_slug(alias) for alias in _HVAC_ALIASES[canonical]}:
-                return option
-    for option in available:
-        if needle and (needle in _slug(option) or _slug(option) in needle):
-            return option
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# Pet feeders
-# ---------------------------------------------------------------------------
-
-
-async def feed_pets(
-    *,
-    portions: int | None = None,
-    feeder: str = "",
-    force: bool = False,
-) -> dict[str, Any]:
-    """Dispense a meal now on the PetZero feeder.
-
-    Feeding is one-way, and voice plus Telegram make an accidental second meal
-    easy, so a repeat inside ``HA_PET_FEEDER_COOLDOWN_SECONDS`` is refused with
-    the remaining wait unless ``force`` is set.
+    Home Assistant only loads a custom integration once it has a config entry,
+    so "not loaded" is the signal that the files are installed (HACS) but no
+    device has been added. That is a completely different fix to "the
+    integration is missing", and the two are indistinguishable from entities
+    alone — both simply produce nothing to match.
     """
-    resolved = await resolve_role("pet_feeder", hint=feeder)
-    if not resolved.get("ok"):
-        return resolved
-    entity_id = str(resolved["entity_id"])
-    domain = str(resolved["domain"])
-    label = str(resolved.get("label") or "Pet feeder")
-    mode = resolved.get("mode")
-
-    if not resolved.get("reachable"):
-        message = f"{label} is unavailable in Home Assistant — nothing was dispensed."
+    config = await ha.loaded_integrations()
+    if not config.get("known"):
         return {
-            "ok": False,
-            "role": "pet_feeder",
-            "entity_id": entity_id,
-            "mode": mode,
-            "error": message,
-            "speak": message,
+            "known": False,
+            "adopted": False,
+            "loaded": [],
+            "speak": (
+                "I cannot read the Home Assistant integration list, so I cannot "
+                "tell whether Tuya has adopted anything."
+            ),
         }
-
-    wanted = settings.ha_pet_feeder_default_portions if portions is None else int(portions)
-    cap = max(1, int(settings.ha_pet_feeder_max_portions))
-    count = max(1, min(cap, wanted))
-    capped = count != wanted
-
-    cooldown = max(0.0, float(settings.ha_pet_feeder_cooldown_seconds))
-    last = _FEED_HISTORY.get(entity_id)
-    if not force and cooldown and last is not None:
-        waited = time.monotonic() - last
-        if waited < cooldown:
-            remaining = int(round(cooldown - waited))
-            minutes = max(1, round(remaining / 60))
-            message = (
-                f"{label} already dispensed a portion just now. Ask again in about "
-                f"{minutes} minute(s), or say feed them anyway for a second one."
-            )
-            return {
-                "ok": False,
-                "role": "pet_feeder",
-                "entity_id": entity_id,
-                "mode": mode,
-                "cooldown_active": True,
-                "cooldown_remaining_s": remaining,
-                "error": message,
-                "speak": message,
-            }
-
-    steps: list[dict[str, Any]] = []
-    portion_entity = await _resolve_first(settings.pet_feeder_portion_entity_list)
-    portion_via = ""
-    presses = count
-    if count > 1 and portion_entity:
-        # A number entity means the feeder dispenses N portions per trigger.
-        step = await ha.call_and_verify(
-            _domain_of(portion_entity),
-            "set_value",
-            portion_entity,
-            {"value": float(count)},
-            expect=_expect_state(str(count), f"{float(count):.1f}"),
-        )
-        steps.append(step)
-        if step.get("accepted"):
-            portion_via = portion_entity
-            presses = 1
-
-    if domain == "button":
-        service, data, expect = "press", None, None
-    elif domain == "switch":
-        service, data, expect = "turn_on", None, _expect_state("on")
-    else:
-        message = f"{label} is a {domain} entity; Hearth can only trigger button or switch feeders."
+    components = set(config.get("components") or [])
+    loaded = [name for name in TUYA_INTEGRATIONS if name in components]
+    if loaded:
         return {
-            "ok": False,
-            "role": "pet_feeder",
-            "entity_id": entity_id,
-            "mode": mode,
-            "error": message,
-            "speak": message,
+            "known": True,
+            "adopted": True,
+            "loaded": loaded,
+            "ha_version": config.get("version"),
+            "speak": (
+                f"{', '.join(loaded)} is loaded in Home Assistant, so the devices "
+                "it adopted should appear above."
+            ),
         }
-
-    for _ in range(presses):
-        steps.append(
-            await ha.call_and_verify(domain, service, entity_id, data, expect=expect)
-        )
-
-    failed = [step for step in steps if step.get("ok") is False]
-    ok = not failed
-    if ok:
-        _FEED_HISTORY[entity_id] = time.monotonic()
-
-    meal = "one portion" if count == 1 else f"{count} portions"
-    if ok:
-        speak = f"Fed the pets — {meal} via {label}."
-        if capped:
-            speak += f" Capped at {cap} portions."
-    else:
-        speak = str(failed[0].get("error") or f"{label} did not confirm the feed.")
-
     return {
-        "ok": ok,
-        "role": "pet_feeder",
-        "entity_id": entity_id,
-        "label": label,
-        "mode": mode,
-        "resolved": resolved.get("resolved"),
-        "portions": count,
-        "portions_capped": capped,
-        "presses": presses,
-        "portion_entity_id": portion_via or None,
-        "steps": steps,
-        "forced": bool(force),
-        "speak": speak,
-        "error": None if ok else speak,
+        "known": True,
+        "adopted": False,
+        "loaded": [],
+        "ha_version": config.get("version"),
+        "speak": (
+            "No Tuya integration is loaded in Home Assistant. Installing "
+            "tuya_local through HACS only copies the files — each device still "
+            "has to be added under Settings, Devices & Services, Add Integration, "
+            "Tuya Local. See docs/devices.md for the exact steps."
+        ),
     }
 
 
-async def _resolve_first(candidates: Sequence[str]) -> str:
-    """First configured helper entity that actually exists in HA."""
-    for entity_id in candidates:
-        probe = await ha.get_state(entity_id)
-        if probe.get("ok") and probe.get("state") is not None:
-            return entity_id
-    return ""
-
-
-async def feeder_schedule(action: str = "status", *, feeder: str = "") -> dict[str, Any]:
-    """Read or flip the feeder's built-in schedule when HA exposes one.
-
-    Most Tuya feeders keep their timetable on the device and only surface an
-    on/off switch for it. Hearth reports that honestly rather than pretending it
-    can write meal times it cannot see.
-    """
-    wanted = _slug(action) or "status"
-    schedule_entity = await _resolve_first(settings.pet_feeder_schedule_entity_list)
-    if not schedule_entity:
-        message = (
-            "This feeder does not expose its schedule to Home Assistant — only "
-            "manual feeding is available. Set the timetable in the feeder's own "
-            "integration, or point HA_PET_FEEDER_SCHEDULE_ENTITIES at the "
-            "schedule switch if one exists."
-        )
-        return {
-            "ok": False,
-            "role": "pet_feeder",
-            "supported": False,
-            "action": wanted,
-            "error": message,
-            "speak": message,
-            "hint": ROLES["pet_feeder"].pairing_hint,
-        }
-
-    snapshot = await ha.get_state(schedule_entity)
-    state = snapshot.get("state") or {}
-    label = _friendly(state) if state else "Feeder schedule"
-    if wanted in {"status", "state", "read", "get"}:
-        status = str(state.get("state") or "unknown")
-        return {
-            "ok": True,
-            "role": "pet_feeder",
-            "supported": True,
-            "action": "status",
-            "entity_id": schedule_entity,
-            "mode": snapshot.get("mode"),
-            "state": state,
-            "enabled": status == "on",
-            "speak": f"{label} is {status}.",
-        }
-
-    if wanted in {"on", "enable", "enabled", "turn_on", "start", "resume"}:
-        service, expect, spoken = "turn_on", _expect_state("on"), "on"
-    elif wanted in {"off", "disable", "disabled", "turn_off", "stop", "pause"}:
-        service, expect, spoken = "turn_off", _expect_state("off"), "off"
-    else:
-        message = f"Unknown schedule action {action!r}; use status, on, or off."
-        return {"ok": False, "role": "pet_feeder", "error": message, "speak": message}
-
-    result = await ha.call_and_verify(
-        _domain_of(schedule_entity), service, schedule_entity, expect=expect
-    )
-    ok = bool(result.get("ok"))
-    speak = (
-        f"Scheduled feeding is {spoken}."
-        if ok
-        else str(result.get("error") or "The feeder schedule did not change.")
-    )
-    return {
-        "ok": ok,
-        "role": "pet_feeder",
-        "supported": True,
-        "action": spoken,
-        "entity_id": schedule_entity,
-        "mode": result.get("mode"),
-        "state": result.get("state"),
-        "verified": result.get("verified"),
-        "speak": speak,
-        "error": None if ok else speak,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Airco (Tuya climate)
-# ---------------------------------------------------------------------------
-
-
-def _clamp_temperature(value: float, state: dict[str, Any] | None) -> tuple[float, bool]:
-    low = float(settings.ha_airco_min_temperature)
-    high = float(settings.ha_airco_max_temperature)
-    entity_low = _attr(state, "min_temp")
-    entity_high = _attr(state, "max_temp")
-    try:
-        if entity_low is not None:
-            low = max(low, float(entity_low))
-        if entity_high is not None:
-            high = min(high, float(entity_high))
-    except (TypeError, ValueError):
-        pass
-    if low > high:
-        low, high = high, low
-    clamped = max(low, min(high, float(value)))
-    return clamped, clamped != float(value)
-
-
-def _speak_climate(label: str, state: dict[str, Any] | None) -> str:
-    if not state:
-        return f"{label} state is unknown."
-    status = str(state.get("state") or "unknown")
-    if status == "off":
-        return f"{label} is off."
-    bits = [f"{label} is {status}"]
-    target = _attr(state, "temperature")
-    if target is not None:
-        bits.append(f"set to {_number(target)}°")
-    current = _attr(state, "current_temperature")
-    if current is not None:
-        bits.append(f"room {_number(current)}°")
-    fan = _attr(state, "fan_mode")
-    if fan:
-        bits.append(f"fan {fan}")
-    return ", ".join(bits) + "."
-
-
-def _number(value: Any) -> str:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    return str(int(number)) if number.is_integer() else f"{number:g}"
-
-
-async def climate_control(
-    action: str = "status",
-    *,
-    temperature: float | None = None,
-    mode: str = "",
-    fan_mode: str = "",
-    target: str = "",
-) -> dict[str, Any]:
-    """Control the airco: power, target temperature, hvac mode, fan speed.
-
-    Setting a temperature on a unit that is off also starts it — "airco 21"
-    means make it 21 in here, not arm a target for later.
-    """
-    resolved = await resolve_role("airco", hint=target)
-    if not resolved.get("ok"):
-        return resolved
-    entity_id = str(resolved["entity_id"])
-    label = str(resolved.get("label") or "Airco")
-    state = resolved.get("state") or {}
-    mode_name = resolved.get("mode")
-    wanted = _slug(action) or "status"
-
-    if wanted in {"status", "state", "read", "get"}:
-        return {
-            "ok": True,
-            "role": "airco",
-            "action": "status",
-            "entity_id": entity_id,
-            "label": label,
-            "mode": mode_name,
-            "state": state,
-            "speak": _speak_climate(label, state),
-        }
-
-    if temperature is not None and wanted in {"on", "turn_on"}:
-        wanted = "set_temperature"
-    if wanted in {"temperature", "set_temperature", "temp", "set_temp"} and temperature is None:
-        return _refuse("airco", entity_id, "Give me a temperature, for example airco 21.")
-
-    steps: list[dict[str, Any]] = []
-    # Set by the power-on step when it already put the unit in the asked-for mode,
-    # so "airco 21 on heat" does not send set_hvac_mode twice.
-    powered_mode = ""
-    if wanted in {"off", "turn_off", "stop"}:
-        result = await ha.call_and_verify(
-            "climate",
-            "set_hvac_mode",
-            entity_id,
-            {"hvac_mode": "off"},
-            expect=_expect_state("off"),
-        )
-        steps.append(result)
-        return _climate_result(label, entity_id, mode_name, "turn_off", steps, f"{label} is off.")
-
-    if wanted in {"on", "turn_on"} or (
-        wanted in {"set_temperature", "set_fan_mode", "fan_mode"}
-        and str(state.get("state") or "").lower() == "off"
-    ):
-        power = await _airco_power_on(entity_id, state, requested_mode=mode)
-        steps.append(power)
-        if mode and power.get("ok"):
-            powered_mode = str(power.get("applied_mode") or "")
-        if not power.get("ok"):
-            return _climate_result(
-                label,
-                entity_id,
-                mode_name,
-                "turn_on",
-                steps,
-                str(power.get("error") or f"{label} did not turn on."),
-            )
-        if wanted in {"on", "turn_on"} and temperature is None and not fan_mode:
-            after = power.get("state") or {}
-            return _climate_result(
-                label, entity_id, mode_name, "turn_on", steps, _speak_climate(label, after)
-            )
-
-    wants_mode = wanted in {"mode", "set_mode", "hvac_mode", "set_hvac_mode"}
-    if wants_mode or (mode and not powered_mode):
-        requested = mode or action
-        modes = _attr(state, "hvac_modes", []) or []
-        chosen = _match_option(requested, modes)
-        if not chosen:
-            available = ", ".join(str(m) for m in modes) or "none reported"
-            return _refuse(
-                "airco",
-                entity_id,
-                f"{label} has no {requested!r} mode. Available: {available}.",
-            )
-        result = await ha.call_and_verify(
-            "climate",
-            "set_hvac_mode",
-            entity_id,
-            {"hvac_mode": chosen},
-            expect=_expect_state(chosen),
-        )
-        steps.append(result)
-        if wanted != "set_temperature" and temperature is None and not fan_mode:
-            return _climate_result(
-                label,
-                entity_id,
-                mode_name,
-                "set_mode",
-                steps,
-                _speak_climate(label, result.get("state")),
-            )
-
-    if temperature is not None:
-        clamped, adjusted = _clamp_temperature(float(temperature), state)
-        result = await ha.call_and_verify(
-            "climate",
-            "set_temperature",
-            entity_id,
-            {"temperature": clamped},
-            expect=_expect_attr("temperature", clamped, tolerance=0.51),
-        )
-        steps.append(result)
-        speak = f"{label} set to {_number(clamped)} degrees."
-        if adjusted:
-            speak += f" {_number(temperature)} is outside its range."
-        return _climate_result(
-            label, entity_id, mode_name, "set_temperature", steps, speak, temperature=clamped
-        )
-
-    if fan_mode:
-        fan_modes = _attr(state, "fan_modes", []) or []
-        chosen = _match_option(fan_mode, fan_modes)
-        if not chosen:
-            available = ", ".join(str(m) for m in fan_modes) or "none reported"
-            return _refuse(
-                "airco",
-                entity_id,
-                f"{label} has no {fan_mode!r} fan speed. Available: {available}.",
-            )
-        result = await ha.call_and_verify(
-            "climate",
-            "set_fan_mode",
-            entity_id,
-            {"fan_mode": chosen},
-            expect=_expect_attr("fan_mode", chosen),
-        )
-        steps.append(result)
-        return _climate_result(
-            label, entity_id, mode_name, "set_fan_mode", steps, f"{label} fan set to {chosen}."
-        )
-
-    if steps:
-        return _climate_result(
-            label,
-            entity_id,
-            mode_name,
-            wanted,
-            steps,
-            _speak_climate(label, steps[-1].get("state")),
-        )
-    return _refuse(
-        "airco",
-        entity_id,
-        f"Unknown airco action {action!r}; use status, on, off, set_temperature, "
-        "set_mode, or set_fan_mode.",
-    )
-
-
-async def _airco_power_on(
-    entity_id: str,
-    state: dict[str, Any],
-    *,
-    requested_mode: str = "",
-) -> dict[str, Any]:
-    """Start the unit in a real running mode, never an ambiguous 'on'."""
-    modes = [str(m) for m in (_attr(state, "hvac_modes", []) or [])]
-    chosen = ""
-    if requested_mode:
-        chosen = _match_option(requested_mode, modes)
-    if not chosen:
-        preference = (settings.ha_airco_default_mode or "").strip()
-        if preference:
-            chosen = _match_option(preference, modes)
-    if not chosen:
-        for candidate in _HVAC_ON_PREFERENCE:
-            match = _match_option(candidate, modes)
-            if match and _slug(match) != "off":
-                chosen = match
-                break
-    if not chosen:
-        # No mode list published — fall back to the plain climate.turn_on service.
-        return await ha.call_and_verify("climate", "turn_on", entity_id, expect=_expect_on())
-    result = await ha.call_and_verify(
-        "climate",
-        "set_hvac_mode",
-        entity_id,
-        {"hvac_mode": chosen},
-        expect=_expect_state(chosen),
-    )
-    return {**result, "applied_mode": chosen}
-
-
-def _climate_result(
-    label: str,
-    entity_id: str,
-    mode: Any,
-    action: str,
-    steps: list[dict[str, Any]],
-    speak: str,
-    *,
-    temperature: float | None = None,
-) -> dict[str, Any]:
-    failed = [step for step in steps if step.get("ok") is False]
-    ok = not failed
-    if not ok:
-        speak = str(failed[0].get("error") or speak)
-    out: dict[str, Any] = {
-        "ok": ok,
-        "role": "airco",
-        "action": action,
-        "entity_id": entity_id,
-        "label": label,
-        "mode": mode,
-        "steps": steps,
-        "state": steps[-1].get("state") if steps else None,
-        "verified": steps[-1].get("verified") if steps else None,
-        "speak": speak,
-        "error": None if ok else speak,
-    }
-    if temperature is not None:
-        out["temperature"] = temperature
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Air purifier (Tuya fan / humidifier / switch)
-# ---------------------------------------------------------------------------
-
-
-def _speak_purifier(label: str, state: dict[str, Any] | None) -> str:
-    if not state:
-        return f"{label} state is unknown."
-    status = str(state.get("state") or "unknown")
-    if status == "off":
-        return f"{label} is off."
-    bits = [f"{label} is {status}"]
-    percentage = _attr(state, "percentage")
-    if percentage is not None:
-        bits.append(f"{_number(percentage)}% speed")
-    preset = _attr(state, "preset_mode")
-    if preset:
-        bits.append(f"{preset} mode")
-    pm25 = _attr(state, "pm25")
-    if pm25 is not None:
-        bits.append(f"PM2.5 {_number(pm25)}")
-    filter_life = _attr(state, "filter_life_remaining")
-    if filter_life is not None:
-        bits.append(f"filter {_number(filter_life)}%")
-    return ", ".join(bits) + "."
-
-
-async def purifier_control(
-    action: str = "status",
-    *,
-    percentage: float | None = None,
-    preset_mode: str = "",
-    target: str = "",
-) -> dict[str, Any]:
-    """Control the KPT air purifier: power, fan speed, preset mode.
-
-    Tuya ships this device as a ``fan`` under Tuya Local but as a ``humidifier``
-    or plain ``switch`` in some OEM builds, so speed and preset are only offered
-    when the resolved entity really supports them.
-    """
-    resolved = await resolve_role("air_purifier", hint=target)
-    if not resolved.get("ok"):
-        return resolved
-    entity_id = str(resolved["entity_id"])
-    domain = str(resolved["domain"])
-    label = str(resolved.get("label") or "Air purifier")
-    state = resolved.get("state") or {}
-    mode_name = resolved.get("mode")
-    wanted = _slug(action) or "status"
-
-    if wanted in {"status", "state", "read", "get"}:
-        return {
-            "ok": True,
-            "role": "air_purifier",
-            "action": "status",
-            "entity_id": entity_id,
-            "label": label,
-            "mode": mode_name,
-            "state": state,
-            "speak": _speak_purifier(label, state),
-        }
-
-    if percentage is not None and wanted in {"on", "turn_on"}:
-        wanted = "set_speed"
-    if preset_mode and wanted in {"on", "turn_on"}:
-        wanted = "set_mode"
-
-    if wanted in {"on", "turn_on", "off", "turn_off", "toggle"}:
-        service = "toggle" if wanted == "toggle" else (
-            "turn_on" if wanted in {"on", "turn_on"} else "turn_off"
-        )
-        expect = (
-            _expect_state("off")
-            if service == "turn_off"
-            else (_expect_on() if service == "turn_on" else None)
-        )
-        result = await ha.call_and_verify(domain, service, entity_id, expect=expect)
-        speak = (
-            _speak_purifier(label, result.get("state"))
-            if result.get("ok")
-            else str(result.get("error") or f"{label} did not respond.")
-        )
-        return _purifier_result(label, entity_id, mode_name, service, result, speak)
-
-    if wanted in {"speed", "set_speed", "percentage", "set_percentage"}:
-        if percentage is None:
-            return _refuse(
-                "air_purifier",
-                entity_id,
-                "Give me a speed percentage, for example purifier 40%.",
-            )
-        if domain != "fan":
-            return _refuse(
-                "air_purifier",
-                entity_id,
-                f"{label} is a {domain} entity in Home Assistant, so it only does on "
-                "and off. Re-pair it with Tuya Local to get fan speeds.",
-            )
-        value = max(0.0, min(100.0, float(percentage)))
-        result = await ha.call_and_verify(
-            "fan",
-            "set_percentage",
-            entity_id,
-            {"percentage": value},
-            expect=_expect_attr("percentage", value, tolerance=1.0),
-        )
-        speak = (
-            f"{label} at {_number(value)}%."
-            if result.get("ok")
-            else str(result.get("error") or f"{label} did not change speed.")
-        )
-        return _purifier_result(label, entity_id, mode_name, "set_percentage", result, speak)
-
-    if wanted in {"mode", "set_mode", "preset", "preset_mode", "set_preset_mode"}:
-        if not preset_mode:
-            return _refuse(
-                "air_purifier",
-                entity_id,
-                "Which mode? For example auto, sleep, or turbo.",
-            )
-        available = _attr(state, "preset_modes", []) or []
-        chosen = _match_option(preset_mode, available)
-        if not chosen:
-            names = ", ".join(str(m) for m in available) or "none reported"
-            return _refuse(
-                "air_purifier",
-                entity_id,
-                f"{label} has no {preset_mode!r} mode. Available: {names}.",
-            )
-        result = await ha.call_and_verify(
-            domain,
-            "set_preset_mode",
-            entity_id,
-            {"preset_mode": chosen},
-            expect=_expect_attr("preset_mode", chosen),
-        )
-        speak = (
-            f"{label} in {chosen} mode."
-            if result.get("ok")
-            else str(result.get("error") or f"{label} did not change mode.")
-        )
-        return _purifier_result(label, entity_id, mode_name, "set_preset_mode", result, speak)
-
-    return _refuse(
-        "air_purifier",
-        entity_id,
-        f"Unknown purifier action {action!r}; use status, on, off, set_speed, or set_mode.",
-    )
-
-
-def _purifier_result(
-    label: str,
-    entity_id: str,
-    mode: Any,
-    action: str,
-    result: dict[str, Any],
-    speak: str,
-) -> dict[str, Any]:
-    ok = bool(result.get("ok"))
-    return {
-        "ok": ok,
-        "role": "air_purifier",
-        "action": action,
-        "entity_id": entity_id,
-        "label": label,
-        "mode": mode,
-        "state": result.get("state"),
-        "verified": result.get("verified"),
-        "result": result,
-        "speak": speak,
-        "error": None if ok else speak,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Combined snapshot
-# ---------------------------------------------------------------------------
-
-
-async def house_devices_status() -> dict[str, Any]:
-    """One speakable snapshot of feeder, airco, and purifier from one HA read."""
-    snapshot = await ha.list_states()
-    if not snapshot.get("ok"):
-        error = str(snapshot.get("error") or "Home Assistant is unreachable")
-        return {
-            "ok": False,
-            "mode": snapshot.get("mode"),
-            "error": error,
-            "speak": f"Home Assistant is unreachable: {error}",
-            "devices": {},
-        }
-    rows = snapshot.get("states") or []
-    mode = str(snapshot.get("mode") or ("live" if ha.live else "mock"))
-
-    devices: dict[str, Any] = {}
-    spoken: list[str] = []
-    for key, role in ROLES.items():
-        resolved = await resolve_role(key, states=rows)
-        if not resolved.get("ok"):
-            devices[key] = {
-                "label": role.label,
-                "ok": False,
-                "configured": role.configured(),
-                "env_var": role.env_var,
-                "ambiguous": bool(resolved.get("ambiguous")),
-                "matches": resolved.get("matches"),
-                "error": resolved.get("error"),
-                "speak": resolved.get("speak"),
-            }
-            spoken.append(f"{role.label} is not paired yet.")
-            continue
-        state = resolved.get("state") or {}
-        if key == "airco":
-            speak = _speak_climate(str(resolved.get("label") or role.label), state)
-        elif key == "air_purifier":
-            speak = _speak_purifier(str(resolved.get("label") or role.label), state)
-        else:
-            speak = f"{resolved.get('label') or role.label} is {state.get('state') or 'unknown'}."
-        devices[key] = {
-            "label": resolved.get("label") or role.label,
-            "ok": True,
-            "entity_id": resolved.get("entity_id"),
-            "domain": resolved.get("domain"),
-            "resolved": resolved.get("resolved"),
-            "reachable": resolved.get("reachable"),
-            "state": state,
-            "speak": speak,
-        }
-        spoken.append(speak)
-
-    return {
-        "ok": True,
-        "mode": mode,
-        "devices": devices,
-        "speak": " ".join(spoken),
-    }

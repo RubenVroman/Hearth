@@ -9,9 +9,9 @@ from hearth.agent.registry import ToolRegistry, registry
 from hearth.config import settings
 from hearth.jev import evaluate_message, log_shadow_outcome, set_utterance
 from hearth.memory import store as memory_store
-from hearth.tools.device_intent import match_device_phrase
 from hearth.memory.summarize import maybe_summarize
 from hearth.runtime import runtime
+from hearth.tools.house import voice_plan
 from hearth import widgets as widget_bus
 
 MAX_TURNS = 8
@@ -253,7 +253,9 @@ class AgentLoop:
         used: list[dict[str, Any]] = []
         if plan is None:
             reply = (
-                "I can drive the house — lights, Denon, LG TV, play titles in Infuse on the "
+                "I can drive the house — lights, scenes, covers, house status, house sleep, "
+                "good morning, movie night, climate, the feeder, the purifier, Denon, LG TV, "
+                "play titles in Infuse on the "
                 "Apple TV (or Plex on LG), grab movies in Radarr or shows in Sonarr, check "
                 "download progress, request "
                 "via Overseerr, suggest movie cards on the glass UI, order food on Thuisbezorgd, "
@@ -335,6 +337,17 @@ def _format_tool_reply(tools: list[dict[str, Any]]) -> str:
 
 def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     mock = " (mock)" if data.get("mode") == "mock" else ""
+    if name in {
+        "house_ritual",
+        "house_climate",
+        "house_feeder",
+        "house_purifier",
+        "house_comfort",
+    }:
+        spoken = str(data.get("speak") or "").strip()
+        if spoken:
+            return spoken if mock == "" else f"{spoken.rstrip('.')}{mock}."
+        return None
     if name == "plex_now_playing":
         sessions = data.get("sessions") or []
         if not sessions:
@@ -420,10 +433,14 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         names = [c.get("name") or c.get("id") for c in containers]
         return f"Containers{mock}: " + ", ".join(str(n) for n in names)
     if name == "ha_call_service":
-        entity = (data.get("entity") or {}).get("entity_id") or data.get("entity")
-        return f"Done{mock}: {entity} is {(data.get('entity') or {}).get('state', 'updated')}."
+        state = data.get("entity") or data.get("state") or {}
+        state = state if isinstance(state, dict) else {}
+        entity = state.get("entity_id") or data.get("entity_id") or "the device"
+        return f"Done{mock}: {entity} is {state.get('state', 'updated')}."
     if name == "house_media":
         return str(data.get("speak") or f"House media{mock}.")
+    if name == "house_status":
+        return str(data.get("speak") or f"House status{mock}: {data.get('health', 'unknown')}.")
     if name == "house_network":
         return str(data.get("speak") or f"House network{mock}: {data.get('health', 'unknown')}.")
     if name == "media_activity":
@@ -664,6 +681,13 @@ _PLAY_ON_TV = re.compile(
     r")\b",
     re.I,
 )
+_PLAY_REFERENCE = re.compile(
+    r"^\s*(?:put|play|throw|send)\s+(?:it|that|this)\s+on\s+(?:the\s+)?("
+    r"infuse|firecore|apple\s*tv|atv|lg(?:\s*webos)?(?:\s*tv)?|webos|"
+    r"living\s*room(?:\s*tv)?|shield|plex|tv|television"
+    r")\s*[.!?]*\s*$",
+    re.I,
+)
 _PLAY_TITLE = re.compile(
     r"\b(?:play|put on)\s+(.+?)(?:\s+please)?$",
     re.I,
@@ -675,9 +699,13 @@ _PUT_ON_INFUSE = re.compile(
 _INFUSE_TRANSPORT = re.compile(
     r"\b(pause|stop|skip(?:\s+(?:ahead|forward))?|next(?:\s+track)?|"
     r"resume|unpause|play|go\s+back|previous(?:\s+track)?)\b"
-    r".*\b(?:apple\s*tv|infuse|atv)\b"
-    r"|\b(?:apple\s*tv|infuse|atv)\b.*"
+    r".*\b(?:apple\s*tv|infuse|atv|tv|television)\b"
+    r"|\b(?:apple\s*tv|infuse|atv|tv|television)\b.*"
     r"\b(pause|stop|skip|next|resume|unpause|go\s+back|previous)\b",
+    re.I,
+)
+_BARE_TRANSPORT = re.compile(
+    r"^\s*(pause|resume|unpause)(?:\s+(?:it|that|this))?\s*[.!?]*\s*$",
     re.I,
 )
 _MEDIA_STATUS = re.compile(
@@ -692,9 +720,28 @@ _NETWORK_STATUS = re.compile(
     r"check (?:all )?(?:the )?(?:devices?|connections?))\b",
     re.I,
 )
+_HOUSE_STATUS = re.compile(
+    r"\b(?:"
+    r"(?:house|home)\s+(?:status|snapshot|check)|"
+    r"status\s+of\s+(?:the\s+)?(?:house|home)|"
+    r"how(?:'s| is)\s+(?:the\s+)?(?:house|home)|"
+    r"what(?:'s| is)\s+on\s+(?:in|around|at)\s+(?:the\s+)?(?:house|home)"
+    r")\b",
+    re.I,
+)
 _MEDIA_ACTIVITY = re.compile(
     r"\b(?:watch|use|start|prepare|switch to)\s+(?:the\s+)?(apple\s*tv|atv|tv|television)\b"
     r"|\b(?:turn|switch|power)\s+(?:the\s+)?(?:whole\s+)?(?:media|tv)\s+(chain\s+)?off\b",
+    re.I,
+)
+_MOVIE_NIGHT = re.compile(
+    r"^\s*(?:(?:set|start|prepare|activate|it'?s)\s+)?"
+    r"(?:movie|film|cinema)\s+night(?:\s+mode)?\s*[.!?]*\s*$",
+    re.I,
+)
+_LIGHTS_DOWN = re.compile(
+    r"^\s*(?:turn|bring|put|dim)?\s*(?:the\s+)?lights?\s+down\s*[.!?]*\s*$"
+    r"|^\s*dim\s+(?:the\s+)?lights?\s*[.!?]*\s*$",
     re.I,
 )
 _PLEX_CLIENTS = re.compile(
@@ -785,9 +832,38 @@ _VOLUME = re.compile(
     r"\b(?:set\s+)?(?:the\s+)?(tv|lg|avr|denon|receiver)?\s*volume\s*(?:to\s*)?(\d{1,3})%?",
     re.I,
 )
+_VOLUME_STEP = re.compile(
+    r"\b(?:(?:(tv|lg|avr|denon|receiver)\s+)?volume\s+(up|down)"
+    r"|turn\s+(?:(?:the\s+)?(tv|lg|avr|denon|receiver|it)\s+)?(up|down))\b",
+    re.I,
+)
 _MUTE = re.compile(r"\b(un)?mute\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\b", re.I)
 _SOURCE = re.compile(
     r"\b(?:set|switch)\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\s+(?:to\s+|source\s+|input\s+)(.+)$",
+    re.I,
+)
+_LIGHT_BRIGHTNESS = re.compile(
+    r"\b(?:dim|set)\s+(?:the\s+)?(.+?\blights?)\s+"
+    r"(?:to|at)\s+(\d{1,3})%?\s*[.?!]*$",
+    re.I,
+)
+_SCENE_ACTIVATE = re.compile(
+    r"\b(?:activate|run|start|turn\s+on)\s+(?:the\s+)?(?:"
+    r"scene\s+(.+?)|(.+?)\s+scene|"
+    r"(movie\s+night|good\s+night)"
+    r")\s*[.?!]*$",
+    re.I,
+)
+_COVER_ACTION = re.compile(
+    r"\b(open|close|stop)\s+(?:the\s+)?"
+    r"(.+?(?:cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters))"
+    r"\s*[.?!]*$",
+    re.I,
+)
+_COVER_POSITION = re.compile(
+    r"\b(?:set|move)\s+(?:the\s+)?"
+    r"(.+?(?:cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters))"
+    r"\s+(?:to\s+)?(\d{1,3})%?\s*[.?!]*$",
     re.I,
 )
 # Videoland on LG — before generic play/plex so Dutch "zet … aan op Videoland" stays house-local.
@@ -951,14 +1027,13 @@ def route_intent(text: str) -> dict[str, Any] | None:
             "tool": "chief_of_staff",
             "args": {"task": raw, "said": raw, "repo": "RubenVroman/Hearth"},
         }
-    # Pet feeder / airco / purifier before the generic routers: "turn off the
-    # airco" must not become a media power command, and "geef de katten eten"
-    # must not become a food order.
-    device = match_device_phrase(raw)
-    if device is not None:
-        return device.as_plan(raw)
     if _FOOD.search(raw) or (_FOOD_CART.search(raw) and _FOOD_ORDER.search(raw)):
         return _food_plan(raw)
+    # Rituals, climate, feeder, purifier. voice_plan already falls through to
+    # the wider device phrases, so "zet de airco op 21" lands here too.
+    house = voice_plan(raw)
+    if house:
+        return house
     if _MEMORY_LIST.search(raw):
         return {"tool": "memory_list", "args": {"kind": "preferences"}}
     if _MEMORY_SEARCH.search(raw):
@@ -986,11 +1061,42 @@ def route_intent(text: str) -> dict[str, Any] | None:
         if _MOVIE.search(raw):
             return {"tool": "radarr_add", "args": {"query": query or raw}}
         return {"tool": "overseerr_request", "args": {"query": query or raw}}
+    if _HOUSE_STATUS.search(raw):
+        return {"tool": "house_status", "args": {}}
     if _NETWORK_STATUS.search(raw):
         return {"tool": "house_network", "args": {}}
+    # Explicit "activate/start/turn on movie night" is the scene command from
+    # house controls. Bare "movie night" stays the receiver-centric activity.
+    scene = _SCENE_ACTIVATE.search(raw)
+    if scene:
+        target = next((group for group in scene.groups() if group), "")
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": target.strip(" ."),
+                "domain": "scene",
+                "action": "activate",
+            },
+        }
+    if _MOVIE_NIGHT.search(raw):
+        return {"tool": "media_activity", "args": {"activity": "movie_night"}}
+    if _LIGHTS_DOWN.search(raw):
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": settings.ha_movie_night_scene.strip() or "Movie night",
+                "domain": "scene",
+                "action": "activate",
+            },
+        }
     videoland_plan = _videoland_plan(raw)
     if videoland_plan is not None:
         return videoland_plan
+    play_reference = _PLAY_REFERENCE.search(raw)
+    if play_reference:
+        reference_plan = _play_reference_plan(play_reference.group(1))
+        if reference_plan is not None:
+            return reference_plan
     activity = _MEDIA_ACTIVITY.search(raw)
     if activity:
         lower_activity = raw.lower()
@@ -1011,6 +1117,8 @@ def route_intent(text: str) -> dict[str, Any] | None:
     play_on = _PLAY_ON_TV.search(raw)
     if play_on:
         title = _play_title_clean(play_on.group(1))
+        if title.lower() in {"it", "that", "this", "something"}:
+            return None
         player = _plex_player_hint(play_on.group(2))
         from hearth.tools.infuse import prefer_infuse_for_apple_tv
 
@@ -1042,6 +1150,15 @@ def route_intent(text: str) -> dict[str, Any] | None:
         device = _media_device(mute.group(2))
         action = "unmute" if mute.group(1) else "volume_mute"
         return {"tool": "ha_media_control", "args": {"device": device, "action": action}}
+    volume_step = _VOLUME_STEP.search(raw)
+    if volume_step:
+        device_name = volume_step.group(1) or volume_step.group(3) or "avr"
+        direction = volume_step.group(2) or volume_step.group(4)
+        device = _media_device("avr" if device_name == "it" else device_name)
+        return {
+            "tool": "ha_media_control",
+            "args": {"device": device, "action": f"volume_{direction.lower()}"},
+        }
     vol = _VOLUME.search(raw)
     if vol:
         device = _media_device(vol.group(1) or "avr")
@@ -1062,6 +1179,38 @@ def route_intent(text: str) -> dict[str, Any] | None:
                 "device": device,
                 "action": "select_source",
                 "source": source.group(2).strip(" ."),
+            },
+        }
+    light_brightness = _LIGHT_BRIGHTNESS.search(raw)
+    if light_brightness:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": light_brightness.group(1).strip(" ."),
+                "domain": "light",
+                "action": "brightness",
+                "value": int(light_brightness.group(2)),
+            },
+        }
+    cover_position = _COVER_POSITION.search(raw)
+    if cover_position:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cover_position.group(1).strip(" ."),
+                "domain": "cover",
+                "action": "set_position",
+                "value": int(cover_position.group(2)),
+            },
+        }
+    cover_action = _COVER_ACTION.search(raw)
+    if cover_action:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cover_action.group(2).strip(" ."),
+                "domain": "cover",
+                "action": cover_action.group(1).lower(),
             },
         }
     m = _TURN_ON.search(raw)
@@ -1479,7 +1628,7 @@ def _plex_player_hint(phrase: str | None) -> str:
         return "tv"
     if "infuse" in name or "firecore" in name:
         return "Infuse"
-    if "apple" in name:
+    if "apple" in name or name in {"atv", "appletv"}:
         return "Apple TV"
     if "lg" in name or "webos" in name:
         return "LG"
@@ -1490,12 +1639,53 @@ def _plex_player_hint(phrase: str | None) -> str:
     return phrase.strip() if phrase else "tv"
 
 
+def _play_reference_plan(target: str) -> dict[str, Any] | None:
+    """Resolve “put it on the TV” from the active server-side media card."""
+    widget = runtime.get_widget("media")
+    if widget is None:
+        return None
+    data = widget.data if isinstance(widget.data, dict) else {}
+    active = data.get("item") if isinstance(data.get("item"), dict) else None
+    items = [row for row in data.get("items") or [] if isinstance(row, dict)]
+    active_id = str(data.get("active_id") or "")
+    if active_id:
+        active = next(
+            (row for row in items if str(row.get("id") or "") == active_id),
+            active,
+        )
+    if not active:
+        return None
+    title = str(active.get("title") or "").strip()
+    if not title:
+        return None
+    player = _plex_player_hint(target)
+    args: dict[str, Any] = {"query": title}
+    rating_key = active.get("ratingKey")
+    tmdb_id = active.get("tmdbId")
+    if rating_key is not None and str(rating_key).strip():
+        args["ratingKey"] = str(rating_key)
+    if tmdb_id is not None:
+        args["tmdbId"] = tmdb_id
+
+    from hearth.tools.infuse import prefer_infuse_for_apple_tv
+
+    if prefer_infuse_for_apple_tv(player) or player.lower() in {"infuse", "firecore"}:
+        return {"tool": "infuse_play", "args": args}
+    args.pop("tmdbId", None)
+    args["player"] = player
+    return {"tool": "plex_play", "args": args}
+
+
 def _infuse_transport_plan(raw: str) -> dict[str, Any] | None:
     match = _INFUSE_TRANSPORT.search(raw)
-    if not match:
-        return None
-    # Action may be in group 1 or 2 depending on word order.
-    action_raw = (match.group(1) or match.group(2) or "").strip().lower()
+    if match:
+        # Action may be in group 1 or 2 depending on word order.
+        action_raw = (match.group(1) or match.group(2) or "").strip().lower()
+    else:
+        bare = _BARE_TRANSPORT.match(raw)
+        if not bare:
+            return None
+        action_raw = bare.group(1).strip().lower()
     action_raw = re.sub(r"\s+", " ", action_raw)
     mapping = {
         "pause": "pause",
@@ -1518,7 +1708,12 @@ def _infuse_transport_plan(raw: str) -> dict[str, Any] | None:
     # Bare "play …" with a title is handled elsewhere; only transport when ATV/Infuse is named.
     if action == "play" and _PLAY_ON_TV.search(raw):
         return None
-    if action == "play" and _PLAY_TITLE.search(raw) and "apple" not in raw.lower() and "infuse" not in raw.lower():
+    if (
+        action == "play"
+        and _PLAY_TITLE.search(raw)
+        and "apple" not in raw.lower()
+        and "infuse" not in raw.lower()
+    ):
         return None
     return {"tool": "infuse_transport", "args": {"action": action}}
 
@@ -1562,36 +1757,22 @@ def _turn_plan(phrase: str, *, on: bool) -> dict[str, Any]:
             "tool": "ha_media_control",
             "args": {"device": device, "action": "turn_on" if on else "turn_off"},
         }
+    if re.search(
+        r"\b(cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters)\b",
+        cleaned,
+    ):
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": cleaned,
+                "domain": "cover",
+                "action": "open" if on else "close",
+            },
+        }
     return {
         "tool": "ha_device_control",
         "args": {"device": cleaned, "action": "turn_on" if on else "turn_off"},
     }
-
-
-def _guess_entity(phrase: str, *, on: bool) -> dict[str, Any]:
-    name = re.sub(r"^(the|my|our)\s+", "", phrase.strip(), flags=re.I).lower().rstrip(".")
-    mapping = {
-        "living room": "light.living_room",
-        "living room lights": "light.living_room",
-        "kitchen": "light.kitchen",
-        "kitchen lights": "light.kitchen",
-        "office": "light.office",
-        "movie night": "scene.movie_night",
-        "good night": "scene.good_night",
-        "tv": "media_player.lg_webos_tv",
-        "lg": "media_player.lg_webos_tv",
-        "denon": "media_player.denon_avr_x3700h",
-        "avr": "media_player.denon_avr_x3700h",
-    }
-    entity = mapping.get(name, f"light.{name.replace(' ', '_')}")
-    domain = entity.split(".", 1)[0]
-    if domain == "scene":
-        service = "turn_on"
-    elif domain == "media_player":
-        service = "turn_on" if on else "turn_off"
-    else:
-        service = "turn_on" if on else "turn_off"
-    return {"domain": domain, "service": service, "entity_id": entity}
 
 
 _MEDIA_NOISE = re.compile(

@@ -285,3 +285,19 @@ class TelegramBotClient:
             "deleteWebhook",
             {"drop_pending_updates": bool(drop_pending_updates)},
         )
+
+    async def set_my_commands(
+        self,
+        commands: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """Publish the command menu users see in Telegram."""
+        cleaned = [
+            {
+                "command": str(row.get("command") or "").strip().lstrip("/")[:32],
+                "description": str(row.get("description") or "").strip()[:256],
+            }
+            for row in commands
+            if str(row.get("command") or "").strip()
+            and str(row.get("description") or "").strip()
+        ]
+        return await self._call("setMyCommands", {"commands": cleaned})

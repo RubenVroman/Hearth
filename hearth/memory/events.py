@@ -17,6 +17,10 @@ _NOTABLE = {
     "ha_device_control",
     "ha_media_control",
     "media_activity",
+    "house_ritual",
+    "house_climate",
+    "house_feeder",
+    "house_purifier",
     "radarr_add",
     "sonarr_add",
     "overseerr_request",
@@ -65,7 +69,7 @@ def on_tool_result(spec: ToolSpec, result: ToolResult) -> None:
 
 
 def _kind(name: str) -> str:
-    if name.startswith("ha_"):
+    if name.startswith("ha_") or name.startswith("house_"):
         return "ha"
     if name in {"radarr_add", "sonarr_add", "overseerr_request"}:
         return "media"
@@ -80,9 +84,10 @@ def _kind(name: str) -> str:
 
 def _title(name: str, data: dict[str, Any]) -> str:
     if name == "ha_call_service":
-        entity = data.get("entity") or {}
+        entity = data.get("entity") or data.get("state") or {}
         if isinstance(entity, dict):
-            return f"HA {entity.get('entity_id') or 'entity'} → {entity.get('state') or 'updated'}"
+            entity_id = entity.get("entity_id") or data.get("entity_id") or "entity"
+            return f"HA {entity_id} → {entity.get('state') or 'updated'}"
         return "HA service"
     if name == "radarr_add":
         added = data.get("added") or {}

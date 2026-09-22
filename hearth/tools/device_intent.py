@@ -1,13 +1,17 @@
-"""Deterministic phrases for the house-device tools (English + Dutch).
+"""Extra device phrases for the house tools (English + Dutch).
 
-Shared by the agent's local router (no OpenAI key) and the Telegram lane so
-"feed the cats" means the same thing however it arrives. Matching is
-intentionally narrow: on Telegram anything that is not recognised here falls
+``hearth.tools.house`` owns the exact-phrase table for rituals, climate,
+feeder, and purifier. This module is the wider net behind it: the words Ruben
+actually uses that the exact table misses — "airco" rather than "thermostat",
+Dutch phrasing, a bare temperature, portions, fan speeds, purifier presets.
+
+It produces plans for the *same* ``house_*`` tools, so there is one control
+path. Both ``house.voice_plan`` (chat and voice) and ``telegram_plan`` fall
+through to it, which keeps a phrase meaning the same thing on every surface.
+
+Matching is intentionally narrow: on Telegram anything unrecognised falls
 through to the Overseerr media search, so a bare "Cats" or "Feed" has to stay a
 film title rather than becoming a meal.
-
-The ``kind`` on each plan lines up with Jev's ``device_ask`` Choice options, so
-the two classifications can be compared instead of quietly disagreeing.
 """
 
 from __future__ import annotations
@@ -243,15 +247,17 @@ def match_device_phrase(text: str) -> DevicePlan | None:
         elif re.search(rf"\b(?:{_ON}|enable|start|resume|hervat)\b", raw, re.I):
             action = "on"
         else:
-            action = "status"
+            action = "status"  # reported, never changed, unless on/off was said
         return DevicePlan(
-            tool="pet_feeder_schedule",
+            tool="house_feeder",
             kind="feeder_schedule",
-            args={"action": action},
+            args={"action": f"schedule_{action}"},
         )
 
     if _FEEDER_STATUS.search(raw):
-        return DevicePlan(tool="house_devices", kind="device_status", args={})
+        return DevicePlan(
+            tool="house_feeder", kind="device_status", args={"action": "status"}
+        )
 
     if _FEED_NOW.search(raw):
         args: dict[str, Any] = {}
@@ -262,7 +268,7 @@ def match_device_phrase(text: str) -> DevicePlan | None:
             args["portions"] = 2
         if _FEED_FORCE.search(raw):
             args["force"] = True
-        return DevicePlan(tool="pet_feeder_feed", kind="feed_pets", args=args)
+        return DevicePlan(tool="house_feeder", kind="feed_pets", args={"action": "feed", **args})
 
     airco = _match_airco(raw)
     if airco is not None:
@@ -273,44 +279,44 @@ def match_device_phrase(text: str) -> DevicePlan | None:
         return purifier
 
     if _DEVICE_STATUS.search(raw):
-        return DevicePlan(tool="house_devices", kind="device_status", args={})
+        return DevicePlan(tool="house_comfort", kind="device_status", args={})
     return None
 
 
 def _match_airco(raw: str) -> DevicePlan | None:
     # Status first: "is the airco on?" is a question, not a power command.
     if _AIRCO_STATUS.search(raw):
-        return DevicePlan(tool="airco_control", kind="airco", args={"action": "status"})
+        return DevicePlan(tool="house_climate", kind="airco", args={"action": "status"})
 
     temperature = _AIRCO_TEMPERATURE.search(raw)
     if temperature:
         return DevicePlan(
-            tool="airco_control",
+            tool="house_climate",
             kind="airco",
-            args={"action": "set_temperature", "temperature": int(_first_group(temperature))},
+            args={"action": "set", "temperature": int(_first_group(temperature))},
         )
 
     # Fan speed before mode: "fan" is also an hvac mode name.
     fan = _AIRCO_FAN.search(raw)
     if fan:
         return DevicePlan(
-            tool="airco_control",
+            tool="house_climate",
             kind="airco",
-            args={"action": "set_fan_mode", "fan_mode": _canonical(fan.group(1))},
+            args={"action": "fan_mode", "fan_mode": _canonical(fan.group(1))},
         )
 
     mode = _AIRCO_MODE.search(raw)
     if mode:
         return DevicePlan(
-            tool="airco_control",
+            tool="house_climate",
             kind="airco",
-            args={"action": "set_mode", "mode": _canonical(mode.group(1))},
+            args={"action": _canonical(mode.group(1))},
         )
 
     power = _AIRCO_POWER.search(raw)
     if power:
         return DevicePlan(
-            tool="airco_control",
+            tool="house_climate",
             kind="airco",
             args={"action": "on" if _is_on(_first_group(power)) else "off"},
         )
@@ -320,13 +326,13 @@ def _match_airco(raw: str) -> DevicePlan | None:
 def _match_purifier(raw: str) -> DevicePlan | None:
     if _PURIFIER_STATUS.search(raw):
         return DevicePlan(
-            tool="air_purifier_control", kind="air_purifier", args={"action": "status"}
+            tool="house_purifier", kind="air_purifier", args={"action": "status"}
         )
 
     speed = _PURIFIER_SPEED.search(raw)
     if speed:
         return DevicePlan(
-            tool="air_purifier_control",
+            tool="house_purifier",
             kind="air_purifier",
             args={"action": "set_speed", "percentage": int(speed.group(1))},
         )
@@ -334,7 +340,7 @@ def _match_purifier(raw: str) -> DevicePlan | None:
     preset = _PURIFIER_PRESET.search(raw)
     if preset:
         return DevicePlan(
-            tool="air_purifier_control",
+            tool="house_purifier",
             kind="air_purifier",
             args={"action": "set_mode", "preset_mode": _canonical(preset.group(1))},
         )
@@ -342,7 +348,7 @@ def _match_purifier(raw: str) -> DevicePlan | None:
     power = _PURIFIER_POWER.search(raw)
     if power:
         return DevicePlan(
-            tool="air_purifier_control",
+            tool="house_purifier",
             kind="air_purifier",
             args={"action": "on" if _is_on(_first_group(power)) else "off"},
         )

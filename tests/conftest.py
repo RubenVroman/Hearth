@@ -113,8 +113,8 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     from hearth.jev import reset_client
 
     reset_client()
-    from hearth.tools.devices import reset_feed_history
     from hearth.tools.ha import reset_mock_house
+    from hearth.tools.house import reset_feed_history
 
     # Device tools mutate the fixture house in place (lights toggle, feeders
     # fire); each test starts from the paired-house baseline.

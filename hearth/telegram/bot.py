@@ -1,4 +1,4 @@
-"""Overseerr-first Telegram media bot.
+"""Telegram house bot with Overseerr-first media handling.
 
 **Jev-first media router:** every media-ish turn hits TypeSafe System One
 (Choice/Noul/Score) to pick a lane — exact title, known franchise, series-all,
@@ -35,7 +35,7 @@ from hearth.telegram.heuristics import (
     looks_like_confirm_no,
     looks_like_confirm_yes,
 )
-from hearth.telegram.house import HOUSE_HELP, detect_house_device, run_house_device
+from hearth.telegram.house import TelegramHouseCommands
 from hearth.telegram.media import (
     MAX_RESULTS,
     SERIES_MAX_RESULTS,
@@ -60,7 +60,7 @@ from hearth.telegram.media import (
     voice,
     without_ids,
 )
-from hearth.telegram.media.play import looks_like_play_command, play_on_tv
+from hearth.telegram.media.play import looks_like_play_command, play_lane_enabled, play_on_tv
 from hearth.telegram.media.watch_next import (
     WatchNext,
     looks_like_continue_pack,
@@ -68,6 +68,7 @@ from hearth.telegram.media.watch_next import (
 )
 
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
+from hearth.telegram.house import house_control_reply, looks_like_house_control
 from hearth.telegram.parse import parse_message
 from hearth.telegram.progress import (
     ProgressTracker,
@@ -82,13 +83,19 @@ from hearth.tools.arr import OverseerrError, overseerr
 log = logging.getLogger("hearth.telegram")
 
 HELP_TEXT = (
-    "Send a title and I’ll find it. I also do franchises (“all Harry Potters”), "
+    "House: /house, /lights, /lights <name> on|off|toggle|0-100, /scenes, "
+    "/scene <name>, /covers, /cover <name> open|close|stop|0-100. "
+    "Natural commands like “turn off kitchen lights”, “activate movie night”, "
+    "and “close the living room blind” work too. "
+    "If a name is unclear, list that device type first and use the exact name. "
+    "Media: send a title and I’ll find it. I also do franchises (“all Harry Potters”), "
     "editions (“LOTR extended”), people (“anything with Florence Pugh”), vibes "
     "(“scary under 2 hours”), lookalikes (“something like Arrival”), and several "
     "at once (“grab Inception and Interstellar”). Follow-ups work too: “the "
     "sequel”, “all of them”, “more like that”. Tap Get to request — I never "
-    "queue from chat alone. Commands: /search <title>, /status, /help.\n\n"
-    f"{HOUSE_HELP}"
+    "queue from chat alone. House controls, when Home Assistant has them: "
+    "house sleep, good morning, movie night mode, climate, feeder, purifier. "
+    "Media commands: /search <title>, /status. Help: /help."
 )
 _PENDING_GUESS_PREFIX = "guess:"
 
@@ -115,12 +122,14 @@ class TelegramMediaBot:
         *,
         overseerr_client: Any | None = None,
         progress: ProgressTracker | None = None,
+        house_commands: TelegramHouseCommands | None = None,
     ) -> None:
         self.store = store
         self.overseerr = overseerr_client or overseerr
         self.progress = progress or ProgressTracker(overseerr_client=self.overseerr)
         self.catalog = CatalogSearch(self.overseerr)
         self.memory = MediaMemory(store)
+        self.house = house_commands or TelegramHouseCommands()
         self.rate = RateLimiter()
         self.bot_user_id: int | None = None
         self._codec: CallbackCodec | None = None
@@ -205,6 +214,12 @@ class TelegramMediaBot:
         if view is None or not self._authorized(view.chat_id, view.user_id):
             return None
 
+        house_reply = await self.house.handle(view.text)
+        if house_reply is not None:
+            # A new explicit house command supersedes any stale media yes/no offer.
+            self._clear_pending_guess(view.chat_id)
+            return house_reply
+
         pending = self._get_pending_guess(view.chat_id)
         regex_yes = looks_like_confirm_yes(view.text)
         regex_no = looks_like_confirm_no(view.text)
@@ -260,13 +275,8 @@ class TelegramMediaBot:
                 return await self._confirm_context_pick(view, context, index=1)
             return BotReply(voice.which_one())
 
-        # House hardware (pet feeder, airco, purifier) before the catalog parser:
-        # these phrases would otherwise be searched for as film titles. Runs after
-        # the pending-guess block so a media confirm still wins, and executes
-        # through the tool registry so the shared Jev gate applies.
-        device = detect_house_device(view.text)
-        if device is not None:
-            return await run_house_device(device, view.text)
+        if looks_like_play_command(view.text):
+            return await self._play_from_context(view)
 
         _, query = parse_message(
             message,
@@ -276,6 +286,13 @@ class TelegramMediaBot:
         # Durable update ids in TelegramStore own transport deduplication. Do
         # not mark a message seen before its reply has actually been delivered:
         # a transient send failure must be able to replay the search.
+        # Explicit house control (rituals, climate, feeder, purifier). This
+        # sits above the chatter ignore list so "good morning" can run, and
+        # above the media router so it never becomes a title search. Bare
+        # "movie night" is still a catalog vibe and is not matched here.
+        if looks_like_house_control(view.text):
+            self._clear_pending_guess(view.chat_id)
+            return await house_control_reply(view.text)
         if query.action == "ignore":
             return None
         if query.action == "help":
@@ -310,6 +327,32 @@ class TelegramMediaBot:
             return await self._route_media_intent(view, query, intent, context)
         except CatalogUnavailable as exc:
             return BotReply(exc.message)
+
+    async def _play_from_context(self, view: MessageView) -> BotReply:
+        """Run the explicit Telegram Play follow-up without entering classify/search."""
+        if not play_lane_enabled():
+            return BotReply(
+                "Play-from-Telegram is turned off "
+                "(HEARTH_TELEGRAM_PLAY_LANE=false)."
+            )
+        context = self.memory.load(view.chat_id)
+        if context is None or not context.hits:
+            return BotReply(
+                "I don't have a title in this thread to put on the TV. "
+                "Send or pick one first."
+            )
+        if len(context.hits) > 1:
+            names = ", ".join(hit.label for hit in context.hits[:4])
+            return BotReply(f"Which one should I put on the TV? {names}.")
+        hit = context.hits[0]
+        outcome = await play_on_tv(
+            title=hit.title,
+            tmdb_id=hit.tmdb_id,
+            media_type=hit.media_type,
+            year=hit.year,
+            season=hit.season,
+        )
+        return BotReply(outcome.message)
 
     @staticmethod
     def _recent_context(context: ChatContext | None) -> list[str] | None:
@@ -1036,11 +1079,6 @@ class TelegramMediaBot:
                 return offered
             # Fall through to sequel when no stored watch-next exists.
             return await self._adjacent_entry_reply(view, context, direction="sequel")
-        if kind == "continue_pack":
-            offered = await self._offer_watch_next(view, context)
-            if offered is not None:
-                return offered
-            return await self._adjacent_entry_reply(view, context, direction="sequel")
         if kind in {"sequel", "prequel"}:
             if kind == "sequel":
                 offered = await self._offer_watch_next(view, context)
@@ -1683,18 +1721,13 @@ class TelegramMediaBot:
                 year = match.year
         if title == "that title":
             title = f"TMDB {tmdb_id}"
-        label = f"{title} ({year})" if year else title
         outcome = await play_on_tv(
             title=title,
             tmdb_id=tmdb_id,
             media_type=media_type,
             year=year,
         )
-        if outcome.ok:
-            text = voice.play_started(label)
-        else:
-            text = voice.play_failed(label, reason=outcome.message)
-        return BotReply(text, edit_message_id=message_id)
+        return BotReply(outcome.message, edit_message_id=message_id)
 
     async def _remember_watch_next_after_queue(
         self,

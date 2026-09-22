@@ -1520,6 +1520,72 @@ input,
   display: none !important;
 }
 
+.comfort-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.comfort-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+  line-height: 1.3;
+}
+
+button.comfort-chip {
+  cursor: pointer;
+  text-align: left;
+}
+
+button.comfort-chip:hover,
+button.comfort-chip:focus-visible {
+  border-color: rgba(224, 138, 58, 0.55);
+  color: var(--ember-2);
+}
+
+.comfort-chip.tone-good {
+  border-color: rgba(125, 255, 179, 0.35);
+}
+
+.comfort-chip.tone-fair {
+  border-color: rgba(255, 206, 138, 0.45);
+}
+
+.comfort-chip.tone-poor {
+  border-color: rgba(255, 180, 162, 0.55);
+}
+
+.comfort-read {
+  min-width: 0;
+}
+
+.comfort-nudge {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.comfort-nudge button {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ember-2);
+  font: inherit;
+  cursor: pointer;
+}
+
 .tiles {
   display: grid;
   gap: 10px;

@@ -12,10 +12,10 @@ from typing import Any, Literal
 
 # Choice options for house routing (cheap triage before gpt/tools).
 DOMAIN_CRITERIA: dict[str, str] = {
-    "lights": "Home Assistant lights, scenes, or room device on/off (not media).",
-    "devices": (
-        "Physical house appliances on Home Assistant that are not lights or "
-        "media: the pet feeder, the air conditioning, or the air purifier."
+    "lights": (
+        "Home Assistant lights, scenes, covers/blinds, climate, indoor air, feeders, "
+        "purifiers, or whole-home rituals (house sleep, good morning, cinema mode) "
+        "— not media playback."
     ),
     "media": (
         "Play/pause, TV/AVR/Apple TV/Infuse/Plex/Videoland, house media status, "
@@ -128,10 +128,9 @@ DEVICE_ASK_KINDS = tuple(DEVICE_ASK_CRITERIA.keys())
 # asked for it.
 DEVICE_TOOLS = frozenset(
     {
-        "pet_feeder_feed",
-        "pet_feeder_schedule",
-        "airco_control",
-        "air_purifier_control",
+        "house_feeder",
+        "house_climate",
+        "house_purifier",
     }
 )
 
@@ -143,7 +142,6 @@ RISK_LEVELS = (
 
 Domain = Literal[
     "lights",
-    "devices",
     "media",
     "food",
     "weather",

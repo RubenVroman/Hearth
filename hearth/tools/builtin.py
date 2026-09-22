@@ -7,16 +7,16 @@ from hearth.memory.tools import register_memory_tools
 from hearth.tools import files as workspace_files
 from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.cos import cos_configured, escalate, not_configured_message
-from hearth.tools.devices import (
-    climate_control,
-    discover_entities,
-    feed_pets,
-    feeder_schedule,
-    house_devices_status,
-    purifier_control,
-)
+from hearth.tools.devices import discover_entities
 from hearth.tools.docker import docker
 from hearth.tools.ha import ha
+from hearth.tools.house import (
+    climate_control,
+    comfort_snapshot,
+    feeder_control,
+    purifier_control,
+    run_ritual,
+)
 from hearth.tools.infuse import infuse
 from hearth.tools.media import house_media_inventory, media_activity, media_control
 from hearth.tools.plex import plex
@@ -53,6 +53,10 @@ async def _house_media(_args: dict[str, Any]) -> dict[str, Any]:
     return await house_media_inventory()
 
 
+async def _house_status(_args: dict[str, Any]) -> dict[str, Any]:
+    return await ha.house_status()
+
+
 async def _house_network(args: dict[str, Any]) -> dict[str, Any]:
     try:
         limit = int(args.get("limit") or 250)
@@ -74,10 +78,6 @@ async def _ha_device_control(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-async def _house_devices(_args: dict[str, Any]) -> dict[str, Any]:
-    return await house_devices_status()
-
-
 async def _discover_entities(args: dict[str, Any]) -> dict[str, Any]:
     keywords = args.get("keywords")
     if isinstance(keywords, str):
@@ -96,52 +96,58 @@ async def _discover_entities(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _optional_number(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
+async def _media_activity(args: dict[str, Any]) -> dict[str, Any]:
+    return await media_activity(str(args.get("activity") or ""))
+
+
+async def _house_ritual(args: dict[str, Any]) -> dict[str, Any]:
+    return await run_ritual(str(args.get("ritual") or ""))
+
+
+async def _house_climate(args: dict[str, Any]) -> dict[str, Any]:
+    temperature = args.get("temperature")
     try:
-        return float(value)
+        parsed = float(temperature) if temperature is not None and temperature != "" else None
     except (TypeError, ValueError):
-        return None
+        parsed = None
+    return await climate_control(
+        str(args.get("action") or "status"),
+        temperature=parsed,
+        entity=str(args.get("entity") or "") or None,
+        fan_mode=str(args.get("fan_mode") or "") or None,
+    )
 
 
-async def _pet_feeder_feed(args: dict[str, Any]) -> dict[str, Any]:
-    portions = _optional_number(args.get("portions"))
-    return await feed_pets(
-        portions=int(portions) if portions is not None else None,
-        feeder=str(args.get("feeder") or ""),
+async def _house_feeder(args: dict[str, Any]) -> dict[str, Any]:
+    portions = args.get("portions")
+    try:
+        count = int(portions) if portions is not None and portions != "" else None
+    except (TypeError, ValueError):
+        count = None
+    return await feeder_control(
+        str(args.get("action") or "feed"),
+        entity=str(args.get("entity") or "") or None,
+        portions=count,
         force=bool(args.get("force")),
     )
 
 
-async def _pet_feeder_schedule(args: dict[str, Any]) -> dict[str, Any]:
-    return await feeder_schedule(
-        str(args.get("action") or "status"),
-        feeder=str(args.get("feeder") or ""),
-    )
-
-
-async def _airco_control(args: dict[str, Any]) -> dict[str, Any]:
-    return await climate_control(
-        str(args.get("action") or "status"),
-        temperature=_optional_number(args.get("temperature")),
-        mode=str(args.get("mode") or ""),
-        fan_mode=str(args.get("fan_mode") or ""),
-        target=str(args.get("target") or ""),
-    )
-
-
-async def _air_purifier_control(args: dict[str, Any]) -> dict[str, Any]:
+async def _house_purifier(args: dict[str, Any]) -> dict[str, Any]:
+    percentage = args.get("percentage")
+    try:
+        parsed = float(percentage) if percentage is not None and percentage != "" else None
+    except (TypeError, ValueError):
+        parsed = None
     return await purifier_control(
         str(args.get("action") or "status"),
-        percentage=_optional_number(args.get("percentage")),
-        preset_mode=str(args.get("preset_mode") or args.get("mode") or ""),
-        target=str(args.get("target") or ""),
+        entity=str(args.get("entity") or "") or None,
+        percentage=parsed,
+        preset_mode=str(args.get("preset_mode") or "") or None,
     )
 
 
-async def _media_activity(args: dict[str, Any]) -> dict[str, Any]:
-    return await media_activity(str(args.get("activity") or ""))
+async def _house_comfort(_args: dict[str, Any]) -> dict[str, Any]:
+    return await comfort_snapshot()
 
 
 async def _ha_media(args: dict[str, Any]) -> dict[str, Any]:
@@ -634,8 +640,6 @@ def register_builtin_tools() -> None:
                     },
                     "entity_id": {"type": "string"},
                     "data": {"type": "object", "description": "Extra service data (brightness, volume_level, source)"},
-                    "confirm": {"type": "boolean"},
-                    "dry_run": {"type": "boolean"},
                 },
                 "required": ["domain", "service", "entity_id"],
             },
@@ -652,6 +656,19 @@ def register_builtin_tools() -> None:
             ),
             parameters={"type": "object", "properties": {}},
             handler=_house_media,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_status",
+            description=(
+                "One coherent Home Assistant snapshot of the house: which lights, switches, "
+                "fans and media players are on; climate readings; cover positions; unavailable "
+                "entities; and feeder last-fed only when HA exposes a matching entity. "
+                "Use for 'house status', 'what is on', or 'how is the house'."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_house_status,
         )
     )
     registry.register(
@@ -690,7 +707,8 @@ def register_builtin_tools() -> None:
                         "type": "string",
                         "description": (
                             "turn_on, turn_off, toggle, brightness, open, close, stop, "
-                            "set_temperature, set_percentage, activate, press, start, return_to_base"
+                            "set_position, set_temperature, set_percentage, activate, press, "
+                            "start, return_to_base"
                         ),
                     },
                     "domain": {"type": "string", "description": "Optional domain disambiguation."},
@@ -702,20 +720,6 @@ def register_builtin_tools() -> None:
                 "required": ["device", "action"],
             },
             handler=_ha_device_control,
-        )
-    )
-    registry.register(
-        ToolSpec(
-            name="house_devices",
-            description=(
-                "Status of the non-media house hardware in one read: the PetZero pet "
-                "feeder, the airco, and the KPT air purifier. Reports which Home "
-                "Assistant entity each one resolved to and whether it is still "
-                "unpaired. Use for “is the airco on”, “is the purifier running”, "
-                "“did the cats get fed”."
-            ),
-            parameters={"type": "object", "properties": {}},
-            handler=_house_devices,
         )
     )
     registry.register(
@@ -757,18 +761,107 @@ def register_builtin_tools() -> None:
     )
     registry.register(
         ToolSpec(
-            name="pet_feeder_feed",
+            name="media_activity",
             description=(
-                "Dispense a meal now on the PetZero feeder via Home Assistant. Use for "
-                "“feed the cats”, “geef de katten eten”, “give them a portion”. Runs "
-                "immediately — no confirm step. Dispensed food cannot be taken back, so "
-                "a repeat inside the cooldown is refused unless force=true; pass force "
-                "only when the user clearly asked for a second portion. If the feeder is "
-                "not paired, say so and call ha_discover_entities — never pretend it fed."
+                "Prepare or stop the receiver-centric living-room chain. movie_night activates "
+                "the configured HA movie-night scene and prepares Apple TV; apple_tv wakes Denon, "
+                "LG, selects the Denon Apple TV input, then wakes Apple TV; tv selects TV Audio; "
+                "off powers Apple TV, LG, then Denon down. Runs immediately."
             ),
             parameters={
                 "type": "object",
                 "properties": {
+                    "activity": {
+                        "type": "string",
+                        "enum": ["movie_night", "apple_tv", "tv", "off"],
+                    }
+                },
+                "required": ["activity"],
+            },
+            handler=_media_activity,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_ritual",
+            description=(
+                "Whole-home ritual: sleep (lights down + cinema off), morning (lights up, "
+                "cinema stays dark), or movie (dim lights + Denon/LG/Apple TV path). "
+                "Uses a matching Home Assistant scene when one exists, otherwise lights "
+                "and the existing media chain. Runs immediately."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "ritual": {
+                        "type": "string",
+                        "enum": ["sleep", "morning", "movie"],
+                        "description": (
+                            "sleep = house sleep / good night, morning = good morning, "
+                            "movie = movie night."
+                        ),
+                    }
+                },
+                "required": ["ritual"],
+            },
+            handler=_house_ritual,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_climate",
+            description=(
+                "Read or adjust a Home Assistant climate entity (setpoint, warmer, cooler, "
+                "hvac mode). Discovers climate.* unless HA_CLIMATE_ENTITY is set. "
+                "No Tuya client — HA services only. Runs immediately."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": (
+                            "status, on, warmer, cooler, set, fan_mode, off, heat, cool, "
+                            "dry, fan_only, auto"
+                        ),
+                    },
+                    "temperature": {
+                        "type": "number",
+                        "description": "Setpoint in °C for action=set.",
+                    },
+                    "fan_mode": {
+                        "type": "string",
+                        "description": "Fan speed for action=fan_mode, e.g. low, medium, high, auto.",
+                    },
+                    "entity": {"type": "string", "description": "Optional climate entity_id."},
+                    "said": {
+                        "type": "string",
+                        "description": "The user's verbatim words, so Jev can gate the request.",
+                    },
+                },
+                "required": ["action"],
+            },
+            handler=_house_climate,
+            jev_gated=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_feeder",
+            description=(
+                "Press the pet feeder through Home Assistant (button.press or switch.turn_on). "
+                "Discovers feeder/voeder entities unless HA_FEEDER_ENTITY is set. "
+                "Runs immediately."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": (
+                            "feed, status, schedule_status, schedule_on, or schedule_off"
+                        ),
+                    },
                     "portions": {
                         "type": "integer",
                         "description": (
@@ -776,122 +869,44 @@ def register_builtin_tools() -> None:
                             "HA_PET_FEEDER_MAX_PORTIONS)."
                         ),
                     },
-                    "feeder": {
-                        "type": "string",
-                        "description": "Optional feeder name when the house has more than one.",
-                    },
                     "force": {
                         "type": "boolean",
                         "description": "Feed again inside the anti-double-feed cooldown.",
                     },
+                    "entity": {"type": "string", "description": "Optional feeder entity_id."},
                     "said": {
                         "type": "string",
                         "description": "The user's verbatim words, so Jev can gate the request.",
                     },
                 },
             },
-            handler=_pet_feeder_feed,
+            handler=_house_feeder,
             jev_gated=True,
         )
     )
     registry.register(
         ToolSpec(
-            name="pet_feeder_schedule",
+            name="house_purifier",
             description=(
-                "Read or switch the feeder's automatic feeding schedule, when Home "
-                "Assistant exposes one. action=status|on|off. Most Tuya feeders keep "
-                "meal times on the device — if the schedule is not exposed, say that "
-                "plainly instead of implying the timetable changed."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "description": "status (default), on, or off"},
-                    "feeder": {"type": "string"},
-                    "said": {
-                        "type": "string",
-                        "description": "The user's verbatim words, so Jev can gate the request.",
-                    },
-                },
-            },
-            handler=_pet_feeder_schedule,
-            jev_gated=True,
-        )
-    )
-    registry.register(
-        ToolSpec(
-            name="airco_control",
-            description=(
-                "Control the air conditioning through Home Assistant (Tuya climate "
-                "entity). action=status|on|off|set_temperature|set_mode|set_fan_mode. "
-                "“airco 21” is set_temperature with temperature=21 — that also starts a "
-                "unit that is off. Modes are matched against what the entity actually "
-                "reports (cool, heat, dry, fan_only, auto); an unsupported mode is "
-                "refused with the real list. Runs immediately — no confirm step."
+                "Switch the air purifier through Home Assistant (fan or switch). "
+                "Discovers purifier entities unless HA_PURIFIER_ENTITY is set. "
+                "Runs immediately."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "status, on, off, set_temperature, set_mode, set_fan_mode",
+                        "description": "status, on, off, toggle, set_speed, or set_mode",
                     },
-                    "temperature": {
-                        "type": "number",
-                        "description": "Target temperature in °C (clamped to the unit's range).",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "description": "cool, heat, dry, fan_only, auto, or off.",
-                    },
-                    "fan_mode": {"type": "string", "description": "low, medium, high, auto, …"},
-                    "target": {
-                        "type": "string",
-                        "description": (
-                            "Optional entity/room name when there is more than one unit."
-                        ),
-                    },
-                    "said": {
-                        "type": "string",
-                        "description": "The user's verbatim words, so Jev can gate the request.",
-                    },
-                },
-            },
-            handler=_airco_control,
-            jev_gated=True,
-        )
-    )
-    registry.register(
-        ToolSpec(
-            name="air_purifier_control",
-            description=(
-                "Control the KPT air purifier through Home Assistant (Tuya fan entity). "
-                "action=status|on|off|toggle|set_speed|set_mode. set_speed takes "
-                "percentage; set_mode takes preset_mode (auto, sleep, turbo, …) matched "
-                "against what the entity reports. If the purifier paired as a plain "
-                "switch it only does on and off — say so rather than faking a speed. "
-                "Runs immediately — no confirm step."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "description": "status, on, off, toggle, set_speed, set_mode",
-                    },
+                    "entity": {"type": "string"},
                     "percentage": {
                         "type": "number",
-                        "description": "Fan speed 0–100 for set_speed.",
+                        "description": "Fan percentage for set_speed, or when turning on.",
                     },
                     "preset_mode": {
                         "type": "string",
-                        "description": "Preset name for set_mode, e.g. auto, sleep, turbo.",
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": (
-                            "Optional entity/room name when there is more than one unit."
-                        ),
+                        "description": "Preset for set_mode, e.g. auto, sleep, turbo.",
                     },
                     "said": {
                         "type": "string",
@@ -899,29 +914,19 @@ def register_builtin_tools() -> None:
                     },
                 },
             },
-            handler=_air_purifier_control,
+            handler=_house_purifier,
             jev_gated=True,
         )
     )
     registry.register(
         ToolSpec(
-            name="media_activity",
+            name="house_comfort",
             description=(
-                "Prepare or stop the receiver-centric living-room chain. apple_tv wakes Denon, LG, "
-                "selects the Denon Apple TV input, then wakes Apple TV; tv selects TV Audio; off "
-                "powers Apple TV, LG, then Denon down. Runs immediately."
+                "Snapshot of Home Assistant climate and indoor air quality "
+                "(PM2.5, CO₂, AQI, and similar sensors), plus purifier and feeder state."
             ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "activity": {
-                        "type": "string",
-                        "enum": ["apple_tv", "tv", "off"],
-                    }
-                },
-                "required": ["activity"],
-            },
-            handler=_media_activity,
+            parameters={"type": "object", "properties": {}},
+            handler=_house_comfort,
         )
     )
     registry.register(
@@ -954,8 +959,6 @@ def register_builtin_tools() -> None:
                     "media_content_id": {"type": "string"},
                     "media_content_type": {"type": "string"},
                     "is_volume_muted": {"type": "boolean"},
-                    "confirm": {"type": "boolean"},
-                    "dry_run": {"type": "boolean"},
                 },
                 "required": ["device", "action"],
             },
