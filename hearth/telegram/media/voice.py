@@ -353,6 +353,20 @@ def needs_openai() -> str:
     )
 
 
+def lane_failed() -> str:
+    # Silence after a real ask is the worst possible answer, so an unexpected
+    # lane failure still says what happened and that nothing was queued.
+    return (
+        "That search broke on my side — nothing was queued. Try again, or send "
+        "the exact title and I'll go straight at it."
+    )
+
+
+def rate_limited(*, wait_s: int, ask: str = "") -> str:
+    heard = f" I heard “{ask}”, so send it again then." if ask else ""
+    return f"Give me about {wait_s}s — too many searches in a row.{heard}"
+
+
 
 
 # --- verbosity ---------------------------------------------------------------
@@ -404,6 +418,20 @@ def play_failed(label: str, *, reason: str) -> str:
     return f"Couldn't play {label} — {clean}"
 
 
+def play_needs_title() -> str:
+    return (
+        "I've lost which title that button was for, so I won't guess at the TV. "
+        "Search it again and tap Play on the fresh card."
+    )
+
+
+def play_nothing_to_play() -> str:
+    return (
+        "Nothing on screen to play. Search a title first — I'll offer Play on "
+        "anything that's already on Plex."
+    )
+
+
 def status_ack(label: str, *, state: str) -> str:
     if state == "pending":
         return f"{label} is still waiting for approval — nothing to Get again."
@@ -427,6 +455,8 @@ __all__ = [
     "terse_pick",
     "play_started",
     "play_failed",
+    "play_needs_title",
+    "play_nothing_to_play",
     "status_ack",
     "watch_next_nudge",
     "watch_next_offer",
@@ -445,6 +475,7 @@ __all__ = [
     "franchise_header",
     "house_pick_header",
     "kind_word",
+    "lane_failed",
     "list_ask",
     "lost_context",
     "mood_header",
@@ -457,6 +488,7 @@ __all__ = [
     "pending_expired",
     "person_header",
     "queued",
+    "rate_limited",
     "series_header",
     "similar_header",
     "tap_get_hint",

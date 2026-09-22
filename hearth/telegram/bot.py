@@ -11,6 +11,7 @@ mediaId, never by re-searching the title.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -356,7 +357,14 @@ class TelegramMediaBot:
         rate_key = (view.chat_id, view.user_id)
         if not self.rate.allow(rate_key):
             wait = max(1, math.ceil(self.rate.retry_after(rate_key)))
-            return BotReply(f"Too many searches. Try again in about {wait} seconds.")
+            # Echo the ask back: a dropped turn the user has to retype from
+            # memory is the part that actually stings.
+            return BotReply(
+                voice.rate_limited(
+                    wait_s=wait,
+                    ask=query.display_label() if query.title else "",
+                )
+            )
 
         # New search/guess replaces any sticky yes/no offer.
         self._clear_pending_guess(view.chat_id)
@@ -376,6 +384,14 @@ class TelegramMediaBot:
             return await self._route_media_intent(view, query, intent, context)
         except CatalogUnavailable as exc:
             return BotReply(exc.message)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # A routed media turn is never silent. Retrying an unexpected lane
+            # failure three times just delays the same outcome behind silence,
+            # so answer honestly instead of letting the update dead-letter.
+            log.exception("telegram media lane failed for intent %s", intent.kind)
+            return BotReply(voice.lane_failed())
 
     async def _play_from_context(self, view: MessageView) -> BotReply:
         """Run the explicit Telegram Play follow-up without entering classify/search."""
@@ -1646,6 +1662,10 @@ class TelegramMediaBot:
 
         view = MessageView(chat_id=chat_id, message_id=message_id, user_id=user_id, text="")
         context = self.memory.load(chat_id)
+        # Card rendering stored the title/year behind this exact button, which
+        # outlives the chat context. Without it a Play tap on an older card
+        # reaches Infuse as "TMDB 603" and cannot possibly succeed.
+        stored = self.store.get_callback_media(data) or {}
         try:
             if action.action == ACTION_SIMILAR and action.tmdb_id:
                 anchor_label = ""
@@ -1685,6 +1705,7 @@ class TelegramMediaBot:
                     media_type=action.media_type or "movie",
                     tmdb_id=int(action.tmdb_id),
                     context=context,
+                    stored=stored,
                 )
             if action.action == ACTION_STATUS and action.tmdb_id:
                 return self._status_ack_callback(
@@ -1692,6 +1713,7 @@ class TelegramMediaBot:
                     media_type=action.media_type or "movie",
                     tmdb_id=int(action.tmdb_id),
                     context=context,
+                    stored=stored,
                 )
         except CatalogUnavailable as exc:
             return BotReply(str(getattr(exc, "message", exc)), edit_message_id=message_id)
@@ -1751,6 +1773,28 @@ class TelegramMediaBot:
             offer_dismiss=True,
         )
 
+    @staticmethod
+    def _card_subject(
+        tmdb_id: int,
+        *,
+        context: ChatContext | None,
+        stored: Mapping[str, Any] | None,
+    ) -> tuple[str, int | None, int | None]:
+        """Title, year and last-known status for the card a button belongs to.
+
+        The chat context is freshest, but it expires long before the signed
+        button does; the per-button payload is the durable fallback.
+        """
+        if context is not None:
+            match = next((hit for hit in context.hits if hit.tmdb_id == tmdb_id), None)
+            if match is not None:
+                return match.title, match.year, match.media_status
+        if stored and _integer(stored.get("tmdb_id")) == tmdb_id:
+            title = str(stored.get("title") or "").strip()
+            if title:
+                return title, _integer(stored.get("year")), None
+        return "", None, None
+
     def _status_ack_callback(
         self,
         message_id: int,
@@ -1758,14 +1802,11 @@ class TelegramMediaBot:
         media_type: str,
         tmdb_id: int,
         context: ChatContext | None,
+        stored: Mapping[str, Any] | None = None,
     ) -> BotReply:
-        label = "that title"
-        status = None
-        if context is not None:
-            match = next((h for h in context.hits if h.tmdb_id == tmdb_id), None)
-            if match is not None:
-                label = match.label
-                status = match.media_status
+        del media_type  # the label carries the kind already
+        title, year, status = self._card_subject(tmdb_id, context=context, stored=stored)
+        label = _display_title(title, year) if title else "that title"
         state = "downloading" if status == 3 else "pending" if status == 2 else "in flight"
         return BotReply(voice.status_ack(label, state=state), edit_message_id=message_id)
 
@@ -1777,16 +1818,17 @@ class TelegramMediaBot:
         media_type: str,
         tmdb_id: int,
         context: ChatContext | None,
+        stored: Mapping[str, Any] | None = None,
     ) -> BotReply:
-        title = "that title"
-        year: int | None = None
-        if context is not None:
-            match = next((h for h in context.hits if h.tmdb_id == tmdb_id), None)
-            if match is not None:
-                title = match.title
-                year = match.year
-        if title == "that title":
-            title = f"TMDB {tmdb_id}"
+        del chat_id  # playback targets the house TV, not the chat
+        title, year, _status = self._card_subject(tmdb_id, context=context, stored=stored)
+        if not title:
+            # Honest fail: guessing a title here would send Infuse chasing
+            # "TMDB 603" and report a failure the user cannot act on.
+            return BotReply(
+                voice.play_needs_title(),
+                edit_message_id=message_id,
+            )
         outcome = await play_on_tv(
             title=title,
             tmdb_id=tmdb_id,
