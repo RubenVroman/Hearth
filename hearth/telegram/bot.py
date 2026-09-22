@@ -84,6 +84,8 @@ log = logging.getLogger("hearth.telegram")
 HELP_TEXT = (
     "House: /house, /lights, /lights <name> on|off|toggle|0-100, /scenes, "
     "/scene <name>, /covers, /cover <name> open|close|stop|0-100. "
+    "Natural commands like “turn off kitchen lights”, “activate movie night”, "
+    "and “close the living room blind” work too. "
     "If a name is unclear, list that device type first and use the exact name. "
     "Media: send a title and I’ll find it. I also do franchises (“all Harry Potters”), "
     "editions (“LOTR extended”), people (“anything with Florence Pugh”), vibes "
@@ -1037,11 +1039,6 @@ class TelegramMediaBot:
             if offered is not None:
                 return offered
             # Fall through to sequel when no stored watch-next exists.
-            return await self._adjacent_entry_reply(view, context, direction="sequel")
-        if kind == "continue_pack":
-            offered = await self._offer_watch_next(view, context)
-            if offered is not None:
-                return offered
             return await self._adjacent_entry_reply(view, context, direction="sequel")
         if kind in {"sequel", "prequel"}:
             if kind == "sequel":

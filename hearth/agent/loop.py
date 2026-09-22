@@ -417,8 +417,10 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
         names = [c.get("name") or c.get("id") for c in containers]
         return f"Containers{mock}: " + ", ".join(str(n) for n in names)
     if name == "ha_call_service":
-        entity = (data.get("entity") or {}).get("entity_id") or data.get("entity")
-        return f"Done{mock}: {entity} is {(data.get('entity') or {}).get('state', 'updated')}."
+        state = data.get("entity") or data.get("state") or {}
+        state = state if isinstance(state, dict) else {}
+        entity = state.get("entity_id") or data.get("entity_id") or "the device"
+        return f"Done{mock}: {entity} is {state.get('state', 'updated')}."
     if name == "house_media":
         return str(data.get("speak") or f"House media{mock}.")
     if name == "house_status":
@@ -786,6 +788,18 @@ _SOURCE = re.compile(
     r"\b(?:set|switch)\s+(?:the\s+)?(tv|lg|avr|denon|receiver)\s+(?:to\s+|source\s+|input\s+)(.+)$",
     re.I,
 )
+_LIGHT_BRIGHTNESS = re.compile(
+    r"\b(?:dim|set)\s+(?:the\s+)?(.+?\blights?)\s+"
+    r"(?:to|at)\s+(\d{1,3})%?\s*[.?!]*$",
+    re.I,
+)
+_SCENE_ACTIVATE = re.compile(
+    r"\b(?:activate|run|start|turn\s+on)\s+(?:the\s+)?(?:"
+    r"scene\s+(.+?)|(.+?)\s+scene|"
+    r"(movie\s+night|good\s+night)"
+    r")\s*[.?!]*$",
+    re.I,
+)
 _COVER_ACTION = re.compile(
     r"\b(open|close|stop)\s+(?:the\s+)?"
     r"(.+?(?:cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters))"
@@ -1066,6 +1080,28 @@ def route_intent(text: str) -> dict[str, Any] | None:
                 "device": device,
                 "action": "select_source",
                 "source": source.group(2).strip(" ."),
+            },
+        }
+    light_brightness = _LIGHT_BRIGHTNESS.search(raw)
+    if light_brightness:
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": light_brightness.group(1).strip(" ."),
+                "domain": "light",
+                "action": "brightness",
+                "value": int(light_brightness.group(2)),
+            },
+        }
+    scene = _SCENE_ACTIVATE.search(raw)
+    if scene:
+        target = next((group for group in scene.groups() if group), "")
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": target.strip(" ."),
+                "domain": "scene",
+                "action": "activate",
             },
         }
     cover_position = _COVER_POSITION.search(raw)

@@ -55,6 +55,66 @@ _COVER_POSITION = re.compile(
     r"^(?P<target>.+?)\s+(?:(?:to|at|position)\s+)?(?P<value>\d{1,3})%?$",
     re.I,
 )
+_NATURAL_HOUSE_STATUS = re.compile(
+    r"^(?:"
+    r"(?:house|home)\s+(?:status|snapshot|check)|"
+    r"status\s+of\s+(?:the\s+)?(?:house|home)|"
+    r"how(?:'s| is)\s+(?:the\s+)?(?:house|home)|"
+    r"what(?:'s| is)\s+on\s+(?:in|around|at)\s+(?:the\s+)?(?:house|home)"
+    r")\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_LIGHT_LIST = re.compile(
+    r"^(?:lights?|list\s+(?:the\s+)?lights?|show\s+(?:me\s+)?(?:the\s+)?lights?|"
+    r"what\s+lights?\s+are\s+on|which\s+lights?\s+are\s+on)\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_LIGHT_ACTION = re.compile(
+    r"^(?:(?:turn|switch)\s+(?P<power>on|off)|(?P<toggle>toggle))\s+"
+    r"(?:the\s+)?(?P<target>.+\blights?)\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_LIGHT_LEVEL = re.compile(
+    r"^(?:dim|set)\s+(?:the\s+)?(?P<target>.+\blights?)\s+"
+    r"(?:to|at)\s+(?P<value>\d{1,3})%?\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_SCENE_LIST = re.compile(
+    r"^(?:scenes?|list\s+(?:the\s+)?scenes?|show\s+(?:me\s+)?(?:the\s+)?scenes?)"
+    r"\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_SCENE_ACTION = re.compile(
+    r"^(?:activate|run|start|turn\s+on)\s+(?:the\s+)?(?:"
+    r"scene\s+(?P<prefix>.+?)|(?P<suffix>.+?)\s+scene|"
+    r"(?P<known>movie\s+night|good\s+night)"
+    r")\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_COVER_LIST = re.compile(
+    r"^(?:covers?|blinds?|shades?|curtains?|shutters?|"
+    r"(?:list|show)(?:\s+me)?\s+(?:the\s+)?"
+    r"(?:covers?|blinds?|shades?|curtains?|shutters?))\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_COVER_ACTION = re.compile(
+    r"^(?P<action>open|close|stop)\s+(?:the\s+)?"
+    r"(?P<target>.+?(?:cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters))"
+    r"\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_COVER_POWER = re.compile(
+    r"^(?:turn|switch)\s+(?P<action>on|off)\s+(?:the\s+)?"
+    r"(?P<target>.+?(?:cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters))"
+    r"\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_COVER_POSITION = re.compile(
+    r"^(?:set|move)\s+(?:the\s+)?"
+    r"(?P<target>.+?(?:cover|blind|blinds|shade|shades|curtain|curtains|shutter|shutters))"
+    r"\s+(?:to|at)\s+(?P<value>\d{1,3})%?\s*[.?!]*$",
+    re.I,
+)
 
 _LIGHT_USAGE = (
     "Use /lights to list lights, or /lights <name> on|off|toggle|0-100. "
@@ -83,10 +143,11 @@ def _target(value: str) -> str:
 
 
 def parse_house_command(text: str) -> HouseCommand | None:
-    """Parse only explicit house slash commands; media parsing stays untouched."""
-    match = _COMMAND.match((text or "").strip())
+    """Parse strict house commands before the media router sees the message."""
+    raw = (text or "").strip()
+    match = _COMMAND.match(raw)
     if match is None:
-        return None
+        return _parse_natural_house_command(raw)
     name = match.group("name").casefold()
     argument = (match.group("argument") or "").strip()
 
@@ -137,6 +198,101 @@ def parse_house_command(text: str) -> HouseCommand | None:
             args["value"] = value
         return HouseCommand("control_cover", "ha_device_control", args)
 
+    return None
+
+
+def _parse_natural_house_command(text: str) -> HouseCommand | None:
+    if not text:
+        return None
+    text = re.sub(
+        r"^(?:please\s+|(?:can|could|would)\s+you\s+)",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+    if _NATURAL_HOUSE_STATUS.fullmatch(text):
+        return HouseCommand("house_status", "house_status", {})
+    if _NATURAL_LIGHT_LIST.fullmatch(text):
+        return HouseCommand("list_lights", "ha_list_entities", {"domain": "light"})
+    if _NATURAL_SCENE_LIST.fullmatch(text):
+        return HouseCommand("list_scenes", "ha_list_entities", {"domain": "scene"})
+    if _NATURAL_COVER_LIST.fullmatch(text):
+        return HouseCommand("list_covers", "ha_list_entities", {"domain": "cover"})
+
+    light = _NATURAL_LIGHT_ACTION.fullmatch(text)
+    if light:
+        target = _target(light.group("target"))
+        power = str(light.group("power") or "").casefold()
+        action = f"turn_{power}" if power else "toggle"
+        return HouseCommand(
+            "control_light",
+            "ha_device_control",
+            {"device": target, "domain": "light", "action": action},
+        )
+    light_level = _NATURAL_LIGHT_LEVEL.fullmatch(text)
+    if light_level:
+        value = int(light_level.group("value"))
+        if value <= 100:
+            return HouseCommand(
+                "control_light",
+                "ha_device_control",
+                {
+                    "device": _target(light_level.group("target")),
+                    "domain": "light",
+                    "action": "brightness",
+                    "value": value,
+                },
+            )
+        return HouseCommand("control_light", "ha_device_control", {}, _LIGHT_USAGE)
+
+    scene = _NATURAL_SCENE_ACTION.fullmatch(text)
+    if scene:
+        target = next((group for group in scene.groups() if group), "")
+        return HouseCommand(
+            "activate_scene",
+            "ha_device_control",
+            {"device": _target(target), "domain": "scene", "action": "activate"},
+        )
+
+    cover = _NATURAL_COVER_ACTION.fullmatch(text)
+    if cover:
+        return HouseCommand(
+            "control_cover",
+            "ha_device_control",
+            {
+                "device": _target(cover.group("target")),
+                "domain": "cover",
+                "action": cover.group("action").casefold(),
+            },
+        )
+    cover_power = _NATURAL_COVER_POWER.fullmatch(text)
+    if cover_power:
+        return HouseCommand(
+            "control_cover",
+            "ha_device_control",
+            {
+                "device": _target(cover_power.group("target")),
+                "domain": "cover",
+                "action": "open"
+                if cover_power.group("action").casefold() == "on"
+                else "close",
+            },
+        )
+    cover_position = _NATURAL_COVER_POSITION.fullmatch(text)
+    if cover_position:
+        value = int(cover_position.group("value"))
+        if value <= 100:
+            return HouseCommand(
+                "control_cover",
+                "ha_device_control",
+                {
+                    "device": _target(cover_position.group("target")),
+                    "domain": "cover",
+                    "action": "set_position",
+                    "value": value,
+                },
+            )
+        return HouseCommand("control_cover", "ha_device_control", {}, _COVER_USAGE)
     return None
 
 

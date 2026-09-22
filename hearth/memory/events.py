@@ -80,9 +80,10 @@ def _kind(name: str) -> str:
 
 def _title(name: str, data: dict[str, Any]) -> str:
     if name == "ha_call_service":
-        entity = data.get("entity") or {}
+        entity = data.get("entity") or data.get("state") or {}
         if isinstance(entity, dict):
-            return f"HA {entity.get('entity_id') or 'entity'} → {entity.get('state') or 'updated'}"
+            entity_id = entity.get("entity_id") or data.get("entity_id") or "entity"
+            return f"HA {entity_id} → {entity.get('state') or 'updated'}"
         return "HA service"
     if name == "radarr_add":
         added = data.get("added") or {}

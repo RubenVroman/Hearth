@@ -257,18 +257,40 @@ class HomeAssistant:
         payload = {"entity_id": entity_id, **(data or {})}
         if not self.live:
             result = _mock.call_service(domain, service, entity_id, data)
-            return {"mode": "mock", "attempts": 1, **result}
+            state = result.get("entity") if isinstance(result.get("entity"), dict) else None
+            return {
+                "mode": "mock",
+                "attempts": 1,
+                **result,
+                "entity_id": entity_id,
+                "state": state,
+            }
         try:
             response, attempts = await self._request(
                 "POST", f"/api/services/{domain}/{service}", json=payload
             )
-            return {
+            changed = response.json()
+            state = _state_from_service_response(changed, entity_id)
+            state_result: dict[str, Any] = {}
+            if state is None:
+                state_result = await self.get_state(entity_id)
+                state = state_result.get("state") if state_result.get("ok") else None
+            result: dict[str, Any] = {
                 "mode": "live",
                 "ok": True,
                 "accepted": True,
                 "attempts": attempts,
-                "changed": response.json(),
+                "entity_id": entity_id,
+                "changed": changed,
+                "state": state,
             }
+            # Keep the historical ``entity`` key for UI/memory consumers while
+            # exposing the clearer ``state`` key used by newer control tools.
+            if state is not None:
+                result["entity"] = state
+            elif state_result.get("error"):
+                result["state_warning"] = str(state_result["error"])
+            return result
         except Exception as exc:  # noqa: BLE001
             return {
                 "mode": "live",
@@ -1304,6 +1326,31 @@ def _error_text(exc: Exception) -> str:
 
 def _role_label(role: str) -> str:
     return "Apple TV" if role == "apple_tv" else "LG TV"
+
+
+def _state_from_service_response(
+    payload: Any,
+    entity_id: str,
+) -> dict[str, Any] | None:
+    """Extract HA's changed-state row before spending another REST round-trip."""
+    rows: list[Any]
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        nested = payload.get("changed_states") or payload.get("states")
+        rows = nested if isinstance(nested, list) else [payload]
+    else:
+        return None
+    match = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("entity_id") or "").casefold() == entity_id.casefold()
+        ),
+        None,
+    )
+    return _summarize_one(match) if match is not None else None
 
 
 def _summarize(states: list[dict[str, Any]]) -> list[dict[str, Any]]:

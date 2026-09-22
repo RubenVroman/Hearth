@@ -4,8 +4,8 @@ Jev is **not** an LLM and does not generate text. It returns typed **Choice / No
 
 1. A cheap gate **before** the OpenAI agent tool loop (cancel / CoS / refuse).
 2. The **first-class Telegram media intent router** — every media-ish Telegram turn hits Jev first, which picks one of eleven lanes; OpenAI is only called when Jev says `descriptive_riddle` / `needs_llm` (or confidence is too low).
-3. A gate before explicit Telegram house commands (`/lights`, `/scene`, `/cover`,
-   `/house`) call the shared Home Assistant tools.
+3. A gate before Telegram house commands (slash commands and strict natural
+   light/scene/cover/status forms) call the shared Home Assistant tools.
 
 ## Defaults (safe)
 

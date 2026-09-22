@@ -486,6 +486,8 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
 
 - **House commands:** `/house`; `/lights`; `/lights <name> on|off|toggle|0-100`;
   `/scenes`; `/scene <name>`; `/covers`; `/cover <name> open|close|stop|0-100`.
+  Strict natural forms such as `turn off kitchen lights`, `activate movie night`,
+  `close the living room blind`, and `house status` take the same pre-media path.
   List first when a friendly name is unclear. Hearth returns actionable HA recovery copy instead
   of claiming a failed write worked. The command menu is published with `setMyCommands` on startup.
 - **Jev media router** (when `HEARTH_JEV_ENABLED=true` + `TYPESAFE_API_KEY`): classifies each ask before search. Missing key / errors / low confidence fail open to local heuristics that route the same lanes. See `docs/jev.md`.

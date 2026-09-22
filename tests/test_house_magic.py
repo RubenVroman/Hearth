@@ -238,6 +238,23 @@ def test_local_router_handles_house_status_and_covers() -> None:
             "action": "close",
         },
     }
+    assert route_intent("dim the kitchen lights to 45%") == {
+        "tool": "ha_device_control",
+        "args": {
+            "device": "kitchen lights",
+            "domain": "light",
+            "action": "brightness",
+            "value": 45,
+        },
+    }
+    assert route_intent("activate movie night") == {
+        "tool": "ha_device_control",
+        "args": {
+            "device": "movie night",
+            "domain": "scene",
+            "action": "activate",
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -279,6 +296,36 @@ def test_local_router_handles_house_status_and_covers() -> None:
                 "value": 55,
             },
         ),
+        (
+            "turn off kitchen lights",
+            "control_light",
+            "ha_device_control",
+            {"device": "kitchen lights", "domain": "light", "action": "turn_off"},
+        ),
+        (
+            "dim living room lights to 25%",
+            "control_light",
+            "ha_device_control",
+            {
+                "device": "living room lights",
+                "domain": "light",
+                "action": "brightness",
+                "value": 25,
+            },
+        ),
+        (
+            "activate movie night",
+            "activate_scene",
+            "ha_device_control",
+            {"device": "movie night", "domain": "scene", "action": "activate"},
+        ),
+        (
+            "open the living room blind",
+            "control_cover",
+            "ha_device_control",
+            {"device": "living room blind", "domain": "cover", "action": "open"},
+        ),
+        ("house status", "house_status", "house_status", {}),
     ],
 )
 def test_house_command_parser(
@@ -369,3 +416,100 @@ async def test_telegram_house_write_is_jev_gated_in_enforce_mode(
         assert state.data["state"]["state"] == "on"
     finally:
         store.close()
+
+
+class _SearchSpy:
+    live = True
+
+    def __init__(self) -> None:
+        self.search_calls: list[str] = []
+
+    async def search(self, query: str, *, page: int = 1) -> dict[str, Any]:
+        self.search_calls.append(query)
+        return {"ok": True, "mode": "live", "results": []}
+
+
+@pytest.mark.asyncio
+async def test_telegram_natural_house_phrases_never_hit_media_search(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "telegram_bot_token", "123:test-token")
+    monkeypatch.setattr(settings, "telegram_chat_ids", str(CHAT_ID))
+    monkeypatch.setattr(settings, "telegram_user_ids", str(USER_ID))
+    provider = _SearchSpy()
+    store = TelegramStore(tmp_path / "natural-house-commands.db")
+    bot = TelegramMediaBot(store, overseerr_client=provider)
+    try:
+        replies = [
+            await bot.handle_message(_message("turn off kitchen lights", message_id=10)),
+            await bot.handle_message(_message("activate movie night", message_id=11)),
+            await bot.handle_message(_message("close the living room blind", message_id=12)),
+            await bot.handle_message(_message("house status", message_id=13)),
+        ]
+        assert all(reply is not None for reply in replies)
+        assert provider.search_calls == []
+        assert "off" in replies[0].text
+        assert "activated" in replies[1].text
+        assert "closed" in replies[2].text
+        assert "House status" in replies[3].text
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_raw_ha_service_returns_post_call_state_and_sensible_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hearth.agent.loop import _pretty_tool
+    from hearth.memory.events import _title
+
+    class _Response:
+        @staticmethod
+        def json() -> list[dict[str, Any]]:
+            return []
+
+    client = HomeAssistant()
+
+    async def _request(
+        method: str,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+    ) -> tuple[_Response, int]:
+        assert method == "POST"
+        assert path == "/api/services/light/turn_on"
+        assert json == {"entity_id": "light.kitchen"}
+        return _Response(), 1
+
+    async def _state(entity_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "mode": "live",
+            "state": {
+                "entity_id": entity_id,
+                "state": "on",
+                "attributes": {"friendly_name": "Kitchen"},
+            },
+        }
+
+    monkeypatch.setattr(settings, "ha_token", "live-test-token")
+    monkeypatch.setattr(client, "_request", _request)
+    monkeypatch.setattr(client, "get_state", _state)
+
+    result = await client.call_service("light", "turn_on", "light.kitchen")
+
+    assert result["ok"] is True
+    assert result["entity_id"] == "light.kitchen"
+    assert result["state"]["state"] == "on"
+    assert result["entity"]["entity_id"] == "light.kitchen"
+    assert _pretty_tool("ha_call_service", result) == "Done: light.kitchen is on."
+    assert _title("ha_call_service", result) == "HA light.kitchen → on"
+
+
+def test_routine_ha_tool_schemas_do_not_advertise_noop_confirm_flags() -> None:
+    tools = {tool["name"]: tool for tool in registry.list_public()}
+    for name in ("ha_call_service", "ha_media_control"):
+        properties = tools[name]["parameters"]["properties"]
+        assert "confirm" not in properties
+        assert "dry_run" not in properties
