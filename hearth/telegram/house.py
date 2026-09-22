@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from hearth.agent.registry import ToolRegistry, registry
-from hearth.jev import evaluate_message, log_shadow_outcome
+from hearth.jev import authorize_tool
 from hearth.telegram.models import BotReply
 from hearth.tools.device_intent import match_device_phrase
 from hearth.tools.house import (
@@ -364,36 +364,21 @@ class TelegramHouseCommands:
         if command.error:
             return BotReply(command.error)
 
-        verdict = await evaluate_message(text)
-        if verdict.action == "block_cancel":
-            log_shadow_outcome(
-                verdict,
-                channel="telegram_house",
-                tools=[],
-                outcome="blocked_cancel",
-            )
+        # The command already names its tool, so it is authorized by the shared
+        # tool gate rather than by a second, coarser Jev call of its own.
+        decision = await authorize_tool(
+            command.tool,
+            command.args,
+            said=text,
+            channel="telegram_house",
+        )
+        if decision.denied:
             return BotReply(
-                "I didn't change the house because that looked like a cancel or refusal. "
-                "Send the full command again if you meant to run it."
-            )
-        if verdict.action == "escalate_cos":
-            log_shadow_outcome(
-                verdict,
-                channel="telegram_house",
-                tools=[],
-                outcome="redirected_cos",
-            )
-            return BotReply(
-                "That doesn't look like a Home Assistant command. Use /help for house examples."
+                f"{decision.message} The house is unchanged — "
+                "send the full command again if you meant it."
             )
 
         result = await self.tools.call(command.tool, command.args)
-        log_shadow_outcome(
-            verdict,
-            channel="telegram_house",
-            tools=[command.tool],
-            outcome="ok" if result.ok else "failed",
-        )
         return BotReply(_format_result(command, result.ok, result.data))
 
 
@@ -656,19 +641,13 @@ def telegram_plan(text: str) -> dict[str, Any] | None:
 
 
 async def house_control_reply(text: str) -> BotReply:
-    """Run one house tool after the Jev gate, then offer a one-tap keyboard."""
-    verdict = await evaluate_message(text)
+    """Run one house tool after the shared Jev gate, then offer a one-tap keyboard."""
     plan = telegram_plan(text) or {"tool": "house_comfort", "args": {}}
-    log_shadow_outcome(
-        verdict,
-        channel="telegram_house",
-        tools=[str(plan.get("tool") or "")],
-        outcome=verdict.action,
-    )
-    if verdict.action == "block_cancel":
-        return BotReply("Okay — leaving the house as it is.")
-    if verdict.action == "escalate_cos":
-        return BotReply("That's outside the house controls I can run from here.")
+    tool = str(plan.get("tool") or "")
+    args = plan.get("args") if isinstance(plan.get("args"), dict) else {}
+    decision = await authorize_tool(tool, args, said=text, channel="telegram_house")
+    if decision.denied:
+        return BotReply(f"{decision.message} The house is unchanged.")
 
     result = await _run(plan)
     speak = str(result.get("speak") or result.get("error") or "Done.")

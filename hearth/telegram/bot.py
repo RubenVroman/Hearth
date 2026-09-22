@@ -433,6 +433,16 @@ class TelegramMediaBot:
             # Only Plex can play it and it is not there yet. Saying so beats
             # handing Infuse a title it will never find and reporting its error.
             return BotReply(voice.play_not_on_plex(_display_title(hit.title, hit.year)))
+        # A typed "put it on the TV" is an instruction, not a tap, so it goes
+        # through the full write gate rather than claiming explicit_confirm.
+        decision = await authorize_tool(
+            "plex_play",
+            {"query": hit.title, "media_type": hit.media_type},
+            said=view.text,
+            channel="telegram_play_text",
+        )
+        if decision.denied:
+            return BotReply(decision.message)
         outcome = await play_on_tv(
             title=hit.title,
             tmdb_id=hit.tmdb_id,
@@ -543,6 +553,16 @@ class TelegramMediaBot:
                 f"Telegram and Overseerr are configured. "
                 f"Tracking {len(self.progress.active)} approved request(s)."
             )
+        # The health probe leaves the house, so it is authorized like any other
+        # media_status read rather than being a second, ungoverned path out.
+        decision = await authorize_tool(
+            "overseerr_search",
+            {"probe": "provider"},
+            said="/status",
+            channel="telegram_status",
+        )
+        if decision.denied:
+            return BotReply(decision.message)
         try:
             probe = await probe_method()
         except OverseerrError:

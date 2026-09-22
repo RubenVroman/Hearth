@@ -292,8 +292,11 @@ async def test_hard_stop_blocks_a_get_tap_without_queueing(
 ) -> None:
     bot, provider = bot_and_overseerr
     _enforce(monkeypatch)
-    set_client(FakeSystemOne(_payload(domain="refuse", domain_conf=0.96)))
+    # Catalog reads share the turn gate, so arm the Get button under an allow
+    # verdict first — then refuse before the tap that must be blocked.
+    set_client(FakeSystemOne(_payload()))
     data = await _get_button(bot)
+    set_client(FakeSystemOne(_payload(domain="refuse", domain_conf=0.96)))
 
     reply = await bot.handle_callback(_callback(data))
 
@@ -309,8 +312,9 @@ async def test_a_denied_get_button_is_not_spent(
     """A refused tap must leave the button usable, not brick it forever."""
     bot, provider = bot_and_overseerr
     _enforce(monkeypatch)
-    set_client(FakeSystemOne(_payload(domain="refuse", domain_conf=0.96)))
+    set_client(FakeSystemOne(_payload()))
     data = await _get_button(bot)
+    set_client(FakeSystemOne(_payload(domain="refuse", domain_conf=0.96)))
 
     denied = await bot.handle_callback(_callback(data))
     assert denied is not None
