@@ -470,7 +470,14 @@ class TelegramMediaBot:
         if intent.kind in {"mood", "house_pick"} and settings.telegram_mood_lane:
             return await self._mood_reply(view, intent)
 
-        if intent.kind == "describe" or intent.needs_llm:
+        if intent.kind == "describe":
+            return await self._guess_reply(view, query, intent=intent)
+
+        # Jev can flag needs_llm on a turn whose lane is still fully
+        # deterministic ("all Harry Potters", "LOTR extended"). Spend the gpt
+        # hop only when there is genuinely no seed to search with, otherwise a
+        # low-confidence verdict throws away a seed we already hold.
+        if intent.needs_llm and not (intent.search_title or query.title):
             return await self._guess_reply(view, query, intent=intent)
 
         if intent.kind == "series_all":
