@@ -258,7 +258,10 @@ async def test_telegram_quick_replies_and_jev_gate(
             }
         )
         assert blocked is not None
-        assert "leaving the house" in blocked.text.lower()
+        # The shared tool gate owns the deny copy now; what matters is that it
+        # says nothing ran and that nothing did.
+        assert "won't run that" in blocked.text.lower()
+        assert "house is unchanged" in blocked.text.lower()
         assert (await _entity("light.kitchen"))["state"] == kitchen_before
     finally:
         store.close()

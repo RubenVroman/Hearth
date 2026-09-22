@@ -411,7 +411,10 @@ async def test_telegram_house_write_is_jev_gated_in_enforce_mode(
     try:
         reply = await bot.handle_message(_message("/lights kitchen off"))
         assert reply is not None
-        assert "didn't change" in reply.text
+        # Deny copy comes from the shared tool gate; the invariant is that the
+        # light is still on and the user is told the house did not change.
+        assert "won't run that" in reply.text
+        assert "house is unchanged" in reply.text
         state = await registry.call("ha_get_state", {"entity_id": "light.kitchen"})
         assert state.data["state"]["state"] == "on"
     finally:

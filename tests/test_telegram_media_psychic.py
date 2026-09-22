@@ -19,6 +19,7 @@ import pytest
 from hearth.config import settings
 from hearth.jev import reset_client, set_client
 from hearth.jev.schema import parse_answers
+from hearth.jev.tools import is_write_tool, lane_for_tool
 from hearth.telegram.bot import TelegramMediaBot
 from hearth.telegram.callbacks import ACTION_CODES, ACTION_TITLE, CallbackCodec
 from hearth.telegram.media.cards import CardRenderer
@@ -29,7 +30,6 @@ from hearth.telegram.media.moods import detect_mood, looks_like_vague_ask, names
 from hearth.telegram.media.people import detect_person_ask
 from hearth.telegram.media.play import PlayOutcome
 from hearth.telegram.media.ranking import apply_exclusions
-from hearth.jev.tools import is_write_tool, lane_for_tool
 from hearth.telegram.models import MediaHit
 from hearth.telegram.store import TelegramStore
 
@@ -974,14 +974,55 @@ def test_catalog_reads_are_not_classified_as_writes() -> None:
 
 
 def test_the_telegram_surface_has_no_second_gate() -> None:
-    """Every Jev entry point under telegram/ is the shared one."""
+    """Every Jev entry point under telegram/ is the shared one.
+
+    Two things would fork the gate: calling System One directly, or reaching
+    for the coarse ``evaluate_message`` governance gate to decide a tool that
+    the caller can already name. Both are failures, not style.
+    """
     root = Path(__file__).resolve().parents[1] / "hearth" / "telegram"
-    offenders: list[str] = []
+    direct_client: list[str] = []
+    coarse_gate: list[str] = []
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
+        where = str(path.relative_to(root))
         if "system_one(" in text or "SystemOneClient(" in text:
-            offenders.append(str(path.relative_to(root)))
-    assert offenders == [], f"telegram must not call System One directly: {offenders}"
+            direct_client.append(where)
+        if "evaluate_message(" in text:
+            coarse_gate.append(where)
+    assert direct_client == [], f"telegram must not call System One directly: {direct_client}"
+    assert coarse_gate == [], (
+        "telegram tool paths must use authorize_tool, not the coarse gate: "
+        f"{coarse_gate}"
+    )
+
+
+def test_the_media_router_hands_its_verdict_to_the_tool_gate() -> None:
+    """Routing and authorization must share one answer set, not fetch two."""
+    classify = (
+        Path(__file__).resolve().parents[1]
+        / "hearth"
+        / "telegram"
+        / "media"
+        / "classify.py"
+    ).read_text(encoding="utf-8")
+    assert "adopt_verdict(verdict)" in classify
+
+
+async def test_a_house_command_costs_one_typed_call(
+    bot_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """House control used to pay for its own governance call on top of the gate."""
+    _enforce(monkeypatch)
+    bot = bot_factory(FakeOverseerr())
+    fake = FakeSystemOne(_gate_payload(domain="house"))
+    set_client(fake)
+
+    reply = await bot.handle_message(_message("/lights kitchen 35"))
+
+    assert reply is not None
+    assert len(fake.calls) == 1, f"one house turn must cost one typed call, not {len(fake.calls)}"
 
 
 def test_an_unresolvable_lane_falls_back_to_search_not_to_prose() -> None:
