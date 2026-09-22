@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Any
 
 MOCK_HA_STATES: list[dict[str, Any]] = [
@@ -54,6 +55,7 @@ MOCK_HA_STATES: list[dict[str, Any]] = [
             "temperature_unit": "°C",
             "hvac_action": "heating",
             "humidity": 48,
+            "hvac_modes": ["off", "heat", "cool", "auto"],
         },
     },
     {
@@ -92,6 +94,38 @@ MOCK_HA_STATES: list[dict[str, Any]] = [
             "app_name": None,
             "source_list": ["Infuse", "Plex", "TV"],
             "volume_level": 0.4,
+        },
+    },
+    {
+        "entity_id": "fan.air_purifier",
+        "state": "off",
+        "attributes": {
+            "friendly_name": "Air purifier",
+            "percentage": 0,
+            "device_class": "air_purifier",
+        },
+    },
+    {
+        "entity_id": "button.pet_feeder",
+        "state": "2026-09-22T07:00:00+00:00",
+        "attributes": {"friendly_name": "Pet feeder"},
+    },
+    {
+        "entity_id": "sensor.living_room_pm25",
+        "state": "8",
+        "attributes": {
+            "friendly_name": "Living room PM2.5",
+            "device_class": "pm25",
+            "unit_of_measurement": "µg/m³",
+        },
+    },
+    {
+        "entity_id": "sensor.living_room_co2",
+        "state": "640",
+        "attributes": {
+            "friendly_name": "Living room CO₂",
+            "device_class": "carbon_dioxide",
+            "unit_of_measurement": "ppm",
         },
     },
 ]
@@ -2454,6 +2488,9 @@ class MockHouse:
     def __init__(self) -> None:
         self.states: list[dict[str, Any]] = deepcopy(MOCK_HA_STATES)
 
+    def reset(self) -> None:
+        self.states = deepcopy(MOCK_HA_STATES)
+
     def list_states(self, domain: str | None = None) -> list[dict[str, Any]]:
         if not domain:
             return deepcopy(self.states)
@@ -2480,7 +2517,11 @@ class MockHouse:
         if domain == "light":
             if service == "turn_on":
                 state["state"] = "on"
-                if "brightness" in data:
+                if "brightness_pct" in data:
+                    pct = max(0.0, min(100.0, float(data["brightness_pct"])))
+                    state["attributes"]["brightness_pct"] = pct
+                    state["attributes"]["brightness"] = int(round(pct / 100 * 255))
+                elif "brightness" in data:
                     state["attributes"]["brightness"] = data["brightness"]
                 elif "brightness_pct" in data:
                     percent = max(0.0, min(100.0, float(data["brightness_pct"])))
@@ -2555,6 +2596,40 @@ class MockHouse:
                 if content.startswith("infuse://"):
                     state["attributes"]["app_name"] = "Infuse"
                     state["attributes"]["media_title"] = content.split("?")[0]
+        elif domain == "climate":
+            if service == "set_temperature" and "temperature" in data:
+                state["attributes"]["temperature"] = float(data["temperature"])
+            elif service == "set_hvac_mode" and data.get("hvac_mode"):
+                mode = str(data["hvac_mode"])
+                state["state"] = mode
+                state["attributes"]["hvac_action"] = "off" if mode == "off" else mode
+        elif domain == "fan":
+            if service == "turn_on":
+                state["state"] = "on"
+                if "percentage" in data:
+                    state["attributes"]["percentage"] = data["percentage"]
+                elif not state["attributes"].get("percentage"):
+                    state["attributes"]["percentage"] = 40
+            elif service == "turn_off":
+                state["state"] = "off"
+                state["attributes"]["percentage"] = 0
+            elif service == "toggle":
+                state["state"] = "off" if state["state"] == "on" else "on"
+            elif service == "set_percentage" and "percentage" in data:
+                pct = max(0.0, min(100.0, float(data["percentage"])))
+                state["attributes"]["percentage"] = pct
+                state["state"] = "on" if pct else "off"
+        elif domain == "switch":
+            if service == "turn_on":
+                state["state"] = "on"
+            elif service == "turn_off":
+                state["state"] = "off"
+            elif service == "toggle":
+                state["state"] = "off" if state["state"] == "on" else "on"
+        elif domain == "button" and service == "press":
+            stamped = datetime.now(timezone.utc).isoformat()
+            state["state"] = stamped
+            state["attributes"]["last_pressed"] = stamped
         elif domain == "webostv":
             # HA webostv.command / webostv.button target the media_player entity.
             # Mock accepts them so Videoland deep-link attempts stay fixture-safe.

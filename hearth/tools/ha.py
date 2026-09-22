@@ -69,6 +69,7 @@ _KEEP_ATTRS = (
     "last_feed",
     "last_feeding",
     "last_feeding_time",
+    "hvac_modes",
 )
 
 
@@ -164,6 +165,14 @@ class HomeAssistant:
     async def aclose(self) -> None:
         await self._drop_client()
         self._entity_cache.clear()
+
+    def reset_mock(self) -> None:
+        """Restore fixture entities. No effect once a live HA token is set."""
+        _mock.reset()
+
+    def set_mock_states(self, states: list[dict[str, Any]]) -> None:
+        """Replace fixture rows. Tests use this; live HA ignores it."""
+        _mock.states = states
 
     def diagnostics(self) -> dict[str, Any]:
         return {

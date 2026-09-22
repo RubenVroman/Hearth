@@ -11,6 +11,7 @@ from hearth.jev import evaluate_message, log_shadow_outcome
 from hearth.memory import store as memory_store
 from hearth.memory.summarize import maybe_summarize
 from hearth.runtime import runtime
+from hearth.tools.house import voice_plan
 from hearth import widgets as widget_bus
 
 MAX_TURNS = 8
@@ -249,7 +250,8 @@ class AgentLoop:
         used: list[dict[str, Any]] = []
         if plan is None:
             reply = (
-                "I can drive the house — lights, scenes, covers, house status, Denon, LG TV, "
+                "I can drive the house — lights, scenes, covers, house status, house sleep, "
+                "good morning, movie night, climate, the feeder, the purifier, Denon, LG TV, "
                 "play titles in Infuse on the "
                 "Apple TV (or Plex on LG), grab movies in Radarr or shows in Sonarr, check "
                 "download progress, request "
@@ -332,6 +334,17 @@ def _format_tool_reply(tools: list[dict[str, Any]]) -> str:
 
 def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     mock = " (mock)" if data.get("mode") == "mock" else ""
+    if name in {
+        "house_ritual",
+        "house_climate",
+        "house_feeder",
+        "house_purifier",
+        "house_comfort",
+    }:
+        spoken = str(data.get("speak") or "").strip()
+        if spoken:
+            return spoken if mock == "" else f"{spoken.rstrip('.')}{mock}."
+        return None
     if name == "plex_now_playing":
         sessions = data.get("sessions") or []
         if not sessions:
@@ -1001,6 +1014,9 @@ def route_intent(text: str) -> dict[str, Any] | None:
         }
     if _FOOD.search(raw) or (_FOOD_CART.search(raw) and _FOOD_ORDER.search(raw)):
         return _food_plan(raw)
+    house = voice_plan(raw)
+    if house:
+        return house
     if _MEMORY_LIST.search(raw):
         return {"tool": "memory_list", "args": {"kind": "preferences"}}
     if _MEMORY_SEARCH.search(raw):
@@ -1032,6 +1048,19 @@ def route_intent(text: str) -> dict[str, Any] | None:
         return {"tool": "house_status", "args": {}}
     if _NETWORK_STATUS.search(raw):
         return {"tool": "house_network", "args": {}}
+    # Explicit "activate/start/turn on movie night" is the scene command from
+    # house controls. Bare "movie night" stays the receiver-centric activity.
+    scene = _SCENE_ACTIVATE.search(raw)
+    if scene:
+        target = next((group for group in scene.groups() if group), "")
+        return {
+            "tool": "ha_device_control",
+            "args": {
+                "device": target.strip(" ."),
+                "domain": "scene",
+                "action": "activate",
+            },
+        }
     if _MOVIE_NIGHT.search(raw):
         return {"tool": "media_activity", "args": {"activity": "movie_night"}}
     if _LIGHTS_DOWN.search(raw):
@@ -1144,17 +1173,6 @@ def route_intent(text: str) -> dict[str, Any] | None:
                 "domain": "light",
                 "action": "brightness",
                 "value": int(light_brightness.group(2)),
-            },
-        }
-    scene = _SCENE_ACTIVATE.search(raw)
-    if scene:
-        target = next((group for group in scene.groups() if group), "")
-        return {
-            "tool": "ha_device_control",
-            "args": {
-                "device": target.strip(" ."),
-                "domain": "scene",
-                "action": "activate",
             },
         }
     cover_position = _COVER_POSITION.search(raw)

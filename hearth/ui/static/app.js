@@ -1837,7 +1837,7 @@ function renderRooms(payload) {
   }
   setEmpty("lights-block", lights.childElementCount === 0);
   setEmpty("scenes-block", scenes.childElementCount === 0);
-  setEmpty("rail-rooms", lights.childElementCount === 0 && scenes.childElementCount === 0 && ($("memory-list")?.childElementCount || 0) === 0);
+  syncRoomsRail();
   setEmpty("media-block", media.childElementCount === 0);
   setEmpty("rail-media", $("now-playing-block")?.classList.contains("is-empty") && media.childElementCount === 0);
 }
@@ -1865,11 +1865,110 @@ function renderMemory(payload) {
     list.appendChild(li);
   }
   setEmpty("memory-block", list.childElementCount === 0);
+  syncRoomsRail();
+}
+
+function comfortHasChips() {
+  return ($("comfort-chips")?.childElementCount || 0) > 0;
+}
+
+function syncRoomsRail() {
   const roomsEmpty =
     ($("lights")?.childElementCount || 0) === 0 &&
     ($("scenes")?.childElementCount || 0) === 0 &&
-    list.childElementCount === 0;
+    ($("memory-list")?.childElementCount || 0) === 0 &&
+    !comfortHasChips();
   setEmpty("rail-rooms", roomsEmpty);
+}
+
+function renderComfort(payload) {
+  const root = $("comfort-chips");
+  if (!root) return;
+  root.innerHTML = "";
+  const data = payload || {};
+
+  for (const ritual of data.rituals || []) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "comfort-chip";
+    btn.textContent = ritual.label || ritual.id;
+    btn.addEventListener("click", () =>
+      invoke("house_ritual", { ritual: ritual.id, confirm: true }).then(refresh)
+    );
+    root.appendChild(btn);
+  }
+
+  for (const climate of data.climate || []) {
+    const chip = document.createElement("div");
+    chip.className = "comfort-chip";
+    const read = document.createElement("span");
+    read.className = "comfort-read";
+    const current = climate.current != null ? climate.current : "–";
+    const target = climate.target != null ? `→${climate.target}` : "";
+    const unit = climate.unit || "°C";
+    read.textContent = `${climate.name || "Climate"} ${current}${target}${unit} · ${climate.state || ""}`;
+    const nudges = document.createElement("span");
+    nudges.className = "comfort-nudge";
+    for (const [label, action] of [
+      ["−", "cooler"],
+      ["+", "warmer"],
+    ]) {
+      const nudge = document.createElement("button");
+      nudge.type = "button";
+      nudge.textContent = label;
+      nudge.setAttribute("aria-label", action === "warmer" ? "Warmer" : "Cooler");
+      nudge.addEventListener("click", () =>
+        invoke("house_climate", {
+          action,
+          entity: climate.entity_id,
+          confirm: true,
+        }).then(refresh)
+      );
+      nudges.appendChild(nudge);
+    }
+    chip.appendChild(read);
+    chip.appendChild(nudges);
+    root.appendChild(chip);
+  }
+
+  for (const air of data.air || []) {
+    const chip = document.createElement("span");
+    const tone = air.tone && air.tone !== "info" ? ` tone-${air.tone}` : "";
+    chip.className = `comfort-chip${tone}`;
+    const unit = air.unit ? ` ${air.unit}` : "";
+    chip.textContent = `${air.label || air.name} ${air.state}${unit}`;
+    root.appendChild(chip);
+  }
+
+  for (const unit of data.purifiers || []) {
+    const on = String(unit.state || "").toLowerCase() === "on";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "comfort-chip";
+    btn.textContent = `${unit.name || "Purifier"} · ${on ? "on" : "off"}`;
+    btn.addEventListener("click", () =>
+      invoke("house_purifier", {
+        action: on ? "off" : "on",
+        entity: unit.entity_id,
+        confirm: true,
+      }).then(refresh)
+    );
+    root.appendChild(btn);
+  }
+
+  for (const feeder of data.feeders || []) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "comfort-chip";
+    btn.textContent = `Feed ${feeder.name || "feeder"}`;
+    btn.addEventListener("click", () =>
+      invoke("house_feeder", { action: "feed", entity: feeder.entity_id, confirm: true }).then(refresh)
+    );
+    root.appendChild(btn);
+  }
+
+  setEmpty("comfort-block", root.childElementCount === 0);
+  syncRoomsRail();
 }
 
 function phoneUi() {
@@ -2035,17 +2134,19 @@ async function talk(message, confirm = false) {
 }
 
 async function refresh() {
-  const [status, playing, rooms, transcript, memory] = await Promise.all([
+  const [status, playing, rooms, transcript, memory, comfort] = await Promise.all([
     api("/api/status"),
     api("/api/now-playing"),
     api("/api/rooms"),
     api("/api/transcript"),
     api("/api/memory"),
+    api("/api/comfort"),
   ]);
   renderStatus(status);
   renderNowPlaying(playing);
   renderRooms(rooms);
   renderMemory(memory);
+  renderComfort(comfort);
   if ($("log").childElementCount === 0) {
     for (const line of transcript.lines || []) {
       if (line.kind === "delta") continue;

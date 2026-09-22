@@ -13,8 +13,9 @@ from typing import Any, Literal
 # Choice options for house routing (cheap triage before gpt/tools).
 DOMAIN_CRITERIA: dict[str, str] = {
     "lights": (
-        "Home Assistant lights, scenes, covers/blinds, or routine room device "
-        "control/status (not media)."
+        "Home Assistant lights, scenes, covers/blinds, climate, indoor air, feeders, "
+        "purifiers, or whole-home rituals (house sleep, good morning, cinema mode) "
+        "— not media playback."
     ),
     "media": (
         "Play/pause, TV/AVR/Apple TV/Infuse/Plex/Videoland, house media status, "
