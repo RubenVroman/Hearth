@@ -59,6 +59,9 @@ class MoodSpec:
     release_date_gte: str = ""
     release_date_lte: str = ""
     sort_by: str = "popularity.desc"
+    # Set when the same words also read as a catalog title ("Date Night"), so
+    # the card can offer a one-tap correction instead of guessing silently.
+    ambiguous_title: str = ""
 
     @property
     def present(self) -> bool:

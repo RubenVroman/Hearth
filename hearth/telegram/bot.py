@@ -11,6 +11,7 @@ mediaId, never by re-searching the title.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -18,7 +19,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from hearth.config import settings
-from hearth.jev import evaluate_telegram_media, log_shadow_outcome, noul_high
+from hearth.jev import evaluate_message, evaluate_telegram_media, log_shadow_outcome, noul_high
 from hearth.telegram.callbacks import (
     ACTION_DISMISS,
     ACTION_MORE,
@@ -26,6 +27,7 @@ from hearth.telegram.callbacks import (
     ACTION_SERIES,
     ACTION_SIMILAR,
     ACTION_STATUS,
+    ACTION_TITLE,
     CallbackCodec,
     CallbackError,
     is_action_callback,
@@ -60,12 +62,10 @@ from hearth.telegram.media import (
     voice,
     without_ids,
 )
+from hearth.telegram.media.memory import speaker_scope, storage_key
+from hearth.telegram.media.phrases import is_known_franchise
 from hearth.telegram.media.play import looks_like_play_command, play_lane_enabled, play_on_tv
-from hearth.telegram.media.watch_next import (
-    WatchNext,
-    looks_like_continue_pack,
-    pick_next_in_order,
-)
+from hearth.telegram.media.watch_next import WatchNext, pick_next_in_order
 
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
 from hearth.telegram.house import house_control_reply, looks_like_house_control
@@ -78,6 +78,11 @@ from hearth.telegram.progress import (
 )
 from hearth.telegram.safeguards import RateLimiter, authorized
 from hearth.telegram.store import TelegramStore
+from hearth.butler.decision import decide_butler_tool
+from hearth.butler.nudge import queue_shelf_aside
+from hearth.butler.phrases import classify_house_phrase
+from hearth.butler.scenes import activate_preset
+from hearth.butler.shelf import shelf_snapshot
 from hearth.tools.arr import OverseerrError, overseerr
 
 log = logging.getLogger("hearth.telegram")
@@ -92,12 +97,20 @@ HELP_TEXT = (
     "editions (“LOTR extended”), people (“anything with Florence Pugh”), vibes "
     "(“scary under 2 hours”), lookalikes (“something like Arrival”), and several "
     "at once (“grab Inception and Interstellar”). Follow-ups work too: “the "
-    "sequel”, “all of them”, “more like that”. Tap Get to request — I never "
-    "queue from chat alone. House controls, when Home Assistant has them: "
-    "house sleep, good morning, movie night mode, climate, feeder, purifier. "
-    "Media commands: /search <title>, /status. Help: /help."
+    "sequel”, “all of them”, “more like that”. Ask “what’s on tonight” for "
+    "what’s already on Plex, or “quiet hours” for the lights. "
+    "Tap Get to request — I never queue from chat alone. House controls, when "
+    "Home Assistant has them: house sleep, good morning, movie night mode, "
+    "climate, feeder, purifier. "
+    "Commands: /search <title>, /status, /help."
 )
 _PENDING_GUESS_PREFIX = "guess:"
+
+
+def _catalog_movie_night(text: str) -> bool:
+    """Bare movie/film/cinema night is a media vibe, not the scene preset."""
+    raw = " ".join((text or "").strip().split()).strip(" .!?").casefold()
+    return raw in {"movie night", "film night", "cinema night"}
 
 
 def _integer(value: Any) -> int | None:
@@ -111,6 +124,36 @@ def _integer(value: Any) -> int | None:
 
 def _display_title(title: str, year: int | None = None) -> str:
     return voice.display_title(title, year)
+
+
+def _with_speaker(fn):  # type: ignore[no-untyped-def]
+    """Keep group threads per person without rewriting every return path."""
+
+    async def wrapper(self: Any, payload: dict[str, Any]) -> BotReply | None:
+        chat_id, user_id = _actor(payload)
+        if chat_id is None:
+            return await fn(self, payload)
+        with speaker_scope(chat_id, user_id):
+            return await fn(self, payload)
+
+    wrapper.__name__ = getattr(fn, "__name__", "wrapper")
+    wrapper.__doc__ = getattr(fn, "__doc__", None)
+    return wrapper
+
+
+def _actor(payload: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    if "data" in payload and isinstance(payload.get("message"), Mapping):
+        message = payload["message"]
+        chat = message.get("chat") if isinstance(message.get("chat"), Mapping) else {}
+        sender = payload.get("from") if isinstance(payload.get("from"), Mapping) else {}
+        try:
+            return int(chat["id"]), _integer(sender.get("id"))
+        except (KeyError, TypeError, ValueError):
+            return None, None
+    view = MessageView.from_telegram(payload)
+    if view is None:
+        return None, None
+    return view.chat_id, view.user_id
 
 
 class TelegramMediaBot:
@@ -177,7 +220,7 @@ class TelegramMediaBot:
 
     @staticmethod
     def _pending_key(chat_id: int) -> str:
-        return f"{_PENDING_GUESS_PREFIX}{int(chat_id)}"
+        return storage_key(_PENDING_GUESS_PREFIX, chat_id)
 
     def _get_pending_guess(self, chat_id: int) -> dict[str, Any] | None:
         payload = self.store.get_callback_media(self._pending_key(chat_id))
@@ -209,6 +252,7 @@ class TelegramMediaBot:
     def _clear_pending_guess(self, chat_id: int) -> None:
         self.store.clear_callback_media(self._pending_key(chat_id))
 
+    @_with_speaker
     async def handle_message(self, message: dict[str, Any]) -> BotReply | None:
         view = MessageView.from_telegram(message)
         if view is None or not self._authorized(view.chat_id, view.user_id):
@@ -278,6 +322,10 @@ class TelegramMediaBot:
         if looks_like_play_command(view.text):
             return await self._play_from_context(view)
 
+        aside = await self._house_aside(view)
+        if aside is not None:
+            return aside
+
         _, query = parse_message(
             message,
             max_length=max(20, int(settings.telegram_max_title_length)),
@@ -307,7 +355,14 @@ class TelegramMediaBot:
         rate_key = (view.chat_id, view.user_id)
         if not self.rate.allow(rate_key):
             wait = max(1, math.ceil(self.rate.retry_after(rate_key)))
-            return BotReply(f"Too many searches. Try again in about {wait} seconds.")
+            # Echo the ask back: a dropped turn the user has to retype from
+            # memory is the part that actually stings.
+            return BotReply(
+                voice.rate_limited(
+                    wait_s=wait,
+                    ask=query.display_label() if query.title else "",
+                )
+            )
 
         # New search/guess replaces any sticky yes/no offer.
         self._clear_pending_guess(view.chat_id)
@@ -327,6 +382,14 @@ class TelegramMediaBot:
             return await self._route_media_intent(view, query, intent, context)
         except CatalogUnavailable as exc:
             return BotReply(exc.message)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # A routed media turn is never silent. Retrying an unexpected lane
+            # failure three times just delays the same outcome behind silence,
+            # so answer honestly instead of letting the update dead-letter.
+            log.exception("telegram media lane failed for intent %s", intent.kind)
+            return BotReply(voice.lane_failed())
 
     async def _play_from_context(self, view: MessageView) -> BotReply:
         """Run the explicit Telegram Play follow-up without entering classify/search."""
@@ -345,6 +408,10 @@ class TelegramMediaBot:
             names = ", ".join(hit.label for hit in context.hits[:4])
             return BotReply(f"Which one should I put on the TV? {names}.")
         hit = context.hits[0]
+        if hit.media_status != 5:
+            # Only Plex can play it and it is not there yet. Saying so beats
+            # handing Infuse a title it will never find and reporting its error.
+            return BotReply(voice.play_not_on_plex(_display_title(hit.title, hit.year)))
         outcome = await play_on_tv(
             title=hit.title,
             tmdb_id=hit.tmdb_id,
@@ -398,7 +465,14 @@ class TelegramMediaBot:
         if intent.kind in {"mood", "house_pick"} and settings.telegram_mood_lane:
             return await self._mood_reply(view, intent)
 
-        if intent.kind == "describe" or intent.needs_llm:
+        if intent.kind == "describe":
+            return await self._guess_reply(view, query, intent=intent)
+
+        # Jev can flag needs_llm on a turn whose lane is still fully
+        # deterministic ("all Harry Potters", "LOTR extended"). Spend the gpt
+        # hop only when there is genuinely no seed to search with, otherwise a
+        # low-confidence verdict throws away a seed we already hold.
+        if intent.needs_llm and not (intent.search_title or query.title):
             return await self._guess_reply(view, query, intent=intent)
 
         if intent.kind == "series_all":
@@ -510,6 +584,7 @@ class TelegramMediaBot:
         offer_series: bool = False,
         offer_more: bool = False,
         offer_dismiss: bool = False,
+        title_chip: str = "",
         page: int = 1,
         accumulate_shown: bool = True,
     ) -> BotReply:
@@ -527,6 +602,7 @@ class TelegramMediaBot:
             series_anchor=top if (offer_series and top is not None) else None,
             offer_more=offer_more,
             offer_dismiss=offer_dismiss,
+            title_chip=title_chip,
         )
         self.memory.remember(
             chat_id,
@@ -548,10 +624,12 @@ class TelegramMediaBot:
         if remember_single_guess and single is not None:
             hit, hit_season = single
             self._set_pending_guess(chat_id, hit, season=hit_season)
-        # Nothing to request and only one candidate: answer in one clear line
-        # instead of a one-row menu with no buttons.
+        # Nothing to request and only one candidate: lead with the one clear
+        # status line instead of a numbered list of one. Any Play / status /
+        # refine button still belongs on it — "On Plex" is exactly when Play is
+        # the useful action.
         if not rendered.requestable and len(hits) == 1:
-            return BotReply(blocked_status_line(hits[0]))
+            return BotReply(blocked_status_line(hits[0]), rendered.reply.reply_markup)
         return rendered.reply
 
     def _miss(self, label: str) -> BotReply:
@@ -691,6 +769,8 @@ class TelegramMediaBot:
             drop_last=intent.drop_last,
             drop_first=intent.drop_first,
         )
+        if not kept:
+            return BotReply(voice.exclusion_left_nothing(seed, found=len(ordered)))
         # Say what was skipped by position, not by title: naming a film that has
         # no button invites "did you queue it?".
         dropped = ""
@@ -886,6 +966,9 @@ class TelegramMediaBot:
             ask_text=intent.raw_text or view.text,
             media_type=spec.media_type,
             offer_more=True,
+            # "Date Night" is both a vibe and a film. Answer as the vibe, but
+            # leave the correction one tap away instead of guessing silently.
+            title_chip=spec.ambiguous_title,
             page=page,
         )
 
@@ -1021,6 +1104,7 @@ class TelegramMediaBot:
             reason="batch",
             raw_text=part.raw,
         )
+        known_seed = is_known_franchise(part.title)
         try:
             if part.series_all:
                 hits = await self._franchise_hits(query, part.title)
@@ -1029,13 +1113,23 @@ class TelegramMediaBot:
                     drop_last=part.drop_last,
                     drop_first=part.drop_first,
                 )[:SERIES_MAX_RESULTS]
-            hits = await self.catalog.hits(query, limit=3)
+            hits = await self.catalog.hits(
+                query,
+                franchise_seed=part.title if known_seed else None,
+                limit=3,
+            )
         except CatalogUnavailable:
             # One unavailable item must not sink the whole plan.
             return []
         # Silently swapping in a loosely related film would be worse than
         # reporting the item as a miss.
-        return [hit for hit in hits if plausible_match(part.title, hit)][:1]
+        kept = [hit for hit in hits if plausible_match(part.title, hit)]
+        if not kept and known_seed:
+            # An alias like "LOTR" can never fuzzy-match "The Lord of the Rings:
+            # The Fellowship of the Ring", so the guard that protects unknown
+            # titles would turn a franchise everyone knows into a plan miss.
+            kept = hits
+        return kept[:1]
 
     # --- follow-ups --------------------------------------------------------
 
@@ -1048,6 +1142,24 @@ class TelegramMediaBot:
     ) -> BotReply:
         """Resolve "the sequel" / "all of them" / "more" against recent context."""
         if context is None or not context.present:
+            # Relational follow-ups ("the sequel", "all of them") are not titles.
+            # In a group they must not fall through into a search that looks like
+            # someone else's thread, and they must not borrow that thread either.
+            relational = intent.follow_up in {
+                "sequel",
+                "prequel",
+                "all_of_them",
+                "more_like_that",
+                "that_one",
+                "other_one",
+                "ordinal",
+                "continue_pack",
+            }
+            if int(view.chat_id) < 0 and relational:
+                return BotReply(
+                    "That follow-up isn’t on your thread. I keep each person in "
+                    "this chat separate — send the title, or ask what’s on tonight."
+                )
             # A real title that merely looks like a follow-up ("Next", "More").
             if query.title and looks_like_concrete_title(query.title):
                 return await self._search_reply(view, query)
@@ -1086,6 +1198,12 @@ class TelegramMediaBot:
                     return offered
             return await self._adjacent_entry_reply(view, context, direction=kind)
         if kind == "more":
+            # "next" lands here too, and a watch-next only exists in the moments
+            # after a queue — when the nudge has just named the next film in the
+            # pack. Honour that before paging the old search again.
+            offered = await self._offer_watch_next(view, context)
+            if offered is not None:
+                return offered
             return await self._more_of_the_same(view, context)
         return BotReply(voice.lost_context())
 
@@ -1432,15 +1550,14 @@ class TelegramMediaBot:
                 )
             except Exception:  # noqa: BLE001
                 log.exception("failed to attach tracker after yes-confirm")
-        nudge = await self._remember_watch_next_after_queue(
+        text = await self._with_queue_asides(
+            text,
             view.chat_id,
             media_type=media_type,
             tmdb_id=tmdb_id,
             title=title,
             year=year,
         )
-        if nudge:
-            text = f"{text}\n{nudge}"
         return BotReply(text)
 
     async def _search_reply(self, view: MessageView, query: MediaQuery) -> BotReply:
@@ -1580,7 +1697,13 @@ class TelegramMediaBot:
 
         view = MessageView(chat_id=chat_id, message_id=message_id, user_id=user_id, text="")
         context = self.memory.load(chat_id)
+        # Card rendering stored the title/year behind this exact button, which
+        # outlives the chat context. Without it a Play tap on an older card
+        # reaches Infuse as "TMDB 603" and cannot possibly succeed.
+        stored = self.store.get_callback_media(data) or {}
         try:
+            if action.action == ACTION_TITLE:
+                return await self._title_correction_reply(view, stored)
             if action.action == ACTION_SIMILAR and action.tmdb_id:
                 anchor_label = ""
                 if context is not None:
@@ -1619,6 +1742,7 @@ class TelegramMediaBot:
                     media_type=action.media_type or "movie",
                     tmdb_id=int(action.tmdb_id),
                     context=context,
+                    stored=stored,
                 )
             if action.action == ACTION_STATUS and action.tmdb_id:
                 return self._status_ack_callback(
@@ -1626,10 +1750,37 @@ class TelegramMediaBot:
                     media_type=action.media_type or "movie",
                     tmdb_id=int(action.tmdb_id),
                     context=context,
+                    stored=stored,
                 )
         except CatalogUnavailable as exc:
             return BotReply(str(getattr(exc, "message", exc)), edit_message_id=message_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # A tap is unambiguously addressed to me. Retrying an unexpected
+            # refine failure three times only delays the same outcome behind a
+            # card that never changes.
+            log.exception("telegram refine action %s failed", action.action)
+            return BotReply(voice.lane_failed(), edit_message_id=message_id)
         return BotReply(voice.lost_context(), edit_message_id=message_id)
+
+    async def _title_correction_reply(
+        self,
+        view: MessageView,
+        stored: Mapping[str, Any],
+    ) -> BotReply:
+        """"I meant the title" — re-run the ambiguous vibe ask as an exact search."""
+        title = str(stored.get("title") or "").strip()
+        if not title:
+            return BotReply(voice.lost_context(), edit_message_id=view.message_id)
+        query = MediaQuery(
+            action="search",
+            title=title,
+            reason="title_correction",
+            raw_text=title,
+        )
+        reply = await self._search_reply(view, query)
+        return BotReply(reply.text, reply.reply_markup, edit_message_id=view.message_id)
 
     async def _offer_watch_next(
         self,
@@ -1685,6 +1836,28 @@ class TelegramMediaBot:
             offer_dismiss=True,
         )
 
+    @staticmethod
+    def _card_subject(
+        tmdb_id: int,
+        *,
+        context: ChatContext | None,
+        stored: Mapping[str, Any] | None,
+    ) -> tuple[str, int | None, int | None]:
+        """Title, year and last-known status for the card a button belongs to.
+
+        The chat context is freshest, but it expires long before the signed
+        button does; the per-button payload is the durable fallback.
+        """
+        if context is not None:
+            match = next((hit for hit in context.hits if hit.tmdb_id == tmdb_id), None)
+            if match is not None:
+                return match.title, match.year, match.media_status
+        if stored and _integer(stored.get("tmdb_id")) == tmdb_id:
+            title = str(stored.get("title") or "").strip()
+            if title:
+                return title, _integer(stored.get("year")), None
+        return "", None, None
+
     def _status_ack_callback(
         self,
         message_id: int,
@@ -1692,14 +1865,11 @@ class TelegramMediaBot:
         media_type: str,
         tmdb_id: int,
         context: ChatContext | None,
+        stored: Mapping[str, Any] | None = None,
     ) -> BotReply:
-        label = "that title"
-        status = None
-        if context is not None:
-            match = next((h for h in context.hits if h.tmdb_id == tmdb_id), None)
-            if match is not None:
-                label = match.label
-                status = match.media_status
+        del media_type  # the label carries the kind already
+        title, year, status = self._card_subject(tmdb_id, context=context, stored=stored)
+        label = _display_title(title, year) if title else "that title"
         state = "downloading" if status == 3 else "pending" if status == 2 else "in flight"
         return BotReply(voice.status_ack(label, state=state), edit_message_id=message_id)
 
@@ -1711,16 +1881,17 @@ class TelegramMediaBot:
         media_type: str,
         tmdb_id: int,
         context: ChatContext | None,
+        stored: Mapping[str, Any] | None = None,
     ) -> BotReply:
-        title = "that title"
-        year: int | None = None
-        if context is not None:
-            match = next((h for h in context.hits if h.tmdb_id == tmdb_id), None)
-            if match is not None:
-                title = match.title
-                year = match.year
-        if title == "that title":
-            title = f"TMDB {tmdb_id}"
+        del chat_id  # playback targets the house TV, not the chat
+        title, year, _status = self._card_subject(tmdb_id, context=context, stored=stored)
+        if not title:
+            # Honest fail: guessing a title here would send Infuse chasing
+            # "TMDB 603" and report a failure the user cannot act on.
+            return BotReply(
+                voice.play_needs_title(),
+                edit_message_id=message_id,
+            )
         outcome = await play_on_tv(
             title=title,
             tmdb_id=tmdb_id,
@@ -1728,6 +1899,81 @@ class TelegramMediaBot:
             year=year,
         )
         return BotReply(outcome.message, edit_message_id=message_id)
+
+    async def _house_aside(self, view: MessageView) -> BotReply | None:
+        """Shelf and scene asks. Jev chooses the tool; the phrase only fail-opens.
+
+        Bare “movie night” stays a catalog vibe. House sleep / filmavond / good
+        night stay on the ritual commands.
+        """
+        phrase = classify_house_phrase(view.text)
+        if phrase is None or looks_like_house_control(view.text):
+            return None
+        if _catalog_movie_night(view.text):
+            return None
+        verdict = await evaluate_message(view.text)
+        decision = decide_butler_tool(view.text, verdict)
+        log_shadow_outcome(
+            verdict,
+            channel="telegram_butler",
+            tools=[decision.tool] if decision.run else [],
+            outcome=decision.source,
+        )
+        if decision.blocked_by_jev:
+            if decision.source == "jev_cancel":
+                return BotReply("Okay — I won't run that.")
+            return BotReply(
+                "That doesn't sound like the shelf or a house scene, so I left it alone."
+            )
+        if not decision.run:
+            return None
+        if decision.tool == "house_shelf":
+            try:
+                snap = await shelf_snapshot()
+            except Exception:  # noqa: BLE001
+                log.exception("telegram shelf snapshot failed")
+                return BotReply(
+                    "Plex didn’t answer. Say “what’s on tonight” again in a moment — "
+                    "I won’t guess a title."
+                )
+            return BotReply(str(snap.get("speak") or "The shelf is quiet."))
+        preset = decision.as_args().get("preset") or phrase.preset
+        try:
+            result = await activate_preset(preset)
+        except Exception:  # noqa: BLE001
+            log.exception("telegram scene preset failed")
+            return BotReply(
+                "Home Assistant didn’t run that scene. I left the lights alone — "
+                "say it again in a moment."
+            )
+        return BotReply(str(result.get("speak") or "I couldn’t run that scene."))
+
+    async def _with_queue_asides(
+        self,
+        text: str,
+        chat_id: int,
+        *,
+        media_type: str,
+        tmdb_id: int,
+        title: str,
+        year: int | None,
+    ) -> str:
+        nudge = await self._remember_watch_next_after_queue(
+            chat_id,
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            title=title,
+            year=year,
+        )
+        try:
+            shelf_line = await queue_shelf_aside(title)
+        except Exception:  # noqa: BLE001
+            log.exception("telegram queue shelf aside failed")
+            shelf_line = None
+        extra = "\n".join(part for part in (nudge, shelf_line) if part)
+        if not extra:
+            return text
+        return f"{text}\n{extra}"
 
     async def _remember_watch_next_after_queue(
         self,
@@ -1802,6 +2048,7 @@ class TelegramMediaBot:
         reply = await self._series_all_reply(view, query, intent)
         return BotReply(reply.text, reply.reply_markup, edit_message_id=view.message_id)
 
+    @_with_speaker
     async def handle_callback(self, callback: dict[str, Any]) -> BotReply | None:
         message = callback.get("message")
         message = message if isinstance(message, Mapping) else {}
@@ -2039,15 +2286,14 @@ class TelegramMediaBot:
                     metadata=tracked_metadata,
                 ):
                     log.warning("accepted request remains pending for reconciliation")
-        nudge = await self._remember_watch_next_after_queue(
+        text = await self._with_queue_asides(
+            text,
             chat_id,
             media_type=request.media_type,
             tmdb_id=request.tmdb_id,
             title=title,
             year=year,
         )
-        if nudge:
-            text = f"{text}\n{nudge}"
         return BotReply(text, edit_message_id=message_id)
 
     async def _recover_uncertain_request(
@@ -2105,17 +2351,29 @@ class TelegramMediaBot:
     def _request_error_text(label: str, result: Mapping[str, Any]) -> str:
         reason = str(result.get("reason") or "")
         if result.get("already") or reason == "already_requested":
-            return f"{label} is already requested in Overseerr."
+            return (
+                f"{label} is already requested in Overseerr. "
+                "Say “what’s on tonight” if you want something already on the shelf."
+            )
         if reason == "no_seasons":
-            return f"Overseerr has no requestable seasons for {label}."
+            return (
+                f"Overseerr has no requestable seasons for {label}. "
+                "I didn’t queue it — name a season, or send the title again."
+            )
         if reason == "forbidden":
             return (
-                f"Overseerr rejected {label}. Check the API key, request permission, "
-                "quota, and blocklist."
+                f"Overseerr rejected {label}. I didn’t queue it. Check the API key, "
+                "request permission, quota, and blocklist, then tap Get again."
             )
         if reason == "invalid_request":
-            return f"Overseerr could not accept the request for {label}."
-        return f"Overseerr did not accept the request for {label}."
+            return (
+                f"Overseerr could not accept the request for {label}. "
+                "Nothing was queued — search again and tap Get."
+            )
+        return (
+            f"Overseerr did not accept the request for {label}. "
+            "Nothing was queued. Search again, or say “what’s on tonight”."
+        )
 
     @staticmethod
     def _accepted_text(

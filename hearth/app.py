@@ -201,6 +201,53 @@ async def now_playing() -> dict[str, Any]:
     return await plex.now_playing()
 
 
+@app.get("/api/house/pulse")
+async def house_pulse() -> dict[str, Any]:
+    """Shelf, last play, and which scene presets Home Assistant can run."""
+    from hearth.butler.shelf import house_pulse as build_pulse
+
+    return await build_pulse()
+
+
+class SceneBody(BaseModel):
+    preset: str = Field(min_length=1, max_length=40)
+
+
+@app.post("/api/house/scene")
+async def house_scene(body: SceneBody) -> dict[str, Any]:
+    """Activate a scene preset only after the shared Jev gate clears it."""
+    from hearth.butler.decision import decide_butler_tool, phrase_for_preset
+    from hearth.butler.scenes import activate_preset
+    from hearth.jev import evaluate_message, log_shadow_outcome
+
+    phrase = phrase_for_preset(body.preset)
+    verdict = await evaluate_message(phrase)
+    decision = decide_butler_tool(phrase, verdict)
+    log_shadow_outcome(
+        verdict,
+        channel="house_scene",
+        tools=[decision.tool] if decision.run else [],
+        outcome=decision.source,
+    )
+    if decision.blocked_by_jev:
+        speak = (
+            "Okay — I won't run that."
+            if decision.source == "jev_cancel"
+            else "That doesn't sound like the shelf or a house scene, so I left it alone."
+        )
+        return {"ok": False, "speak": speak, "preset": body.preset, "jev": verdict.as_log_dict()}
+    if decision.run and decision.tool == "house_scene":
+        return await activate_preset(decision.as_args().get("preset") or body.preset)
+    if decision.run:
+        return {
+            "ok": False,
+            "speak": "Jev didn't clear that scene, so I left the lights alone.",
+            "preset": body.preset,
+            "jev": verdict.as_log_dict(),
+        }
+    return await activate_preset(body.preset)
+
+
 @app.get("/api/plex/genres")
 async def plex_genres(type: str = Query(default="movie")) -> dict[str, Any]:
     """List genres for the Plex movie or show library. Token stays server-side."""

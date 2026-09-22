@@ -1758,10 +1758,143 @@ function bindInfoOverlay() {
   });
 }
 
+let housePulse = null;
+
+function askHouse(text) {
+  const input = $("line");
+  if (!input || !text) return;
+  input.value = text;
+  $("composer")?.requestSubmit();
+}
+
+function showHouseFault(failed) {
+  const el = $("house-fault");
+  const copy = $("house-fault-copy");
+  if (!el || !copy) return;
+  const names = new Set(failed.map((row) => row.name));
+  let text = "Part of the house didn’t answer. Retry when you’re ready.";
+  if (names.has("pulse") && names.size === 1) {
+    text = "The shelf didn’t answer. The rest of the house is still here.";
+  } else if (names.has("playing") && !names.has("status")) {
+    text = "Plex didn’t answer. Retry, or ask what’s on tonight in a moment.";
+  } else if (names.has("rooms")) {
+    text = "Home Assistant didn’t answer. The lights were left alone — retry to look again.";
+  }
+  copy.textContent = text;
+  el.hidden = false;
+}
+
+function clearHouseFault() {
+  const el = $("house-fault");
+  if (el) el.hidden = true;
+}
+
+async function runPreset(preset, label) {
+  const note = $("preset-note");
+  if (note) {
+    note.hidden = false;
+    note.textContent = `Running ${label || preset}…`;
+  }
+  try {
+    const out = await api("/api/house/scene", {
+      method: "POST",
+      body: JSON.stringify({ preset }),
+    });
+    if (note) {
+      note.hidden = false;
+      note.textContent = out.speak || (out.ok ? "Scene is on." : "That scene didn’t run.");
+    }
+  } catch (err) {
+    if (note) {
+      note.hidden = false;
+      note.textContent =
+        "Home Assistant didn’t run that scene. Try again — the lights were left alone.";
+    }
+  }
+  refresh();
+}
+
+function renderHousePulse(pulse) {
+  housePulse = pulse || null;
+  const chips = $("house-chips");
+  if (chips) {
+    const plex = pulse.plex || {};
+    const home = pulse.ha || {};
+    const chip = (label, kind) =>
+      `<span class="house-chip${kind ? ` ${kind}` : ""}">${escapeHtml(label)}</span>`;
+    const bits = [];
+    if (plex.error) bits.push(chip("Plex quiet", "is-down"));
+    else if (plex.live) bits.push(chip("Plex live", "is-live"));
+    else bits.push(chip(plex.mode === "mock" ? "Plex fixture" : "Plex", ""));
+    if (home.ok === false || home.error) bits.push(chip("HA quiet", "is-down"));
+    else if (home.live) bits.push(chip("HA live", "is-live"));
+    else bits.push(chip("HA fixture", ""));
+    if (pulse.active_preset) {
+      bits.push(chip(String(pulse.active_preset).replaceAll("_", " "), "is-live"));
+    }
+    const halfway = (pulse.continue_watching || []).length;
+    if (halfway) bits.push(chip(`${halfway} half-watched`, ""));
+    chips.innerHTML = bits.join("");
+  }
+
+  const list = $("shelf-list");
+  if (list) {
+    list.innerHTML = "";
+    const rows = [
+      ...(pulse.continue_watching || []).slice(0, 3).map((item) => ({ item, kind: "continue" })),
+      ...(pulse.recently_added || []).slice(0, 2).map((item) => ({ item, kind: "new" })),
+    ];
+    for (const row of rows) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      const percent = row.item.progress_pct;
+      const meta =
+        row.kind === "continue" ? (percent ? `${percent}% in · tap to play` : "continue") : "new on Plex";
+      btn.innerHTML = `${escapeHtml(row.item.label || row.item.title || "Untitled")}<span class="meta">${escapeHtml(meta)}</span>`;
+      const title = row.item.show || row.item.title || row.item.label;
+      btn.addEventListener("click", () => askHouse(`play ${title}`));
+      list.appendChild(btn);
+    }
+    setEmpty("shelf-block", list.childElementCount === 0);
+  }
+
+  const presets = $("scene-presets");
+  if (presets && Array.isArray(pulse.presets) && pulse.presets.length) {
+    presets.innerHTML = "";
+    for (const preset of pulse.presets) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "preset";
+      btn.dataset.preset = preset.preset;
+      btn.textContent = preset.label || preset.preset;
+      presets.appendChild(btn);
+    }
+  }
+  const shelfCount = $("shelf-list")?.childElementCount || 0;
+  const playingEmpty = $("now-playing-block")?.classList.contains("is-empty");
+  const mediaEmpty = ($("media-stack")?.childElementCount || 0) === 0;
+  if (!playingEmpty || shelfCount) setEmpty("rail-media", false);
+  else if (mediaEmpty) setEmpty("rail-media", true);
+}
+
 function renderNowPlaying(payload) {
   const root = $("now-playing");
   const session = (payload.sessions || [])[0];
+  const last = housePulse && housePulse.last_played;
+  const lastLine = last
+    ? `<p class="meta">Last finished · ${escapeHtml(last.label || last.title || "")}</p>`
+    : "";
   if (!session) {
+    if (last) {
+      root.innerHTML = `
+        <p class="kicker" style="margin:0 0 8px">quiet wire</p>
+        <h2>${escapeHtml(last.label || last.title || "Last play")}</h2>
+        <p class="meta">Last finished${last.year ? ` · ${escapeHtml(last.year)}` : ""}</p>
+      `;
+      setEmpty("now-playing-block", false);
+      setEmpty("rail-media", false);
+      return;
+    }
     root.innerHTML = `<p class="muted">Nothing on the wire.</p>`;
     setEmpty("now-playing-block", true);
     return;
@@ -1769,11 +1902,12 @@ function renderNowPlaying(payload) {
   const pct = session.duration_ms
     ? Math.min(100, Math.round((session.progress_ms / session.duration_ms) * 100))
     : 0;
-  const show = session.show ? `${session.show} · ` : "";
+  const show = session.show ? `${escapeHtml(session.show)} · ` : "";
   root.innerHTML = `
-    <p class="kicker" style="margin:0 0 8px">${payload.mode || "plex"}</p>
-    <h2>${show}${session.title || "Untitled"}</h2>
-    <p class="meta">${session.player || "player"} · ${session.state || "idle"} · ${fmtMs(session.remaining_ms)} left</p>
+    <p class="kicker" style="margin:0 0 8px">${escapeHtml(payload.mode || "plex")}</p>
+    <h2>${show}${escapeHtml(session.title || "Untitled")}</h2>
+    <p class="meta">${escapeHtml(session.player || "player")} · ${escapeHtml(session.state || "idle")} · ${fmtMs(session.remaining_ms)} left</p>
+    ${lastLine}
     <div class="progress"><span style="width:${pct}%"></span></div>
   `;
   setEmpty("now-playing-block", false);
@@ -1839,7 +1973,12 @@ function renderRooms(payload) {
   setEmpty("scenes-block", scenes.childElementCount === 0);
   syncRoomsRail();
   setEmpty("media-block", media.childElementCount === 0);
-  setEmpty("rail-media", $("now-playing-block")?.classList.contains("is-empty") && media.childElementCount === 0);
+  setEmpty(
+    "rail-media",
+    $("now-playing-block")?.classList.contains("is-empty") &&
+      media.childElementCount === 0 &&
+      ($("shelf-list")?.childElementCount || 0) === 0
+  );
 }
 
 function renderMemory(payload) {
@@ -1876,6 +2015,7 @@ function syncRoomsRail() {
   const roomsEmpty =
     ($("lights")?.childElementCount || 0) === 0 &&
     ($("scenes")?.childElementCount || 0) === 0 &&
+    ($("scene-presets")?.childElementCount || 0) === 0 &&
     ($("memory-list")?.childElementCount || 0) === 0 &&
     !comfortHasChips();
   setEmpty("rail-rooms", roomsEmpty);
@@ -2126,7 +2266,7 @@ async function talk(message, confirm = false) {
     renderActivity(state.serverActivity);
     return out;
   } catch (err) {
-    flashLocalActivity("error", "Request failed", 4000);
+    flashLocalActivity("error", "The house didn’t answer", 4000);
     throw err;
   } finally {
     if (!state.call) setRefreshInterval(8000);
@@ -2134,26 +2274,41 @@ async function talk(message, confirm = false) {
 }
 
 async function refresh() {
-  const [status, playing, rooms, transcript, memory, comfort] = await Promise.all([
-    api("/api/status"),
-    api("/api/now-playing"),
-    api("/api/rooms"),
-    api("/api/transcript"),
-    api("/api/memory"),
-    api("/api/comfort"),
-  ]);
-  renderStatus(status);
-  renderNowPlaying(playing);
-  renderRooms(rooms);
-  renderMemory(memory);
-  renderComfort(comfort);
-  if ($("log").childElementCount === 0) {
-    for (const line of transcript.lines || []) {
+  const jobs = [
+    ["status", () => api("/api/status")],
+    ["playing", () => api("/api/now-playing")],
+    ["rooms", () => api("/api/rooms")],
+    ["transcript", () => api("/api/transcript")],
+    ["memory", () => api("/api/memory")],
+    ["pulse", () => api("/api/house/pulse")],
+    ["comfort", () => api("/api/comfort")],
+  ];
+  const settled = await Promise.all(
+    jobs.map(async ([name, run]) => {
+      try {
+        return { name, ok: true, value: await run() };
+      } catch (error) {
+        return { name, ok: false, error };
+      }
+    })
+  );
+  const byName = Object.fromEntries(settled.map((row) => [row.name, row]));
+  if (byName.pulse?.ok) renderHousePulse(byName.pulse.value);
+  if (byName.status?.ok) renderStatus(byName.status.value);
+  if (byName.playing?.ok) renderNowPlaying(byName.playing.value);
+  if (byName.rooms?.ok) renderRooms(byName.rooms.value);
+  if (byName.memory?.ok) renderMemory(byName.memory.value);
+  if (byName.comfort?.ok) renderComfort(byName.comfort.value);
+  if (byName.transcript?.ok && $("log").childElementCount === 0) {
+    for (const line of byName.transcript.value.lines || []) {
       if (line.kind === "delta") continue;
       appendLog(displayRole(line.role), line.text);
     }
   }
   setEmpty("transcript", $("log").childElementCount === 0);
+  const failed = settled.filter((row) => !row.ok);
+  if (failed.length) showHouseFault(failed);
+  else clearHouseFault();
 }
 
 function sendRealtime(event) {
@@ -2164,6 +2319,16 @@ function sendRealtime(event) {
   }
   return false;
 }
+
+$("scene-presets")?.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-preset]");
+  if (!btn) return;
+  runPreset(btn.dataset.preset, btn.textContent.trim());
+});
+
+$("house-fault-retry")?.addEventListener("click", () => {
+  refresh();
+});
 
 $("composer").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -2190,7 +2355,7 @@ $("composer").addEventListener("submit", async (ev) => {
   try {
     await talk(text);
   } catch (err) {
-    appendLog("system", err.message || "Request failed");
+    appendLog("system", "That didn’t go through. Send it again — nothing was changed.");
   }
   refresh();
 });
@@ -2199,7 +2364,7 @@ $("confirm-btn").addEventListener("click", async () => {
   try {
     await talk("confirm", true);
   } catch (err) {
-    appendLog("system", err.message || "Request failed");
+    appendLog("system", "That confirm didn’t go through. Tap it again — nothing else was changed.");
   }
   refresh();
 });

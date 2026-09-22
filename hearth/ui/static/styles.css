@@ -240,6 +240,85 @@ input,
   font-size: 13px;
 }
 
+.house-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 14px;
+  min-height: 0;
+}
+
+.house-chips:empty {
+  display: none;
+}
+
+.house-chip {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  padding: 4px 10px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ember-2);
+}
+
+.house-chip.is-live {
+  color: var(--live);
+  border-color: color-mix(in srgb, var(--live) 35%, transparent);
+}
+
+.house-chip.is-down {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 45%, transparent);
+}
+
+.house-fault {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--error) 45%, transparent);
+  border-radius: 12px;
+  color: var(--error);
+  background: rgba(40, 16, 10, 0.55);
+}
+
+.house-fault p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.house-fault button,
+.stack button.preset {
+  font: inherit;
+}
+
+.preset-note {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 8px 0 0;
+}
+
+.shelf-list button {
+  text-align: left;
+  width: 100%;
+  padding: 10px 12px;
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.shelf-list .meta {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
 .progress {
   margin-top: 18px;
   height: 2px;

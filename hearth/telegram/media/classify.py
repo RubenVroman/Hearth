@@ -147,6 +147,18 @@ def _title_from_parsed(raw: str, parsed: MediaQuery | None) -> tuple[str, int | 
     return title, year, ""
 
 
+def _unsubstantiated_kind(raw: str, parsed: MediaQuery | None) -> MediaAskKind:
+    """Where a lane goes when its extractor found nothing to work with.
+
+    A concrete title in hand is worth one instant Overseerr search; only a
+    genuinely title-less ask is worth waiting on gpt.
+    """
+    for candidate in ((parsed.title if parsed else "") or "", raw):
+        if candidate and looks_like_concrete_title(candidate):
+            return "exact_title"
+    return "describe"
+
+
 def _enrich(
     kind: MediaAskKind,
     text: str,
@@ -209,7 +221,8 @@ def _enrich(
                 note=note or "person_credits",
                 **base,
             )
-        kind = "describe"
+        kind = _unsubstantiated_kind(raw, parsed)
+        note = "person_without_name"
 
     if kind == "similar":
         like = detect_similar_ask(raw)
@@ -224,7 +237,8 @@ def _enrich(
                 note=note or ("similar_context" if like.uses_context else "similar_anchor"),
                 **base,
             )
-        kind = "describe"
+        kind = _unsubstantiated_kind(raw, parsed)
+        note = "similar_without_anchor"
 
     if kind == "mood":
         spec = detect_mood(raw)
@@ -240,7 +254,8 @@ def _enrich(
         if looks_like_vague_ask(raw):
             kind = "house_pick"
         else:
-            kind = "describe"
+            kind = _unsubstantiated_kind(raw, parsed)
+            note = "mood_without_vibe"
 
     if kind == "house_pick":
         hint = "tv" if media_type == "tv" else "movie"

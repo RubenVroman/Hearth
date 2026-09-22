@@ -58,6 +58,18 @@ async def _house_status(_args: dict[str, Any]) -> dict[str, Any]:
     return await ha.house_status()
 
 
+async def _house_shelf(_args: dict[str, Any]) -> dict[str, Any]:
+    from hearth.butler.shelf import shelf_snapshot
+
+    return await shelf_snapshot()
+
+
+async def _house_scene(args: dict[str, Any]) -> dict[str, Any]:
+    from hearth.butler.scenes import activate_preset
+
+    return await activate_preset(str(args.get("preset") or ""))
+
+
 async def _house_network(args: dict[str, Any]) -> dict[str, Any]:
     try:
         limit = int(args.get("limit") or 250)
@@ -1767,6 +1779,40 @@ def register_builtin_tools() -> None:
             handler=_tb_order,
             destructive=True,
             preview=_tb_order_preview,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_shelf",
+            description=(
+                "What’s already on Plex tonight: continue watching (On Deck), recently added "
+                "library titles, and the last finished play. The Jev gate calls this — not the "
+                "language model. Not for a new download and not for what’s playing this second."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=_house_shelf,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="house_scene",
+            description=(
+                "Run a house scene preset through Home Assistant: movie_night, quiet_hours, "
+                "or good_night. The Jev gate calls this — not the language model. Activates "
+                "the matching scene when it exists. If it does not, say so and do not pretend "
+                "the lights changed."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "preset": {
+                        "type": "string",
+                        "description": "movie_night, quiet_hours, or good_night",
+                    }
+                },
+                "required": ["preset"],
+            },
+            handler=_house_scene,
         )
     )
     registry.register(

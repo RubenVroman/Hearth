@@ -23,8 +23,15 @@ from websockets.asyncio.client import connect as ws_connect
 
 from hearth.agent.prompts import compose_system_prompt, compose_system_prompt_async
 from hearth.agent.registry import registry
+from hearth.butler.decision import JEV_GATED_TOOL_NAMES, decide_butler_tool, hide_from_llm
 from hearth.config import settings
-from hearth.jev import DEVICE_TOOLS, current_utterance, set_utterance
+from hearth.jev import (
+    DEVICE_TOOLS,
+    current_utterance,
+    evaluate_message,
+    log_shadow_outcome,
+    set_utterance,
+)
 from hearth.memory import store as memory_store
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
@@ -78,7 +85,7 @@ def session_config(*, query: str | None = None, instructions: str | None = None)
                 "voice": settings.openai_tts_voice,
             },
         },
-        "tools": registry.openai_realtime_tools(),
+        "tools": hide_from_llm(registry.openai_realtime_tools()),
         "tool_choice": "auto",
     }
 
@@ -103,6 +110,24 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
     payload = dict(args or {})
     if name == "chief_of_staff":
         payload.setdefault("said", said or json.dumps(payload))
+    if name in JEV_GATED_TOOL_NAMES:
+        uttered = (said or runtime.latest_user() or "").strip()
+        verdict = await evaluate_message(uttered or name)
+        decision = decide_butler_tool(uttered, verdict)
+        log_shadow_outcome(
+            verdict,
+            channel="voice",
+            tools=[decision.tool] if decision.run else [],
+            outcome=decision.source,
+        )
+        if not decision.run or decision.tool != name:
+            return {
+                "ok": False,
+                "name": name,
+                "speak": "Jev didn't clear that, so I left it alone.",
+                "jev": verdict.as_log_dict(),
+            }
+        payload = decision.as_args()
     elif name in DEVICE_TOOLS:
         # Physical hardware: carry the spoken words so the shared Jev gate has a
         # sentence to judge instead of only the flattened arguments.

@@ -712,7 +712,9 @@ async def test_already_available_answers_in_one_clear_line_with_no_get_button(
 
     assert reply is not None
     assert "Plex" in reply.text or "library" in reply.text.lower()
-    assert reply.reply_markup is None
+    # No Get — but "on Plex" is exactly when Play is the useful button.
+    assert _get_rows(reply) == []
+    assert any("Play" in button["text"] for button in _action_rows(reply))
     assert fake.request_calls == []
 
 
@@ -727,7 +729,10 @@ async def test_already_requested_says_so_instead_of_offering_a_duplicate(
 
     assert reply is not None
     assert "already" in reply.text.lower()
-    assert reply.reply_markup is None
+    # The only queue-shaped button would be a duplicate Get; the status button
+    # is an acknowledgement and carries no queue authority.
+    assert _get_rows(reply) == []
+    assert any("Downloading" in button["text"] for button in _action_rows(reply))
     assert fake.request_calls == []
 
 

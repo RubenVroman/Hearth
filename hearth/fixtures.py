@@ -190,6 +190,78 @@ MOCK_PLEX_SESSIONS: dict[str, Any] = {
     }
 }
 
+# In-progress library items (Plex /library/onDeck). Distinct from the live session.
+MOCK_PLEX_ON_DECK: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 2,
+        "Metadata": [
+            {
+                "title": "Fishes",
+                "type": "episode",
+                "grandparentTitle": "The Bear",
+                "parentTitle": "Season 2",
+                "parentIndex": 2,
+                "index": 6,
+                "year": 2023,
+                "ratingKey": "9001",
+                "duration": 3900000,
+                "viewOffset": 1560000,
+                "Guid": [{"id": "tmdb://136315"}],
+            },
+            {
+                "title": "Arrival",
+                "type": "movie",
+                "year": 2016,
+                "ratingKey": "9002",
+                "duration": 6960000,
+                "viewOffset": 2784000,
+                "Guid": [{"id": "tmdb://329865"}],
+            },
+        ],
+    }
+}
+
+# Newly in the library (Plex /library/recentlyAdded) — already owned, not a request.
+MOCK_PLEX_RECENTLY_ADDED: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 2,
+        "Metadata": [
+            {
+                "title": "Poor Things",
+                "type": "movie",
+                "year": 2023,
+                "ratingKey": "9101",
+                "addedAt": 1710000000,
+            },
+            {
+                "title": "The Holdovers",
+                "type": "movie",
+                "year": 2023,
+                "ratingKey": "9102",
+                "addedAt": 1709000000,
+            },
+        ],
+    }
+}
+
+# Last finished play (Plex /status/sessions/history/all).
+MOCK_PLEX_HISTORY: dict[str, Any] = {
+    "MediaContainer": {
+        "size": 1,
+        "Metadata": [
+            {
+                "title": "Blade Runner 2049",
+                "type": "movie",
+                "year": 2017,
+                "ratingKey": "9201",
+                "viewedAt": 1708000000,
+                "duration": 9840000,
+                "viewOffset": 9840000,
+            }
+        ],
+    }
+}
+
 # Library titles for mock search / play (not only now-playing sessions).
 MOCK_PLEX_SECTIONS: list[dict[str, Any]] = [
     {
@@ -2521,6 +2593,7 @@ class MockHouse:
         self.states: list[dict[str, Any]] = deepcopy(MOCK_HA_STATES)
 
     def reset(self) -> None:
+        """Restore fixture lights and scenes. Tests share this in-memory house."""
         self.states = deepcopy(MOCK_HA_STATES)
 
     def list_states(self, domain: str | None = None) -> list[dict[str, Any]]:

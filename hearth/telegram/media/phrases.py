@@ -63,11 +63,26 @@ EXCLUDE_TAIL = re.compile(
     r"behalve|zonder|niet)\b\s+"
     r"(?:the\s+|de\s+|het\s+)?"
     r"(?P<count>last|first|final|latest|newest|oldest|laatste|eerste)"
-    r"(?:\s+(?P<amount>one|two|three|1|2|3|twee|drie))?"
+    r"(?:\s+(?P<amount>one|two|three|four|five|[1-5]|twee|drie|vier|vijf))?"
     r"(?:\s+(?:one|ones|movie|movies|film|films|part|parts|deel|delen))?\s*$",
     re.I,
 )
-_AMOUNTS = {"one": 1, "1": 1, "two": 2, "2": 2, "twee": 2, "three": 3, "3": 3, "drie": 3}
+_AMOUNTS = {
+    "one": 1,
+    "1": 1,
+    "two": 2,
+    "2": 2,
+    "twee": 2,
+    "three": 3,
+    "3": 3,
+    "drie": 3,
+    "four": 4,
+    "4": 4,
+    "vier": 4,
+    "five": 5,
+    "5": 5,
+    "vijf": 5,
+}
 _FROM_END = {"last", "final", "latest", "newest", "laatste"}
 
 KNOWN_FRANCHISE_SEEDS = frozenset(
