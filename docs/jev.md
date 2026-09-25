@@ -167,3 +167,7 @@ No line ever contains the API key, a bot token, or tool argument *values*.
 7. To turn the gate off without turning Jev off, set `HEARTH_JEV_TOOL_GATE=false`. To stop Jev steering the local router, set `HEARTH_JEV_ROUTE_LOCAL_TOOLS=false`.
 
 The client prefers the official `typesafe-sdk` (`AsyncTypeSafeClient`); if the package is missing, Hearth falls back to a thin httpx POST to System One. Both honour `HEARTH_JEV_TIMEOUT_SECONDS`, and `evaluate_message` wraps the call in a hard `asyncio.timeout` so an injected or SDK client without its own budget still cannot stall a turn.
+
+## See also
+
+Tier-3 house intelligence (proactive macros, Plex-aware watch-next, play-on-TV, surprise butler) is specified in [docs/proposals/tier-3-smart-as-hell.md](proposals/tier-3-smart-as-hell.md) and tracked in [#93](https://github.com/RubenVroman/Hearth/issues/93). That proposal does not change the gate; it requires every new tool path to keep using this one.
