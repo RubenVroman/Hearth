@@ -21,6 +21,7 @@ const MIC_GATE_COOLDOWN_MS = 14 * 24 * 60 * 60 * 1000;
 const state = {
   pending: null,
   call: null,
+  callStarting: false,
   /** Kept alive across hangups so iOS Safari / Home Screen PWAs avoid re-prompting. */
   mic: null,
   micPermission: "unknown",
@@ -37,7 +38,7 @@ const state = {
   infoHideTimer: null,
   infoIdleTimer: null,
   /**
-   * User-chosen carousel card. Survives /api/status polls + transcript sync so
+   * User-chosen board card. Survives /api/status polls + transcript sync so
    * browsing does not jump back to "page 1" while the assistant narrates.
    */
   clientMediaFocusId: null,
@@ -57,16 +58,13 @@ const state = {
    * Isolated from the voice path — failures never break audio.
    */
   spokenAnswer: null,
+  ambientReader: null,
 };
 
 /** Client grace before fading when talk is clearly unrelated (ms). */
 const OVERLAY_IRRELEVANT_GRACE_MS = 650;
-/** Client idle soft-hide while still "relevant" but conversation is quiet (ms). */
-const OVERLAY_IDLE_HIDE_MS = 28000;
-/** Max stacked media cards in the glass overlay (genre browse + search). */
+/** Max media cards on the reading board (genre browse + search). */
 const MEDIA_STACK_CAP = 12;
-/** Horizontal swipe distance (px) to flick to the next/prev card. */
-const MEDIA_FLICK_PX = 56;
 
 function micStorageGet(key) {
   try {
@@ -331,7 +329,7 @@ function escapeHtml(value) {
 
 function isVisualOverlay(widget) {
   const kind = widget && widget.kind;
-  return kind === "weather" || kind === "media" || kind === "downloads";
+  return kind === "weather" || kind === "media" || kind === "downloads" || kind === "information";
 }
 
 function pickVisualOverlay(widgets) {
@@ -363,7 +361,7 @@ function mediaItemsOf(widget) {
     const id = String(row.id || mediaItemKey(row));
     if (!byId.has(id)) byId.set(id, { ...row, id, skeleton: true });
   }
-  // Keep server order. Active title is indicated via active_id + carousel slots —
+  // Keep server order. Active title is indicated via active_id + board slots —
   // reordering remounts the deck and causes pop-in/out flicker.
   return [...byId.values()].slice(0, MEDIA_STACK_CAP);
 }
@@ -384,32 +382,17 @@ function mediaItemKey(item) {
 
 function overlaySignature(widget) {
   if (!widget) return "";
-  const downloads = widget.data && Array.isArray(widget.data.downloads) ? widget.data.downloads : [];
-  const progressKey = downloads
-    .map((row) => `${row.title || ""}:${row.status || ""}:${row.percent ?? ""}`)
-    .join(",");
-  const media = mediaItemsOf(widget);
-  const mediaKey = media
-    .map((row) => `${row.id || ""}:${row.title || ""}:${row.skeleton ? 1 : 0}`)
-    .join(",");
-  const activeId =
-    (widget.context && widget.context.active_id) ||
-    (widget.data && widget.data.active_id) ||
-    (media[0] && media[0].id) ||
-    "";
-  return [
-    widget.id,
-    widget.kind,
-    widget.updated_at || "",
-    widget.status || "",
-    widget.title || "",
-    widget.body || "",
-    widget.detail || "",
-    progressKey,
-    mediaKey,
-    activeId,
-    widget.context && widget.context.relevant === false ? "0" : "1",
-  ].join("|");
+  // Content, not poll timestamps or spoken focus, decides when the board remounts.
+  const data = { ...(widget.data || {}) };
+  if (widget.kind === "media") {
+    data.items = mediaItemsOf(widget);
+    delete data.active_id;
+    delete data.item;
+  }
+  return JSON.stringify([widget.id, widget.kind, widget.status, data,
+    widget.kind === "media" && data.items.length ? "" : widget.title,
+    widget.status === "error" || widget.status === "info" || widget.kind !== "media" ? widget.body : "",
+    widget.kind !== "media" || widget.status === "error" ? widget.detail : ""]);
 }
 
 function clearInfoCloseTimer() {
@@ -531,21 +514,41 @@ function overlayIsRelevant(widget) {
 }
 
 function scheduleOverlayIdleHide() {
-  if (state.infoIdleTimer) {
-    clearTimeout(state.infoIdleTimer);
-    state.infoIdleTimer = null;
+  // Results remain readable until a new topic replaces them or the user dismisses.
+  // An arbitrary timeout used to erase long lists before they could be read.
+  if (state.infoIdleTimer) clearTimeout(state.infoIdleTimer);
+  state.infoIdleTimer = null;
+}
+
+function ensureAmbientReader() {
+  if (!state.ambientReader && globalThis.HearthPresentation?.AmbientReader) {
+    state.ambientReader = new globalThis.HearthPresentation.AmbientReader({
+      viewport: $("info-glass"), button: $("info-reading-toggle"), status: $("info-reading-status"),
+    });
   }
-  if (state.infoSoftHidden || state.infoPinned) return;
-  const visual = pickVisualOverlay(state.widgets);
-  if (!visual) return;
-  state.infoIdleTimer = setTimeout(() => {
-    state.infoIdleTimer = null;
-    if (state.infoPinned) return;
-    softHideInfoOverlay();
-  }, OVERLAY_IDLE_HIDE_MS);
+  return state.ambientReader;
+}
+
+function presentationKey(widget) {
+  return JSON.stringify([widget.id, widget.kind, widget.kind === "media"
+    ? mediaItemsOf(widget).map((item) => item.id)
+    : widget.data?.query || widget.title]);
+}
+
+function focusPresentation(widget) {
+  const activeId = String(widget.context?.active_id || widget.data?.active_id || "");
+  $("info-content")?.querySelectorAll(".info-media-card").forEach((card) => {
+    const active = card.dataset.mediaId === activeId;
+    card.classList.toggle("is-active", active);
+    card.classList.toggle("is-front", active);
+    if (active) card.setAttribute("aria-current", "true");
+    else card.removeAttribute("aria-current");
+  });
 }
 
 function softHideInfoOverlay() {
+  state.ambientReader?.stop();
+  document.body.classList.remove("has-presentation");
   const root = $("info-overlay");
   if (!root || root.hidden) return;
   if (state.infoSoftHidden) return;
@@ -613,14 +616,14 @@ function isAckUtterance(text) {
 }
 
 /**
- * Remember a user-chosen carousel card across status polls / transcript sync.
+ * Remember a user-chosen board card across status polls / transcript sync.
  */
 function rememberClientMediaFocus(mediaId) {
   state.clientMediaFocusId = mediaId != null && mediaId !== "" ? String(mediaId) : null;
 }
 
 /**
- * Re-apply the user's carousel selection onto a fresh server widget payload.
+ * Re-apply the user's board selection onto a fresh server widget payload.
  * Returns true when focus was restored.
  */
 function reconcileClientMediaFocus(visual) {
@@ -666,7 +669,7 @@ function focusMediaById(mediaId, { reveal = true, fromUser = true } = {}) {
   }
   data.active_id = hit.id;
   data.item = hit;
-  // Preserve list order so the carousel can slide without remount thrash.
+  // Preserve list order so the board can slide without remount thrash.
   data.items = items;
   visual.data = data;
   visual.title = hit.title || visual.title;
@@ -684,24 +687,6 @@ function focusMediaById(mediaId, { reveal = true, fromUser = true } = {}) {
     openInfoOverlay(visual);
   }
   return true;
-}
-
-/**
- * Cycle the stacked media cards (flick / arrow keys). Positive = next.
- */
-function cycleMedia(delta) {
-  const visual = pickVisualOverlay(state.widgets);
-  if (!visual || visual.kind !== "media") return false;
-  const items = mediaItemsOf(visual);
-  if (items.length < 2) return false;
-  const activeId = String(
-    (visual.context && visual.context.active_id) || (visual.data && visual.data.active_id) || items[0].id || ""
-  );
-  let idx = items.findIndex((row) => String(row.id) === activeId);
-  if (idx < 0) idx = 0;
-  const next = items[(idx + delta + items.length * 8) % items.length];
-  if (!next) return false;
-  return focusMediaById(next.id, { reveal: true });
 }
 
 async function playActiveInInfuse(mediaId) {
@@ -758,7 +743,7 @@ async function playActiveInInfuse(mediaId) {
           item: localItem,
           items: [localItem],
           active_id: localItem.id,
-          presentation: "carousel",
+          presentation: "board",
           tool: "infuse_play",
         },
       });
@@ -800,7 +785,7 @@ function showLocalMediaOverlay({ title, status, body, detail, data }) {
     body: body || "",
     detail: detail || "",
     data: {
-      presentation: "carousel",
+      presentation: "board",
       tool: (data && data.tool) || "infuse_play",
       item,
       items: items.length ? items : item.title ? [item] : [],
@@ -926,7 +911,7 @@ function noteOverlayConversation(text, { live = false } = {}) {
     return;
   }
   // Streaming deltas only keep the panel policy warm — focusing mid-word remounts
-  // the carousel and yanks scroll back to card 1 / top of the glass.
+  // the board and yanks scroll back to card 1 / top of the glass.
   if (!live) {
     const focused = focusMediaFromText(text, { reveal: true });
     if (focused) return;
@@ -1072,149 +1057,36 @@ function mediaPosterFallback(title) {
   )}</div>`;
 }
 
-function mediaCardMarkup(
-  item,
-  { active = false, slot = 0, labelled = false, genre = "" } = {}
-) {
+function mediaCardMarkup(item, { active = false, labelled = false, genre = "" } = {}) {
   const title = item.title || "Untitled";
-  const year = item.year;
-  const type = item.type || "movie";
-  const summary = item.summary || "";
-  const meta = [year, type !== "movie" ? type : "", item.show, item.contentRating]
-    .filter(Boolean)
-    .map((v) => escapeHtml(v))
-    .join(" · ");
+  const type = ({ show: "Series", tv: "Series", movie: "Film", episode: "Episode", season: "Season" })[item.type] || "Film";
+  const meta = [item.year, type, item.contentRating].filter(Boolean).map(escapeHtml).join(" · ");
   const art = mediaArtUrl({ ...item, title });
-  // /api/media/art returns real JPEG or SVG initials when the session cookie authorizes the GET.
-  const poster = art
-    ? `<img class="info-poster" src="${escapeHtml(art)}" alt="" width="120" height="180" loading="${
-        active ? "eager" : "lazy"
-      }" />`
-    : mediaPosterFallback(title);
-  const itemGenres = Array.isArray(item.genres)
-    ? item.genres.map((g) => String(g || "").trim()).filter(Boolean)
-    : [];
-  const bits = [];
-  if (active) {
-    if (itemGenres.length) {
-      bits.push(
-        `<p class="info-media-genres">${itemGenres
-          .slice(0, 4)
-          .map((g) => `<span class="info-media-genre-tag">${escapeHtml(g)}</span>`)
-          .join("")}</p>`
-      );
-    }
-    if (item.skeleton && !summary) {
-      bits.push(`<p class="info-detail info-media-skeleton-line">Looking this up…</p>`);
-    } else if (summary) {
-      bits.push(`<p class="info-detail">${escapeHtml(summary)}</p>`);
-    }
-    if (item.player) {
-      bits.push(
-        `<p class="info-detail">${escapeHtml(item.player)}${
-          item.state ? ` · ${escapeHtml(item.state)}` : ""
-        }</p>`
-      );
-    }
-    if (item.rating != null) {
-      bits.push(`<p class="info-detail">Rating ${escapeHtml(item.rating)}</p>`);
-    }
-    const playable = !item.skeleton && (item.title || item.tmdbId || item.ratingKey);
-    if (playable) {
-      const playId = escapeHtml(String(item.id || mediaItemKey(item)));
-      bits.push(
-        `<div class="info-media-actions">
-        <button type="button" class="info-infuse-btn" data-infuse-play="1" data-media-id="${playId}">
-          Open in Infuse
-        </button>
-      </div>`
-      );
-    }
-  }
-  const links = item.links && typeof item.links === "object" ? item.links : null;
-  const tmdbLink = links && links.tmdb ? String(links.tmdb) : "";
-  const imdbLink = links && links.imdb ? String(links.imdb) : "";
-  if (active && (tmdbLink || imdbLink)) {
-    const linkBits = [];
-    if (tmdbLink) {
-      linkBits.push(
-        `<a class="info-media-link" href="${escapeHtml(tmdbLink)}" target="_blank" rel="noopener noreferrer">TMDB</a>`
-      );
-    }
-    if (imdbLink) {
-      linkBits.push(
-        `<a class="info-media-link" href="${escapeHtml(imdbLink)}" target="_blank" rel="noopener noreferrer">IMDb</a>`
-      );
-    }
-    bits.push(`<p class="info-media-links">${linkBits.join(" · ")}</p>`);
-  }
-  const kicker = item.skeleton
-    ? "Mentioned"
-    : item.pending
-      ? "Ready to play"
-      : item.source === "suggest"
-        ? "Suggested"
-        : item.player && item.state === "opening"
-          ? "Opening"
-          : item.player
-            ? "Now playing"
-            : genre
-              ? escapeHtml(genre)
-              : "Library";
-  const slotAbs = Math.abs(Number(slot) || 0);
-  const classes = [
-    "info-media-card",
-    active ? "is-active is-front" : "is-recessed is-selectable",
-    item.skeleton ? "is-skeleton" : "",
-    item.source === "suggest" ? "is-suggest" : "",
-    item.pending ? "is-pending" : "",
-    slotAbs > 2 ? "is-far" : "",
-    Number(slot) < 0 ? "is-peek-prev" : "",
-    Number(slot) > 0 ? "is-peek-next" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-  return `
-    <article
-      class="${classes}"
-      data-media-id="${escapeHtml(String(item.id || mediaItemKey(item)))}"
-      style="--slot:${Number(slot) || 0};--slot-abs:${slotAbs}"
-      aria-hidden="${active ? "false" : "true"}"
-      ${!active ? 'tabindex="0" role="button" aria-label="Show this title"' : ""}
-    >
-      <div class="info-media">
-        ${poster}
-        <div class="info-media-copy">
-          <p class="info-kicker">${kicker}</p>
-          <h2 class="info-title"${labelled ? ' id="info-title"' : ""}>${escapeHtml(title)}</h2>
-          ${meta ? `<p class="info-meta">${meta}</p>` : ""}
-          ${bits.join("")}
-        </div>
-      </div>
-    </article>
-  `;
-}
-
-function mediaStackCounter(items, activeId, total) {
-  if (!items || items.length < 2) return "";
-  let idx = items.findIndex((row) => String(row.id) === String(activeId || ""));
-  if (idx < 0) idx = 0;
-  const shown = items.length;
-  const totalN = total != null && Number(total) > shown ? Number(total) : shown;
-  const label =
-    totalN > shown ? `${idx + 1} / ${shown} · ${totalN} in library` : `${idx + 1} / ${shown}`;
-  const dots = items
-    .slice(0, Math.min(shown, 12))
-    .map(
-      (_, i) =>
-        `<button type="button" class="info-media-dot${i === idx ? " is-on" : ""}" data-media-dot="${i}" aria-label="Show title ${i + 1}" ${i === idx ? 'aria-current="true"' : ""}></button>`
-    )
-    .join("");
-  return `<div class="info-media-rail" aria-label="${escapeHtml(label)}">
-    <p class="info-media-count">${escapeHtml(label)}</p>
-    <div class="info-media-dots">${dots}</div>
-    <p class="info-media-hint">Swipe or tap cards to browse</p>
-  </div>`;
+  const poster = art ? '<img class="info-poster" src="' + escapeHtml(art) + '" alt="" width="120" height="180" loading="eager" />' : mediaPosterFallback(title);
+  const links = item.links && typeof item.links === "object" ? item.links : {};
+  const linkMarkup = Object.entries({ TMDB: links.tmdb, IMDb: links.imdb }).map(([label, url]) => {
+    const safe = globalThis.HearthPresentation.safeUrl(url);
+    return safe ? '<a class="info-media-link" href="' + escapeHtml(safe) + '" target="_blank" rel="noopener noreferrer">' + label + '</a>' : "";
+  }).filter(Boolean).join(" · ");
+  const genres = Array.isArray(item.genres) ? item.genres.slice(0, 3).map(escapeHtml).join(" · ") : "";
+  const availability = typeof item.availability === "string" ? item.availability : item.status || "";
+  const unresolved = item.status === "unresolved";
+  const label = unresolved ? "Metadata unavailable" : item.skeleton ? "Looking this up…" : item.player ? item.state === "opening" ? "Opening" : "Now playing" : item.source === "suggest" ? "Suggested" : availability || (item.source === "plex" ? "In your library" : "Catalog match");
+  const id = escapeHtml(String(item.id || mediaItemKey(item)));
+  const summary = item.summary || item.overview || "";
+  const rating = item.rating != null ? '<span class="info-rating">★ ' + escapeHtml(item.rating) + '</span>' : "";
+  return '<article class="info-media-card' + (active ? ' is-active is-front' : '') + (item.skeleton ? ' is-skeleton' : '') + '" data-media-id="' + id + '"' + (active ? ' aria-current="true"' : '') + '>' +
+    '<div class="info-media">' + poster + '<div class="info-media-copy">' +
+    '<p class="info-kicker">' + escapeHtml(label) + '</p>' +
+    '<h3 class="info-title"' + (labelled ? ' id="info-title"' : '') + '>' + escapeHtml(title) + '</h3>' +
+    '<p class="info-meta">' + meta + rating + '</p>' +
+    (genres ? '<p class="info-media-genres">' + genres + '</p>' : '') +
+    (item.reason ? '<p class="info-media-reason">' + escapeHtml(item.reason) + '</p>' : '') +
+    (summary ? '<p class="info-detail">' + escapeHtml(summary) + '</p>' : '') +
+    (item.skeleton && !unresolved ? '<p class="info-detail">Finding the details for you.</p>' : '') +
+    (linkMarkup ? '<p class="info-media-links">' + linkMarkup + '</p>' : '') +
+    (!item.skeleton && (item.title || item.ratingKey || item.tmdbId) ? '<div class="info-media-actions"><button type="button" class="info-infuse-btn" data-infuse-play="1" data-media-id="' + id + '">Open in Infuse</button></div>' : '') +
+    '</div></div></article>';
 }
 
 function mediaGenreChips(genres, activeGenre = "", { mediaType = "movie" } = {}) {
@@ -1251,7 +1123,7 @@ function mediaGenresMarkup(widget) {
     <div class="info-genre-browser">
       <p class="info-kicker">Library</p>
       <h2 class="info-title" id="info-title">${escapeHtml(widget.title || `${kindLabel} by genre`)}</h2>
-      <p class="info-meta">${escapeHtml(widget.detail || `Tap a genre to see ${kindLabel} in that category.`)}</p>
+      <p class="info-meta">${escapeHtml(widget.detail || `Name a genre to see ${kindLabel} in that category.`)}</p>
       ${chips || `<p class="info-detail">No genres found in the Plex library.</p>`}
       <p class="info-detail info-genre-hint">Categories come from Plex metadata (e.g. Science Fiction).</p>
     </div>
@@ -1260,56 +1132,21 @@ function mediaGenresMarkup(widget) {
 
 function mediaMarkup(widget) {
   const data = widget.data || {};
-  if (data.presentation === "genres" || data.listed_genres) {
-    return mediaGenresMarkup(widget);
-  }
+  if (data.presentation === "genres" || data.listed_genres) return mediaGenresMarkup(widget);
   const items = mediaItemsOf(widget);
-  const genre = data.genre || "";
-  const total = data.total;
-  const mediaType = data.media_type || "movie";
-  const genreChips = mediaGenreChips(data.genres || [], genre, { mediaType });
-  const activeId =
-    (widget.context && widget.context.active_id) || data.active_id || (items[0] && items[0].id) || "";
-  const statusBanner = mediaStatusBanner(widget);
-  if (!items.length) {
-    const item = data.item || {};
-    const title = widget.title || item.title || "";
-    if (!title && !genreChips) {
-      return `${statusBanner}${emptyMediaMarkup(widget)}`;
-    }
-    return `${statusBanner}${genreChips}${mediaCardMarkup(
-      { ...item, id: mediaItemKey(item), title: title || "Untitled" },
-      { active: true, slot: 0, labelled: true, genre }
-    )}`;
-  }
-  if (items.length === 1) {
-    return `${statusBanner}${genreChips}<div class="info-media-stack is-single" data-count="1">${mediaCardMarkup(items[0], {
-      active: true,
-      slot: 0,
-      labelled: true,
-      genre,
-    })}</div>`;
-  }
-  let activeIdx = items.findIndex((row) => String(row.id) === String(activeId));
-  if (activeIdx < 0) activeIdx = 0;
-  const cards = items
-    .map((item, index) =>
-      mediaCardMarkup(item, {
-        active: index === activeIdx,
-        slot: index - activeIdx,
-        labelled: index === activeIdx,
-        genre,
-      })
-    )
-    .join("");
-  return `${statusBanner}${genreChips}<div class="info-media-stack is-stacked is-carousel" data-count="${items.length}" data-flick="1" data-active-idx="${activeIdx}">
-    ${mediaStackCounter(items, activeId, total)}
-    <div class="info-media-carousel">
-      <button type="button" class="info-media-nav info-media-prev" data-media-nav="-1" aria-label="Previous title">‹</button>
-      <div class="info-media-deck">${cards}</div>
-      <button type="button" class="info-media-nav info-media-next" data-media-nav="1" aria-label="Next title">›</button>
-    </div>
-  </div>`;
+  if (!items.length) return emptyMediaMarkup(widget);
+  const activeId = widget.context?.active_id || data.active_id || items[0]?.id || "";
+  const heading = data.heading || (items.length === 1 ? "A closer look" : data.genre ? data.genre + " for your evening" : "Your next great watch");
+  const total = Number(data.total);
+  const count = Number.isFinite(total) && total > items.length
+    ? items.length + " of " + total + " titles"
+    : items.length + (items.length === 1 ? " title" : " titles");
+  return '<header class="info-board-heading"><p class="info-kicker">Curated by Hearth · ' + escapeHtml(count) + '</p>' +
+    '<h2 class="info-title" id="info-title">' + escapeHtml(heading) + '</h2>' +
+    '<p class="info-board-summary">' + escapeHtml(data.summary || "Just keep talking. Everything we find appears here.") + '</p></header>' +
+    mediaStatusBanner(widget) +
+    '<div class="info-media-stack info-media-board' + (items.length === 1 ? ' is-single' : '') + '" data-count="' + items.length + '">' +
+    items.map((item) => mediaCardMarkup(item, { active: String(item.id) === String(activeId), genre: data.genre || "" })).join("") + '</div>';
 }
 
 function mediaStatusBanner(widget) {
@@ -1339,9 +1176,9 @@ function emptyMediaMarkup(widget) {
   const title = (widget && widget.title) || "Nothing to play";
   const body =
     (widget && (widget.body || widget.detail)) ||
-    "No playable title loaded. Dismiss and ask again, or name the movie.";
+    "No titles found yet. Try a different title, year, or genre.";
   return `<div class="info-media-empty" role="status">
-    <p class="info-kicker">Play</p>
+    <p class="info-kicker">Your results</p>
     <h2 class="info-title" id="info-title">${escapeHtml(title)}</h2>
     <p class="info-detail">${escapeHtml(body)}</p>
   </div>`;
@@ -1453,6 +1290,7 @@ function overlayInnerHtml(widget) {
   if (widget.kind === "weather") return weatherMarkup(widget);
   if (widget.kind === "media") return mediaMarkup(widget);
   if (widget.kind === "downloads") return downloadsMarkup(widget);
+  if (widget.kind === "information") return globalThis.HearthPresentation.informationMarkup(widget);
   const html = `
     <p class="info-kicker">Info</p>
     <h2 class="info-title" id="info-title">${escapeHtml(widget.title || "")}</h2>
@@ -1483,6 +1321,8 @@ function openInfoOverlay(widget) {
   const contentEmpty = !String(content.innerHTML || "").trim();
   // Never keep a blank glass open — remount when the DOM was cleared or markup is empty.
   if (alreadyOpen && state.infoSignature === signature && !contentEmpty) {
+    focusPresentation(widget);
+    ensureAmbientReader()?.show(presentationKey(widget));
     scheduleOverlayIdleHide();
     return;
   }
@@ -1518,13 +1358,19 @@ function openInfoOverlay(widget) {
     void root.offsetWidth;
   }
   root.classList.add("is-open");
+  root.dataset.kind = widget.kind;
+  document.body.classList.add("has-presentation");
   if (glass && scrollTop > 0) {
     glass.scrollTop = scrollTop;
   }
+  focusPresentation(widget);
+  ensureAmbientReader()?.show(presentationKey(widget));
   scheduleOverlayIdleHide();
 }
 
 function closeInfoOverlay({ animate = true } = {}) {
+  state.ambientReader?.stop();
+  document.body.classList.remove("has-presentation");
   const root = $("info-overlay");
   clearOverlayPolicyTimers();
   state.infoSoftHidden = false;
@@ -1625,110 +1471,7 @@ function bindInfoOverlay() {
       playActiveInInfuse(playBtn.getAttribute("data-media-id") || "");
       return;
     }
-    const nav = target.closest("[data-media-nav]");
-    if (nav) {
-      ev.preventDefault();
-      ev.stopPropagation();
-      pinFromUser();
-      cycleMedia(Number(nav.getAttribute("data-media-nav")) || 1);
-      return;
-    }
-    const dot = target.closest("[data-media-dot]");
-    if (dot) {
-      ev.preventDefault();
-      ev.stopPropagation();
-      const visual = pickVisualOverlay(state.widgets);
-      const items = visual ? mediaItemsOf(visual) : [];
-      const idx = Number(dot.getAttribute("data-media-dot"));
-      if (items[idx]) {
-        pinFromUser();
-        focusMediaById(items[idx].id, { reveal: true });
-      }
-      return;
-    }
-    const card = target.closest(".info-media-card.is-selectable, .info-media-card.is-recessed");
-    if (card && card.dataset.mediaId) {
-      ev.preventDefault();
-      pinFromUser();
-      focusMediaById(card.dataset.mediaId, { reveal: true });
-    }
   });
-  $("info-content")?.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Enter" && ev.key !== " ") return;
-    const target = ev.target;
-    if (!(target instanceof Element)) return;
-    const card = target.closest(".info-media-card.is-selectable");
-    if (!card || !card.dataset.mediaId) return;
-    ev.preventDefault();
-    pinFromUser();
-    focusMediaById(card.dataset.mediaId, { reveal: true });
-  });
-
-  // Flick / swipe through the stacked genre (or search) cards.
-  let flick = null;
-  let suppressClickUntil = 0;
-  const content = $("info-content");
-  content?.addEventListener(
-    "pointerdown",
-    (ev) => {
-      if (!(ev.target instanceof Element)) return;
-      if (ev.target.closest("[data-infuse-play], [data-genre-browse], .info-dismiss, button, a, [data-media-nav], [data-media-dot]")) return;
-      const stack = ev.target.closest(".info-media-stack.is-stacked");
-      if (!stack) return;
-      flick = { x: ev.clientX, y: ev.clientY, id: ev.pointerId, moved: false };
-      try {
-        content.setPointerCapture(ev.pointerId);
-      } catch {
-        /* ignore capture failures on older engines */
-      }
-    },
-    { passive: true }
-  );
-  content?.addEventListener(
-    "pointermove",
-    (ev) => {
-      if (!flick || flick.id !== ev.pointerId) return;
-      const dx = ev.clientX - flick.x;
-      const dy = ev.clientY - flick.y;
-      if (Math.abs(dx) > 12 || Math.abs(dy) > 12) flick.moved = true;
-    },
-    { passive: true }
-  );
-  const endFlick = (ev) => {
-    if (!flick || flick.id !== ev.pointerId) return;
-    const dx = ev.clientX - flick.x;
-    const dy = ev.clientY - flick.y;
-    const wasFlick = flick.moved;
-    flick = null;
-    if (!wasFlick) return;
-    if (Math.abs(dx) < MEDIA_FLICK_PX && Math.abs(dy) < MEDIA_FLICK_PX) return;
-    // Prefer the dominant axis: horizontal or upward vertical advances.
-    suppressClickUntil = Date.now() + 400;
-    pinFromUser();
-    if (Math.abs(dx) >= Math.abs(dy)) {
-      cycleMedia(dx < 0 ? 1 : -1);
-    } else if (dy < 0) {
-      cycleMedia(1);
-    } else {
-      cycleMedia(-1);
-    }
-  };
-  content?.addEventListener("pointerup", endFlick);
-  content?.addEventListener("pointercancel", () => {
-    flick = null;
-  });
-
-  // Re-bind click handler path: skip synthetic click right after a flick.
-  content?.addEventListener(
-    "click",
-    (ev) => {
-      if (Date.now() < suppressClickUntil) {
-        ev.preventDefault();
-        ev.stopPropagation();
-      }
-    },
-    true
-  );
 
   document.addEventListener("keydown", (ev) => {
     const root = $("info-overlay");
@@ -1737,23 +1480,6 @@ function bindInfoOverlay() {
     if (ev.key === "Escape") {
       dismiss();
       return;
-    }
-    if (ev.key === "ArrowRight" || ev.key === "ArrowDown") {
-      const visual = pickVisualOverlay(state.widgets);
-      if (!visual || visual.kind !== "media") return;
-      if (mediaItemsOf(visual).length < 2) return;
-      ev.preventDefault();
-      pinFromUser();
-      cycleMedia(1);
-      return;
-    }
-    if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") {
-      const visual = pickVisualOverlay(state.widgets);
-      if (!visual || visual.kind !== "media") return;
-      if (mediaItemsOf(visual).length < 2) return;
-      ev.preventDefault();
-      pinFromUser();
-      cycleMedia(-1);
     }
   });
 }
@@ -2235,7 +1961,7 @@ function appendLog(role, text) {
   const log = $("log");
   const li = document.createElement("li");
   li.dataset.role = displayRole(role);
-  li.innerHTML = `<span class="who">${displayRole(role)}</span>${text}`;
+  li.innerHTML = `<span class="who">${escapeHtml(displayRole(role))}</span>${escapeHtml(text)}`;
   log.appendChild(li);
   log.scrollTop = log.scrollHeight;
   setEmpty("transcript", false);
@@ -2338,6 +2064,7 @@ $("composer").addEventListener("submit", async (ev) => {
   input.value = "";
   appendLog("you", text);
   noteOverlayConversation(text);
+  if (state.call) { state.call.said = text; state.call.inputItemId = ""; }
   if (
     sendRealtime({
       type: "conversation.item.create",
@@ -2355,7 +2082,7 @@ $("composer").addEventListener("submit", async (ev) => {
   try {
     await talk(text);
   } catch (err) {
-    appendLog("system", "That didn’t go through. Send it again — nothing was changed.");
+    appendLog("system", "The reply didn’t arrive. Check the current status before trying again.");
   }
   refresh();
 });
@@ -2364,7 +2091,7 @@ $("confirm-btn").addEventListener("click", async () => {
   try {
     await talk("confirm", true);
   } catch (err) {
-    appendLog("system", "That confirm didn’t go through. Tap it again — nothing else was changed.");
+    appendLog("system", "The confirmation response didn’t arrive. Check the current status before trying again.");
   }
   refresh();
 });
@@ -2401,8 +2128,34 @@ function dismissSpokenAnswer(opts) {
   }
 }
 
+function finishCallAfterAudio(call) {
+  if (!call || state.call !== call || call.pendingHangup) return;
+  call.pendingHangup = true;
+  // A completed tool response may precede the last audio packet. Give playback
+  // a moment to start; normally output_audio_buffer.stopped ends the call.
+  call.endAudioGrace = setTimeout(() => {
+    if (state.call === call && call.pendingHangup && !call.audioPlaying) stopConversation();
+  }, 350);
+  call.endAudioFallback = setTimeout(() => {
+    if (state.call === call && call.pendingHangup) stopConversation();
+  }, 30000);
+}
+
+function isEndCallTool(item) {
+  if (!item || item.type !== "function_call" || item.name !== "end_call" || !item.call_id) return false;
+  try {
+    const args = JSON.parse(item.arguments || "{}");
+    return args !== null && typeof args === "object" && !Array.isArray(args);
+  } catch (_) { return false; }
+}
+
 function onRealtimeEvent(event) {
   const type = event.type;
+  if (state.call && type === "output_audio_buffer.started") state.call.audioPlaying = true;
+  if (state.call && type === "output_audio_buffer.stopped") {
+    state.call.audioPlaying = false;
+    if (state.call.pendingHangup) { stopConversation(); return; }
+  }
   if (state.call?.bargeIn) {
     state.call.bargeIn.noteRealtimeEvent(type);
   }
@@ -2414,7 +2167,7 @@ function onRealtimeEvent(event) {
   ) {
     const delta = event.delta || "";
     if (delta) {
-      state.liveAssistantTranscript = `${state.liveAssistantTranscript || ""}${delta}`;
+      state.liveAssistantTranscript = `${state.liveAssistantTranscript || ""}${delta}`.slice(-12000);
       noteOverlayConversation(state.liveAssistantTranscript, { live: true });
     }
   }
@@ -2427,12 +2180,22 @@ function onRealtimeEvent(event) {
   if (type === "response.created") {
     state.liveAssistantTranscript = "";
   }
+  if (state.call && (type === "response.created" || type === "input_audio_buffer.speech_started")) {
+    state.call.responseGeneration += 1;
+  }
+  if (state.call && type === "input_audio_buffer.speech_started") {
+    state.call.said = "";
+    state.call.inputItemId = event.item_id || "";
+  }
   // User speech — requires session audio.input.transcription (see webrtc.session_config).
   // User mic transcript is NOT shown on the spoken-answer panel (assistant only).
   if (
     type === "conversation.item.input_audio_transcription.completed" ||
     type === "conversation.item.audio_transcription.completed"
   ) {
+    if (state.call && (!state.call.inputItemId || state.call.inputItemId === event.item_id)) {
+      state.call.said = String(event.transcript || "").slice(0, 6000);
+    }
     appendLog("you", event.transcript);
     noteOverlayConversation(event.transcript || "");
   }
@@ -2441,16 +2204,13 @@ function onRealtimeEvent(event) {
     appendLog("system", message);
     flashLocalActivity("error", "Voice error", 4000);
   }
-  if (type === "response.function_call_arguments.done" && event.name === "end_call") {
-    if (state.call) state.call.pendingHangup = true;
-  }
-  if (type === "response.done" && state.call?.pendingHangup) {
-    stopConversation();
-    return;
-  }
   // Sideband runs house tools on the server; still refresh overlays promptly so
   // media / weather panels appear during the live call (not only on the 8s poll).
   if (state.call?.sidebandOk) {
+    if (type === "response.done" && event.response?.status === "completed" &&
+        Array.isArray(event.response.output) && event.response.output.some(isEndCallTool)) {
+      finishCallAfterAudio(state.call);
+    }
     if (
       type === "response.function_call_arguments.done" ||
       type === "response.done" ||
@@ -2461,18 +2221,44 @@ function onRealtimeEvent(event) {
     }
     return;
   }
-  if (type !== "response.function_call_arguments.done") return;
-  relayTool(event);
+  // Completed response output is authoritative. Partial/cancelled tool arguments
+  // must never execute, and a multi-tool response gets just one continuation.
+  if (type === "response.done") relayCompletedTools(event);
 }
 
-async function relayTool(event) {
+async function relayCompletedTools(event) {
+  const call = state.call;
+  const response = event.response || {};
+  if (!call || call.sidebandOk || response.status !== "completed") return;
+  const tools = Array.isArray(response.output) ? response.output.filter((item) => item.type === "function_call") : [];
+  const generation = call.responseGeneration;
+  let completed = false;
+  for (const tool of tools) {
+    if (state.call !== call || call.responseGeneration !== generation) break;
+    if (!tool.call_id || call.toolCalls.has(tool.call_id)) continue;
+    call.toolCalls.add(tool.call_id);
+    completed = await relayTool(tool, call) || completed;
+    if (isEndCallTool(tool)) {
+      finishCallAfterAudio(call);
+      return;
+    }
+  }
+  if (completed && state.call === call && call.responseGeneration === generation) {
+    sendRealtime({ type: "response.create" });
+  }
+}
+
+async function relayTool(event, call = state.call) {
+  if (!call || state.call !== call) return false;
   let args = {};
   try {
     args = JSON.parse(event.arguments || "{}");
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Invalid tool arguments");
   } catch (_) {
-    args = {};
+    sendRealtime({ type: "conversation.item.create", item: { type: "function_call_output", call_id: event.call_id,
+      output: JSON.stringify({ ok: false, error: "Tool arguments were invalid; no action was taken." }) } });
+    return true;
   }
-  const endCall = event.name === "end_call";
   try {
     const out = await api("/api/realtime/tools", {
       method: "POST",
@@ -2480,8 +2266,11 @@ async function relayTool(event) {
         name: event.name,
         arguments: args,
         call_id: event.call_id || "",
+        session_id: call.callId,
+        said: call.said || "",
       }),
     });
+    if (state.call !== call) return false;
     sendRealtime({
       type: "conversation.item.create",
       item: {
@@ -2490,17 +2279,19 @@ async function relayTool(event) {
         output: JSON.stringify(out.output || out),
       },
     });
-    if (endCall) {
-      if (state.call) state.call.pendingHangup = true;
-      // Hang up when this response finishes (response.done); do not start another turn.
-      return;
-    }
-    sendRealtime({ type: "response.create" });
     applyWidgetPayload(out);
     refresh();
+    return true;
   } catch (err) {
+    if (state.call !== call) return false;
     appendLog("system", `Tool failed: ${err.message}`);
     flashLocalActivity("error", "Tool failed", 4000);
+    sendRealtime({
+      type: "conversation.item.create",
+      item: { type: "function_call_output", call_id: event.call_id,
+        output: JSON.stringify({ ok: false, error: "The tool response could not be received. Its outcome is unknown; check current state before retrying." }) },
+    });
+    return true;
   }
 }
 
@@ -2526,6 +2317,7 @@ function abandonCallSetup(pc) {
 async function startConversation() {
   const remote = $("remote-audio");
   const pc = new RTCPeerConnection();
+  try {
   let stream;
   try {
     stream = await acquireMicStream();
@@ -2577,7 +2369,7 @@ async function startConversation() {
   }
   const answer = await sdpResponse.text();
   await pc.setRemoteDescription({ type: "answer", sdp: answer });
-  const callId = sdpResponse.headers.get("X-Hearth-Call-Id") || "";
+  const callId = sdpResponse.headers.get("X-Hearth-Call-Id") || crypto.randomUUID();
   const sideband = sdpResponse.headers.get("X-Hearth-Sideband") || "";
   hideMicPanels();
   const micTrack = stream.getAudioTracks()[0] || null;
@@ -2594,6 +2386,11 @@ async function startConversation() {
     sidebandOk: sideband === "ok" || sideband === "starting",
     bargeIn,
     pendingHangup: false,
+    audioPlaying: false,
+    responseGeneration: 0,
+    toolCalls: new Set(),
+    said: "",
+    inputItemId: "",
   };
   pc.addEventListener("connectionstatechange", () => {
     if (!state.call || state.call.pc !== pc) return;
@@ -2604,12 +2401,14 @@ async function startConversation() {
   $("orb").classList.add("live", "hot");
   $("orb").setAttribute("aria-label", "End conversation");
   $("orb-label").textContent = "Listening";
-  $("hint").textContent = phoneUi()
-    ? "Listening. Speak to interrupt — background noise is ignored. Tap to hang up."
-    : "Live WebRTC conversation. Real speech interrupts; TV/HVAC noise should not. Tap to hang up.";
+  $("hint").textContent = "Listening. Speak naturally. Tap to end the conversation.";
   $("voice-pill").textContent = "voice webrtc-ga";
   $("voice-pill").classList.add("live");
   setRefreshInterval(1200);
+  } catch (err) {
+    abandonCallSetup(pc);
+    throw err;
+  }
 }
 
 async function stopConversation() {
@@ -2624,6 +2423,8 @@ async function stopConversation() {
   $("hint").textContent = idleHint();
   $("voice-pill").classList.remove("live");
   if (!call) return;
+  clearTimeout(call.endAudioGrace);
+  clearTimeout(call.endAudioFallback);
   try {
     call.bargeIn && call.bargeIn.stop();
     /* Detach from PC first so close() does not end the local MediaStreamTrack. */
@@ -2658,10 +2459,12 @@ async function stopConversation() {
 }
 
 async function beginVoiceFromUserGesture() {
+  if (state.callStarting || state.call) return;
+  state.callStarting = true;
   hideMicPanels();
   $("orb").classList.add("hot");
   $("orb-label").textContent = "Connecting";
-  $("hint").textContent = phoneUi() ? "Connecting…" : "Opening GA WebRTC session…";
+  $("hint").textContent = "Connecting…";
   try {
     await startConversation();
   } catch (err) {
@@ -2675,6 +2478,8 @@ async function beginVoiceFromUserGesture() {
       $("hint").textContent = idleHint();
       appendLog("system", classified.message);
     }
+  } finally {
+    state.callStarting = false;
   }
 }
 
@@ -2745,6 +2550,7 @@ $("logout-btn").addEventListener("click", async () => {
 });
 
 function onPageHide() {
+  state.ambientReader?.stop();
   /* Document is going away — release hardware. A warm mute is useless across navigations. */
   if (state.call) {
     try {

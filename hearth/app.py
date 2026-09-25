@@ -464,7 +464,7 @@ class SuggestBody(BaseModel):
     titles: list[str] | None = None
     query: str | None = None
     type: str = "any"
-    limit: int = Field(default=4, ge=1, le=6)
+    limit: int | None = Field(default=None, ge=1, le=12)
 
 
 @app.post("/api/media/suggest")
@@ -676,6 +676,7 @@ class RealtimeToolBody(BaseModel):
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     call_id: str = ""
+    session_id: str = ""
     said: str = ""
 
 
@@ -683,7 +684,10 @@ class RealtimeToolBody(BaseModel):
 async def realtime_tools(body: RealtimeToolBody) -> dict[str, Any]:
     """House tools stay on Hearth. Browser only relays function_call events."""
     args = dict(body.arguments)
-    result = await realtime_rtc.run_house_tool(body.name, args, said=body.said)
+    result = await realtime_rtc.run_house_tool(
+        body.name, args, said=body.said,
+        execution_id=body.call_id, session_id=body.session_id,
+    )
     return {
         "ok": result.get("ok", False),
         "path": "webrtc-ga",

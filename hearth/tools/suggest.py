@@ -8,6 +8,7 @@ glass media overlay already consumes. Never sends API keys to the browser.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -15,9 +16,11 @@ from hearth.fixtures import MOCK_RADARR_LOOKUP, MOCK_SONARR_LOOKUP, pipeline
 from hearth.tools.arr import overseerr, radarr, sonarr
 from hearth.tools.media_art import enrich_media_hit
 
-MAX_TITLES = 6
+MAX_TITLES = 12
 DEFAULT_LIMIT = 4
 SPEAK_LEN = 720
+LOOKUP_CONCURRENCY = 4
+LOOKUP_TIMEOUT_SECONDS = 15.0
 
 _WS = re.compile(r"\s+")
 _YEAR = re.compile(r"\((\d{4})\)\s*$")
@@ -235,6 +238,8 @@ def _skeleton(title: str, *, year: int | None, media_type: str) -> dict[str, Any
         "tmdbId": None,
         "posterPath": None,
         "skeleton": True,
+        "status": "unresolved",
+        "reason": "Metadata unavailable",
         "source": "suggest",
         "links": {},
     }
@@ -399,7 +404,7 @@ def format_speak(results: list[dict[str, Any]], *, query: str = "") -> str:
         year = row.get("year")
         label = f"{title} ({year})" if year else title
         if row.get("skeleton"):
-            bits.append(f"{label} (looking up)")
+            bits.append(f"{label} (metadata unavailable)")
         else:
             bits.append(label)
     if len(bits) == 1:
@@ -419,7 +424,12 @@ async def suggest_titles(args: dict[str, Any]) -> dict[str, Any]:
         limit = DEFAULT_LIMIT
     limit = max(1, min(MAX_TITLES, limit))
 
-    titles = parse_title_list(args.get("titles") if args.get("titles") is not None else args.get("title"))
+    raw_titles = args.get("titles") if args.get("titles") is not None else args.get("title")
+    titles = parse_title_list(raw_titles)
+    requested_total = (
+        len({title for row in raw_titles for title in parse_title_list([row])})
+        if isinstance(raw_titles, (list, tuple)) else len(titles)
+    )
     query = _WS.sub(" ", str(args.get("query") or args.get("q") or "")).strip()
 
     if not titles and query:
@@ -434,12 +444,30 @@ async def suggest_titles(args: dict[str, Any]) -> dict[str, Any]:
         speak = "Tell me which titles to show, or ask for a recommendation like 'suggest sci-fi movies'."
         return {"ok": False, "error": speak, "speak": speak, "results": [], "query": query or None}
 
-    titles = titles[:limit]
-    results: list[dict[str, Any]] = []
+    if raw_limit is None:
+        # An explicit list is already the requested size; do not silently lose
+        # the fifth title because the freeform-recommendation default is four.
+        limit = min(MAX_TITLES, len(titles))
+    titles = list(dict.fromkeys(titles))[:limit]
+    semaphore = asyncio.Semaphore(LOOKUP_CONCURRENCY)
+
+    async def resolve_bounded(title: str) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(
+                    resolve_title(title, media_type=media_type), timeout=LOOKUP_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                # A single slow/unavailable catalog must not discard the whole list.
+                asked, year = split_title_year(title)
+                item = _skeleton(asked, year=year,
+                                 media_type=media_type if media_type != "any" else "movie")
+                item["reason"] = "Metadata unavailable"
+                return item
+
+    results = list(await asyncio.gather(*(resolve_bounded(title) for title in titles)))
     modes: set[str] = set()
-    for title in titles:
-        hit = await resolve_title(title, media_type=media_type)
-        results.append(hit)
+    for hit in results:
         if hit.get("skeleton"):
             modes.add("partial")
         elif overseerr.live or radarr.live or sonarr.live:
@@ -462,6 +490,8 @@ async def suggest_titles(args: dict[str, Any]) -> dict[str, Any]:
         "mode": mode,
         "query": query or None,
         "asked": titles,
+        "total": max(requested_total, len(results)),
+        "truncated": requested_total > len(results),
         "media_type": media_type,
         "results": results,
         "speak": speak,

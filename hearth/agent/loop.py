@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from hearth.jev import (
     adopt_verdict,
     current_turn,
     evaluate_message,
+    is_write_tool,
+    lane_for_tool,
     log_shadow_outcome,
     tool_turn,
     turn_lane,
@@ -24,6 +27,8 @@ from hearth.tools.house import voice_plan
 from hearth import widgets as widget_bus
 
 MAX_TURNS = 8
+MODEL_TIMEOUT_SECONDS = 25.0
+MAX_TOOL_CALLS = 32
 
 
 @dataclass
@@ -36,6 +41,7 @@ class _TurnScope:
     context_note: str = ""
     idle_reply: str = ""
     external_history: list[dict[str, Any]] | None = None
+    executed_tools: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AgentLoop:
@@ -43,6 +49,7 @@ class AgentLoop:
         self.tools = tools or registry
         self.history: list[dict[str, Any]] = []
         self._turn = _TurnScope()
+        self._run_lock = asyncio.Lock()
 
     def reset(self) -> None:
         self.history = []
@@ -61,6 +68,16 @@ class AgentLoop:
         return out
 
     async def run(
+        self,
+        user_text: str,
+        **options: Any,
+    ) -> dict[str, Any]:
+        # A shared chat session must not overwrite another request's channel,
+        # tool restrictions, or history while its provider call is suspended.
+        async with self._run_lock:
+            return await self._run_locked(user_text, **options)
+
+    async def _run_locked(
         self,
         user_text: str,
         *,
@@ -105,9 +122,10 @@ class AgentLoop:
                 return await self._run_turn(text, recent=recent_turns, confirm=confirm)
             with tool_turn(text, channel=self._turn.channel, recent=recent_turns):
                 return await self._run_turn(text, recent=recent_turns, confirm=confirm)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             if self._turn.announce:
                 widget_bus.finish_turn(ok=False, detail="Failed.")
+                runtime.set_status("idle")
             raise
         finally:
             self._turn = _TurnScope()
@@ -253,7 +271,20 @@ class AgentLoop:
             )
             return self._seal(out, detail="Butler tool held.")
 
-        if settings.openai_configured:
+        # Jev can finish a confidently classified, locally resolvable request
+        # without paying for a second model to choose the same tool.
+        lane = _jev_lane()
+        answers = jev_verdict.answers
+        local_plan = route_intent(text, jev_lane=lane) if lane else None
+        fast_local = bool(
+            jev_verdict.ok
+            and answers is not None
+            and answers.needs_llm is not None
+            and answers.needs_llm.noul <= 0.2
+            and local_plan is not None
+            and lane_for_tool(str(local_plan.get("tool") or "")) == lane
+        )
+        if settings.openai_configured and not fast_local:
             try:
                 out = await self._run_openai(text)
                 if jev_verdict is not None:
@@ -271,10 +302,24 @@ class AgentLoop:
                 await _after_turn(text, out, channel=self._turn.channel)
                 return self._seal(out, detail="Done.")
             except Exception as exc:  # noqa: BLE001
+                if self._turn.executed_tools:
+                    # A tool may already have queued a movie or changed a device.
+                    # Never replay that action through the local fallback because
+                    # the provider failed while trying to describe its result.
+                    used = list(self._turn.executed_tools)
+                    out = {
+                        "reply": _format_tool_reply(used),
+                        "mode": "openai_degraded",
+                        "tools": used,
+                        "degraded": True,
+                    }
+                    self._remember_reply(text, out["reply"])
+                    await _after_turn(text, out, channel=self._turn.channel)
+                    return self._seal(out, detail="Tool results recovered.")
                 if self._turn.announce:
                     runtime.note(
                         "system",
-                        f"OpenAI path failed, using local router: {exc}",
+                        f"Model unavailable; using local tools ({type(exc).__name__}).",
                         kind="status",
                     )
                     runtime.flash_error("Model call failed")
@@ -282,6 +327,8 @@ class AgentLoop:
         out = await self._run_local(text)
         if out.get("mode") == "held":
             return out
+        if fast_local and settings.openai_configured:
+            out["mode"] = "jev_local"
         if jev_verdict is not None:
             out["jev"] = jev_verdict.as_log_dict()
             log_shadow_outcome(
@@ -313,7 +360,12 @@ class AgentLoop:
     async def _run_openai(self, user_text: str) -> dict[str, Any]:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        async with AsyncOpenAI(
+            api_key=settings.openai_api_key, timeout=MODEL_TIMEOUT_SECONDS, max_retries=0
+        ) as client:
+            return await self._run_openai_client(user_text, client)
+
+    async def _run_openai_client(self, user_text: str, client: Any) -> dict[str, Any]:
         history = (
             self._turn.external_history
             if self._turn.external_history is not None
@@ -331,7 +383,8 @@ class AgentLoop:
             *history,
             {"role": "user", "content": spoken},
         ]
-        used: list[dict[str, Any]] = []
+        used = self._turn.executed_tools
+        writes: dict[str, ToolResult] = {}
         tools = hide_from_llm(self.tools.openai_chat_tools())
 
         for _ in range(MAX_TURNS):
@@ -342,7 +395,8 @@ class AgentLoop:
             if tools:
                 kwargs["tools"] = tools
                 kwargs["tool_choice"] = "auto"
-            response = await client.chat.completions.create(**kwargs)
+            async with asyncio.timeout(MODEL_TIMEOUT_SECONDS):
+                response = await client.chat.completions.create(**kwargs)
             try:
                 from hearth.openai_usage import record_chat_usage
 
@@ -372,13 +426,30 @@ class AgentLoop:
                 if self._turn.announce:
                     runtime.set_status("tool")
                 for tc in msg.tool_calls:
-                    args = _parse_args(tc.function.arguments)
+                    if len(used) >= MAX_TOOL_CALLS:
+                        reply = _format_tool_reply(used) + "\nI stopped the tool loop here."
+                        self._remember_reply(user_text, reply)
+                        return {"reply": reply, "mode": "openai", "tools": used}
+                    try:
+                        args = _parse_args(tc.function.arguments)
+                    except ValueError:
+                        invalid = ToolResult(
+                            name=tc.function.name,
+                            ok=False,
+                            data={"error": "invalid_arguments", "speak": "The tool needs valid JSON object arguments; nothing ran."},
+                        )
+                        used.append(invalid.as_dict())
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(invalid.as_dict())})
+                        continue
                     if tc.function.name == "chief_of_staff":
                         args.setdefault("said", user_text)
                         args.setdefault("task", user_text)
                     # Queue-shaped tools stay on the caller's confirm button
                     # (Telegram Get). The model hears the refusal and can answer.
-                    if tc.function.name in self._turn.blocked_tools:
+                    fingerprint = tc.function.name + ":" + json.dumps(args, sort_keys=True)
+                    if is_write_tool(tc.function.name) and fingerprint in writes:
+                        result = writes[fingerprint]
+                    elif tc.function.name in self._turn.blocked_tools:
                         result = ToolResult(
                             name=tc.function.name,
                             ok=False,
@@ -398,6 +469,8 @@ class AgentLoop:
                             args,
                             said=user_text,
                         )
+                        if is_write_tool(tc.function.name):
+                            writes[fingerprint] = result
                     used.append(result.as_dict())
                     messages.append(
                         {
@@ -408,18 +481,22 @@ class AgentLoop:
                     )
                 continue
 
-            reply = (msg.content or "").strip() or "Done."
-            history.append({"role": "user", "content": user_text})
-            history.append({"role": "assistant", "content": reply})
-            trimmed = history[-24:]
-            if self._turn.external_history is not None:
-                self._turn.external_history[:] = trimmed
-            else:
-                self.history = trimmed
+            reply = (msg.content or "").strip() or (
+                _format_tool_reply(used) if used else "I didn't receive an answer. Please try again."
+            )
+            self._remember_reply(user_text, reply)
             return {"reply": reply, "mode": "openai", "tools": used}
 
-        reply = "Stopped after too many tool turns."
+        reply = _format_tool_reply(used) + "\nI stopped the tool loop here."
+        self._remember_reply(user_text, reply)
         return {"reply": reply, "mode": "openai", "tools": used}
+
+    def _remember_reply(self, user_text: str, reply: str) -> None:
+        history = self._turn.external_history
+        if history is None:
+            history = self.history
+        history.extend([{"role": "user", "content": user_text}, {"role": "assistant", "content": reply}])
+        history[:] = history[-24:]
 
     async def _run_local(self, user_text: str) -> dict[str, Any]:
         plan = route_intent(user_text, jev_lane=_jev_lane())
@@ -485,7 +562,9 @@ async def _after_turn(user_text: str, out: dict[str, Any], *, channel: str) -> N
         if reply:
             memory_store.persist_turn("assistant", reply, session_id=session_id, channel=channel)
         if session_id:
-            await maybe_summarize(session_id)
+            # Memory housekeeping cannot keep an otherwise finished turn stuck.
+            async with asyncio.timeout(3.0):
+                await maybe_summarize(session_id)
     except Exception:  # noqa: BLE001
         return
 
@@ -495,9 +574,11 @@ def _parse_args(raw: str | None) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("Tool arguments must be valid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Tool arguments must be a JSON object")
+    return data
 
 
 def _format_tool_reply(tools: list[dict[str, Any]]) -> str:

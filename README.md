@@ -297,23 +297,24 @@ curl -s http://vault:8787/readyz | jq '{ready, jev_mode, degraded}'
 
 The old “update guard” widget stack (Thinking / Action / Update cards beside the orb) is gone — it remounted on every status poll and flickered.
 
-In its place, a **centered glass panel** opens when there is rich visual content. Media titles stack as cards when several come up in conversation.
+An **ambient information board** opens automatically for rich conversation results. All returned titles are readable in a responsive grid, with posters, summaries, and known availability. Long boards advance through reading pages without touch; voice references emphasize the relevant title. Spoken captions are hidden while internal transcripts still support routing and context.
 
 | Kind | Source tools | Shows |
 | --- | --- | --- |
 | `weather` | `get_weather` | Place, temperature, condition, humidity / wind (single panel) |
-| `media` | `plex_search`, `plex_browse_genre`, `plex_now_playing`, `plex_play`, `radarr_search`, `sonarr_search`, `overseerr_search`, `suggest_titles` | Stacked title cards (poster, year, summary); front card = what is being talked about now |
+| `media` | `plex_search`, `plex_browse_genre`, `plex_now_playing`, `plex_play`, `radarr_search`, `sonarr_search`, `overseerr_search`, `suggest_titles`, `house_shelf`, `house_media` | Readable title grid, with speech-follow emphasis, shelf reasons and known availability |
 | `downloads` | `radarr_queue`, `sonarr_queue` | Queue progress list |
+| `information` | `web_search` | Sourced findings, summaries, and safe source links |
 
 ### Behavior
 
 - **Hide when talk leaves.** Soft-hide (fade) when the conversation is no longer about the on-screen weather/title. Acknowledgments (“ok”, “thanks”) do not force-hide. Clear topic switches (lights, food, docker, weather↔media) hide promptly. The widget stays in runtime memory so the same topic can reappear without a new tool fetch. Hard dismiss (× / backdrop / Esc) still deletes.
-- **Stacked media cards.** Search hits and successive title lookups accumulate into one `media` widget (`data.items` + `data.active_id`, with `data.item` = the active card). Naming a stacked title (chat or live Realtime transcript, including assistant audio deltas) brings that card forward. Single title → one card (not an empty stack).
+- **Complete media boards.** Search hits and successive single-title lookups accumulate in `data.items`; naming a title emphasizes it through `data.active_id`. New recommendation lists, genre browses and shelf snapshots replace the previous list. Explicit lists include up to 12 titles and resolve four at a time; one slow lookup does not discard the others. Failed or empty searches replace stale titles with an honest status.
 - **Relevance** is evaluated against the *active* card’s entity tokens (title/place), not generic words like “movie”. Past the fresh window with no entity evidence → `context.relevant: false` (`stale` / `idle` / `unrelated:*`).
 
 Payload path:
 
-1. Tool runs on the server → `hearth/widgets.publish_tool` upserts a `Widget` on `runtime` (`kind` = `weather` \| `media` \| `downloads`).
+1. Tool runs on the server → `hearth/widgets.publish_tool` upserts a `Widget` on `runtime` (`kind` = `weather` \| `media` \| `downloads` \| `information`).
 2. Chat / invoke / realtime / `GET /api/status` return `widgets: [...]` with `context: { relevant, reason, topics, active_id? }` from `hearth/overlay_context.py`.
 3. The UI (`#info-overlay`) renders the glass panel / card stack, reacts to live transcripts (not only the 8s status poll), and **skips DOM work when the overlay signature is unchanged** so polls do not flicker.
 4. Dismiss: ×, backdrop, or Esc → `DELETE /api/widgets/{id}`.
@@ -582,7 +583,7 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
    # Jev routes the media lanes and gates the queue button. On by default; add
    # the key to switch it on for real (shadow keeps allow/deny advisory):
    # TYPESAFE_API_KEY=…
-   # OPENAI_API_KEY=…         # only for descriptive riddles / title Q&A
+   # OPENAI_API_KEY=…         # vision, conversation, descriptive riddles / title Q&A
    ```
 
 6. Recreate the Hearth container. The bot stays **off** until both token and chat id are set. `TELEGRAM_POLL=false` is an operational kill switch.
@@ -613,7 +614,8 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
 - Title info questions (`what's X about?`) get a short answer with **no** Get / queue.
 - A text message never downloads by itself. **Get** is the confirmation (or yes on a single sticky guess), and it queues by `mediaId` — confirming never runs a second title search. Callbacks are HMAC-signed, chat-bound, and expire after `TELEGRAM_CALLBACK_TTL_SECONDS`.
 - Nah/No never queues: with an offer on screen it says so out loud; with nothing on screen it stays quiet rather than replying to chatter.
-- Magnets, `.torrent` files, and raw media attachments are refused. Rate limits, maximum title length, durable SQLite deduplication, secret redaction, ordered handling within each chat, and bounded concurrency across chats are enabled by default.
+- **Pictures become requests.** A captionless movie poster or screenshot of a title list identifies up to eight depicted titles, verifies them against the catalog, and automatically requests confident missing matches through Overseerr and the existing Jev gate. `preview` or `don't download` captions only identify; ambiguous matches remain choices. Set `HEARTH_TELEGRAM_VISION_AUTO_REQUEST=false` to require Get for every picture. Requires `OPENAI_API_KEY`; see [image intake and smoke checks](docs/ambient-ai-and-images.md).
+- Magnets, `.torrent` files, video/audio and non-image documents are refused. JPEG, PNG and WebP images are decoded and stripped of metadata in memory. Rate limits, maximum title length, durable SQLite deduplication, secret redaction, ordered handling within each chat, and bounded concurrency across chats are enabled by default.
 - Progress checks Radarr/Sonarr only for titles this bot queued.
 
 The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, `TELEGRAM_DB_PATH`, the lane switches (`HEARTH_TELEGRAM_MOOD_LANE`, `HEARTH_TELEGRAM_PERSON_LANE`, `HEARTH_TELEGRAM_SIMILAR_LANE`, `HEARTH_TELEGRAM_BATCH_LANE`, `HEARTH_TELEGRAM_BATCH_MAX_ITEMS`, `HEARTH_TELEGRAM_CONTEXT_TTL_SECONDS`, `HEARTH_TELEGRAM_BUTLER_VOICE` — all default on), plus the Jev variables in `docs/jev.md`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.

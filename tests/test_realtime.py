@@ -263,11 +263,19 @@ async def test_sideband_end_call_closes_after_response_done(monkeypatch):
             "call_id": "call_end_1",
         }
     )
-    assert band._pending_hangup is True
-    assert any(m.get("type") == "conversation.item.create" for m in sent)
+    # Partial argument events must not execute tools: the response can still
+    # be cancelled. Only its completed final output may end the call.
+    assert band._pending_hangup is False
+    assert not any(m.get("type") == "conversation.item.create" for m in sent)
     assert not any(m.get("type") == "response.create" for m in sent)
 
-    await band._on_event({"type": "response.done", "response": {"output": []}})
+    await band._on_event({"type": "response.done", "response": {"output": [{
+        "type": "function_call", "name": "end_call", "arguments": '{"reason":"goodbye"}',
+        "call_id": "call_end_1",
+    }]}})
+    import asyncio
+
+    await asyncio.gather(*list(band._jobs))
     # Hangup is scheduled as a task; let it run.
     if band._hangup_task is not None:
         await band._hangup_task

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import shutil
 from pathlib import Path
 
 UI = Path(__file__).resolve().parents[1] / "hearth" / "ui" / "static"
@@ -16,6 +17,8 @@ def test_spoken_answer_shell_is_wired(client):
     assert page.status_code == 200
     assert 'id="spoken-answer"' in page.text
     assert 'id="spoken-answer-text"' in page.text
+    assert 'data-enabled="false"' in page.text
+    assert 'src="/static/presentation.js"' in page.text
     assert 'src="/static/spoken-answer.js"' in page.text
 
     js = client.get("/static/spoken-answer.js")
@@ -52,7 +55,7 @@ def test_spoken_answer_shell_is_wired(client):
     assert "height: 0" in css.text
 
     sw = client.get("/sw.js")
-    assert "hearth-shell-v21" in sw.text
+    assert "hearth-shell-v22" in sw.text
     assert "/static/spoken-answer.js" in sw.text
 
 
@@ -71,7 +74,7 @@ def test_spoken_answer_reuses_overlay_dismiss_event_set():
 
 def test_spoken_answer_lifetime_policy_node():
     """Pure classifier + panel lifetime: reveal → finalize/hold → interrupt/call-end."""
-    node_bin = str(NODE if NODE.is_file() else Path("/usr/bin/node"))
+    node_bin = shutil.which("node") or str(NODE if NODE.is_file() else Path("/usr/bin/node"))
     script = r"""
 const sa = require('./hearth/ui/static/spoken-answer.js');
 const assert = (cond, msg) => { if (!cond) { console.error(msg); process.exit(1); } };
@@ -137,6 +140,12 @@ panel.onCallEnded();
 assert(panel._visible === false, 'call end hard-dismisses');
 assert(root.hidden === true, 'root hidden after call end');
 assert(panel._full === '', 'buffer cleared on call end');
+
+// Default document captions stay completely silent and hidden.
+const quiet = sa.createFromDocument({getElementById: (id) => id === 'spoken-answer' ? root : text});
+quiet.onRealtimeEvent('response.output_audio_transcript.delta', { delta: 'Do not show a transcript' });
+assert(quiet._visible === false && root.hidden === true, 'captions remain disabled');
+assert(quiet._full === '', 'disabled captions do not retain transcript');
 
 // Overlay throw must not escape
 panel.root = null;

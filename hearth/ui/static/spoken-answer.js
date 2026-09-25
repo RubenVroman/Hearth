@@ -101,6 +101,7 @@
       this._visible = false;
       this._closing = false;
       this._generation = 0;
+      this.enabled = !els || els.enabled !== false;
     }
 
     bind(root, textEl) {
@@ -112,6 +113,7 @@
     /** Feed a Realtime data-channel event. Never throws. */
     onRealtimeEvent(type, event) {
       try {
+        if (!this.enabled) return;
         const action = classifyEvent(type);
         if (action === "reveal") {
           const delta = (event && event.delta) || "";
@@ -296,6 +298,7 @@
     return new SpokenAnswerPanel({
       root: documentRef.getElementById("spoken-answer"),
       textEl: documentRef.getElementById("spoken-answer-text"),
+      enabled: documentRef.getElementById("spoken-answer")?.dataset?.enabled === "true",
     });
   }
 

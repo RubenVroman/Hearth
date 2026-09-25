@@ -124,7 +124,7 @@ class TelegramBotService:
         if self.store is None:
             self.store = self._store_factory()
         if self.bot is None:
-            self.bot = TelegramMediaBot(self.store)
+            self.bot = TelegramMediaBot(self.store, image_client=self.client)
 
     async def start(self) -> None:
         if not settings.telegram_configured:
@@ -184,14 +184,23 @@ class TelegramBotService:
         self._task = None
         self._progress_task = None
         self._bot_ready = False
-        await self.client.aclose()
-        if self.store is not None:
-            if self._owns_store:
-                self.store.close()
-                self.store = None
-                self.bot = None
-            else:
-                self.store.release_poller_lock()
+        try:
+            try:
+                await self.client.aclose()
+            finally:
+                if self.bot is not None:
+                    vision = getattr(self.bot, "vision", None)
+                    if vision is not None and hasattr(vision, "aclose"):
+                        await vision.aclose()
+        finally:
+            # Client shutdown failures must never strand the single-poller lock.
+            if self.store is not None:
+                if self._owns_store:
+                    self.store.close()
+                    self.store = None
+                    self.bot = None
+                else:
+                    self.store.release_poller_lock()
 
     async def _wait_or_stop(self, seconds: float) -> None:
         try:

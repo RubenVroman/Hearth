@@ -169,8 +169,14 @@ async def test_agent_loop_injects_retrieved_memory_into_openai_prompt(monkeypatc
         completions = FakeCompletions()
 
     class FakeClient:
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, **_kwargs):
             self.chat = FakeChat()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
 
     monkeypatch.setattr(settings, "openai_api_key", "sk-test-hearth-memory")
     with patch("openai.AsyncOpenAI", FakeClient):

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -42,8 +43,12 @@ MAX_MESSAGE_LENGTH = 4096
 # Bot API methods that are safe to repeat: re-reading updates or re-acking a
 # callback cannot double-post anything into a chat.
 RETRY_SAFE_METHODS = frozenset(
-    {"getMe", "getUpdates", "deleteWebhook", "answerCallbackQuery"}
+    {"getMe", "getUpdates", "getFile", "sendChatAction", "deleteWebhook", "answerCallbackQuery"}
 )
+
+
+class TelegramFileError(ValueError):
+    """An attachment could not be fetched within the trusted file boundary."""
 
 
 class TelegramBotClient:
@@ -278,6 +283,55 @@ class TelegramBotClient:
             self.bot_username = str(result.get("username") or "")
         return data
 
+    async def download_image(self, file_id: str, *, max_bytes: int) -> bytes:
+        """Fetch only a Bot API file path, without redirects, logging or disk I/O.
+
+        The caller owns chat authorization and MIME validation. Both declared
+        and streamed sizes are bounded here; a forged Telegram URL cannot cause
+        a request to an arbitrary host or leak the bot token in an exception.
+        """
+        if not file_id or len(file_id) > 512:
+            raise TelegramFileError("Invalid Telegram image.")
+        data = await self._call("getFile", {"file_id": file_id})
+        result = data.get("result")
+        if not data.get("ok") or not isinstance(result, dict):
+            raise TelegramFileError("Telegram could not provide that image. Try sending it again.")
+        path = result.get("file_path")
+        if (
+            not isinstance(path, str)
+            or not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
+            or path.startswith("/")
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+        ):
+            raise TelegramFileError("Telegram returned an invalid image path.")
+        size = result.get("file_size")
+        if size is not None and (type(size) is not int or size < 1 or size > max_bytes):
+            raise TelegramFileError("That image is too large. Send a smaller JPEG, PNG or WebP.")
+        client = await self._http()
+        try:
+            async with client.stream(
+                "GET", f"{self._api_root}/file/bot{self.token}/{path}",
+                follow_redirects=False, timeout=15.0,
+            ) as response:
+                if response.status_code != 200:
+                    raise TelegramFileError("Telegram could not download that image.")
+                declared = response.headers.get("content-length")
+                if declared and (not declared.isdigit() or int(declared) > max_bytes):
+                    raise TelegramFileError("That image is too large. Send a smaller image.")
+                chunks = bytearray()
+                async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                    if len(chunks) + len(chunk) > max_bytes:
+                        raise TelegramFileError("That image is too large. Send a smaller image.")
+                    chunks.extend(chunk)
+                if not chunks:
+                    raise TelegramFileError("That image was empty. Try sending it again.")
+                return bytes(chunks)
+        except TelegramFileError:
+            raise
+        except Exception:
+            # httpx exceptions contain the token-bearing request URL.
+            raise TelegramFileError("Telegram could not download that image. Try again.") from None
+
     async def get_updates(
         self,
         *,
@@ -320,6 +374,10 @@ class TelegramBotClient:
         if reply_markup is not None:
             body["reply_markup"] = reply_markup
         return await self._call("sendMessage", body, ambiguous_write=True)
+
+    async def send_chat_action(self, chat_id: int) -> dict[str, Any]:
+        """Ephemeral feedback while an authorized image is being understood."""
+        return await self._call("sendChatAction", {"chat_id": int(chat_id), "action": "typing"})
 
     async def edit_message_text(
         self,

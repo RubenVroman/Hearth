@@ -21,6 +21,8 @@ _MEDIA_TOOLS = {
     "sonarr_search",
     "overseerr_search",
     "suggest_titles",
+    "house_shelf",
+    "house_media",
 }
 
 _DOWNLOAD_TOOLS = {
@@ -32,7 +34,7 @@ _DOWNLOAD_TOOLS = {
     "radarr_grab_release",
 }
 
-_VISUAL_KINDS = frozenset({"weather", "media", "downloads"})
+_VISUAL_KINDS = frozenset({"weather", "media", "downloads", "information"})
 
 
 def new_id(prefix: str = "w") -> str:
@@ -64,6 +66,8 @@ def publish_tool(result: dict[str, Any]) -> Widget | None:
         return None
     if name == "get_weather":
         return _weather_widget(result)
+    if name == "web_search":
+        return _information_widget(result)
     if name in _DOWNLOAD_TOOLS:
         return _downloads_widget(result)
     if name in _MEDIA_TOOLS:
@@ -73,6 +77,59 @@ def publish_tool(result: dict[str, Any]) -> Widget | None:
 
 def is_visual(kind: str | None) -> bool:
     return (kind or "") in _VISUAL_KINDS
+
+
+def _public_link(value: Any) -> str | None:
+    """Keep source links navigable without allowing script or credential URLs."""
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or len(value) > 2048:
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+            return None
+        if parsed.username or parsed.password:
+            return None
+    except ValueError:
+        return None
+    return value.strip()
+
+
+def _information_widget(result: dict[str, Any]) -> Widget:
+    """Present sourced findings directly; never turn search prose into actions."""
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    ok = bool(result.get("ok")) and data.get("ok") is not False
+    query = str(data.get("query") or "What I found")[:240]
+    rows = data.get("results") if isinstance(data.get("results"), list) else []
+    items = []
+    for row in rows[:12] if ok else []:
+        if not isinstance(row, dict):
+            continue
+        items.append({
+            "title": str(row.get("title") or row.get("source") or "Source")[:240],
+            "body": str(row.get("snippet") or "")[:1200],
+            "url": _public_link(row.get("url")),
+            "source": str(row.get("source") or "")[:120],
+        })
+    summary = str(data.get("summary") or "")[:2400] if ok else ""
+    body = summary if ok else str(data.get("speak") or "Search is unavailable right now.")[:800]
+    if ok and not items and not summary:
+        body = "No results found. Try a more specific question."
+    if data.get("mode") == "mock":
+        detail = "Demo results · live search is not connected"
+    else:
+        detail = f"{len(items)} sources" if items else ""
+    return runtime.upsert_widget(Widget(
+        id="information", kind="information", title=query,
+        status="done" if ok else "error", body=body, detail=detail,
+        data={
+            "tool": "web_search", "query": query, "summary": summary,
+            "items": items, "sources": [{"title": row["title"], "url": row["url"]}
+                                         for row in items if row["url"]],
+            "mode": data.get("mode"), "empty": not bool(items or summary),
+        }, sticky=False,
+    ))
 
 
 def _weather_widget(result: dict[str, Any]) -> Widget:
@@ -376,7 +433,9 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
     genres = row.get("genres")
     if not isinstance(genres, list):
         genres = []
-    genres = [str(g).strip() for g in genres if str(g or "").strip()]
+    genres = [str(g.get("name") or "") if isinstance(g, dict) else str(g)
+              for g in genres if g]
+    genres = [g.strip() for g in genres if g.strip()]
     raw_type = str(row.get("type") or row.get("mediaType") or "movie").lower()
     if raw_type in {"tv", "show", "series"}:
         media_type = "show"
@@ -392,7 +451,7 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
         "show": row.get("show") or row.get("grandparentTitle"),
         "summary": row.get("summary") or row.get("overview") or "",
         "contentRating": row.get("contentRating"),
-        "rating": row.get("rating") or row.get("audienceRating"),
+        "rating": row.get("rating") or row.get("audienceRating") or row.get("voteAverage"),
         "genres": genres,
         **art,
         "source": source,
@@ -404,10 +463,19 @@ def _normalize_media_item(row: dict[str, Any], *, source: str) -> dict[str, Any]
         item["state"] = row.get("state")
     if row.get("pending"):
         item["pending"] = True
+    for key in ("reason", "availability", "status", "progress_pct"):
+        if row.get(key) is not None:
+            item[key] = row[key]
+    if not item.get("availability"):
+        if source == "plex":
+            item["availability"] = "On Plex"
+        elif row.get("hasFile") is True:
+            item["availability"] = "Available"
     links = row.get("links") if isinstance(row.get("links"), dict) else None
     if links:
         item["links"] = {
-            k: str(v) for k, v in links.items() if k in {"tmdb", "imdb"} and v
+            k: _public_link(v) for k, v in links.items()
+            if k in {"tmdb", "imdb"} and _public_link(v)
         }
     return item
 
@@ -429,6 +497,25 @@ def _candidate_media_items(data: dict[str, Any], *, source: str) -> list[dict[st
 
 def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, Any]]:
     """Normalize one or many hits from a media tool into stack cards."""
+    if name == "house_media":
+        plex = data.get("plex") if isinstance(data.get("plex"), dict) else {}
+        return _media_items_from_tool("plex_now_playing", plex)
+    if name == "house_shelf":
+        out = []
+        seen = set()
+        for key, reason in (("now", "Playing now"), ("continue_watching", "Continue watching"),
+                            ("recently_added", "Recently added")):
+            rows = data.get(key) if isinstance(data.get(key), list) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                item = _normalize_media_item(
+                    {**row, "reason": reason, "availability": "On Plex"}, source="plex",
+                )
+                if item and item["id"] not in seen:
+                    seen.add(item["id"])
+                    out.append(item)
+        return out[:_MEDIA_STACK_CAP]
     if name == "plex_now_playing":
         sessions = data.get("sessions") or []
         out: list[dict[str, Any]] = []
@@ -508,7 +595,7 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
             "overseerr_search": "overseerr",
             "suggest_titles": "suggest",
         }.get(name, "media")
-        default_type = "movie" if "radarr" in name or name == "plex_browse_genre" else "show"
+        default_type = "show" if name == "sonarr_search" else "movie"
         if name == "plex_browse_genre" and str(data.get("media_type") or "").lower() == "show":
             default_type = "show"
         if name == "suggest_titles":
@@ -517,7 +604,7 @@ def _media_items_from_tool(name: str, data: dict[str, Any]) -> list[dict[str, An
                 default_type = "show"
             else:
                 default_type = "movie"
-        cap = _BROWSE_HIT_CAP if name == "plex_browse_genre" else _SEARCH_HIT_CAP
+        cap = _BROWSE_HIT_CAP if name in {"plex_browse_genre", "suggest_titles"} else _SEARCH_HIT_CAP
         out = []
         for hit in results[:cap]:
             if not isinstance(hit, dict):
@@ -642,7 +729,7 @@ def _media_panel_copy(
     elif active.get("player"):
         detail_parts.append(str(active["player"]))
     if active.get("skeleton"):
-        detail_parts.append("looking up")
+        detail_parts.append(str(active.get("reason") or "Metadata unavailable"))
     if mode == "mock":
         detail_parts.append("mock")
     if not genre and len(items) > 1:
@@ -712,7 +799,7 @@ def _genres_widget(result: dict[str, Any]) -> Widget | None:
 
 def _media_widget(result: dict[str, Any]) -> Widget | None:
     name = str(result.get("name") or "media")
-    data = result.get("data") or {}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
     ok = bool(result.get("ok")) and data.get("ok") is not False
 
     # List-genres asks → category picker (not an empty media stack).
@@ -721,14 +808,25 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
 
     incoming = _media_items_from_tool(name, data)
     if not incoming:
-        # Empty search / nothing playing — no overlay (voice/transcript still answers).
-        return None
+        # Replace stale titles with an honest result, including failed lookups.
+        query = str(data.get("query") or "").strip()
+        body = str(data.get("speak") or (
+            "No matching titles found." if ok else "I couldn't load the media results."
+        ))[:1200]
+        return runtime.upsert_widget(Widget(
+            id="media", kind="media", title=query or "Your media",
+            status="info" if ok else "error", body=body,
+            detail="Try naming a title or a year." if ok else "You can ask me to try again.",
+            data={"tool": name, "query": query, "items": [], "active_id": "",
+                  "empty": True, "presentation": "board", "speak": body},
+            sticky=False,
+        ))
     if result.get("needs_confirm"):
         incoming[0]["pending"] = True
 
     # Genre browse replaces the prior stack so ask-once shows only that genre.
     existing_items: list[dict[str, Any]] = []
-    if name != "plex_browse_genre":
+    if name not in {"plex_browse_genre", "suggest_titles", "house_shelf", "house_media"}:
         existing_widget = runtime.get_widget("media")
         if existing_widget is not None and existing_widget.kind == "media":
             raw_items = (existing_widget.data or {}).get("items")
@@ -757,7 +855,14 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
         "item": active,
         "items": items,
         "active_id": active_id,
-        "presentation": "carousel",
+        "presentation": "board",
+        "query": data.get("query"),
+        "heading": data.get("query") or (f"{genre} picks" if genre else (
+            "Your Plex shelf" if name == "house_shelf" else
+            "For your next watch" if name == "suggest_titles" else ""
+        )),
+        "mode": data.get("mode"),
+        "truncated": bool(data.get("truncated")),
     }
     if genre:
         payload["genre"] = genre
@@ -782,7 +887,7 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
                 title=title,
                 status="info",
                 body=str(data.get("speak") or data.get("error") or "Which title should I play?"),
-                detail="Tap a card, then Open in Infuse.",
+                detail="Say the title and year you want to play.",
                 data=payload,
                 sticky=False,
             )

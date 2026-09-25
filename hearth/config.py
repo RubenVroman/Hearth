@@ -373,6 +373,14 @@ class Settings(BaseSettings):
         le=8,
         alias="HEARTH_TELEGRAM_BATCH_MAX_ITEMS",
     )
+    # Authorized Telegram images become catalog requests; captions can opt out.
+    telegram_vision_enabled: bool = Field(default=True, alias="HEARTH_TELEGRAM_VISION_ENABLED")
+    telegram_vision_auto_request: bool = Field(default=True, alias="HEARTH_TELEGRAM_VISION_AUTO_REQUEST")
+    telegram_vision_model: str = Field(default="gpt-4o", alias="HEARTH_TELEGRAM_VISION_MODEL")
+    telegram_vision_max_bytes: int = Field(default=4 * 1024 * 1024, ge=1024, le=10 * 1024 * 1024, alias="HEARTH_TELEGRAM_VISION_MAX_BYTES")
+    telegram_vision_max_items: int = Field(default=8, ge=1, le=8, alias="HEARTH_TELEGRAM_VISION_MAX_ITEMS")
+    telegram_vision_timeout_seconds: float = Field(default=20.0, ge=1, le=60, alias="HEARTH_TELEGRAM_VISION_TIMEOUT_SECONDS")
+    telegram_vision_rate_per_minute: int = Field(default=2, ge=1, le=20, alias="HEARTH_TELEGRAM_VISION_RATE_PER_MINUTE")
     # In-thread follow-up memory ("the sequel", "all of them", "more like that").
     telegram_context_ttl_seconds: int = Field(
         default=30 * 60,

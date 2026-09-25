@@ -19,6 +19,7 @@ dependencies = [
   "PyJWT>=2.9.0",
   "rapidfuzz>=3.0.0,<4.0",
   "typesafe-sdk>=0.6.0,<1.0",
+  "Pillow>=11.0,<13.0",
 ]
 
 [project.optional-dependencies]

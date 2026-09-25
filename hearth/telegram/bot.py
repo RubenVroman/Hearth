@@ -4,9 +4,9 @@
 (Choice/Noul/Score) to pick a lane — exact title, known franchise, series-all,
 edition, person filmography, mood/vibe, "something like X", a multi-title batch,
 or an in-thread follow-up. OpenAI (gpt-4o) runs only when Jev says a descriptive
-riddle or needs_llm (or fail-open). Get / yes confirm remains the only queue
-boundary — never invent a grab from chat alone, and confirming queues by
-mediaId, never by re-searching the title.
+riddle or needs_llm (or fail-open). Typed searches queue after Get / yes.
+Authorized images can automatically request unambiguous catalog matches through
+the same durable queue, with Jev governing every write by exact mediaId.
 
 Turns that are not an instant media or house lane go through the same
 :class:`hearth.agent.loop.AgentLoop` Ask-the-House uses, so weather, lights,
@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import logging
 import math
+import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -95,6 +96,14 @@ from hearth.telegram.media.play import looks_like_play_command, play_lane_enable
 from hearth.telegram.media.watch_next import WatchNext, pick_next_in_order
 
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
+from hearth.telegram.client import TelegramFileError
+from hearth.telegram.callbacks import RequestCallback
+from hearth.telegram.media.vision import (
+    OpenAIVisionProvider, VisionError, caption_mode, exact_matches,
+    image_attachment, names_selected_titles, prepare_image,
+)
+from hearth.telegram.media.ranking import to_hits
+from hearth.telegram.media.memory import RememberedHit
 from hearth.telegram.house import house_control_reply, looks_like_house_control
 from hearth.telegram.parse import parse_message
 from hearth.telegram.progress import (
@@ -129,7 +138,9 @@ HELP_TEXT = (
     "what’s already on Plex, or “quiet hours” for the lights. "
     "You can also just talk — weather, lights, what's playing — and follow up "
     "on the last card (“the second one”, “also dim the lights”). "
-    "Tap Get to request — I never queue from chat alone. House controls, when "
+    "Send a movie poster or a picture of a movie list and I’ll request clear "
+    "catalog matches automatically. Caption it ‘preview’ to look first. "
+    "For typed searches, tap Get to request. House controls, when "
     "Home Assistant has them: house sleep, good morning, movie night mode, "
     "climate, feeder, purifier. "
     "Commands: /search <title>, /status, /help."
@@ -197,6 +208,8 @@ class TelegramMediaBot:
         progress: ProgressTracker | None = None,
         house_commands: TelegramHouseCommands | None = None,
         agent: AgentLoop | None = None,
+        image_client: Any | None = None,
+        vision_provider: Any | None = None,
     ) -> None:
         self.store = store
         self.overseerr = overseerr_client or overseerr
@@ -207,12 +220,18 @@ class TelegramMediaBot:
         self.agent = agent or AgentLoop()
         self.house = house_commands or TelegramHouseCommands()
         self.rate = RateLimiter()
+        self.vision_rate = RateLimiter()
+        self.image_client = image_client
+        self.vision = vision_provider or OpenAIVisionProvider()
+        self._vision_inflight: set[int] = set()
+        self._vision_slots = asyncio.Semaphore(2)
         self.bot_user_id: int | None = None
         self._codec: CallbackCodec | None = None
         self._codec_signature: tuple[str, int] | None = None
 
     def reset(self) -> None:
         self.rate.reset()
+        self.vision_rate.reset()
         self.progress.reset()
         self.bot_user_id = None
         self.agent.reset()
@@ -289,7 +308,7 @@ class TelegramMediaBot:
     @_with_speaker
     async def handle_message(self, message: dict[str, Any]) -> BotReply | None:
         view = MessageView.from_telegram(message)
-        if view is None or not self._authorized(view.chat_id, view.user_id):
+        if view is None or view.is_bot or not self._authorized(view.chat_id, view.user_id):
             return None
         # One Jev scope per Telegram turn: the media router's verdict is reused
         # by the tool gate, so routing and authorization share a single call.
@@ -301,6 +320,11 @@ class TelegramMediaBot:
         view: MessageView,
         message: dict[str, Any],
     ) -> BotReply | None:
+        if view.has_media:
+            # Attachment captions must never be interpreted as house commands.
+            if view.media_kind in {"photo", "document"} and settings.telegram_vision_enabled:
+                return await self._image_reply(view, message)
+            return BotReply(format_reject_download())
         house_reply = await self.house.handle(view.text)
         if house_reply is not None:
             # A new explicit house command supersedes any stale media yes/no offer.
@@ -452,6 +476,183 @@ class TelegramMediaBot:
             # so answer honestly instead of letting the update dead-letter.
             log.exception("telegram media lane failed for intent %s", intent.kind)
             return BotReply(voice.lane_failed())
+
+    async def _image_reply(self, view: MessageView, message: dict[str, Any]) -> BotReply:
+        turn_key = f"image:{view.chat_id}:{view.user_id}:{view.message_id}"
+        saved = self.store.get_callback_media(turn_key) or {}
+        if saved.get("reply"):
+            return BotReply(str(saved["reply"]), saved.get("reply_markup"))
+        mode = caption_mode(view.text)
+        self._clear_pending_guess(view.chat_id)
+        self.thread.dismiss_confirm(view.chat_id)
+        self.memory.forget(view.chat_id)
+        if mode == "cancel":
+            return BotReply("Okay — I won't read or request anything from that image.")
+        try:
+            attachment = image_attachment(message, max_bytes=settings.telegram_vision_max_bytes)
+        except VisionError as exc:
+            return BotReply(str(exc))
+        if not self.backend_configured:
+            return BotReply("Connect Overseerr on Hearth before requesting titles from images.")
+        if self.image_client is None:
+            return BotReply("Image intake is unavailable. Try again after the Telegram service reconnects.")
+        if isinstance(self.vision, OpenAIVisionProvider) and not settings.openai_configured:
+            return BotReply("Image recognition needs an OpenAI API key configured on Hearth.")
+        if view.chat_id in self._vision_inflight:
+            return BotReply("I'm still reading your previous image. Give me a moment.")
+        self.vision_rate.max_calls = settings.telegram_vision_rate_per_minute
+        if not saved and not self.vision_rate.allow((view.chat_id, view.user_id)):
+            wait = max(1, math.ceil(self.vision_rate.retry_after((view.chat_id, view.user_id))))
+            return BotReply(f"Give me {wait}s before another image, then send it again.")
+        self._vision_inflight.add(view.chat_id)
+        typing_task = (
+            asyncio.create_task(self._image_typing(view.chat_id))
+            if hasattr(self.image_client, "send_chat_action") else None
+        )
+        try:
+            if not saved:
+                async with asyncio.timeout(settings.telegram_vision_timeout_seconds + 15):
+                    async with self._vision_slots:
+                        raw = await self.image_client.download_image(
+                            attachment.file_id, max_bytes=settings.telegram_vision_max_bytes,
+                        )
+                        clean, mime = await asyncio.to_thread(
+                            prepare_image, raw, mime=attachment.mime,
+                            max_bytes=settings.telegram_vision_max_bytes,
+                        )
+                        result = await self.vision.identify(
+                            clean, mime, view.text,
+                            limit=settings.telegram_vision_max_items,
+                        )
+                if result.kind == "refuse":
+                    return BotReply("I can't identify movie titles from that image.")
+                if result.kind == "not_media" or not result.candidates:
+                    return BotReply("I couldn't find readable movie or series titles. Send a clearer poster or list.")
+                # Freeze title evidence before any write: a transport retry must
+                # never re-run vision and discover a different set to request.
+                saved = {"result": result.model_dump(), "mode": mode}
+                self.store.put_callback_media(turn_key, saved, ttl_s=86400)
+            from hearth.telegram.media.vision import VisionResult
+            result = VisionResult.model_validate(saved["result"])
+            automatic = settings.telegram_vision_auto_request and saved.get("mode") == "request"
+            if names_selected_titles(view.text, result.candidates):
+                automatic = False
+            said = "Request the depicted movies and series." if automatic else "Identify the depicted movies and series."
+            said += " Titles: " + "; ".join(item.title for item in result.candidates[:8])
+            # All catalog lookups and requests reuse a single Jev verdict.
+            with tool_turn(said + (f" Caption: {view.text[:500]}" if view.text else ""), channel="telegram_image"):
+                reply = await self._resolve_image(view, result, automatic=automatic, turn_key=turn_key)
+            self.store.put_callback_media(
+                turn_key, {**saved, "reply": reply.text, "reply_markup": reply.reply_markup}, ttl_s=86400,
+            )
+            return reply
+        except (VisionError, TelegramFileError) as exc:
+            return BotReply(str(exc))
+        except TimeoutError:
+            return BotReply("Reading that image took too long. Try a smaller crop or send the titles as text.")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("telegram image turn failed; image and provider output omitted")
+            return BotReply("I couldn't finish that image request. Check Overseerr before trying again.")
+        finally:
+            self._vision_inflight.discard(view.chat_id)
+            if typing_task is not None:
+                typing_task.cancel()
+                await asyncio.gather(typing_task, return_exceptions=True)
+
+    async def _image_typing(self, chat_id: int) -> None:
+        while True:
+            try:
+                async with asyncio.timeout(3.0):
+                    response = await self.image_client.send_chat_action(chat_id)
+                if not response.get("ok"):
+                    return
+            except Exception:
+                return
+            await asyncio.sleep(4.0)
+
+    async def _resolve_image(self, view: MessageView, result: Any, *, automatic: bool, turn_key: str) -> BotReply:
+        candidates = result.candidates[:settings.telegram_vision_max_items]
+        slots = asyncio.Semaphore(3)
+
+        async def resolve(candidate: Any) -> tuple[Any, list[MediaHit], str]:
+            if candidate.confidence < 0.90:
+                return candidate, [], "The title is unclear; send it as text."
+            try:
+                async with slots:
+                    async with asyncio.timeout(15):
+                        rows = await self.catalog.rows(candidate.query())
+                matches = exact_matches(candidate, to_hits(rows))
+                if len(matches) > 1:
+                    options = "; ".join(hit.display_label() for hit in matches[:3])
+                    return candidate, [], f"Ambiguous — {options}. Send the title and year."
+                if not matches:
+                    return candidate, [], "No exact catalog match; nothing requested."
+                return candidate, matches, ""
+            except CatalogUnavailable as exc:
+                return candidate, [], exc.message
+            except TimeoutError:
+                return candidate, [], "Catalog lookup timed out; nothing requested."
+            except Exception:
+                return candidate, [], "Catalog lookup failed; nothing requested."
+
+        resolved = await asyncio.gather(*(resolve(candidate) for candidate in candidates))
+        lines = ["From your image" if automatic else "Image preview · nothing requested"]
+        remembered: list[RememberedHit] = []
+        buttons: list[list[dict[str, str]]] = []
+        seen: set[tuple[str, int, int | None]] = set()
+        queue_deadline = asyncio.get_running_loop().time() + 40.0
+        for candidate, matches, error in resolved:
+            label = candidate.title + (f" ({candidate.year})" if candidate.year else "")
+            if error:
+                lines.append(f"• {label}: {error}")
+                continue
+            hit = matches[0]
+            key = (hit.media_type, hit.tmdb_id, candidate.season)
+            if key in seen:
+                continue
+            seen.add(key)
+            remembered.append(RememberedHit.from_hit(hit, season=candidate.season))
+            label = hit.display_label()
+            if hit.available:
+                lines.append(f"• {label}: already on Plex.")
+            elif hit.already_requested:
+                lines.append(f"• {label}: {hit.status_label}; already requested.")
+            elif hit.media_status in {6, 7}:
+                lines.append(f"• {label}: {hit.status_label}; nothing requested.")
+            elif not automatic:
+                lines.append(f"• {label}: {hit.status_label}.")
+                data = self._callback_codec().encode(hit.media_type, hit.tmdb_id, view.chat_id, season=candidate.season)
+                self.store.put_callback_media(data, {
+                    "chat_id": view.chat_id, "media_type": hit.media_type,
+                    "tmdb_id": hit.tmdb_id, "title": hit.title, "year": hit.year,
+                }, ttl_s=settings.telegram_callback_ttl_seconds)
+                buttons.append([{"text": f"Get {hit.title}"[:64], "callback_data": data}])
+            else:
+                if asyncio.get_running_loop().time() >= queue_deadline:
+                    lines.append(f"• {label}: not requested; the image batch time limit was reached.")
+                    continue
+                digest = hashlib.sha256(f"{turn_key}:{hit.media_type}:{hit.tmdb_id}:{candidate.season}".encode()).hexdigest()[:32]
+                reply = await self._queue_media(
+                    RequestCallback(hit.media_type, hit.tmdb_id, candidate.season, 0),
+                    {"title": hit.title, "year": hit.year}, chat_id=view.chat_id,
+                    user_id=view.user_id, message_id=None, digest=digest,
+                    callback_id=turn_key, automatic=True,
+                )
+                if reply.reply_markup:
+                    buttons.extend(reply.reply_markup.get("inline_keyboard", []))
+                lines.append(f"• {reply.text}" if hit.title in reply.text else f"• {label}: {reply.text}")
+        omitted = max(0, len(result.candidates) - len(candidates))
+        if omitted or result.more_visible:
+            lines.append(f"I processed at most {len(candidates)} titles. Send another crop for the remaining or unreadable titles.")
+        if remembered:
+            context = ChatContext(hits=tuple(remembered), ask_kind="image",
+                                  ask_text="depicted movie and series titles", updated_at=time.time())
+            self.memory.remember_context(view.chat_id, context)
+        # Keep every per-title outcome visible within Telegram's 4096-char cap.
+        text = "\n\n".join(line if len(line) <= 420 else line[:419] + "…" for line in lines)
+        return BotReply(text, {"inline_keyboard": buttons} if buttons else None)
 
     async def _play_from_context(self, view: MessageView) -> BotReply:
         """Run the explicit Telegram Play follow-up without entering classify/search."""
@@ -2286,19 +2487,51 @@ class TelegramMediaBot:
                 edit_message_id=message_id,
             )
 
+        digest = hashlib.sha256(f"{chat_id}:{message_id}:{data}".encode()).hexdigest()[:32]
+        return await self._queue_media(
+            request, metadata, chat_id=chat_id, user_id=user_id,
+            message_id=message_id, digest=digest,
+            callback_id=str(callback.get("id") or ""),
+        )
+
+    async def _queue_media(
+        self,
+        request: RequestCallback,
+        metadata: Mapping[str, Any],
+        *,
+        chat_id: int,
+        user_id: int | None,
+        message_id: int | None,
+        digest: str,
+        callback_id: str,
+        automatic: bool = False,
+    ) -> BotReply:
+        """The shared durable request boundary for Get and authorized images."""
         # Gate before claiming. A tap is a confirm, so only Jev's hard stops can
         # block it — and leaving the action unclaimed means a refused button is
         # still there rather than permanently spent.
         decision = await self._authorize_queue(
-            said=str(metadata.get("title") or f"TMDB {request.tmdb_id}"),
+            said="" if automatic else str(metadata.get("title") or f"TMDB {request.tmdb_id}"),
             tmdb_id=request.tmdb_id,
             media_type=request.media_type,
+            explicit_confirm=not automatic,
         )
         if decision is not None and decision.denied:
             return BotReply(decision.message, edit_message_id=message_id)
+        if decision is not None and decision.needs_confirm:
+            title = str(metadata.get("title") or f"TMDB {request.tmdb_id}")
+            data = self._callback_codec().encode(request.media_type, request.tmdb_id,
+                                                 chat_id, season=request.season)
+            self.store.put_callback_media(data, {
+                **metadata, "chat_id": chat_id, "media_type": request.media_type,
+                "tmdb_id": request.tmdb_id,
+            }, ttl_s=settings.telegram_callback_ttl_seconds)
+            return BotReply(
+                f"{title}: Jev wants confirmation. Tap Get to request it.",
+                {"inline_keyboard": [[{"text": f"Get {title}"[:64], "callback_data": data}]]},
+                edit_message_id=message_id,
+            )
 
-        callback_id = str(callback.get("id") or "")
-        digest = hashlib.sha256(f"{chat_id}:{message_id}:{data}".encode()).hexdigest()[:32]
         season_key = "all" if request.season is None else str(request.season)
         media_key = f"{request.media_type}:{request.tmdb_id}:{season_key}"
         claimed = self.store.claim_callback(
@@ -2312,7 +2545,7 @@ class TelegramMediaBot:
         if not claimed:
             previous = self.store.callback_state(digest) or {}
             state = str(previous.get("state") or "done")
-            if state == "uncertain":
+            if state == "uncertain" and not automatic:
                 # A previous process may have stopped on either side of the
                 # provider POST. Overseerr rejects duplicate media/season
                 # requests, so reclaiming lets a pre-POST crash finish without
@@ -2332,6 +2565,10 @@ class TelegramMediaBot:
                 text = (
                     "This request is already being handled."
                     if state == "processing"
+                    else "The previous request outcome is uncertain. Check Overseerr before requesting again."
+                    if state == "uncertain"
+                    else "This image request was already handled. Check Overseerr for its status."
+                    if automatic
                     else "This button was already handled. Search again to refresh its status."
                 )
                 return BotReply(text, edit_message_id=message_id)
@@ -2346,12 +2583,13 @@ class TelegramMediaBot:
             seasons = [request.season] if request.season is not None else "all"
 
         try:
-            result = await self.overseerr.request(
-                query=title,
-                media_id=request.tmdb_id,
-                media_type=request.media_type,
-                seasons=seasons,
-            )
+            async with asyncio.timeout(15.0 if automatic else None):
+                result = await self.overseerr.request(
+                    query=title,
+                    media_id=request.tmdb_id,
+                    media_type=request.media_type,
+                    seasons=seasons,
+                )
         except OverseerrError as exc:
             self.store.finish_callback(digest, state="uncertain", error=str(exc))
             return BotReply(
@@ -2481,14 +2719,15 @@ class TelegramMediaBot:
                     metadata=tracked_metadata,
                 ):
                     log.warning("accepted request remains pending for reconciliation")
-        text = await self._with_queue_asides(
-            text,
-            chat_id,
-            media_type=request.media_type,
-            tmdb_id=request.tmdb_id,
-            title=title,
-            year=year,
-        )
+        if not automatic:
+            text = await self._with_queue_asides(
+                text,
+                chat_id,
+                media_type=request.media_type,
+                tmdb_id=request.tmdb_id,
+                title=title,
+                year=year,
+            )
         return BotReply(text, edit_message_id=message_id)
 
     async def _recover_uncertain_request(
@@ -2548,12 +2787,16 @@ class TelegramMediaBot:
         said: str,
         tmdb_id: int,
         media_type: str,
+        explicit_confirm: bool = True,
     ) -> ToolDecision | None:
         """Jev gate for the one Telegram action that spends the house's bandwidth.
 
         Get taps and typed yeses are already explicit confirms, so only Jev's
         hard stops (refuse / do-not-auto-run) can block them. ``None`` means the
         gate had no opinion and the request proceeds.
+
+        Automatic image requests pass explicit_confirm=False and therefore
+        retain Jev's cancellation, lane, permission and confirmation decisions.
 
         For a tap, ``said`` is the title rather than the original sentence: the
         only question left is whether *this title* is something the house should
@@ -2565,7 +2808,7 @@ class TelegramMediaBot:
                 {"media_id": tmdb_id, "media_type": media_type},
                 said=said or None,
                 channel="telegram_queue",
-                explicit_confirm=True,
+                explicit_confirm=explicit_confirm,
             )
         except Exception:  # noqa: BLE001 — the gate must never block a confirmed Get
             log.warning("jev queue gate failed open", exc_info=True)

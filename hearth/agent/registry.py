@@ -324,7 +324,12 @@ def _finish_tool(result: ToolResult, *, flash_error: bool = True) -> ToolResult:
     """Record the tool result, publish widgets, and update the UI activity."""
     payload = result.as_dict()
     runtime.last_tools.append(payload)
-    widget_bus.publish_tool(payload)
+    try:
+        widget_bus.publish_tool(payload)
+    except Exception as exc:  # noqa: BLE001
+        # Publishing a card happens after the action. A rendering failure must
+        # never turn a completed download/device write into a retryable failure.
+        log.warning("Tool %s display update failed: %s", result.name, type(exc).__name__)
     if not result.ok and flash_error:
         data = result.data if isinstance(result.data, dict) else {}
         # Unconfigured integrations are soft misses, not scary UI errors.

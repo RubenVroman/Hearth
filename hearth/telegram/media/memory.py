@@ -329,6 +329,10 @@ class MediaMemory:
     def forget(self, chat_id: int) -> None:
         self.store.clear_callback_media(self._key(chat_id))
 
+    def remember_context(self, chat_id: int, context: ChatContext) -> None:
+        """Persist an exact resolved context, including different TV seasons."""
+        self.store.put_callback_media(self._key(chat_id), context.to_dict(), ttl_s=self.ttl_seconds)
+
     def remember(
         self,
         chat_id: int,

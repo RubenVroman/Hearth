@@ -7,7 +7,6 @@ Telegram messages are never persisted.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import sqlite3
@@ -18,6 +17,20 @@ from pathlib import Path
 from typing import Any
 
 from hearth.config import settings
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+
+def _lock_poller(fd: int, *, release: bool = False) -> None:
+    """A nonblocking OS lock that also releases automatically on process exit."""
+    if os.name == "nt":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK if release else msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN if release else fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS telegram_meta (
@@ -203,7 +216,7 @@ class TelegramStore:
                 return True
             fd = os.open(self.poller_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_poller(fd)
             except (BlockingIOError, OSError):
                 os.close(fd)
                 return False
@@ -232,7 +245,7 @@ class TelegramStore:
             if self._poller_fd is None:
                 return
             try:
-                fcntl.flock(self._poller_fd, fcntl.LOCK_UN)
+                _lock_poller(self._poller_fd, release=True)
             finally:
                 os.close(self._poller_fd)
                 self._poller_fd = None
