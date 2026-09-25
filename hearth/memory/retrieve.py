@@ -121,7 +121,13 @@ def _preference_lines(limit: int = MAX_PREFERENCES) -> list[str]:
     return lines
 
 
-def prompt_block(query: str = "", *, include_recent_turns: bool = True, hits: list[dict[str, Any]] | None = None) -> str:
+def prompt_block(
+    query: str = "",
+    *,
+    include_recent_turns: bool = True,
+    hits: list[dict[str, Any]] | None = None,
+    turn_limit: int = 4,
+) -> str:
     """Compact text injected into the system prompt for chat and Realtime."""
     if not store.memory_enabled() or not settings.memory_inject:
         return ""
@@ -136,7 +142,7 @@ def prompt_block(query: str = "", *, include_recent_turns: bool = True, hits: li
         if summary and summary.get("text"):
             sections.append("Session summary:\n" + redact(str(summary["text"]))[:500])
         if include_recent_turns:
-            turns = store.recent_turns(session_id, limit=4)
+            turns = store.recent_turns(session_id, limit=max(1, int(turn_limit)))
             if turns:
                 bits = []
                 for turn in turns:
@@ -168,9 +174,19 @@ def prompt_block(query: str = "", *, include_recent_turns: bool = True, hits: li
     )
 
 
-async def prompt_block_async(query: str = "", *, include_recent_turns: bool = True) -> str:
+async def prompt_block_async(
+    query: str = "",
+    *,
+    include_recent_turns: bool = True,
+    turn_limit: int = 4,
+) -> str:
     hits = await search(query, k=int(settings.memory_retrieve_k)) if query.strip() else []
-    return prompt_block(query, include_recent_turns=include_recent_turns, hits=hits)
+    return prompt_block(
+        query,
+        include_recent_turns=include_recent_turns,
+        hits=hits,
+        turn_limit=turn_limit,
+    )
 
 
 def status_snapshot() -> dict[str, Any]:

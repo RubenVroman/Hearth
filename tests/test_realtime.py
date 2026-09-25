@@ -293,3 +293,232 @@ async def test_sideband_house_tool_still_requests_follow_up_response():
     await band._run_function_call("plex_now_playing", "{}", "call_plex_1")
     assert any(m.get("type") == "response.create" for m in sent)
     assert band._pending_hangup is False
+
+
+def test_voice_instructions_keep_a_wider_turn_slice_than_chat():
+    """A recreated voice call has no agent-loop history, so the slice is longer."""
+    from hearth.agent.prompts import compose_system_prompt
+    from hearth.memory.store import persist_turn
+
+    for i in range(6):
+        persist_turn("user", f"voice-user-{i}", channel="voice")
+        persist_turn("assistant", f"voice-assistant-{i}", channel="voice")
+    text = realtime_rtc.session_config(query="voice-user-5")["instructions"]
+    assert "Live voice" in text
+    assert "voice-user-2" in text
+    assert "voice-user-0" not in text
+    chat = compose_system_prompt("voice-user-5", include_recent_turns=True)
+    assert "voice-user-2" not in chat
+    assert "voice-user-5" in chat
+
+
+def test_instructions_update_does_not_resend_turn_detection():
+    event = realtime_rtc.instructions_update("Stay with the film we just picked.")
+    assert event["type"] == "session.update"
+    assert event["session"]["type"] == "realtime"
+    assert "audio" not in event["session"]
+    assert "turn_detection" not in event["session"]
+    assert "tools" not in event["session"]
+    with_tools = realtime_rtc.instructions_update("again", include_tools=True)
+    assert with_tools["session"]["tool_choice"] == "auto"
+    assert "audio" not in with_tools["session"]
+
+
+def test_fatal_realtime_error_tokens():
+    assert realtime_rtc.is_fatal_realtime_error({"code": "session_expired"}) is True
+    assert realtime_rtc.is_fatal_realtime_error("call_id_not_found") is True
+    assert realtime_rtc.is_fatal_realtime_error({"message": "invalid_value"}) is False
+
+
+@pytest.mark.asyncio
+async def test_memory_refresh_waits_until_the_response_is_idle(monkeypatch):
+    sent: list[dict] = []
+
+    class DummyWS:
+        async def send(self, msg):
+            sent.append(json.loads(msg) if isinstance(msg, str) else msg)
+
+        async def close(self):
+            return None
+
+    async def fake_voice(query: str) -> str:
+        return f"VOICE {query}"
+
+    monkeypatch.setattr(realtime_rtc, "voice_instructions_async", fake_voice)
+    band = realtime_rtc.Sideband("rtc_ctx")
+    band._ws = DummyWS()
+    await band._on_event({"type": "response.created", "response": {"id": "r1"}})
+    await band._on_event(
+        {
+            "type": "conversation.item.input_audio_transcription.delta",
+            "delta": "play the ",
+        }
+    )
+    await band._on_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "play the other one",
+        }
+    )
+    assert band._pending_query == "play the other one"
+    assert band._said() == "play the other one"
+    assert sent == []
+    await band._on_event({"type": "response.done", "response": {"output": []}})
+    updates = [m for m in sent if m.get("type") == "session.update"]
+    assert len(updates) == 1
+    assert updates[0]["session"]["instructions"] == "VOICE play the other one"
+    assert "audio" not in updates[0]["session"]
+
+
+@pytest.mark.asyncio
+async def test_memory_refresh_holds_if_a_response_starts_while_loading(monkeypatch):
+    sent: list[dict] = []
+
+    class DummyWS:
+        async def send(self, msg):
+            sent.append(json.loads(msg) if isinstance(msg, str) else msg)
+
+        async def close(self):
+            return None
+
+    band = realtime_rtc.Sideband("rtc_race")
+    band._ws = DummyWS()
+
+    calls = {"n": 0}
+
+    async def fake_voice(query: str) -> str:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            band._active_responses += 1
+        return f"VOICE {query}"
+
+    monkeypatch.setattr(realtime_rtc, "voice_instructions_async", fake_voice)
+    band._pending_query = "the other one"
+    await band._flush_instructions()
+    assert sent == []
+    assert band._pending_query == "the other one"
+    band._active_responses = 0
+    await band._flush_instructions()
+    assert sent[0]["session"]["instructions"] == "VOICE the other one"
+
+
+@pytest.mark.asyncio
+async def test_sideband_tool_call_passes_spoken_utterance(monkeypatch):
+    captured: dict = {}
+
+    async def fake(name, args, said=""):
+        captured["name"] = name
+        captured["said"] = said
+        return {"ok": True, "name": name, "speak": "Done."}
+
+    monkeypatch.setattr(realtime_rtc, "run_house_tool", fake)
+    band = realtime_rtc.Sideband("rtc_said")
+
+    class DummyWS:
+        async def send(self, _msg):
+            return None
+
+        async def close(self):
+            return None
+
+    band._ws = DummyWS()
+    band._partial_user = "dim the "
+    await band._run_function_call("house_comfort", "{}", "fc_partial")
+    assert captured["said"] == "dim the"
+    band._latest_user = "dim the kitchen"
+    await band._run_function_call("house_comfort", "{}", "fc_final")
+    assert captured["said"] == "dim the kitchen"
+
+
+@pytest.mark.asyncio
+async def test_sideband_reconnects_once_then_drops_a_closed_socket(monkeypatch):
+    from hearth.runtime import runtime
+
+    class Boom:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise ConnectionError("reset")
+
+        async def close(self):
+            return None
+
+        async def send(self, _msg):
+            return None
+
+    opened: list = []
+
+    class Quiet:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        async def close(self):
+            return None
+
+        async def send(self, msg):
+            self.sent.append(json.loads(msg) if isinstance(msg, str) else msg)
+
+    async def fake_connect():
+        quiet = Quiet()
+        opened.append(quiet)
+        band._ws = quiet
+
+    band = realtime_rtc.Sideband("rtc_reconnect")
+    band._ws = Boom()
+    monkeypatch.setattr(band, "_connect_socket", fake_connect)
+    realtime_rtc._sidebands["rtc_reconnect"] = band
+    runtime.voice_path = realtime_rtc.PATH_ID
+    runtime.voice_mode = "live"
+    await band._listen()
+    assert band._sideband_reconnects == 1
+    assert len(opened) == 1
+    assert opened[0].sent[0]["type"] == "session.update"
+    assert "tools" in opened[0].sent[0]["session"]
+    assert "audio" not in opened[0].sent[0]["session"]
+    assert "rtc_reconnect" not in realtime_rtc._sidebands
+    assert runtime.voice_mode == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_fatal_sideband_error_does_not_reconnect(monkeypatch):
+    class FatalWS:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self.n += 1
+            if self.n == 1:
+                return json.dumps(
+                    {"type": "error", "error": {"code": "session_expired", "message": "gone"}}
+                )
+            raise AssertionError("read past fatal error")
+
+        async def close(self):
+            return None
+
+        async def send(self, _msg):
+            return None
+
+    connects = {"n": 0}
+
+    async def fake_connect():
+        connects["n"] += 1
+
+    band = realtime_rtc.Sideband("rtc_fatal")
+    band._ws = FatalWS()
+    monkeypatch.setattr(band, "_connect_socket", fake_connect)
+    realtime_rtc._sidebands["rtc_fatal"] = band
+    await band._listen()
+    assert connects["n"] == 0
+    assert "session_expired" in band._fail_reason
+    assert "rtc_fatal" not in realtime_rtc._sidebands

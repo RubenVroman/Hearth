@@ -83,6 +83,18 @@
         { value: "alive", label: "Alive" },
       ],
     },
+    {
+      id: "captions",
+      label: "Live transcription",
+      group: "Voice",
+      type: "choice",
+      default: "hidden",
+      hint: "Hidden keeps the call free of read-along captions. Hearth still hears you.",
+      options: [
+        { value: "hidden", label: "Hidden" },
+        { value: "shown", label: "Shown" },
+      ],
+    },
   ];
 
   const THEME_COLORS = {
@@ -155,6 +167,24 @@
 
   let current = sanitize({ ...defaults(), ...readStore() });
   apply(current);
+  const listeners = new Set();
+
+  function emit() {
+    const snapshot = get();
+    listeners.forEach((fn) => {
+      try {
+        fn(snapshot);
+      } catch (_) {
+        /* a listener must not break Look */
+      }
+    });
+  }
+
+  function subscribe(fn) {
+    if (typeof fn !== "function") return () => {};
+    listeners.add(fn);
+    return () => listeners.delete(fn);
+  }
 
   function get() {
     return { ...current };
@@ -165,6 +195,7 @@
     writeStore(current);
     apply(current);
     syncPanel();
+    emit();
     return get();
   }
 
@@ -173,6 +204,7 @@
     writeStore(current);
     apply(current);
     syncPanel();
+    emit();
     return get();
   }
 
@@ -548,6 +580,12 @@
           choices.appendChild(btn);
         }
         row.appendChild(choices);
+        if (knob.hint) {
+          const hint = document.createElement("p");
+          hint.className = "settings-hint";
+          hint.textContent = knob.hint;
+          row.appendChild(hint);
+        }
         section.appendChild(row);
       }
       body.appendChild(section);
@@ -612,6 +650,7 @@
     set,
     reset,
     apply,
+    subscribe,
     mount,
     open: openPanel,
     close: closePanel,
