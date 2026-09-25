@@ -83,9 +83,38 @@ _NATURAL_LIGHT_LIST = re.compile(
     r"what\s+lights?\s+are\s+on|which\s+lights?\s+are\s+on)\s*[.?!]*$",
     re.I,
 )
-_NATURAL_LIGHT_ACTION = re.compile(
+# Verb-first ("turn off the kitchen lights"), verb-last ("turn the lights off"),
+# and bare ("lights off", "all lights off"). The bare form keeps a light noun
+# so a title that merely contains "off" does not become a house command.
+# Separate patterns: the stdlib rejects one name reused across alternatives.
+_LIGHT_NOUN = r".+?\blights?"
+_BARE_LIGHT_TARGET = (
+    r"(?:(?:all|every|each)(?:\s+of)?\s+)?"
+    r"(?:(?:the|my|our)\s+)?"
+    r"(?:[a-z0-9][\w'’-]*\s+)*"
+    r"lights?"
+)
+_NATURAL_LIGHT_VERB_FIRST = re.compile(
     r"^(?:(?:turn|switch)\s+(?P<power>on|off)|(?P<toggle>toggle))\s+"
-    r"(?:the\s+)?(?P<target>.+\blights?)\s*[.?!]*$",
+    r"(?:the\s+)?(?P<target>" + _LIGHT_NOUN + r")\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_LIGHT_VERB_LAST = re.compile(
+    r"^(?:turn|switch)\s+(?P<target>" + _LIGHT_NOUN + r")\s+"
+    r"(?P<power>on|off)\s*[.?!]*$",
+    re.I,
+)
+_NATURAL_LIGHT_BARE = re.compile(
+    r"^(?P<target>" + _BARE_LIGHT_TARGET + r")\s+"
+    r"(?:(?P<power>on|off)|(?P<toggle>toggle))\s*[.?!]*$",
+    re.I,
+)
+_LEADING_POLITE = re.compile(
+    r"^(?:please\s+|(?:can|could|would)\s+you\s+)",
+    re.I,
+)
+_TRAILING_POLITE = re.compile(
+    r"(?:\s*[,;:]?\s*(?:please|thanks))+\s*[.?!]*$",
     re.I,
 )
 _NATURAL_LIGHT_LEVEL = re.compile(
@@ -215,15 +244,21 @@ def parse_house_command(text: str) -> HouseCommand | None:
     return None
 
 
+def _strip_politeness(text: str) -> str:
+    """Drop leading and trailing please/thanks the way people actually talk."""
+    previous = None
+    current = text.strip()
+    while current and current != previous:
+        previous = current
+        current = _LEADING_POLITE.sub("", current).strip()
+        current = _TRAILING_POLITE.sub("", current).strip()
+    return current
+
+
 def _parse_natural_house_command(text: str) -> HouseCommand | None:
     if not text:
         return None
-    text = re.sub(
-        r"^(?:please\s+|(?:can|could|would)\s+you\s+)",
-        "",
-        text,
-        flags=re.I,
-    ).strip()
+    text = _strip_politeness(text)
     if _NATURAL_HOUSE_STATUS.fullmatch(text):
         return HouseCommand("house_status", "house_status", {})
     if _NATURAL_LIGHT_LIST.fullmatch(text):
@@ -233,9 +268,13 @@ def _parse_natural_house_command(text: str) -> HouseCommand | None:
     if _NATURAL_COVER_LIST.fullmatch(text):
         return HouseCommand("list_covers", "ha_list_entities", {"domain": "cover"})
 
-    light = _NATURAL_LIGHT_ACTION.fullmatch(text)
+    light = (
+        _NATURAL_LIGHT_VERB_FIRST.fullmatch(text)
+        or _NATURAL_LIGHT_VERB_LAST.fullmatch(text)
+        or _NATURAL_LIGHT_BARE.fullmatch(text)
+    )
     if light:
-        target = _target(light.group("target"))
+        target = _target(light.group("target")).casefold()
         power = str(light.group("power") or "").casefold()
         action = f"turn_{power}" if power else "toggle"
         return HouseCommand(
