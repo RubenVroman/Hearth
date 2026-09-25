@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 from hearth.agent.prompts import SYSTEM_PROMPT, compose_system_prompt_async
-from hearth.agent.registry import ToolRegistry, registry
+from hearth.agent.registry import ToolRegistry, ToolResult, registry
 from hearth.config import settings
 from hearth.butler.decision import decide_butler_tool, hide_from_llm, is_butler_phrase
-from hearth.jev import adopt_verdict, evaluate_message, log_shadow_outcome, tool_turn, turn_lane
+from hearth.jev import (
+    adopt_verdict,
+    current_turn,
+    evaluate_message,
+    log_shadow_outcome,
+    tool_turn,
+    turn_lane,
+)
 from hearth.memory import store as memory_store
 from hearth.memory.summarize import maybe_summarize
 from hearth.runtime import runtime
@@ -18,29 +26,91 @@ from hearth import widgets as widget_bus
 MAX_TURNS = 8
 
 
+@dataclass
+class _TurnScope:
+    """Per-call options. Defaults keep the glass Ask-the-House path unchanged."""
+
+    channel: str = "chat"
+    announce: bool = True
+    blocked_tools: frozenset[str] = field(default_factory=frozenset)
+    context_note: str = ""
+    idle_reply: str = ""
+    external_history: list[dict[str, Any]] | None = None
+
+
 class AgentLoop:
     def __init__(self, tools: ToolRegistry | None = None) -> None:
         self.tools = tools or registry
         self.history: list[dict[str, Any]] = []
+        self._turn = _TurnScope()
 
     def reset(self) -> None:
         self.history = []
 
-    async def run(self, user_text: str, *, confirm: bool = False) -> dict[str, Any]:
-        runtime.set_status("thinking")
-        runtime.note("user", user_text)
-        widget_bus.start_turn(user_text)
+    def _seal(self, out: dict[str, Any], *, detail: str) -> dict[str, Any]:
+        """Finish a turn. Glass channels record it; Telegram leaves the overlay alone."""
+        if not self._turn.announce:
+            out["widgets"] = []
+            return out
+        reply = str(out.get("reply") or "")
+        if reply:
+            runtime.note("assistant", reply)
+        runtime.set_status("idle")
+        widget_bus.finish_turn(ok=True, detail=detail)
+        out["widgets"] = runtime.list_widgets()
+        return out
+
+    async def run(
+        self,
+        user_text: str,
+        *,
+        confirm: bool = False,
+        channel: str = "chat",
+        recent: list[str] | None = None,
+        inherit_turn: bool = False,
+        blocked_tools: frozenset[str] | None = None,
+        context_note: str = "",
+        history: list[dict[str, Any]] | None = None,
+        announce: bool | None = None,
+        idle_reply: str = "",
+    ) -> dict[str, Any]:
+        """Run one house turn.
+
+        ``inherit_turn`` reuses a Jev scope the caller already opened (Telegram
+        does this) so routing and tool authorization stay one typed decision.
+        ``blocked_tools`` are refused inside the loop instead of executed —
+        Telegram uses that to keep download queues on the Get button.
+        ``announce`` updates the glass transcript; other channels leave it alone.
+        """
+        self._turn = _TurnScope(
+            channel=channel or "chat",
+            announce=channel == "chat" if announce is None else bool(announce),
+            blocked_tools=frozenset(blocked_tools or ()),
+            context_note=(context_note or "").strip(),
+            idle_reply=(idle_reply or "").strip(),
+            external_history=history,
+        )
+        if self._turn.announce:
+            runtime.set_status("thinking")
+            runtime.note("user", user_text)
+            widget_bus.start_turn(user_text)
         text = user_text.strip()
-        recent = _recent_turns()
+        recent_turns = list(recent) if recent is not None else _recent_turns()
         try:
             # One Jev scope per turn. Every tool call underneath is decided from
             # the same typed answer set, so an eight-tool OpenAI turn still costs
-            # exactly one System One call.
-            with tool_turn(text, channel="chat", recent=recent):
-                return await self._run_turn(text, recent=recent, confirm=confirm)
+            # exactly one System One call. A caller that already opened the scope
+            # (Telegram) inherits it instead of paying for a second one.
+            if inherit_turn and current_turn() is not None:
+                return await self._run_turn(text, recent=recent_turns, confirm=confirm)
+            with tool_turn(text, channel=self._turn.channel, recent=recent_turns):
+                return await self._run_turn(text, recent=recent_turns, confirm=confirm)
         except Exception:
-            widget_bus.finish_turn(ok=False, detail="Failed.")
+            if self._turn.announce:
+                widget_bus.finish_turn(ok=False, detail="Failed.")
             raise
+        finally:
+            self._turn = _TurnScope()
 
     async def _run_turn(
         self,
@@ -66,45 +136,43 @@ class AgentLoop:
                 explicit_confirm=True,
             )
             reply = _format_tool_reply([result.as_dict()])
-            runtime.note("assistant", reply)
             out = {
                 "reply": reply,
                 "mode": "confirm",
                 "tools": [result.as_dict()],
             }
-            await _after_turn(text or pending.tool, out, channel="chat")
-            runtime.set_status("idle")
-            widget_bus.finish_turn(ok=True, detail="Confirmed.")
-            out["widgets"] = runtime.list_widgets()
-            return out
+            await _after_turn(text or pending.tool, out, channel=self._turn.channel)
+            return self._seal(out, detail="Confirmed.")
 
         # Cheap typed gate before OpenAI / local tool routing (shadow by
         # default). The tool gate reuses this verdict for the whole turn.
-        jev_verdict = await evaluate_message(text, recent=recent)
-        adopt_verdict(jev_verdict)
+        # A caller that already paid for System One this turn (the Telegram
+        # media router) keeps that answer set — one decision, not two.
+        scope = current_turn()
+        if scope is not None and scope.verdict is not None:
+            jev_verdict = scope.verdict
+        else:
+            jev_verdict = await evaluate_message(text, recent=recent)
+            adopt_verdict(jev_verdict)
         if jev_verdict.action == "block_cancel":
             reply = (
                 "Okay — I won't queue or run that. Say what you'd like instead, "
                 "or confirm explicitly if you meant to proceed."
             )
-            runtime.note("assistant", reply)
             out = {
                 "reply": reply,
                 "mode": "jev_cancel",
                 "tools": [],
                 "jev": jev_verdict.as_log_dict(),
             }
-            await _after_turn(text, out, channel="chat")
+            await _after_turn(text, out, channel=self._turn.channel)
             log_shadow_outcome(
                 jev_verdict,
-                channel="chat",
+                channel=self._turn.channel,
                 tools=[],
                 outcome="blocked_cancel",
             )
-            runtime.set_status("idle")
-            widget_bus.finish_turn(ok=True, detail="Cancelled (Jev).")
-            out["widgets"] = runtime.list_widgets()
-            return out
+            return self._seal(out, detail="Cancelled (Jev).")
         if jev_verdict.action == "escalate_cos":
             # Jev already chose this tool this turn; don't ask it again.
             result = await self.tools.call(
@@ -115,24 +183,20 @@ class AgentLoop:
             )
             used = [result.as_dict()]
             reply = _format_tool_reply(used)
-            runtime.note("assistant", reply)
             out = {
                 "reply": reply,
                 "mode": "jev_cos",
                 "tools": used,
                 "jev": jev_verdict.as_log_dict(),
             }
-            await _after_turn(text, out, channel="chat")
+            await _after_turn(text, out, channel=self._turn.channel)
             log_shadow_outcome(
                 jev_verdict,
-                channel="chat",
+                channel=self._turn.channel,
                 tools=["chief_of_staff"],
                 outcome="escalated_cos",
             )
-            runtime.set_status("idle")
-            widget_bus.finish_turn(ok=True, detail="Escalated (Jev).")
-            out["widgets"] = runtime.list_widgets()
-            return out
+            return self._seal(out, detail="Escalated (Jev).")
 
         # Jev chooses shelf and scene-preset tools. Phrases the playback
         # and device routers already own (movie night, lights down, covers)
@@ -144,7 +208,8 @@ class AgentLoop:
         }
         decision = decide_butler_tool(text, jev_verdict)
         if butler_turn and decision.run:
-            runtime.set_status("tool")
+            if self._turn.announce:
+                runtime.set_status("tool")
             result = await self.tools.call(
                 decision.tool,
                 decision.as_args(),
@@ -152,7 +217,6 @@ class AgentLoop:
             )
             used = [result.as_dict()]
             reply = _format_tool_reply(used)
-            runtime.note("assistant", reply)
             mode = "jev_butler" if decision.source == "jev" else "local"
             out = {
                 "reply": reply,
@@ -160,41 +224,34 @@ class AgentLoop:
                 "tools": used,
                 "jev": jev_verdict.as_log_dict(),
             }
-            await _after_turn(text, out, channel="chat")
+            await _after_turn(text, out, channel=self._turn.channel)
             log_shadow_outcome(
                 jev_verdict,
-                channel="chat",
+                channel=self._turn.channel,
                 tools=[decision.tool],
                 outcome=mode,
             )
-            runtime.set_status("idle")
-            widget_bus.finish_turn(ok=True, detail="Butler tool.")
-            out["widgets"] = runtime.list_widgets()
-            return out
+            return self._seal(out, detail="Butler tool.")
         if butler_turn and decision.blocked_by_jev and is_butler_phrase(text):
             reply = (
                 "Okay — I won't run that."
                 if decision.source == "jev_cancel"
                 else "That doesn't sound like the shelf or a house scene, so I left it alone."
             )
-            runtime.note("assistant", reply)
             out = {
                 "reply": reply,
                 "mode": "jev_butler",
                 "tools": [],
                 "jev": jev_verdict.as_log_dict(),
             }
-            await _after_turn(text, out, channel="chat")
+            await _after_turn(text, out, channel=self._turn.channel)
             log_shadow_outcome(
                 jev_verdict,
-                channel="chat",
+                channel=self._turn.channel,
                 tools=[],
                 outcome=decision.source,
             )
-            runtime.set_status("idle")
-            widget_bus.finish_turn(ok=True, detail="Butler tool held.")
-            out["widgets"] = runtime.list_widgets()
-            return out
+            return self._seal(out, detail="Butler tool held.")
 
         if settings.openai_configured:
             try:
@@ -203,7 +260,7 @@ class AgentLoop:
                     out["jev"] = jev_verdict.as_log_dict()
                     log_shadow_outcome(
                         jev_verdict,
-                        channel="chat",
+                        channel=self._turn.channel,
                         tools=[
                             str(t.get("name") or "")
                             for t in (out.get("tools") or [])
@@ -211,21 +268,25 @@ class AgentLoop:
                         ],
                         outcome=str(out.get("mode") or "openai"),
                     )
-                await _after_turn(text, out, channel="chat")
-                runtime.set_status("idle")
-                widget_bus.finish_turn(ok=True, detail="Done.")
-                out["widgets"] = runtime.list_widgets()
-                return out
+                await _after_turn(text, out, channel=self._turn.channel)
+                return self._seal(out, detail="Done.")
             except Exception as exc:  # noqa: BLE001
-                runtime.note("system", f"OpenAI path failed, using local router: {exc}", kind="status")
-                runtime.flash_error("Model call failed")
+                if self._turn.announce:
+                    runtime.note(
+                        "system",
+                        f"OpenAI path failed, using local router: {exc}",
+                        kind="status",
+                    )
+                    runtime.flash_error("Model call failed")
 
         out = await self._run_local(text)
+        if out.get("mode") == "held":
+            return out
         if jev_verdict is not None:
             out["jev"] = jev_verdict.as_log_dict()
             log_shadow_outcome(
                 jev_verdict,
-                channel="chat",
+                channel=self._turn.channel,
                 tools=[
                     str(t.get("name") or "")
                     for t in (out.get("tools") or [])
@@ -233,11 +294,8 @@ class AgentLoop:
                 ],
                 outcome=str(out.get("mode") or "local"),
             )
-        await _after_turn(text, out, channel="chat")
-        runtime.set_status("idle")
-        widget_bus.finish_turn(ok=True, detail="Done.")
-        out["widgets"] = runtime.list_widgets()
-        return out
+        await _after_turn(text, out, channel=self._turn.channel)
+        return self._seal(out, detail="Done.")
 
     async def iter_events(self, user_text: str, *, confirm: bool = False) -> AsyncIterator[dict[str, Any]]:
         """Yield protocol events while running a turn (used by the voice fallback)."""
@@ -256,14 +314,22 @@ class AgentLoop:
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(api_key=settings.openai_api_key)
+        history = (
+            self._turn.external_history
+            if self._turn.external_history is not None
+            else self.history
+        )
         system = await compose_system_prompt_async(
             user_text,
-            include_recent_turns=not bool(self.history),
+            include_recent_turns=not bool(history),
         )
+        spoken = user_text
+        if self._turn.context_note:
+            spoken = f"{user_text}\n\n{self._turn.context_note}"
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system},
-            *self.history,
-            {"role": "user", "content": user_text},
+            *history,
+            {"role": "user", "content": spoken},
         ]
         used: list[dict[str, Any]] = []
         tools = hide_from_llm(self.tools.openai_chat_tools())
@@ -303,19 +369,35 @@ class AgentLoop:
                         ],
                     }
                 )
-                runtime.set_status("tool")
+                if self._turn.announce:
+                    runtime.set_status("tool")
                 for tc in msg.tool_calls:
                     args = _parse_args(tc.function.arguments)
                     if tc.function.name == "chief_of_staff":
                         args.setdefault("said", user_text)
                         args.setdefault("task", user_text)
-                    # Every model-chosen tool still passes the Jev gate; a deny
-                    # comes back as a tool result the model can react to.
-                    result = await self.tools.call(
-                        tc.function.name,
-                        args,
-                        said=user_text,
-                    )
+                    # Queue-shaped tools stay on the caller's confirm button
+                    # (Telegram Get). The model hears the refusal and can answer.
+                    if tc.function.name in self._turn.blocked_tools:
+                        result = ToolResult(
+                            name=tc.function.name,
+                            ok=False,
+                            data={
+                                "denied": True,
+                                "speak": (
+                                    "Tap Get on the card to queue that. "
+                                    "I won't grab it from chat."
+                                ),
+                            },
+                        )
+                    else:
+                        # Every model-chosen tool still passes the Jev gate; a deny
+                        # comes back as a tool result the model can react to.
+                        result = await self.tools.call(
+                            tc.function.name,
+                            args,
+                            said=user_text,
+                        )
                     used.append(result.as_dict())
                     messages.append(
                         {
@@ -327,21 +409,31 @@ class AgentLoop:
                 continue
 
             reply = (msg.content or "").strip() or "Done."
-            self.history.append({"role": "user", "content": user_text})
-            self.history.append({"role": "assistant", "content": reply})
-            self.history = self.history[-24:]
-            runtime.note("assistant", reply)
+            history.append({"role": "user", "content": user_text})
+            history.append({"role": "assistant", "content": reply})
+            trimmed = history[-24:]
+            if self._turn.external_history is not None:
+                self._turn.external_history[:] = trimmed
+            else:
+                self.history = trimmed
             return {"reply": reply, "mode": "openai", "tools": used}
 
         reply = "Stopped after too many tool turns."
-        runtime.note("assistant", reply)
         return {"reply": reply, "mode": "openai", "tools": used}
 
     async def _run_local(self, user_text: str) -> dict[str, Any]:
         plan = route_intent(user_text, jev_lane=_jev_lane())
         used: list[dict[str, Any]] = []
+        if plan is not None and str(plan.get("tool") or "") in self._turn.blocked_tools:
+            # Caller owns this tool (Telegram queues only from a Get tap).
+            return {
+                "reply": "",
+                "mode": "held",
+                "tools": [],
+                "held_tool": str(plan.get("tool") or ""),
+            }
         if plan is None:
-            reply = (
+            reply = self._turn.idle_reply or (
                 "I can drive the house — lights, scenes, covers, house status, house sleep, "
                 "good morning, movie night, climate, the feeder, the purifier, Denon, LG TV, "
                 "play titles in Infuse on the "
@@ -352,10 +444,10 @@ class AgentLoop:
                 "workspace, docker inspect. Repo, Gridways, Discord, calendar, and anything I "
                 "can't do yet go to Chief of Staff."
             )
-            runtime.note("assistant", reply)
             return {"reply": reply, "mode": "local", "tools": used}
 
-        runtime.set_status("tool")
+        if self._turn.announce:
+            runtime.set_status("tool")
         result = await self.tools.call(
             plan["tool"],
             plan.get("args") or {},
@@ -363,7 +455,6 @@ class AgentLoop:
         )
         used.append(result.as_dict())
         reply = _format_tool_reply(used)
-        runtime.note("assistant", reply)
         return {"reply": reply, "mode": "local", "tools": used}
 
 

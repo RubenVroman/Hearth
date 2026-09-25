@@ -7,6 +7,11 @@ or an in-thread follow-up. OpenAI (gpt-4o) runs only when Jev says a descriptive
 riddle or needs_llm (or fail-open). Get / yes confirm remains the only queue
 boundary — never invent a grab from chat alone, and confirming queues by
 mediaId, never by re-searching the title.
+
+Turns that are not an instant media or house lane go through the same
+:class:`hearth.agent.loop.AgentLoop` Ask-the-House uses, so weather, lights,
+memory, and mixed follow-ups ("also dim the lights", "and tomorrow?") share
+one Jev tool decision with the rest of the house.
 """
 
 from __future__ import annotations
@@ -48,7 +53,18 @@ from hearth.telegram.heuristics import (
     looks_like_confirm_no,
     looks_like_confirm_yes,
 )
+from hearth.telegram.converse import (
+    HELD_TOOLS,
+    agent_utterance,
+    awaiting_confirm,
+    continue_thread,
+    describe_context,
+    edition_correction,
+    house_summary,
+    idle_line,
+)
 from hearth.telegram.house import TelegramHouseCommands
+from hearth.telegram.thread import ThreadMemory
 from hearth.telegram.media import (
     MAX_RESULTS,
     SERIES_MAX_RESULTS,
@@ -89,6 +105,7 @@ from hearth.telegram.progress import (
 )
 from hearth.telegram.safeguards import RateLimiter, authorized
 from hearth.telegram.store import TelegramStore
+from hearth.agent.loop import AgentLoop
 from hearth.butler.decision import decide_butler_tool
 from hearth.butler.nudge import queue_shelf_aside
 from hearth.butler.phrases import classify_house_phrase
@@ -110,6 +127,8 @@ HELP_TEXT = (
     "at once (“grab Inception and Interstellar”). Follow-ups work too: “the "
     "sequel”, “all of them”, “more like that”. Ask “what’s on tonight” for "
     "what’s already on Plex, or “quiet hours” for the lights. "
+    "You can also just talk — weather, lights, what's playing — and follow up "
+    "on the last card (“the second one”, “also dim the lights”). "
     "Tap Get to request — I never queue from chat alone. House controls, when "
     "Home Assistant has them: house sleep, good morning, movie night mode, "
     "climate, feeder, purifier. "
@@ -177,12 +196,15 @@ class TelegramMediaBot:
         overseerr_client: Any | None = None,
         progress: ProgressTracker | None = None,
         house_commands: TelegramHouseCommands | None = None,
+        agent: AgentLoop | None = None,
     ) -> None:
         self.store = store
         self.overseerr = overseerr_client or overseerr
         self.progress = progress or ProgressTracker(overseerr_client=self.overseerr)
         self.catalog = CatalogSearch(self.overseerr)
         self.memory = MediaMemory(store)
+        self.thread = ThreadMemory(store)
+        self.agent = agent or AgentLoop()
         self.house = house_commands or TelegramHouseCommands()
         self.rate = RateLimiter()
         self.bot_user_id: int | None = None
@@ -193,6 +215,7 @@ class TelegramMediaBot:
         self.rate.reset()
         self.progress.reset()
         self.bot_user_id = None
+        self.agent.reset()
 
     def _cards(self) -> CardRenderer:
         return CardRenderer(
@@ -282,6 +305,7 @@ class TelegramMediaBot:
         if house_reply is not None:
             # A new explicit house command supersedes any stale media yes/no offer.
             self._clear_pending_guess(view.chat_id)
+            self.thread.dismiss_confirm(view.chat_id)
             return house_reply
 
         pending = self._get_pending_guess(view.chat_id)
@@ -327,6 +351,16 @@ class TelegramMediaBot:
         if pending is not None and regex_no:
             self._clear_pending_guess(view.chat_id)
             return await self._offer_alternative(view)
+        if (
+            pending is None
+            and regex_yes
+            and self.thread.load(view.chat_id).awaiting_house_confirm
+        ):
+            # A destructive house preview owns "yes" only when no media card
+            # is waiting. A card on screen still confirms that card.
+            context = self.memory.load(view.chat_id)
+            if context is None or not context.hits:
+                return await self._confirm_house(view)
         if pending is None and (regex_yes or regex_no):
             # Bare yes/nah/no without an armed offer must never invent a queue.
             # With a live card on screen it is still a real answer, so reply.
@@ -347,6 +381,12 @@ class TelegramMediaBot:
         if aside is not None:
             return aside
 
+        # House conversation (weather, lights, "also dim the lights", "and
+        # tomorrow?") shares the Ask-the-House loop. Instant titles stay below.
+        conversational = await self._converse_house(view)
+        if conversational is not None:
+            return conversational
+
         _, query = parse_message(
             message,
             max_length=max(20, int(settings.telegram_max_title_length)),
@@ -361,6 +401,7 @@ class TelegramMediaBot:
         # "movie night" is still a catalog vibe and is not matched here.
         if looks_like_house_control(view.text):
             self._clear_pending_guess(view.chat_id)
+            self.thread.dismiss_confirm(view.chat_id)
             return await house_control_reply(view.text)
         if query.action == "ignore":
             return None
@@ -468,14 +509,32 @@ class TelegramMediaBot:
         intent: MediaIntent,
         context: ChatContext | None = None,
     ) -> BotReply:
+        # A fresh catalog turn replaces a stale house confirm.
+        self.thread.dismiss_confirm(view.chat_id)
+        correction = edition_correction(view.text, context)
+        if correction is not None:
+            media_type = correction.media_type if correction.media_type in {"movie", "tv"} else None
+            edition_query = MediaQuery(
+                action="search",
+                title=correction.search_title,
+                year=correction.year,
+                media_type=media_type,
+                reason="follow_up",
+                raw_text=view.text,
+            )
+            return await self._edition_reply(view, edition_query, correction)
+
         if intent.note == "list_ask":
             return BotReply(voice.list_ask())
 
         if intent.kind == "other":
-            # not_media / chatter. Search anything the parser already salvaged,
-            # otherwise say what I can do — a routed media turn is never silent.
+            # not_media. A salvaged concrete title still searches instantly.
+            # Anything else is a house conversation, not a dead-end nudge.
             if query.title and looks_like_concrete_title(query.title):
                 return await self._search_reply(view, query)
+            spoken = await self._converse_open(view)
+            if spoken is not None:
+                return spoken
             return BotReply(voice.nudge())
 
         if intent.kind == "chat_about":
@@ -1957,6 +2016,70 @@ class TelegramMediaBot:
             year=year,
         )
         return BotReply(outcome.message, edit_message_id=message_id)
+
+    async def _converse_house(self, view: MessageView) -> BotReply | None:
+        """Route a house/follow-up turn through the shared agent, if it owns it."""
+        thread = self.thread.load(view.chat_id)
+        utterance = agent_utterance(view.text)
+        if utterance is None and not continue_thread(view.text, thread):
+            return None
+        return await self._run_agent_turn(view, utterance or view.text.strip())
+
+    async def _converse_open(self, view: MessageView) -> BotReply | None:
+        """Open chat that the media router already decided is not a catalog ask."""
+        text = (view.text or "").strip()
+        if not text:
+            return None
+        return await self._run_agent_turn(view, text)
+
+    async def _confirm_house(self, view: MessageView) -> BotReply:
+        """Run a destructive preview the shared loop already parked for confirm."""
+        reply = await self._run_agent_turn(view, (view.text or "yes").strip(), confirm=True)
+        if reply is not None:
+            return reply
+        self.thread.dismiss_confirm(view.chat_id)
+        return BotReply("That confirm expired. Say what you'd like me to do.")
+
+    async def _run_agent_turn(
+        self,
+        view: MessageView,
+        utterance: str,
+        *,
+        confirm: bool = False,
+    ) -> BotReply | None:
+        """One shared-agent turn. Does not clear media cards or queue anything."""
+        context = self.memory.load(view.chat_id)
+        pending = self._get_pending_guess(view.chat_id)
+        thread = self.thread.load(view.chat_id)
+        try:
+            out = await self.agent.run(
+                utterance,
+                confirm=confirm,
+                channel="telegram",
+                recent=thread.recent_lines(),
+                inherit_turn=True,
+                blocked_tools=HELD_TOOLS,
+                context_note=describe_context(context, pending, thread),
+                history=thread.as_messages(),
+                announce=False,
+                idle_reply=idle_line(thread),
+            )
+        except Exception:  # noqa: BLE001 — a house ask is never silent
+            log.exception("telegram house turn failed")
+            return BotReply(voice.lane_failed())
+        if out.get("mode") == "held":
+            return None
+        reply = str(out.get("reply") or "").strip()
+        if not reply:
+            return None
+        self.thread.remember_exchange(
+            view.chat_id,
+            user=view.text,
+            assistant=reply,
+            house=house_summary(out),
+            awaiting_house_confirm=awaiting_confirm(out),
+        )
+        return BotReply(reply)
 
     async def _house_aside(self, view: MessageView) -> BotReply | None:
         """Shelf and scene asks. Jev chooses the tool; the phrase only fail-opens.
