@@ -485,7 +485,7 @@ hearth/jev/      TypeSafe Jev (System One) tool-calling gate — see docs/jev.md
 hearth/ui/       Static command center (no Node build)
 workspace/       Sandboxed files + skills
 ha/              Home Assistant config (onboarding still required)
-docs/            Operator notes (Jev gate, Telegram media smoke script, …)
+docs/            Operator notes (Jev gate, Telegram media smoke, proposals/)
 data/            Auth + memory SQLite (compose bind-mount; gitignores *.db)
 docker-compose.yml
 Dockerfile
