@@ -108,6 +108,9 @@ services:
     volumes:
       - ./workspace:/app/workspace
       - ./data:/app/data
+      # Overlay the image COPY of hearth/ so a recreate picks up host edits
+      # without a --no-cache rebuild. HEARTH_BIND and HA host networking stay as-is.
+      - ./hearth:/app/hearth
       - /var/run/docker.sock:/var/run/docker.sock:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
