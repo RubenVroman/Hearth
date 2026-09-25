@@ -52,7 +52,7 @@ def test_spoken_answer_shell_is_wired(client):
     assert "height: 0" in css.text
 
     sw = client.get("/sw.js")
-    assert "hearth-shell-v21" in sw.text
+    assert "hearth-shell-v22" in sw.text
     assert "/static/spoken-answer.js" in sw.text
 
 
@@ -137,6 +137,21 @@ panel.onCallEnded();
 assert(panel._visible === false, 'call end hard-dismisses');
 assert(root.hidden === true, 'root hidden after call end');
 assert(panel._full === '', 'buffer cleared on call end');
+
+panel.onRealtimeEvent('response.output_audio_transcript.delta', { delta: 'Shown' });
+assert(panel._visible === true, 'captions paint while enabled');
+panel.setEnabled(false);
+assert(panel._visible === false, 'hiding captions dismisses');
+assert(panel._full === '', 'buffer cleared when captions hide');
+panel.onRealtimeEvent('response.output_audio_transcript.delta', { delta: 'Secret' });
+assert(panel._visible === false, 'hidden captions ignore deltas');
+assert(panel._full === '', 'hidden captions do not buffer');
+panel.setEnabled(true);
+panel.onRealtimeEvent('response.output_audio_transcript.delta', { delta: 'Again' });
+assert(panel._full === 'Again', 'showing captions resumes');
+panel.setEnabled(false);
+panel.setEnabled(false);
+assert(panel._enabled === false, 'setEnabled is idempotent');
 
 // Overlay throw must not escape
 panel.root = null;

@@ -1,10 +1,11 @@
 /* Minimal shell cache. Documents and API stay on the network so the cookie session stays live. */
-const VERSION = "hearth-shell-v21";
+const VERSION = "hearth-shell-v22";
 const SHELL = [
   "/static/styles.css",
   "/static/app.js",
   "/static/vad.js",
   "/static/spoken-answer.js",
+  "/static/voice-session.js",
   "/static/settings.js",
   "/static/login.js",
   "/static/pwa.js",

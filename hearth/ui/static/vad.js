@@ -139,7 +139,8 @@
       this._timer = global.setInterval(() => this._tick(), POLL_MS);
     }
 
-    stop() {
+    stop(opts) {
+      const restoreMic = !opts || opts.restoreMic !== false;
       this._running = false;
       if (this._timer != null) {
         global.clearInterval(this._timer);
@@ -154,7 +155,20 @@
         this._ctx = null;
       }
       this._analyser = null;
-      this._applyMic(true);
+      if (restoreMic) this._applyMic(true);
+    }
+
+    /**
+     * Point the gate at a replaced mic track without dropping assistant-speaking state.
+     * Used when the OS ends the track mid-call and getUserMedia returns a new one.
+     */
+    async retarget(track, stream) {
+      const speaking = this.gate.assistantSpeaking;
+      this.stop({ restoreMic: false });
+      this.track = track;
+      this.stream = stream;
+      await this.start();
+      if (speaking) this.setAssistantSpeaking(true);
     }
 
     setAssistantSpeaking(speaking) {

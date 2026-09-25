@@ -57,7 +57,12 @@ const state = {
    * Isolated from the voice path — failures never break audio.
    */
   spokenAnswer: null,
+  /** Latest mic transcript (final preferred, partial while STT is still streaming). */
+  userUtterance: { final: "", partial: "" },
 };
+
+/** Epoch + one-reconnect budget for the live WebRTC call. Policy lives in voice-session.js. */
+const voiceLife = new HearthVoiceSession.VoiceLifecycle();
 
 /** Client grace before fading when talk is clearly unrelated (ms). */
 const OVERLAY_IRRELEVANT_GRACE_MS = 650;
@@ -2201,6 +2206,17 @@ function renderStatus(status) {
     ? `voice ${rt.path || voice.path || "webrtc-ga"}`
     : `voice ${voice.mode || "off"}`;
   $("voice-pill").classList.toggle("live", live);
+  if (
+    HearthVoiceSession.shouldRecoverFromServer({
+      hasCall: Boolean(state.call),
+      voiceMode: voice.mode,
+      sidebandOk: Boolean(state.call && state.call.sidebandOk),
+      phase: voiceLife.phase,
+      userEnded: voiceLife.userEnded,
+    })
+  ) {
+    void recoverConversation("sideband_disconnected");
+  }
   $("mode-pill").textContent = rt.beta ? "beta" : status.openai ? "openai" : "local";
   state.pending = status.pending;
   const confirmBtn = $("confirm-btn");
@@ -2216,7 +2232,13 @@ function renderStatus(status) {
   if (Array.isArray(status.widgets)) {
     renderWidgets(status.widgets);
   }
-  if (!state.call) {
+  // A reconnect briefly clears state.call. Don't paint "Tap to talk" over it.
+  if (
+    !state.call &&
+    voiceLife.phase !== "connecting" &&
+    voiceLife.phase !== "recovering" &&
+    voiceLife.phase !== "ending"
+  ) {
     $("hint").textContent = idleHint();
     $("orb-label").textContent = "Tap to talk";
   }
@@ -2381,10 +2403,43 @@ function ensureSpokenAnswer() {
   return state.spokenAnswer;
 }
 
+function captionsPreference() {
+  try {
+    const look = globalThis.HearthSettings?.get?.();
+    if (!look || look.captions == null) return "hidden";
+    return look.captions;
+  } catch (_) {
+    return "hidden";
+  }
+}
+
+function liveCaptionsOn() {
+  try {
+    return HearthVoiceSession.captionsVisible(captionsPreference());
+  } catch (_) {
+    return false;
+  }
+}
+
+function applyCaptionPreference(value) {
+  try {
+    const panel = ensureSpokenAnswer();
+    panel?.setEnabled?.(HearthVoiceSession.captionsVisible(value));
+  } catch (_) {
+    /* overlay must never break the voice path */
+  }
+}
+
 function noteSpokenAnswer(type, event) {
   try {
     const panel = ensureSpokenAnswer();
-    panel?.onRealtimeEvent?.(type, event);
+    if (!panel) return;
+    if (!liveCaptionsOn()) {
+      panel.setEnabled?.(false);
+      return;
+    }
+    panel.setEnabled?.(true);
+    panel.onRealtimeEvent?.(type, event);
   } catch (_) {
     /* overlay must never break the voice path */
   }
@@ -2429,10 +2484,18 @@ function onRealtimeEvent(event) {
   }
   // User speech — requires session audio.input.transcription (see webrtc.session_config).
   // User mic transcript is NOT shown on the spoken-answer panel (assistant only).
+  // Partials exist so a tool call that races STT still has a `said` for the Jev gate.
+  if (
+    type === "conversation.item.input_audio_transcription.delta" ||
+    type === "conversation.item.audio_transcription.delta"
+  ) {
+    state.userUtterance = HearthVoiceSession.mergeUserUtterance(state.userUtterance, event, true);
+  }
   if (
     type === "conversation.item.input_audio_transcription.completed" ||
     type === "conversation.item.audio_transcription.completed"
   ) {
+    state.userUtterance = HearthVoiceSession.mergeUserUtterance(state.userUtterance, event, false);
     appendLog("you", event.transcript);
     noteOverlayConversation(event.transcript || "");
   }
@@ -2480,6 +2543,7 @@ async function relayTool(event) {
         name: event.name,
         arguments: args,
         call_id: event.call_id || "",
+        said: HearthVoiceSession.utteranceText(state.userUtterance),
       }),
     });
     sendRealtime({
@@ -2523,84 +2587,7 @@ function abandonCallSetup(pc) {
   releaseMicStream({ hard: false });
 }
 
-async function startConversation() {
-  const remote = $("remote-audio");
-  const pc = new RTCPeerConnection();
-  let stream;
-  try {
-    stream = await acquireMicStream();
-  } catch (err) {
-    pc.close();
-    throw err;
-  }
-  for (const track of stream.getAudioTracks()) {
-    pc.addTrack(track, stream);
-  }
-  pc.ontrack = (ev) => {
-    remote.srcObject = ev.streams[0];
-    remote.play().catch(() => {});
-  };
-  const dc = pc.createDataChannel("oai-events");
-  dc.addEventListener("message", (ev) => {
-    try {
-      onRealtimeEvent(JSON.parse(ev.data));
-    } catch (_) {
-      /* ignore non-json */
-    }
-  });
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  const sdpResponse = await request("/api/realtime/calls", {
-    method: "POST",
-    body: offer.sdp,
-    headers: { "Content-Type": "application/sdp" },
-  });
-  const path = sdpResponse.headers.get("X-Hearth-Realtime-Path") || "";
-  const beta = sdpResponse.headers.get("X-Hearth-Realtime-Beta") || "";
-  if (!sdpResponse.ok) {
-    let err = { error: `calls ${sdpResponse.status}` };
-    try {
-      err = await sdpResponse.json();
-    } catch (_) {
-      /* ignore */
-    }
-    abandonCallSetup(pc);
-    throw new Error(err.error || err.message || `realtime/calls ${sdpResponse.status}`);
-  }
-  if (path && path !== "webrtc-ga") {
-    abandonCallSetup(pc);
-    throw new Error(`unexpected realtime path ${path}`);
-  }
-  if (beta === "true") {
-    abandonCallSetup(pc);
-    throw new Error("beta realtime path is disabled");
-  }
-  const answer = await sdpResponse.text();
-  await pc.setRemoteDescription({ type: "answer", sdp: answer });
-  const callId = sdpResponse.headers.get("X-Hearth-Call-Id") || "";
-  const sideband = sdpResponse.headers.get("X-Hearth-Sideband") || "";
-  hideMicPanels();
-  const micTrack = stream.getAudioTracks()[0] || null;
-  let bargeIn = null;
-  if (micTrack && globalThis.HearthVad?.SpeechBargeIn) {
-    bargeIn = new HearthVad.SpeechBargeIn(micTrack, stream);
-    await bargeIn.start();
-  }
-  state.call = {
-    pc,
-    dc,
-    stream,
-    callId,
-    sidebandOk: sideband === "ok" || sideband === "starting",
-    bargeIn,
-    pendingHangup: false,
-  };
-  pc.addEventListener("connectionstatechange", () => {
-    if (!state.call || state.call.pc !== pc) return;
-    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-      stopConversation();
-    }
-  });
+function showListeningChrome() {
   $("orb").classList.add("live", "hot");
   $("orb").setAttribute("aria-label", "End conversation");
   $("orb-label").textContent = "Listening";
@@ -2609,21 +2596,34 @@ async function startConversation() {
     : "Live WebRTC conversation. Real speech interrupts; TV/HVAC noise should not. Tap to hang up.";
   $("voice-pill").textContent = "voice webrtc-ga";
   $("voice-pill").classList.add("live");
-  setRefreshInterval(1200);
 }
 
-async function stopConversation() {
-  const call = state.call;
-  state.call = null;
-  setRefreshInterval(8000);
-  // Conversation panel rule: voice session end → spoken read-along must go.
-  dismissSpokenAnswer({ callEnded: true });
+function showIdleVoiceChrome() {
   $("orb").classList.remove("live", "hot");
   $("orb").setAttribute("aria-label", "Tap to talk");
   $("orb-label").textContent = "Tap to talk";
   $("hint").textContent = idleHint();
   $("voice-pill").classList.remove("live");
+}
+
+function showReconnectingChrome() {
+  $("orb").classList.add("live", "hot");
+  $("orb-label").textContent = "Reconnecting";
+  $("hint").textContent = phoneUi() ? "Reconnecting…" : "Reconnecting the live call…";
+}
+
+async function hangupCallId(callId) {
+  if (!callId) return;
+  try {
+    await request(`/api/realtime/calls/${encodeURIComponent(callId)}/hangup`, { method: "POST" });
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function teardownCall(call) {
   if (!call) return;
+  call.superseded = true;
   try {
     call.bargeIn && call.bargeIn.stop();
     /* Detach from PC first so close() does not end the local MediaStreamTrack. */
@@ -2644,27 +2644,284 @@ async function stopConversation() {
   } catch (_) {
     /* ignore */
   }
-  $("remote-audio").srcObject = null;
-  if (call.callId) {
+  const remote = $("remote-audio");
+  if (remote) remote.srcObject = null;
+  await hangupCallId(call.callId);
+}
+
+function applyTransportDecision(decision) {
+  if (!decision || !state.call || state.call.superseded) return;
+  if (decision.action === "wait") {
+    showReconnectingChrome();
+    return;
+  }
+  if (decision.action === "keep") {
+    if (decision.reason === "connected" && $("orb-label").textContent === "Reconnecting") {
+      showListeningChrome();
+    }
+    return;
+  }
+  if (decision.action === "reconnect") {
+    void recoverConversation();
+    return;
+  }
+  if (decision.action === "end" && decision.reason !== "user") {
+    appendLog("system", "Voice dropped. Tap the hearth to try again.");
+    void stopConversation();
+  }
+}
+
+function bindCallTransport(call) {
+  const onSignal = () => {
+    if (!state.call || state.call !== call || call.superseded) return;
+    if (!voiceLife.isCurrent(call.epoch)) return;
+    applyTransportDecision(
+      voiceLife.onTransport({
+        connectionState: call.pc ? call.pc.connectionState : "",
+        iceConnectionState: call.pc ? call.pc.iceConnectionState : "",
+        dataChannelState: call.dc ? call.dc.readyState : "",
+      })
+    );
+  };
+  call.pc.addEventListener("connectionstatechange", onSignal);
+  call.pc.addEventListener("iceconnectionstatechange", onSignal);
+  if (call.dc) call.dc.addEventListener("close", onSignal);
+}
+
+async function onMicTrackEnded(call) {
+  if (!call || call.superseded || state.call !== call) return;
+  if (!voiceLife.isCurrent(call.epoch)) return;
+  if ((call.micSwaps || 0) >= 1) {
+    appendLog("system", "Microphone ended. Tap the hearth to talk again.");
+    await stopConversation();
+    return;
+  }
+  call.micSwaps += 1;
+  try {
+    const fresh = await acquireMicStream();
+    if (state.call !== call || !voiceLife.isCurrent(call.epoch)) return;
+    const next = fresh.getAudioTracks()[0];
+    const sender = call.pc.getSenders().find((s) => !s.track || s.track.kind === "audio");
+    if (!sender || !next) throw new Error("no audio sender");
+    await sender.replaceTrack(next);
+    call.stream = fresh;
+    if (call.bargeIn && call.bargeIn.retarget) await call.bargeIn.retarget(next, fresh);
+    next.addEventListener("ended", () => {
+      void onMicTrackEnded(call);
+    }, { once: true });
+  } catch (_) {
+    if (state.call !== call) return;
+    appendLog("system", "Microphone ended. Tap the hearth to talk again.");
+    await stopConversation();
+  }
+}
+
+async function recoverConversation() {
+  const epoch = voiceLife.beginReconnect();
+  if (epoch == null) {
+    if (voiceLife.phase === "recovering" || voiceLife.phase === "ending" || voiceLife.userEnded) return;
+    appendLog("system", "Voice dropped. Tap the hearth to try again.");
+    await stopConversation();
+    return;
+  }
+  const previous = state.call;
+  if (previous) previous.superseded = true;
+  state.call = null;
+  showReconnectingChrome();
+  dismissSpokenAnswer({ callEnded: true });
+  await teardownCall(previous);
+  if (!voiceLife.isCurrent(epoch)) return;
+  try {
+    await startConversation({ epoch });
+  } catch (err) {
+    if (!voiceLife.isCurrent(epoch)) return;
+    voiceLife.beginUserStop();
+    voiceLife.markIdle();
+    showIdleVoiceChrome();
+    setRefreshInterval(8000);
+    const classified = classifyMicError(err);
+    appendLog("system", classified.message || "Voice dropped. Tap the hearth to try again.");
+  }
+}
+
+async function startConversation({ epoch } = {}) {
+  const lifeEpoch = epoch == null ? voiceLife.beginUserStart() : epoch;
+  const remote = $("remote-audio");
+  const pc = new RTCPeerConnection();
+  let callId = "";
+  let bargeIn = null;
+  const stale = () => !voiceLife.isCurrent(lifeEpoch);
+  const bail = async () => {
     try {
-      await request(`/api/realtime/calls/${encodeURIComponent(call.callId)}/hangup`, {
-        method: "POST",
-      });
+      bargeIn && bargeIn.stop();
     } catch (_) {
       /* ignore */
     }
+    abandonCallSetup(pc);
+    await hangupCallId(callId);
+  };
+
+  let stream;
+  try {
+    stream = await acquireMicStream();
+  } catch (err) {
+    try {
+      pc.close();
+    } catch (_) {
+      /* ignore */
+    }
+    throw err;
   }
+  if (stale()) {
+    await bail();
+    return;
+  }
+  for (const track of stream.getAudioTracks()) {
+    pc.addTrack(track, stream);
+  }
+  pc.ontrack = (ev) => {
+    if (stale()) return;
+    remote.srcObject = ev.streams[0];
+    remote.play().catch(() => {});
+  };
+  const dc = pc.createDataChannel("oai-events");
+  dc.addEventListener("message", (ev) => {
+    try {
+      onRealtimeEvent(JSON.parse(ev.data));
+    } catch (_) {
+      /* ignore non-json */
+    }
+  });
+  try {
+    const offer = await pc.createOffer();
+    if (stale()) {
+      await bail();
+      return;
+    }
+    await pc.setLocalDescription(offer);
+    if (stale()) {
+      await bail();
+      return;
+    }
+    const sdpResponse = await request("/api/realtime/calls", {
+      method: "POST",
+      body: offer.sdp,
+      headers: { "Content-Type": "application/sdp" },
+    });
+    const path = sdpResponse.headers.get("X-Hearth-Realtime-Path") || "";
+    const beta = sdpResponse.headers.get("X-Hearth-Realtime-Beta") || "";
+    callId = sdpResponse.headers.get("X-Hearth-Call-Id") || "";
+    if (stale()) {
+      await bail();
+      return;
+    }
+    if (!sdpResponse.ok) {
+      let err = { error: `calls ${sdpResponse.status}` };
+      try {
+        err = await sdpResponse.json();
+      } catch (_) {
+        /* ignore */
+      }
+      throw new Error(err.error || err.message || `realtime/calls ${sdpResponse.status}`);
+    }
+    if (path && path !== "webrtc-ga") {
+      throw new Error(`unexpected realtime path ${path}`);
+    }
+    if (beta === "true") {
+      throw new Error("beta realtime path is disabled");
+    }
+    const answer = await sdpResponse.text();
+    if (stale()) {
+      await bail();
+      return;
+    }
+    await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    if (stale()) {
+      await bail();
+      return;
+    }
+    const sideband = sdpResponse.headers.get("X-Hearth-Sideband") || "";
+    hideMicPanels();
+    const micTrack = stream.getAudioTracks()[0] || null;
+    if (micTrack && globalThis.HearthVad?.SpeechBargeIn) {
+      bargeIn = new HearthVad.SpeechBargeIn(micTrack, stream);
+      await bargeIn.start();
+    }
+    if (stale() || !voiceLife.markLive(lifeEpoch)) {
+      await bail();
+      return;
+    }
+    const call = {
+      pc,
+      dc,
+      stream,
+      callId,
+      sidebandOk: sideband === "ok" || sideband === "starting",
+      bargeIn,
+      pendingHangup: false,
+      superseded: false,
+      micSwaps: 0,
+      epoch: lifeEpoch,
+    };
+    state.call = call;
+    bindCallTransport(call);
+    if (micTrack) {
+      micTrack.addEventListener("ended", () => {
+        void onMicTrackEnded(call);
+      }, { once: true });
+    }
+    showListeningChrome();
+    setRefreshInterval(1200);
+    applyTransportDecision(
+      voiceLife.onTransport({
+        connectionState: pc.connectionState,
+        iceConnectionState: pc.iceConnectionState,
+        dataChannelState: dc.readyState,
+      })
+    );
+  } catch (err) {
+    if (state.call && state.call.pc === pc) state.call = null;
+    await bail();
+    throw err;
+  }
+}
+
+async function stopConversation() {
+  voiceLife.beginUserStop();
+  const call = state.call;
+  if (call) call.superseded = true;
+  state.call = null;
+  setRefreshInterval(8000);
+  // Conversation panel rule: voice session end → spoken read-along must go.
+  dismissSpokenAnswer({ callEnded: true });
+  showIdleVoiceChrome();
+  state.userUtterance = { final: "", partial: "" };
+  await teardownCall(call);
+  voiceLife.markIdle();
   refresh();
 }
 
 async function beginVoiceFromUserGesture() {
+  if (
+    state.call ||
+    voiceLife.phase === "connecting" ||
+    voiceLife.phase === "recovering" ||
+    voiceLife.phase === "live" ||
+    voiceLife.phase === "ending"
+  ) {
+    return;
+  }
+  const epoch = voiceLife.beginUserStart();
   hideMicPanels();
   $("orb").classList.add("hot");
   $("orb-label").textContent = "Connecting";
   $("hint").textContent = phoneUi() ? "Connecting…" : "Opening GA WebRTC session…";
   try {
-    await startConversation();
+    await startConversation({ epoch });
   } catch (err) {
+    if (!voiceLife.isCurrent(epoch)) return;
+    voiceLife.beginUserStop();
+    voiceLife.markIdle();
     $("orb").classList.remove("hot", "live");
     $("orb-label").textContent = "Tap to talk";
     const classified = classifyMicError(err);
@@ -2679,7 +2936,13 @@ async function beginVoiceFromUserGesture() {
 }
 
 async function handleOrbTap() {
-  if (state.call) {
+  if (voiceLife.phase === "ending") return;
+  if (
+    state.call ||
+    voiceLife.phase === "connecting" ||
+    voiceLife.phase === "recovering" ||
+    voiceLife.phase === "live"
+  ) {
     await stopConversation();
     return;
   }
@@ -2745,14 +3008,28 @@ $("logout-btn").addEventListener("click", async () => {
 });
 
 function onPageHide() {
-  /* Document is going away — release hardware. A warm mute is useless across navigations. */
-  if (state.call) {
+  /* Document is going away — release hardware and tell Hearth to drop the sideband.
+     A warm mute is useless across navigations, and an async hangup will not finish. */
+  const call = state.call;
+  voiceLife.beginUserStop();
+  if (call) call.superseded = true;
+  state.call = null;
+  if (call && call.callId && navigator.sendBeacon) {
     try {
-      state.call.pc && state.call.pc.close();
+      navigator.sendBeacon(`/api/realtime/calls/${encodeURIComponent(call.callId)}/hangup`);
     } catch (_) {
       /* ignore */
     }
-    state.call = null;
+  }
+  try {
+    call && call.bargeIn && call.bargeIn.stop();
+  } catch (_) {
+    /* ignore */
+  }
+  try {
+    call && call.pc && call.pc.close();
+  } catch (_) {
+    /* ignore */
   }
   releaseMicStream({ hard: true });
 }
@@ -2771,6 +3048,10 @@ async function boot() {
   if (window.HearthSettings) {
     window.HearthSettings.mount();
     window.HearthSettings.setSpendFetcher(() => api("/api/openai/spend?days=30"));
+    window.HearthSettings.subscribe((values) => {
+      applyCaptionPreference(values && values.captions);
+    });
+    applyCaptionPreference(window.HearthSettings.get().captions);
   }
   bindInfoOverlay();
   const ok = await refreshAccessToken();
