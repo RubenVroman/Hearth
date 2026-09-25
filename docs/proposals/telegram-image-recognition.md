@@ -1,5 +1,7 @@
 # Telegram image recognition — feature request
 
+**Issue:** [#96](https://github.com/RubenVroman/Hearth/issues/96)
+
 Status: **proposal**. Nothing in this document is implemented. The house bot
 still refuses every photo, document, and other attachment. Queueing still
 happens only after **Get** or an explicit yes, and only by TMDB `mediaId`.
