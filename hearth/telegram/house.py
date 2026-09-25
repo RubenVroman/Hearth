@@ -385,6 +385,8 @@ class TelegramHouseCommands:
 def _format_result(command: HouseCommand, ok: bool, data: dict[str, Any]) -> str:
     if command.kind == "house_status":
         return _format_house_status(data)
+    if command.kind == "control_light" and data.get("collective"):
+        return str(data.get("speak") or data.get("error") or "Done.")
     if not ok:
         return _format_failure(command, data)
     if command.kind in {"list_lights", "list_scenes", "list_covers"}:
@@ -427,17 +429,29 @@ def _format_failure(command: HouseCommand, data: dict[str, Any]) -> str:
             + "."
         )
     error = str(data.get("error") or "Home Assistant did not accept the command")
+    recovery = _name_recovery(command.kind)
+    # A name miss means HA answered. Don't describe that as the house being down.
+    if "no home assistant entity matches" in error.casefold():
+        if data.get("mode") == "live":
+            return (
+                f"{error}. Home Assistant responded, but nothing matched that name."
+                f"{recovery}"
+            )
+        return f"{error}.{recovery}"
     if data.get("mode") == "live" or "home assistant" in error.casefold():
         return (
             f"Home Assistant isn't reachable or rejected that command: {error}. "
             "Nothing was reported as changed; check HA and try again."
         )
-    recovery = {
+    return f"I couldn't run that house command: {error}.{recovery}"
+
+
+def _name_recovery(kind: str) -> str:
+    return {
         "control_light": " Run /lights to see available names.",
         "activate_scene": " Run /scenes to see available names.",
         "control_cover": " Run /covers to see available names.",
-    }.get(command.kind, "")
-    return f"I couldn't run that house command: {error}.{recovery}"
+    }.get(kind, "")
 
 
 def _format_entity_list(kind: HouseCommandKind, states: list[dict[str, Any]]) -> str:

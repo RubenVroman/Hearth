@@ -1034,10 +1034,40 @@ class HomeAssistant:
         domain: str | None = None,
         value: float | str | bool | None = None,
     ) -> dict[str, Any]:
-        """Control any routine HA entity by friendly name, safely and dynamically."""
-        resolved = await self.resolve_entity(device, domains=[domain] if domain else _CONTROL_DOMAINS)
+        """Control any routine HA entity by friendly name, safely and dynamically.
+
+        ``lights``, ``all lights``, ``every light``, and ``the lights`` target every
+        ``light.*`` entity. An exact entity id or friendly name still controls one.
+        """
+        normalized = (domain or "").strip() or None
+        if _is_light_collective(device) and normalized in {None, "light"}:
+            resolved = await self.resolve_entity(
+                device,
+                domains=["light"] if normalized == "light" else _CONTROL_DOMAINS,
+            )
+            if resolved.get("ok") and resolved.get("resolved") == "exact":
+                return await self._finish_control(device, action, value, resolved)
+            # A collective that only partially matches names is still every light.
+            # A failed Home Assistant read is not: surface that error unchanged.
+            if resolved.get("ok") or _name_resolution_miss(resolved):
+                return await self._control_all_lights(device, action, value=value)
+            return resolved
+
+        resolved = await self.resolve_entity(
+            device,
+            domains=[normalized] if normalized else _CONTROL_DOMAINS,
+        )
         if not resolved.get("ok"):
             return resolved
+        return await self._finish_control(device, action, value, resolved)
+
+    async def _finish_control(
+        self,
+        device: str,
+        action: str,
+        value: float | str | bool | None,
+        resolved: dict[str, Any],
+    ) -> dict[str, Any]:
         entity_id = str(resolved["entity_id"])
         entity_domain = _domain(entity_id)
         service, data, error = _generic_service(entity_domain, action, value)
@@ -1056,6 +1086,91 @@ class HomeAssistant:
             "state": after.get("state"),
             "error": result.get("error"),
         }
+
+    async def _control_all_lights(
+        self,
+        device: str,
+        action: str,
+        *,
+        value: float | str | bool | None = None,
+    ) -> dict[str, Any]:
+        """Apply one light action to every ``light.*`` entity Home Assistant has."""
+        listed = await self.list_states("light")
+        if not listed.get("ok"):
+            return {
+                **listed,
+                "ok": False,
+                "collective": True,
+                "domain": "light",
+                "device": device,
+            }
+        rows = [
+            row
+            for row in listed.get("states") or []
+            if isinstance(row, dict) and _domain(str(row.get("entity_id") or "")) == "light"
+        ]
+        rows.sort(key=_entity_sort_key)
+        mode = listed.get("mode")
+        if not rows:
+            message = "No light entities are exposed by Home Assistant."
+            return {
+                "ok": False,
+                "mode": mode,
+                "collective": True,
+                "domain": "light",
+                "device": device,
+                "count": 0,
+                "entity_ids": [],
+                "error": message,
+                "speak": message,
+            }
+        service, payload, error = _generic_service("light", action, value)
+        if error:
+            return {
+                "ok": False,
+                "mode": mode,
+                "collective": True,
+                "domain": "light",
+                "device": device,
+                "error": error,
+                "speak": error,
+            }
+        results: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for row in rows:
+            entity_id = str(row.get("entity_id") or "")
+            result = await self.call_service("light", service, entity_id, payload or None)
+            after = await self.get_state(entity_id)
+            entry = {
+                "entity_id": entity_id,
+                "ok": bool(result.get("ok")),
+                "state": after.get("state"),
+                "error": result.get("error"),
+            }
+            results.append(entry)
+            if not entry["ok"]:
+                failed.append(entry)
+        speak = _collective_lights_speak(action, value, results, failed)
+        out: dict[str, Any] = {
+            "ok": not failed,
+            "mode": mode,
+            "collective": True,
+            "domain": "light",
+            "device": device,
+            "action": action,
+            "service": f"light.{service}",
+            "data": payload or None,
+            "count": len(results),
+            "entity_ids": [item["entity_id"] for item in results],
+            "states": [item["state"] for item in results if isinstance(item.get("state"), dict)],
+            "failed": [
+                {"entity_id": item["entity_id"], "error": item.get("error")} for item in failed
+            ],
+            "speak": speak,
+        }
+        if failed:
+            out["error"] = speak
+        return out
 
     async def call_and_verify(
         self,
@@ -1352,6 +1467,67 @@ def _activity_error(failed: list[dict[str, Any]]) -> str | None:
         reason = str(step.get("error") or step.get("warning") or "command was not verified")
         details.append(f"{labels.get(key, key.replace('_', ' '))}: {reason.rstrip('.')}")
     return "; ".join(details)
+
+
+_LIGHT_COLLECTIVE = re.compile(
+    r"(?:(?:all|every|each)(?:\s+of)?\s+)?(?:the\s+|my\s+|our\s+)?lights?\Z",
+    re.IGNORECASE,
+)
+
+
+def _is_light_collective(query: str) -> bool:
+    """True for domain-wide light phrases, not for a room or bulb name."""
+    text = re.sub(r"\s+", " ", (query or "").strip().lower()).strip(" .!?\"'")
+    return _LIGHT_COLLECTIVE.fullmatch(text) is not None
+
+
+def _name_resolution_miss(resolved: dict[str, Any]) -> bool:
+    """Home Assistant answered, but the query did not settle on one entity."""
+    if resolved.get("ok"):
+        return False
+    if resolved.get("ambiguous"):
+        return True
+    return str(resolved.get("error") or "").startswith("No Home Assistant entity matches")
+
+
+def _collective_lights_speak(
+    action: str,
+    value: float | str | bool | None,
+    results: list[dict[str, Any]],
+    failed: list[dict[str, Any]],
+) -> str:
+    count = len(results)
+    changed = count - len(failed)
+    noun = "light" if count == 1 else "lights"
+    slug = _slug(action)
+    if slug in {"brightness", "dim", "set_brightness"}:
+        pct: int | None
+        try:
+            pct = int(round(float(value))) if value is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        level = f" to {pct}%" if pct is not None else ""
+        if not failed:
+            if count == 1:
+                return f"1 light is on{level}."
+            return f"All {count} lights are on{level}."
+        if changed == 0:
+            return f"None of the {count} {noun} accepted that brightness."
+        return f"Set {changed} of {count} lights{level}. {len(failed)} did not change."
+    if slug == "toggle":
+        if not failed:
+            return f"Toggled {count} {noun}."
+        if changed == 0:
+            return f"None of the {count} {noun} accepted toggle."
+        return f"Toggled {changed} of {count} lights. {len(failed)} did not change."
+    word = "off" if slug in {"turn_off", "off"} else "on"
+    if not failed:
+        if count == 1:
+            return f"1 light is {word}."
+        return f"All {count} lights are {word}."
+    if changed == 0:
+        return f"None of the {count} {noun} accepted turn {word}."
+    return f"Turned {word} {changed} of {count} lights. {len(failed)} did not change."
 
 
 def _entity_match_score(query: str, row: dict[str, Any]) -> int:
