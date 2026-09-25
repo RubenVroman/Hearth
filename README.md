@@ -582,7 +582,7 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
    # Jev routes the media lanes and gates the queue button. On by default; add
    # the key to switch it on for real (shadow keeps allow/deny advisory):
    # TYPESAFE_API_KEY=…
-   # OPENAI_API_KEY=…         # only for descriptive riddles / title Q&A
+   # OPENAI_API_KEY=…         # riddles / title Q&A, and poster recognition
    ```
 
 6. Recreate the Hearth container. The bot stays **off** until both token and chat id are set. `TELEGRAM_POLL=false` is an operational kill switch.
@@ -613,10 +613,11 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
 - Title info questions (`what's X about?`) get a short answer with **no** Get / queue.
 - A text message never downloads by itself. **Get** is the confirmation (or yes on a single sticky guess), and it queues by `mediaId` — confirming never runs a second title search. Callbacks are HMAC-signed, chat-bound, and expire after `TELEGRAM_CALLBACK_TTL_SECONDS`.
 - Nah/No never queues: with an offer on screen it says so out loud; with nothing on screen it stays quiet rather than replying to chatter.
-- Magnets, `.torrent` files, and raw media attachments are refused. Rate limits, maximum title length, durable SQLite deduplication, secret redaction, ordered handling within each chat, and bounded concurrency across chats are enabled by default.
+- **Posters and list graphics** (a photo, or an `image/jpeg` / `image/png` / `image/webp` document) are read for depicted titles and answered with the same status cards and signed **Get** buttons as a typed ask. A 4×4 grid is one plan, one Get per missing title, nothing queued until a tap. The lane is on by default in confirm mode and uses `OPENAI_API_KEY` with `HEARTH_TELEGRAM_VISION_MODEL` (default `gpt-4o-mini`). No key means photos stay on today's refusal. `HEARTH_TELEGRAM_VISION_MODE=shadow` keeps the refusal and does not search. `auto` behaves as confirm. Images are not retained and are not sent to Jev.
+- Magnets, `.torrent` files, video, audio, and other non-image attachments are refused. Rate limits, maximum title length, durable SQLite deduplication, secret redaction, ordered handling within each chat, and bounded concurrency across chats are enabled by default. Vision has its own tighter bucket (`HEARTH_TELEGRAM_VISION_PER_MINUTE`, default 2, plus `HEARTH_TELEGRAM_VISION_DAILY_CAP`).
 - Progress checks Radarr/Sonarr only for titles this bot queued.
 
-The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, `TELEGRAM_DB_PATH`, the lane switches (`HEARTH_TELEGRAM_MOOD_LANE`, `HEARTH_TELEGRAM_PERSON_LANE`, `HEARTH_TELEGRAM_SIMILAR_LANE`, `HEARTH_TELEGRAM_BATCH_LANE`, `HEARTH_TELEGRAM_BATCH_MAX_ITEMS`, `HEARTH_TELEGRAM_CONTEXT_TTL_SECONDS`, `HEARTH_TELEGRAM_BUTLER_VOICE` — all default on), plus the Jev variables in `docs/jev.md`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.
+The relevant tuning variables are `TELEGRAM_RATE_LIMIT_PER_MINUTE`, `TELEGRAM_MAX_TITLE_LENGTH`, `TELEGRAM_PROGRESS_INTERVAL_SECONDS`, `TELEGRAM_CONCURRENCY`, `TELEGRAM_CALLBACK_TTL_SECONDS`, `TELEGRAM_DB_PATH`, the lane switches (`HEARTH_TELEGRAM_MOOD_LANE`, `HEARTH_TELEGRAM_PERSON_LANE`, `HEARTH_TELEGRAM_SIMILAR_LANE`, `HEARTH_TELEGRAM_BATCH_LANE`, `HEARTH_TELEGRAM_BATCH_MAX_ITEMS` default 4 / ceiling 16, `HEARTH_TELEGRAM_CONTEXT_TTL_SECONDS`, `HEARTH_TELEGRAM_BUTLER_VOICE` — all default on), the vision lane (`HEARTH_TELEGRAM_VISION_LANE`, `HEARTH_TELEGRAM_VISION_MODE`, `HEARTH_TELEGRAM_VISION_PROVIDER`, `HEARTH_TELEGRAM_VISION_MODEL`, `HEARTH_TELEGRAM_VISION_LIST_CAP` default 16, `HEARTH_TELEGRAM_VISION_PER_MINUTE`, `HEARTH_TELEGRAM_VISION_DAILY_CAP`, `HEARTH_TELEGRAM_VISION_MAX_BYTES`, `HEARTH_TELEGRAM_VISION_RESIDENCY`), plus the Jev variables in `docs/jev.md`. Keep the database under the mounted `./data` directory so update and callback idempotency survives container restarts.
 
 After a deploy, walk [docs/telegram-media-smoke.md](docs/telegram-media-smoke.md): a few minutes of real messages that prove status truth, the house-night / person / similar lanes, plans, follow-ups, watch-next, Play on the TV, and the never-silent and mediaId-confirm boundaries.
 
@@ -638,6 +639,8 @@ After a deploy, walk [docs/telegram-media-smoke.md](docs/telegram-media-smoke.md
 | `search.py` | The only place lanes call Overseerr |
 | `cards.py` | Result cards, Get buttons, refine buttons |
 | `voice.py` | House-butler phrasing |
+| `vision.py` | Still-image screen, title resolution, residency check |
+| `vision_provider.py` | `VisionProvider`: OpenAI, fixture, unwired local seam |
 
 ## What is stubbed vs live in v0.1
 

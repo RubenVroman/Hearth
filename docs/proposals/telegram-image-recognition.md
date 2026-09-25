@@ -2,9 +2,24 @@
 
 **Issue:** [#96](https://github.com/RubenVroman/Hearth/issues/96)
 
-Status: **proposal**. Nothing in this document is implemented. The house bot
-still refuses every photo, document, and other attachment. Queueing still
-happens only after **Get** or an explicit yes, and only by TMDB `mediaId`.
+Status: **shipped** (confirm-to-request). A still image in an allowlisted chat
+is identified and turned into the same Overseerr cards a typed title already
+gets. Queueing still happens only after **Get** or an explicit yes, and only
+by TMDB `mediaId`.
+
+`HEARTH_TELEGRAM_VISION_LANE` defaults on, `HEARTH_TELEGRAM_VISION_MODE`
+defaults to `confirm`, and the provider defaults to `openai`. The lane stays
+dark until `OPENAI_API_KEY` is set, so the house can use posters after deploy
+without a shadow reply that still shows the download refusal. Set mode to
+`shadow` to log candidates and keep that refusal. `auto` is accepted and
+behaves as `confirm` — a picture never queues itself.
+
+The vision list cap defaults to 16 (`HEARTH_TELEGRAM_VISION_LIST_CAP`) so a
+4×4 poster grid fits. Typed batches stay on `HEARTH_TELEGRAM_BATCH_MAX_ITEMS`
+(default 4, ceiling 16). Catalog posters are not blocked on an EU residency
+note. Household photos are outside this lane; `residency_allows_upload("personal")`
+still requires `HEARTH_TELEGRAM_VISION_RESIDENCY=accepted` or `eu`, or the
+`local` provider.
 
 This RFC lives in `docs/proposals/` with the other product proposals. It is
 not part of the [tier-3 house-intelligence RFC](tier-3-smart-as-hell.md); that
@@ -470,9 +485,10 @@ eval aid**, and it is not a Hearth runtime dependency.
 
 ## Phased rollout
 
-Each phase is a mode on a default-off lane. Shipping the code for a later
-phase does not enable it. Suggested flag names, **not added by this document**
-and not to be put in the live `.env` until a later change:
+The lane shipped with confirm-to-request as the default mode (see the status
+at the top). Shadow remains available. Auto-request did not ship: `auto` is
+accepted and behaves as confirm, so a picture still cannot queue itself.
+Suggested flag names from the original request, now real settings:
 
 | Flag | Intent |
 | --- | --- |
@@ -520,5 +536,5 @@ list, one non-media image, one torrent document. Expect Get only where the
 table above says Get, and expect Overseerr to show a request only after the
 tap. Shadow mode's expected reply is the old refusal.
 
-Until that implementation lands, the smoke script is unchanged and photos
-remain a refusal.
+The smoke script's poster section is the live check. With the lane off, or
+in shadow mode, photos remain the download refusal.

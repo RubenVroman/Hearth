@@ -104,7 +104,7 @@ One parallel System One call (`evaluate_telegram_media`) classifies every media-
 | `person_filmography` | `search_person` → `person_combined_credits` → ranked credits | no |
 | `mood_vibe` | Vibe language → `discover` genre / runtime / era / rating filters | no |
 | `similar_to` | Resolve the anchor once → `/{movie,tv}/{id}/similar` + `/recommendations` | no |
-| `batch_multi` | Split into ≤ `HEARTH_TELEGRAM_BATCH_MAX_ITEMS` items → one plan, one Get per item | no |
+| `batch_multi` | Split into ≤ `HEARTH_TELEGRAM_BATCH_MAX_ITEMS` items (default 4, ceiling 16) → one plan, one Get per item | no |
 | `follow_up` | Resolve against the recent chat context (sequel, all of them, nth, other, more) | no |
 | `descriptive_riddle` | gpt-4o catalog guess → search → Get/yes confirm | yes |
 | `chat_about_title` | gpt-4o short answer (info only) — **no** Get / queue | yes |
@@ -115,6 +115,8 @@ Franchise seeds, edition tokens, person names, discover coordinates and plan ite
 The Telegram question map has no `tool_lane`: on Telegram `media_ask` **is** the lane choice, and `tool_allow` is what gates the queue and play tools.
 
 Overseerr still queues **only** after Get or an explicit yes on a pending guess, and that queue always goes out by `mediaId` — confirming never re-searches the title.
+
+A poster or list graphic does not go through `media_ask`. The vision lane returns structured titles, then each title uses the same Overseerr search and signed Get path as `exact_title` / `batch_multi`. The image is not sent to Jev. Lists do not auto-queue. See `docs/proposals/telegram-image-recognition.md`.
 
 The Telegram media question map does **not** include `butler_ask` or `domain`. Shelf and scene asks on Telegram call `evaluate_message` (the shared hearth map) before Plex or Home Assistant.
 

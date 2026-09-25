@@ -8,7 +8,8 @@ whose type and id can be extracted locally.
 from __future__ import annotations
 
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal, Mapping
 from urllib.parse import unquote, urlparse
 
 from hearth.telegram.models import MediaQuery, MediaType, MessageView
@@ -258,6 +259,233 @@ def _parse_season_residual(
     return season, episode, True
 
 
+_IMAGE_MIMES = frozenset({"image/jpeg", "image/jpg", "image/png", "image/webp"})
+_MEDIA_KIND_ORDER = (
+    "document",
+    "video",
+    "audio",
+    "voice",
+    "video_note",
+    "animation",
+    "sticker",
+    "photo",
+)
+_REFUSED_MEDIA_KINDS = frozenset(
+    {"video", "audio", "voice", "video_note", "animation", "sticker"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MediaScreen:
+    """Intake decision for one attachment, before any bytes are downloaded."""
+
+    disposition: Literal["none", "eligible", "reject"]
+    reason: str = ""
+    kind: str = ""
+    file_id: str = ""
+    mime: str = ""
+    file_name: str = ""
+    file_size: int | None = None
+
+
+def _mime_type(value: object) -> str:
+    text = str(value or "").split(";", 1)[0].strip().casefold()
+    if text == "image/jpg":
+        return "image/jpeg"
+    return text
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _blocked_filename(name: str) -> bool:
+    lowered = (name or "").strip().casefold()
+    return bool(
+        lowered.endswith(".torrent")
+        or lowered.endswith(".magnet")
+        or _TORRENT.search(name)
+    )
+
+
+def choose_photo_size(
+    sizes: list[Any],
+    *,
+    min_edge: int,
+    max_bytes: int,
+) -> dict[str, Any] | None:
+    """Smallest PhotoSize that is still readable, else the largest under the cap.
+
+    Telegram lists sizes smallest-first. Skip any size whose advertised
+    ``file_size`` is already over the house cap so we never download it.
+    """
+    parsed: list[tuple[int, int, int, dict[str, Any]]] = []
+    for row in sizes:
+        if not isinstance(row, dict):
+            continue
+        file_id = str(row.get("file_id") or "").strip()
+        if not file_id:
+            continue
+        width = _optional_int(row.get("width")) or 0
+        height = _optional_int(row.get("height")) or 0
+        file_size = _optional_int(row.get("file_size"))
+        if file_size is not None and file_size > max_bytes:
+            continue
+        edge = max(width, height)
+        weight = file_size if file_size is not None else 0
+        parsed.append((edge, weight, width + height, row))
+    if not parsed:
+        return None
+    readable = [item for item in parsed if item[0] >= min_edge]
+    pool = readable or parsed
+    if readable:
+        pool.sort(key=lambda item: (item[0], item[1], item[2]))
+        return pool[0][3]
+    pool.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return pool[0][3]
+
+
+def screen_media(
+    message: Mapping[str, Any] | MessageView,
+    *,
+    max_bytes: int | None = None,
+    min_edge: int | None = None,
+) -> MediaScreen:
+    """Split ``has_media`` into an image lane or today's refusal.
+
+    No network and no download. Magnets, torrents, video, audio, and
+    non-image documents stay rejected. Photos and allowlisted still-image
+    documents are eligible.
+    """
+    if max_bytes is None or min_edge is None:
+        from hearth.config import settings
+
+        if max_bytes is None:
+            max_bytes = int(settings.telegram_vision_max_bytes)
+        if min_edge is None:
+            min_edge = int(settings.telegram_vision_min_edge)
+
+    if isinstance(message, MessageView):
+        kind = message.media_kind
+        if _MAGNET.search(message.text):
+            return MediaScreen(disposition="reject", reason="torrent_download", kind=kind)
+        if kind == "photo":
+            return MediaScreen(
+                disposition="eligible",
+                reason="image",
+                kind="photo",
+                mime="image/jpeg",
+            )
+        if kind:
+            return MediaScreen(
+                disposition="reject",
+                reason=f"media_attachment:{kind}",
+                kind=kind,
+            )
+        return MediaScreen(disposition="none")
+
+    kind = ""
+    for key in _MEDIA_KIND_ORDER:
+        if message.get(key):
+            kind = key
+            break
+    if not kind:
+        return MediaScreen(disposition="none")
+
+    caption = message.get("caption") if isinstance(message.get("caption"), str) else ""
+    text = message.get("text") if isinstance(message.get("text"), str) else ""
+    document = message.get("document") if isinstance(message.get("document"), Mapping) else {}
+    file_name = str(document.get("file_name") or "") if kind == "document" else ""
+    combined = f"{text}\n{caption}\n{file_name}"
+    if _MAGNET.search(combined) or _blocked_filename(file_name):
+        return MediaScreen(
+            disposition="reject",
+            reason="torrent_download",
+            kind=kind,
+            file_name=file_name,
+        )
+
+    if kind in _REFUSED_MEDIA_KINDS:
+        return MediaScreen(
+            disposition="reject",
+            reason=f"media_attachment:{kind}",
+            kind=kind,
+        )
+
+    if kind == "photo":
+        sizes = message.get("photo")
+        chosen = choose_photo_size(
+            list(sizes) if isinstance(sizes, list) else [],
+            min_edge=min_edge,
+            max_bytes=max_bytes,
+        )
+        if chosen is None:
+            raw = list(sizes) if isinstance(sizes, list) else []
+            oversize = False
+            for row in raw:
+                if not isinstance(row, Mapping):
+                    continue
+                size = _optional_int(row.get("file_size"))
+                if size is not None and size > max_bytes:
+                    oversize = True
+            return MediaScreen(
+                disposition="reject",
+                reason="media_too_large" if oversize else "media_attachment:photo",
+                kind="photo",
+            )
+        return MediaScreen(
+            disposition="eligible",
+            reason="image",
+            kind="photo",
+            file_id=str(chosen.get("file_id") or ""),
+            mime="image/jpeg",
+            file_size=_optional_int(chosen.get("file_size")),
+        )
+
+    if kind == "document":
+        mime = _mime_type(document.get("mime_type"))
+        file_id = str(document.get("file_id") or "").strip()
+        file_size = _optional_int(document.get("file_size"))
+        if mime not in _IMAGE_MIMES or not file_id:
+            return MediaScreen(
+                disposition="reject",
+                reason="media_attachment:document",
+                kind="document",
+                mime=mime,
+                file_name=file_name,
+                file_size=file_size,
+            )
+        if file_size is not None and file_size > max_bytes:
+            return MediaScreen(
+                disposition="reject",
+                reason="media_too_large",
+                kind="document",
+                mime=mime,
+                file_name=file_name,
+                file_size=file_size,
+            )
+        return MediaScreen(
+            disposition="eligible",
+            reason="image",
+            kind="document",
+            file_id=file_id,
+            mime=mime,
+            file_name=file_name,
+            file_size=file_size,
+        )
+
+    return MediaScreen(
+        disposition="reject",
+        reason=f"media_attachment:{kind or 'unknown'}",
+        kind=kind,
+    )
+
+
 def parse_message_text(
     text: str,
     *,
@@ -470,6 +698,24 @@ def parse_message(
         return None, MediaQuery(action="ignore", reason="invalid_message")
     if view.is_bot or (bot_user_id is not None and view.user_id == bot_user_id):
         return view, MediaQuery(action="ignore", reason="bot_sender")
+    if view.has_media:
+        screen = screen_media(message if isinstance(message, Mapping) else view)
+        if screen.disposition == "reject":
+            return view, MediaQuery(
+                action="reject",
+                reason=screen.reason or f"media_attachment:{view.media_kind or 'unknown'}",
+                raw_text=view.text[: max(0, max_length * 2)],
+            )
+        if screen.disposition == "eligible":
+            # A slash-command caption is still a command. Everything else is
+            # an image hint, not a title search that bypasses the picture.
+            if view.text.startswith("/"):
+                return view, parse_message_text(view.text, max_length=max_length)
+            return view, MediaQuery(
+                action="vision",
+                reason="image",
+                raw_text=view.text[: max(0, max_length * 2)],
+            )
     return view, parse_message_text(
         view.text,
         max_length=max_length,

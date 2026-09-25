@@ -42,7 +42,7 @@ MAX_MESSAGE_LENGTH = 4096
 # Bot API methods that are safe to repeat: re-reading updates or re-acking a
 # callback cannot double-post anything into a chat.
 RETRY_SAFE_METHODS = frozenset(
-    {"getMe", "getUpdates", "deleteWebhook", "answerCallbackQuery"}
+    {"getMe", "getUpdates", "deleteWebhook", "answerCallbackQuery", "getFile"}
 )
 
 
@@ -370,6 +370,50 @@ class TelegramBotClient:
         if text:
             body["text"] = text[:200]
         return await self._call("answerCallbackQuery", body)
+
+    async def get_file(self, file_id: str) -> dict[str, Any]:
+        """Resolve a file id. The result path is not logged: it builds a token URL."""
+        return await self._call("getFile", {"file_id": str(file_id)})
+
+    async def download_file_bytes(self, file_path: str, *, max_bytes: int) -> bytes | None:
+        """Download one Bot API file into memory.
+
+        The request URL embeds the bot token, so this method never logs it.
+        Oversized bodies are discarded and not returned.
+        """
+        path = (file_path or "").lstrip("/")
+        if not path or path.startswith("..") or "://" in path or "\\" in path:
+            return None
+        url = f"{self._api_root}/file/bot{self.token}/{path}"
+        client = await self._http()
+        timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=5.0)
+        try:
+            async with client.stream("GET", url, timeout=timeout) as response:
+                if response.status_code != 200:
+                    log.warning(
+                        "telegram file download rejected %s",
+                        {"status": response.status_code},
+                    )
+                    return None
+                advertised = response.headers.get("content-length")
+                try:
+                    if advertised is not None and int(advertised) > max_bytes:
+                        return None
+                except (TypeError, ValueError):
+                    pass
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        return None
+                    chunks.append(chunk)
+        except Exception:  # noqa: BLE001 — do not log the token URL
+            log.warning("telegram file download failed %s", {"byte_cap": int(max_bytes)})
+            return None
+        if not chunks:
+            return None
+        return b"".join(chunks)
 
     async def delete_webhook(self, *, drop_pending_updates: bool = False) -> dict[str, Any]:
         """Disable a webhook before long polling; preserve pending updates by default."""
