@@ -125,6 +125,9 @@ class TelegramBotService:
             self.store = self._store_factory()
         if self.bot is None:
             self.bot = TelegramMediaBot(self.store)
+        bind = getattr(self.bot, "bind_telegram", None)
+        if bind is not None:
+            bind(self.client)
 
     async def start(self) -> None:
         if not settings.telegram_configured:

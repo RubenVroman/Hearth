@@ -455,6 +455,52 @@ def watch_next_nudge(label: str, *, after: str) -> str:
 def watch_next_offer(label: str, *, after: str) -> str:
     return f"Continuing the pack after {after} — {label}:"
 
+
+def vision_looking() -> str:
+    return "Looking at that…"
+
+
+def vision_checking(count: int) -> str:
+    return f"Found {count} titles, checking the catalog…"
+
+
+def vision_unreadable() -> str:
+    return "I couldn't read that image."
+
+
+def vision_not_media() -> str:
+    return "That doesn't look like a film or series. Send the title if you want me to search."
+
+
+def vision_refuse() -> str:
+    return "I can't use that image."
+
+
+def vision_uncertain(label: str) -> str:
+    return f"{label} — I'm not sure that's the title. Send it in text if you want it."
+
+
+def vision_list_header(label: str, *, shown: int, omitted: int) -> str:
+    heading = (label or "").strip() or "From that image"
+    if omitted > 0:
+        return f"{heading}. Showing {shown}, leaving {omitted} off this page."
+    return f"{heading}."
+
+
+def vision_caption_fallback() -> str:
+    return "I couldn't read that image, so I used the caption."
+
+
+def vision_busy() -> str:
+    return "I'm still reading another image. Try that one again in a moment."
+
+
+def vision_episode_ignored() -> str:
+    return (
+        "Overseerr requests whole seasons, not individual episodes. "
+        "I'll look up the series."
+    )
+
 __all__ = [
     "verbosity_for",
     "terse_pick",
@@ -465,6 +511,16 @@ __all__ = [
     "status_ack",
     "watch_next_nudge",
     "watch_next_offer",
+    "vision_busy",
+    "vision_caption_fallback",
+    "vision_checking",
+    "vision_episode_ignored",
+    "vision_list_header",
+    "vision_looking",
+    "vision_not_media",
+    "vision_refuse",
+    "vision_uncertain",
+    "vision_unreadable",
     "already_available",
     "already_requested",
     "backend_auth_failed",

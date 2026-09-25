@@ -370,9 +370,85 @@ class Settings(BaseSettings):
     telegram_batch_max_items: int = Field(
         default=4,
         ge=2,
-        le=8,
+        le=16,
         alias="HEARTH_TELEGRAM_BATCH_MAX_ITEMS",
     )
+    # Still-image intake. On by default so a poster in an allowlisted chat
+    # becomes Overseerr cards after deploy when OPENAI_API_KEY is set.
+    # Empty provider, or openai without a key, keeps today's download refusal.
+    # Mode ``auto`` is accepted and treated as ``confirm``: nothing queues
+    # without Get / yes. See docs/proposals/telegram-image-recognition.md.
+    telegram_vision_lane: bool = Field(default=True, alias="HEARTH_TELEGRAM_VISION_LANE")
+    telegram_vision_mode: str = Field(default="confirm", alias="HEARTH_TELEGRAM_VISION_MODE")
+    telegram_vision_provider: str = Field(default="openai", alias="HEARTH_TELEGRAM_VISION_PROVIDER")
+    telegram_vision_fallback: str = Field(default="", alias="HEARTH_TELEGRAM_VISION_FALLBACK")
+    telegram_vision_model: str = Field(
+        default="gpt-4o-mini",
+        alias="HEARTH_TELEGRAM_VISION_MODEL",
+    )
+    telegram_vision_timeout_seconds: float = Field(
+        default=20.0,
+        gt=0.0,
+        le=60.0,
+        alias="HEARTH_TELEGRAM_VISION_TIMEOUT_SECONDS",
+    )
+    telegram_vision_max_bytes: int = Field(
+        default=4 * 1024 * 1024,
+        ge=32_768,
+        le=8 * 1024 * 1024,
+        alias="HEARTH_TELEGRAM_VISION_MAX_BYTES",
+    )
+    telegram_vision_min_edge: int = Field(
+        default=512,
+        ge=64,
+        le=4096,
+        alias="HEARTH_TELEGRAM_VISION_MIN_EDGE",
+    )
+    telegram_vision_per_minute: int = Field(
+        default=2,
+        ge=1,
+        le=30,
+        alias="HEARTH_TELEGRAM_VISION_PER_MINUTE",
+    )
+    telegram_vision_daily_cap: int = Field(
+        default=30,
+        ge=1,
+        le=500,
+        alias="HEARTH_TELEGRAM_VISION_DAILY_CAP",
+    )
+    # Separate from the typed-batch cap so a 4×4 poster grid fits without
+    # raising how many titles a sentence may ask for.
+    telegram_vision_list_cap: int = Field(
+        default=16,
+        ge=1,
+        le=24,
+        alias="HEARTH_TELEGRAM_VISION_LIST_CAP",
+    )
+    telegram_vision_show_confidence: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_TELEGRAM_VISION_SHOW_CONFIDENCE",
+    )
+    telegram_vision_ambiguous_margin: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_TELEGRAM_VISION_AMBIGUOUS_MARGIN",
+    )
+    # Reserved for a later single-title auto-request bar. This slice does not
+    # queue from it; Get / yes remains the only confirm.
+    telegram_vision_auto_confidence: float = Field(
+        default=0.92,
+        ge=0.0,
+        le=1.0,
+        alias="HEARTH_TELEGRAM_VISION_AUTO_CONFIDENCE",
+    )
+    # Not required for catalog posters. Household / personal photos (not this
+    # lane) stay off a cloud provider until this is ``accepted`` or ``eu``,
+    # or the provider is ``local``.
+    telegram_vision_residency: str = Field(default="", alias="HEARTH_TELEGRAM_VISION_RESIDENCY")
+    telegram_vision_detail: str = Field(default="high", alias="HEARTH_TELEGRAM_VISION_DETAIL")
     # In-thread follow-up memory ("the sequel", "all of them", "more like that").
     telegram_context_ttl_seconds: int = Field(
         default=30 * 60,

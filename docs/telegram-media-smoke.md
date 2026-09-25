@@ -15,7 +15,8 @@ pytest -q                                   # whole suite
 pytest -q tests/test_telegram_media_psychic.py    # this surface's regressions
 pytest -q tests/test_telegram_media_magic.py \
          tests/test_telegram_media_next_tier.py \
-         tests/test_telegram_media_intelligence.py
+         tests/test_telegram_media_intelligence.py \
+         tests/test_telegram_vision.py
 ```
 
 A deterministic lane check with no Overseerr, no OpenAI and no TypeSafe:
@@ -184,3 +185,22 @@ Fail-open is the point: stop TypeSafe, or clear `TYPESAFE_API_KEY`, and the bot
 must behave exactly as it did before the gate existed — every lane still
 answers. A gate the house cannot reach must never be able to make the catalog
 look empty.
+
+## 11. Posters and list graphics
+
+Needs `OPENAI_API_KEY` (or another configured vision provider) and
+`HEARTH_TELEGRAM_VISION_LANE=true` (the default) with mode `confirm` (also the
+default). Overseerr shows a request only after Get.
+
+| Send | Expect |
+| --- | --- |
+| one movie poster | `Looking at that…`, then one card. **Get** only if it is missing. Nothing queued before the tap. |
+| an ambiguous remake (two *Dune*s, no year on the image) | both catalog hits named. Nothing queued until you tap one. |
+| a poster grid (up to 16, including a 4×4) | one plan, one row per title, one **Get** per title that is actually missing. A miss is named. No **Get all**. |
+| a selfie, pet, or receipt | it isn't a film or series. No Get, no Overseerr request. |
+| a `.torrent` file, a video, or a photo whose caption contains `magnet:?` | the download refusal. No "Looking at that…". |
+
+With `HEARTH_TELEGRAM_VISION_MODE=shadow`, every row above that is an image
+still gets the download refusal and Overseerr stays empty. With
+`HEARTH_TELEGRAM_VISION_LANE=false`, same refusal, and the bot does not
+download the file.
