@@ -101,8 +101,7 @@
       this._visible = false;
       this._closing = false;
       this._generation = 0;
-      /** When false, live captions stay hidden. Defaults on so direct tests still paint. */
-      this._enabled = true;
+      this._enabled = !els || els.enabled !== false;
     }
 
     bind(root, textEl) {
@@ -117,6 +116,7 @@
      */
     setEnabled(on) {
       const next = Boolean(on);
+      if (this.root?.dataset) this.root.dataset.enabled = String(next);
       if (this._enabled === next) return this;
       this._enabled = next;
       if (!next) this.dismiss({ reason: "captions_hidden", immediate: true });
@@ -311,6 +311,7 @@
     return new SpokenAnswerPanel({
       root: documentRef.getElementById("spoken-answer"),
       textEl: documentRef.getElementById("spoken-answer-text"),
+      enabled: documentRef.getElementById("spoken-answer")?.dataset?.enabled === "true",
     });
   }
 

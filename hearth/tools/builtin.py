@@ -1668,7 +1668,7 @@ def register_builtin_tools() -> None:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max cards to show (default 4, max 6)",
+                        "description": "Max cards (max 12); explicit title lists default to all, freeform suggestions to 4",
                     },
                 },
             },

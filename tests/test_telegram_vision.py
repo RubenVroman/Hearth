@@ -1,722 +1,452 @@
-"""Telegram still-image intake: allowlist, refusal, titles, and no silent queue."""
+"""Image intake contract. All Telegram, vision, Jev and Overseerr calls are fake."""
 
 from __future__ import annotations
 
-import json
-import logging
-from collections.abc import Callable
-from pathlib import Path
+import asyncio
+import io
+from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
+from PIL import Image
+from pydantic import ValidationError
 
-from hearth.config import Settings, settings
+from hearth.config import settings
 from hearth.telegram.bot import TelegramMediaBot
-from hearth.telegram.media.vision import (
-    VisionCandidate,
-    VisionResult,
-    declared_mime_matches,
-    parse_vision_payload,
-    residency_allows_upload,
-    sniff_image_mime,
+from hearth.telegram.client import TelegramBotClient, TelegramFileError
+from hearth.telegram.media.memory import speaker_scope
+from hearth.telegram.media.image_requests import (
+    OpenAIVisionProvider, VisionCandidate, VisionError, VisionResult,
+    caption_mode, image_attachment, prepare_image,
 )
-from hearth.telegram.media.vision_provider import (
-    FixtureVisionProvider,
-    OpenAIVisionProvider,
-    VisionUnavailable,
-)
-from hearth.telegram.parse import choose_photo_size, parse_message, screen_media
-from hearth.telegram.progress import format_reject_download
 from hearth.telegram.store import TelegramStore
-
-CHAT_ID = -100123
-USER_ID = 42
-JPEG = b"\xff\xd8\xff" + b"\x00" * 32 + b"SECRETPIXEL"
+from hearth.telegram.service import TelegramBotService
 
 
-def _photo(
-    caption: str = "",
-    *,
-    chat_id: int = CHAT_ID,
-    user_id: int = USER_ID,
-    sizes: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    return {
-        "message_id": 7,
-        "chat": {"id": chat_id, "type": "supergroup"},
-        "from": {"id": user_id, "is_bot": False},
-        "caption": caption,
-        "photo": sizes
-        or [
-            {"file_id": "small", "width": 320, "height": 240, "file_size": 4000},
-            {"file_id": "mid", "width": 800, "height": 600, "file_size": 20000},
-            {"file_id": "big", "width": 2000, "height": 1500, "file_size": 400000},
-        ],
-    }
+def pixels(kind: str = "PNG", *, size: tuple[int, int] = (30, 30)) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", size, color="blue").save(output, format=kind)
+    return output.getvalue()
 
 
-def _document(
-    *,
-    mime: str = "image/jpeg",
-    file_name: str = "poster.jpg",
-    file_size: int = 1000,
-    caption: str = "",
-    file_id: str = "doc-1",
-) -> dict[str, Any]:
-    return {
-        "message_id": 8,
-        "chat": {"id": CHAT_ID, "type": "supergroup"},
-        "from": {"id": USER_ID, "is_bot": False},
-        "caption": caption,
-        "document": {
-            "file_id": file_id,
-            "mime_type": mime,
-            "file_name": file_name,
-            "file_size": file_size,
-        },
-    }
+def candidate(title: str, *, year: int | None = None, kind: str | None = "movie",
+              confidence: float = 0.99, season: int | None = None) -> VisionCandidate:
+    return VisionCandidate(title=title, year=year, media_type=kind, confidence=confidence, season=season)
 
 
-class QueryOverseerr:
+def movie(title: str, number: int, year: int, *, kind: str = "movie", status: int = 1) -> dict[str, Any]:
+    return {"id": number, "title": title, "mediaType": kind, "year": year, "mediaStatus": status}
+
+
+def photo(caption: str = "", *, message_id: int = 1, user: int = 42, chat: int = -1001) -> dict[str, Any]:
+    return {"message_id": message_id, "chat": {"id": chat}, "from": {"id": user},
+            "caption": caption, "photo": [{"file_id": "small", "width": 100, "height": 100},
+                                           {"file_id": "readable", "width": 1280, "height": 900}]}
+
+
+class FakeVision:
+    def __init__(self, titles: list[VisionCandidate], *, kind: str = "titles", more: bool = False) -> None:
+        self.result = VisionResult(kind=kind, candidates=titles, more_visible=more)
+        self.calls: list[Any] = []
+
+    async def identify(self, *args: Any, **kwargs: Any) -> VisionResult:
+        self.calls.append((args, kwargs))
+        return self.result
+
+
+class FakeFiles:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.typing: list[int] = []
+        self.data = pixels()
+
+    async def download_image(self, file_id: str, **kwargs: Any) -> bytes:
+        self.calls.append(file_id)
+        return self.data
+
+    async def send_chat_action(self, chat_id: int) -> dict[str, Any]:
+        self.typing.append(chat_id)
+        return {"ok": True}
+
+
+class FakeCatalog:
     live = True
 
     def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self.rows = list(rows)
-        self.search_calls: list[tuple[str, int]] = []
-        self.request_calls: list[dict[str, Any]] = []
+        self.rows = rows
+        self.searches: list[str] = []
+        self.requests: list[Any] = []
+        self.result: Any = {"ok": True, "requestStatus": 2, "mediaStatus": 3, "requestId": 77}
 
-    async def search(self, query: str, *, page: int = 1) -> dict[str, Any]:
-        self.search_calls.append((query, page))
-        needle = query.casefold()
-        matched = [
-            row
-            for row in self.rows
-            if str(row.get("title") or row.get("name") or "").casefold() in needle
-        ]
-        return {"ok": True, "mode": "live", "results": matched}
-
-    async def media_details(self, media_id: int, media_type: str) -> dict[str, Any]:
-        return {"ok": False, "reason": "not_found"}
+    async def search(self, query: str, **kwargs: Any) -> dict[str, Any]:
+        self.searches.append(query)
+        await asyncio.sleep(0)
+        return {"ok": True, "results": self.rows}
 
     async def request(self, **kwargs: Any) -> dict[str, Any]:
-        self.request_calls.append(dict(kwargs))
-        return {"ok": True, "requestStatus": 2, "mediaStatus": 3, "requestId": 9}
-
-
-class RecordingProgress:
-    def __init__(self) -> None:
-        self.active: list[Any] = []
-
-    def reset(self) -> None:
-        self.active.clear()
-
-    def track(self, *args: Any, **kwargs: Any) -> None:
-        return None
-
-
-def _row(
-    title: str,
-    tmdb_id: int,
-    *,
-    year: int = 2008,
-    media_type: str = "movie",
-) -> dict[str, Any]:
-    return {
-        "mediaType": media_type,
-        "id": tmdb_id,
-        "title": title,
-        "releaseDate": f"{year}-06-01",
-        "year": year,
-    }
-
-
-def _candidate(title: str, *, year: int | None = 2008, confidence: float = 0.95) -> VisionCandidate:
-    return VisionCandidate(title=title, year=year, media_type="movie", confidence=confidence)
+        self.requests.append(kwargs)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
 
 
 @pytest.fixture
-def vision_bot(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]]:
-    monkeypatch.setattr(settings, "telegram_bot_token", "123456:test-token")
-    monkeypatch.setattr(settings, "telegram_chat_ids", str(CHAT_ID))
-    monkeypatch.setattr(settings, "telegram_user_ids", str(USER_ID))
-    monkeypatch.setattr(settings, "telegram_rate_limit_per_minute", 100)
-    monkeypatch.setattr(settings, "telegram_callback_ttl_seconds", 3600)
-    monkeypatch.setattr(settings, "telegram_vision_lane", True)
-    monkeypatch.setattr(settings, "telegram_vision_mode", "confirm")
-    monkeypatch.setattr(settings, "telegram_vision_provider", "fixture")
-    monkeypatch.setattr(settings, "telegram_vision_per_minute", 10)
-    monkeypatch.setattr(settings, "telegram_vision_daily_cap", 30)
-    monkeypatch.setattr(settings, "telegram_vision_list_cap", 16)
-    monkeypatch.setattr(settings, "openai_api_key", "")
-    stores: list[TelegramStore] = []
+def setup_bot(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "telegram_chat_ids", "-1001")
+    monkeypatch.setattr(settings, "telegram_user_ids", "42")
+    monkeypatch.setattr(settings, "telegram_vision_enabled", True)
+    monkeypatch.setattr(settings, "telegram_vision_auto_request", True)
+    monkeypatch.setattr(settings, "telegram_vision_rate_per_minute", 20)
+    monkeypatch.setattr(settings, "telegram_vision_max_items", 8)
+    stores = []
 
-    def make(
-        result: VisionResult | Exception,
-        rows: list[dict[str, Any]],
-        *,
-        fetcher_bytes: bytes | None = JPEG,
-    ) -> tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]:
-        store = TelegramStore(tmp_path / f"vision-{len(stores)}.db")
+    def make(titles, rows, **kwargs):
+        store = TelegramStore(tmp_path / f"images-{len(stores)}.db")
         stores.append(store)
-        overseerr = QueryOverseerr(rows)
-        provider = FixtureVisionProvider(result)
-        bot = TelegramMediaBot(
-            store,
-            overseerr_client=overseerr,
-            progress=RecordingProgress(),
-        )
-        bot._vision_provider = provider
-
-        async def fetch(file_id: str, *, max_bytes: int) -> bytes | None:
-            provider.calls  # touch so a missing fetch is obvious in asserts
-            fetch.ids.append(file_id)
-            if fetcher_bytes is None:
-                return None
-            if len(fetcher_bytes) > max_bytes:
-                return None
-            return fetcher_bytes
-
-        fetch.ids = []  # type: ignore[attr-defined]
-        bot._file_fetcher = fetch
-        bot._fetch = fetch  # type: ignore[attr-defined]
-        return bot, overseerr, provider
+        files = FakeFiles()
+        vision = FakeVision(titles, **kwargs)
+        catalog = FakeCatalog(rows)
+        tracker = SimpleNamespace(reset=lambda: None, track=lambda *args, **kwargs: None)
+        bot = TelegramMediaBot(store, overseerr_client=catalog, image_client=files,
+                               vision_provider=vision, progress=tracker)
+        return bot, files, vision, catalog
 
     yield make
     for store in stores:
         store.close()
 
 
-def test_screen_allows_photos_and_still_image_documents() -> None:
-    photo = screen_media(_photo(), max_bytes=4_000_000, min_edge=512)
-    assert photo.disposition == "eligible"
-    assert photo.file_id == "mid"
-    assert photo.mime == "image/jpeg"
-
-    for mime in ("image/png", "image/webp", "image/jpeg"):
-        screen = screen_media(_document(mime=mime), max_bytes=4_000_000, min_edge=512)
-        assert screen.disposition == "eligible", mime
-        assert screen.mime == mime
-
-    parsed = parse_message(_photo())
-    assert parsed[1].action == "vision"
-
-
-@pytest.mark.parametrize(
-    ("message", "reason"),
-    [
-        (
-            {
-                "message_id": 1,
-                "chat": {"id": 1},
-                "from": {"id": 2},
-                "video": {"file_id": "v"},
-            },
-            "media_attachment:video",
-        ),
-        (
-            {
-                "message_id": 1,
-                "chat": {"id": 1},
-                "from": {"id": 2},
-                "audio": {"file_id": "a"},
-            },
-            "media_attachment:audio",
-        ),
-        (
-            {
-                "message_id": 1,
-                "chat": {"id": 1},
-                "from": {"id": 2},
-                "sticker": {"file_id": "s"},
-            },
-            "media_attachment:sticker",
-        ),
-        (_document(mime="image/gif", file_name="loop.gif"), "media_attachment:document"),
-        (
-            _document(mime="application/octet-stream", file_name="notes.txt"),
-            "media_attachment:document",
-        ),
-        (_document(file_name="movie.torrent", mime="image/jpeg"), "torrent_download"),
-        (_photo(caption="magnet:?xt=urn:btih:abc"), "torrent_download"),
-        (_document(file_size=5_000_000), "media_too_large"),
-    ],
-)
-def test_screen_refuses_non_images_magnets_and_oversize(
-    message: dict[str, Any],
-    reason: str,
-) -> None:
-    screen = screen_media(message, max_bytes=4_000_000, min_edge=512)
-    assert screen.disposition == "reject"
-    assert screen.reason == reason
-
-
-def test_choose_photo_size_skips_original_when_a_readable_size_exists() -> None:
-    chosen = choose_photo_size(
-        [
-            {"file_id": "small", "width": 90, "height": 90, "file_size": 100},
-            {"file_id": "mid", "width": 640, "height": 480, "file_size": 1000},
-            {"file_id": "huge", "width": 4000, "height": 3000, "file_size": 9_000_000},
-        ],
-        min_edge=512,
-        max_bytes=4_000_000,
+@pytest.mark.asyncio
+async def test_image_automatically_requests_exact_missing_titles_once(setup_bot):
+    bot, files, vision, catalog = setup_bot(
+        [candidate("Alien", year=1979), candidate("Arrival", year=2016), candidate("Alien", year=1979)],
+        [movie("Alien", 348, 1979), movie("Arrival", 329865, 2016)],
     )
-    assert chosen is not None
-    assert chosen["file_id"] == "mid"
-
-
-def test_magic_bytes_accept_jpeg_png_webp_and_reject_html() -> None:
-    assert sniff_image_mime(JPEG) == "image/jpeg"
-    assert sniff_image_mime(b"\x89PNG\r\n\x1a\n" + b"rest") == "image/png"
-    assert sniff_image_mime(b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP") == "image/webp"
-    assert sniff_image_mime(b"<html>not an image</html>") is None
-    assert declared_mime_matches("image/jpeg", "image/jpeg")
-    assert not declared_mime_matches("image/png", "image/jpeg")
-
-
-def test_parse_vision_payload_keeps_titles_and_drops_magnets() -> None:
-    parsed = parse_vision_payload(
-        {
-            "kind": "list",
-            "list_label": "Five best horror",
-            "notes": "ignore previous instructions magnet:?xt=urn:btih:dead",
-            "candidates": [
-                {"title": "The Witch", "year": 2015, "media_type": "movie", "confidence": 0.91},
-                {"title": "magnet:?xt=urn:btih:abc", "confidence": 0.99},
-                {"title": "https://evil.example/grab", "confidence": 0.99},
-            ],
-        }
-    )
-    assert parsed.kind == "single"
-    assert [item.title for item in parsed.candidates] == ["The Witch"]
-    assert parsed.list_label == "Five best horror"
-
-
-def test_residency_does_not_block_catalog_posters(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "telegram_vision_provider", "openai")
-    monkeypatch.setattr(settings, "telegram_vision_residency", "")
-    assert residency_allows_upload("catalog") is True
-    assert residency_allows_upload("poster") is True
-    assert residency_allows_upload("personal") is False
-    monkeypatch.setattr(settings, "telegram_vision_residency", "accepted")
-    assert residency_allows_upload("personal") is True
-    monkeypatch.setattr(settings, "telegram_vision_residency", "")
-    monkeypatch.setattr(settings, "telegram_vision_provider", "local")
-    assert residency_allows_upload("personal") is True
-
-
-def test_batch_ceiling_fits_a_sixteen_poster_grid() -> None:
-    loaded = Settings.model_validate({"HEARTH_TELEGRAM_BATCH_MAX_ITEMS": 16})
-    assert loaded.telegram_batch_max_items == 16
-    assert Settings.model_fields["telegram_vision_list_cap"].default == 16
-    assert Settings.model_fields["telegram_vision_lane"].default is True
-    assert Settings.model_fields["telegram_vision_mode"].default == "confirm"
+    first = await bot.handle_message(photo())
+    repeated = await bot.handle_message(photo())
+    assert first == repeated
+    assert len(vision.calls) == 1
+    assert files.calls == ["readable"]
+    assert files.typing == [-1001]
+    assert [item["media_id"] for item in catalog.requests] == [348, 329865]
+    assert first is not None and "Alien" in first.text and "Arrival" in first.text
+    assert "Overseerr sent it" in first.text
+    assert first.edit_message_id is None and first.reply_markup is None
+    assert len(bot.store.list_active_requests()) == 2
 
 
 @pytest.mark.asyncio
-async def test_poster_becomes_a_get_card_and_does_not_queue(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    bot, overseerr, provider = vision_bot(
-        VisionResult(
-            kind="single",
-            candidates=(_candidate("The Witch", year=2015),),
-            list_label="",
-        ),
-        [_row("The Witch", 310131, year=2015)],
+async def test_image_status_truth_and_confidence_leave_unresolved_items_unqueued(setup_bot):
+    bot, _, _, catalog = setup_bot(
+        [candidate("Alien"), candidate("Dune"), candidate("Arrival", year=2016),
+         candidate("No idea", confidence=0.4), candidate("Ghost"), candidate("Unknown")],
+        [movie("Alien", 1, 1979, status=5), movie("Dune", 2, 1984), movie("Dune", 3, 2021),
+         movie("Arrival", 4, 2016, status=3), movie("Ghost", 5, 1990, status=6)],
     )
-    reply = await bot.handle_message(_photo())
+    reply = await bot.handle_message(photo())
+    assert catalog.requests == []
+    assert reply and "already on Plex" in reply.text and "Ambiguous" in reply.text
+    assert "already requested" in reply.text and "unclear" in reply.text
+    assert "No exact catalog match" in reply.text
+    assert "No idea" not in catalog.searches
 
-    assert reply is not None
-    assert "The Witch" in reply.text
-    assert reply.reply_markup is not None
-    button = reply.reply_markup["inline_keyboard"][0][0]["text"]
-    assert button.startswith("Get ")
-    assert overseerr.request_calls == []
-    assert overseerr.search_calls
-    assert provider.calls and provider.calls[0]["nbytes"] == len(JPEG)
-    assert "SECRETPIXEL" not in reply.text
 
-    searches_before = len(overseerr.search_calls)
+@pytest.mark.parametrize("caption", ["preview", "don't download these", "do not download", "What movies are these?",
+                                    "download only Alien", "download all except Alien", "niet downloaden",
+                                    "never download this", "stop downloading", "download the first two",
+                                    "download these excluding Dune", "download 2 movies", "get the top 3",
+                                    "download these 2 movies"])
+@pytest.mark.asyncio
+async def test_image_preview_and_negative_captions_never_request(setup_bot, caption):
+    bot, _, _, catalog = setup_bot([candidate("Alien", year=1979)], [movie("Alien", 348, 1979)])
+    reply = await bot.handle_message(photo(caption))
+    assert not catalog.requests
+    assert reply and "nothing requested" in reply.text and reply.reply_markup
     data = reply.reply_markup["inline_keyboard"][0][0]["callback_data"]
-    queued = await bot.handle_callback(
-        {
-            "id": "callback-1",
-            "data": data,
-            "from": {"id": USER_ID, "is_bot": False},
-            "message": {
-                "message_id": 900,
-                "chat": {"id": CHAT_ID, "type": "supergroup"},
-            },
-        }
-    )
-    assert queued is not None
-    assert overseerr.request_calls == [
-        {
-            "query": "The Witch",
-            "media_id": 310131,
-            "media_type": "movie",
-            "seasons": None,
-        }
-    ]
-    assert len(overseerr.search_calls) == searches_before
+    decoded = bot._callback_codec().decode(data, -1001)
+    assert decoded.tmdb_id == 348
 
 
 @pytest.mark.asyncio
-async def test_collage_plans_sixteen_titles_with_one_get_each_and_no_queue(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    titles = [
-        "The Devil's Backbone",
-        "Signs",
-        "28 Days Later",
-        "Saw",
-        "The Ring",
-        "Cloverfield",
-        "Let the Right One In",
-        "The Strangers",
-        "Let Me In",
-        "The Cabin in the Woods",
-        "Creep",
-        "Goodnight Mommy",
-        "The Witch",
-        "Green Room",
-        "It Comes at Night",
-        "Host",
-    ]
-    rows = [_row(title, 1000 + index, year=2000 + index) for index, title in enumerate(titles)]
-    candidates = tuple(
-        _candidate(title, year=2000 + index, confidence=0.93) for index, title in enumerate(titles)
-    )
-    bot, overseerr, _provider = vision_bot(
-        VisionResult(kind="list", candidates=candidates, list_label="Horror"),
-        rows,
-    )
-    reply = await bot.handle_message(_photo())
-
-    assert reply is not None
-    assert reply.reply_markup is not None
-    buttons = [
-        cell["text"]
-        for row in reply.reply_markup["inline_keyboard"]
-        for cell in row
-        if str(cell.get("text", "")).startswith("Get ")
-    ]
-    assert len(buttons) == 16
-    assert overseerr.request_calls == []
-    assert len(overseerr.search_calls) == 16
-    assert "Host" in reply.text
-    assert "Horror" in reply.text
+async def test_cancel_stops_before_download_and_clears_stale_yes_context(setup_bot):
+    bot, files, vision, catalog = setup_bot([candidate("Alien")], [])
+    await bot.handle_message(photo("cancel"))
+    assert not files.calls and not files.typing and not vision.calls and not catalog.requests
 
 
 @pytest.mark.asyncio
-async def test_list_over_the_cap_names_what_was_left_off(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    titles = [f"Poster {index:02d}" for index in range(1, 18)]
-    rows = [_row(title, index, year=2001) for index, title in enumerate(titles, start=1)]
-    candidates = tuple(_candidate(title, year=2001) for title in titles)
-    bot, overseerr, _provider = vision_bot(
-        VisionResult(kind="list", candidates=candidates),
-        rows,
-    )
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert "leaving 1 off" in reply.text
-    assert "Poster 17" in reply.text
-    assert len(overseerr.search_calls) == 16
-    assert overseerr.request_calls == []
+async def test_named_subset_caption_does_not_authorize_entire_picture(setup_bot):
+    bot, _, _, catalog = setup_bot([candidate("Alien"), candidate("Arrival")],
+                                   [movie("Alien", 1, 1979), movie("Arrival", 2, 2016)])
+    reply = await bot.handle_message(photo("download Alien"))
+    assert catalog.requests == []
+    assert reply and "Image preview" in reply.text
+    single, _, _, single_catalog = setup_bot([candidate("Alien")], [movie("Alien", 1, 1979)])
+    await single.handle_message(photo("download Alien"))
+    assert len(single_catalog.requests) == 1
+
+
+@pytest.mark.parametrize("change", ["chat", "user", "bot", "torrent", "magnet", "large"])
+@pytest.mark.asyncio
+async def test_rejected_intake_does_not_download_or_upload(setup_bot, change):
+    bot, files, vision, catalog = setup_bot([candidate("Alien")], [])
+    message = photo()
+    if change == "chat":
+        message["chat"]["id"] = 55
+    elif change == "user":
+        message["from"]["id"] = 55
+    elif change == "bot":
+        message["from"]["is_bot"] = True
+    elif change == "magnet":
+        message["caption"] = "magnet:?xt=foo"
+    else:
+        message.pop("photo")
+        message["document"] = {"file_id": "bad", "mime_type": "image/png", "file_name": "movies.torrent",
+                               "file_size": 100}
+        if change == "large":
+            message["document"].update(file_name="movies.png", file_size=100_000_000)
+    await bot.handle_message(message)
+    assert not files.calls and not files.typing and not vision.calls and not catalog.requests
 
 
 @pytest.mark.asyncio
-async def test_non_images_never_download_or_call_the_provider(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    bot, overseerr, provider = vision_bot(VisionResult(kind="not_media"), [])
-    message = {
-        "message_id": 3,
-        "chat": {"id": CHAT_ID, "type": "supergroup"},
-        "from": {"id": USER_ID, "is_bot": False},
-        "caption": "Dune",
-        "video": {"file_id": "video-1"},
+async def test_invalid_pixels_do_not_reach_provider(setup_bot):
+    bot, files, vision, catalog = setup_bot([candidate("Alien")], [])
+    files.data = b"<html>not an image</html>"
+    reply = await bot.handle_message(photo())
+    assert reply and "couldn't read" in reply.text
+    assert not vision.calls and not catalog.requests
+
+
+@pytest.mark.asyncio
+async def test_series_season_preserved_in_request_and_speaker_memory(setup_bot):
+    bot, _, _, catalog = setup_bot([candidate("Severance", kind="tv", season=2)],
+                                   [movie("Severance", 95396, 2022, kind="tv")])
+    await bot.handle_message(photo())
+    assert catalog.requests[0]["seasons"] == [2]
+    with speaker_scope(-1001, 42):
+        remembered = bot.memory.load(-1001)
+    assert remembered and remembered.hits[0].season == 2
+
+
+@pytest.mark.asyncio
+async def test_uncertain_write_is_not_automatically_retried(setup_bot):
+    bot, _, _, catalog = setup_bot([candidate("Alien")], [movie("Alien", 348, 1979)])
+    catalog.result = RuntimeError("connection lost after POST")
+    reply = await bot.handle_message(photo())
+    # Simulate losing final reply while retaining the extracted evidence.
+    key = "image:-1001:42:1"
+    saved = bot.store.get_callback_media(key)
+    saved.pop("reply")
+    bot.store.put_callback_media(key, saved, ttl_s=3600)
+    replay = await bot.handle_message(photo())
+    assert len(catalog.requests) == 1
+    assert reply and replay and "uncertain" in replay.text
+
+
+@pytest.mark.asyncio
+async def test_jev_hard_stop_blocks_entire_batch_with_one_decision(setup_bot, monkeypatch):
+    from hearth.jev import reset_client, set_client
+    from hearth.jev.schema import parse_answers
+
+    calls = []
+    async def system_one(**kwargs):
+        calls.append(kwargs)
+        return parse_answers({"model": "jev-test", "answers": {
+            "domain": {"type": "choice", "choice": "refuse", "confidence": 0.99,
+                       "probabilities": {"refuse": 0.99}},
+            "risk": {"type": "score", "score": 2, "confidence": 0.99,
+                     "legend": {"0": "harmless", "1": "needs_confirm", "2": "do_not_auto_run"}},
+        }})
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+    set_client(SimpleNamespace(system_one=system_one))
+    try:
+        bot, _, _, catalog = setup_bot([candidate("Alien"), candidate("Arrival")],
+                                       [movie("Alien", 1, 1979), movie("Arrival", 2, 2016)])
+        reply = await bot.handle_message(photo())
+        assert len(calls) == 1
+        assert not catalog.requests
+        assert reply is not None
+    finally:
+        reset_client()
+
+
+@pytest.mark.parametrize("gate", ["cancel", "deny", "confirm", "lane"])
+@pytest.mark.asyncio
+async def test_automatic_images_honor_jev_write_decision(setup_bot, monkeypatch, gate):
+    from hearth.jev import reset_client, set_client
+    from hearth.jev.schema import parse_answers
+
+    calls = []
+    answers = {
+        "tool_allow": {"type": "noul", "noul": 0.1 if gate == "deny" else 0.9},
+        "is_cancel": {"type": "noul", "noul": 0.99 if gate == "cancel" else 0.01},
+        "risk": {"type": "score", "score": 1 if gate == "confirm" else 0, "confidence": 0.99,
+                 "legend": {"0": "harmless", "1": "needs_confirm", "2": "do_not_auto_run"}},
+        "tool_lane": {"type": "choice", "choice": "no_tool" if gate == "lane" else "media_queue",
+                      "confidence": 0.99,
+                      "probabilities": {"no_tool" if gate == "lane" else "media_queue": 0.99}},
     }
-    reply = await bot.handle_message(message)
-    assert reply is not None
-    assert reply.text == format_reject_download()
-    assert provider.calls == []
-    assert bot._fetch.ids == []  # type: ignore[attr-defined]
-    assert overseerr.request_calls == []
-    assert overseerr.search_calls == []
+    async def system_one(**kwargs):
+        calls.append(kwargs)
+        return parse_answers({"model": "jev-test", "answers": answers})
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "jev_shadow", False)
+    set_client(SimpleNamespace(system_one=system_one))
+    try:
+        bot, _, _, catalog = setup_bot([candidate("Alien"), candidate("Arrival")],
+                                       [movie("Alien", 1, 1979), movie("Arrival", 2, 2016)])
+        reply = await bot.handle_message(photo())
+        assert len(calls) == 1
+        assert catalog.requests == []
+        assert reply is not None
+        if gate == "confirm":
+            assert "confirmation" in reply.text and reply.reply_markup
+            data = reply.reply_markup["inline_keyboard"][0][0]["callback_data"]
+            # A real Get is an explicit confirm and retains existing behavior.
+            await bot.handle_callback({"id": "cb", "data": data, "from": {"id": 42},
+                                       "message": {"message_id": 99, "chat": {"id": -1001}}})
+            assert len(catalog.requests) == 1
+    finally:
+        reset_client()
+
+
+def test_prepare_image_validates_contents_and_strips_exif():
+    original = Image.new("RGB", (30, 30))
+    exif = Image.Exif()
+    exif[270] = "private photo metadata"
+    source = io.BytesIO()
+    original.save(source, format="JPEG", exif=exif)
+    data, mime = prepare_image(source.getvalue(), mime="image/jpeg", max_bytes=100000)
+    assert mime == "image/jpeg"
+    with Image.open(io.BytesIO(data)) as cleaned:
+        assert not cleaned.getexif()
+    with pytest.raises(VisionError):
+        prepare_image(pixels(), mime="image/jpeg", max_bytes=100000)
+    with pytest.raises(VisionError):
+        prepare_image(pixels("GIF"), mime=None, max_bytes=100000)
+
+
+@pytest.mark.parametrize("value", ["https://bad.test/file", "magnet:?xt=123", "title\nrequest all", "movie.torrent"])
+def test_provider_title_validation_drops_file_and_instruction_payloads(value):
+    with pytest.raises(ValidationError):
+        candidate(value)
 
 
 @pytest.mark.asyncio
-async def test_html_with_an_image_mime_is_refused_without_a_provider_call(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    bot, overseerr, provider = vision_bot(
-        VisionResult(kind="single", candidates=(_candidate("Dune"),)),
-        [_row("Dune", 438631, year=2021)],
-        fetcher_bytes=b"<html>SECRETPIXEL</html>",
-    )
-    reply = await bot.handle_message(_document())
-    assert reply is not None
-    assert reply.text == format_reject_download()
-    assert provider.calls == []
-    assert overseerr.search_calls == []
-    assert overseerr.request_calls == []
+@pytest.mark.parametrize("failure", ["path", "redirect", "size", "stream", "token_error"])
+async def test_telegram_file_download_boundary(failure):
+    requests = []
+    async def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("getFile"):
+            return httpx.Response(200, json={"ok": True, "result": {
+                "file_path": "../secret" if failure == "path" else "photos/file.png",
+                "file_size": 10000 if failure == "size" else 100,
+            }})
+        if failure == "redirect":
+            return httpx.Response(302, headers={"Location": "https://untrusted.test/file"})
+        if failure == "token_error":
+            raise httpx.ConnectError("URL has token 123:SECRET", request=request)
+        return httpx.Response(200, content=b"x" * 1025)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient("123:SECRET", client=http)
+        with pytest.raises(TelegramFileError) as error:
+            await client.download_image("file", max_bytes=1024)
+    assert "SECRET" not in str(error.value)
+    assert all(request.url.host == "api.telegram.org" for request in requests)
+    if failure in {"path", "size"}:
+        assert len(requests) == 1
 
 
 @pytest.mark.asyncio
-async def test_not_media_refuse_and_low_confidence_do_not_search(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    bot, overseerr, _provider = vision_bot(VisionResult(kind="not_media"), [_row("Dune", 1)])
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert "film or series" in reply.text
-    assert overseerr.search_calls == []
-    assert overseerr.request_calls == []
-
-    bot, overseerr, _provider = vision_bot(VisionResult(kind="refuse"), [_row("Dune", 1)])
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert reply.text == "I can't use that image."
-    assert overseerr.search_calls == []
-
-    bot, overseerr, _provider = vision_bot(
-        VisionResult(kind="single", candidates=(_candidate("Saw", confidence=0.2),)),
-        [_row("Saw", 176)],
-    )
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert "not sure" in reply.text
-    assert reply.reply_markup is None
-    assert overseerr.search_calls == []
-    assert overseerr.request_calls == []
-
-
-@pytest.mark.asyncio
-async def test_ambiguous_catalog_hits_are_a_pick_and_not_a_queue(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    bot, overseerr, _provider = vision_bot(
-        VisionResult(kind="single", candidates=(_candidate("Dune", year=None, confidence=0.9),)),
-        [
-            _row("Dune", 841, year=1984),
-            _row("Dune", 438631, year=2021),
-        ],
-    )
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert "Which one matches the image?" in reply.text
-    assert reply.reply_markup is not None
-    gets = [
-        cell
-        for row in reply.reply_markup["inline_keyboard"]
-        for cell in row
-        if str(cell.get("text", "")).startswith("Get ")
-    ]
-    assert len(gets) == 2
-    assert overseerr.request_calls == []
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_refuses_without_search_or_get(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "telegram_vision_mode", "shadow")
-    bot, overseerr, provider = vision_bot(
-        VisionResult(kind="single", candidates=(_candidate("Host"),)),
-        [_row("Host", 736769, year=2020)],
-    )
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert reply.text == format_reject_download()
-    assert reply.reply_markup is None
-    assert provider.calls
-    assert overseerr.search_calls == []
-    assert overseerr.request_calls == []
-
-
-@pytest.mark.asyncio
-async def test_auto_mode_still_requires_get(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "telegram_vision_mode", "auto")
-    bot, overseerr, _provider = vision_bot(
-        VisionResult(
-            kind="single",
-            candidates=(_candidate("Host", year=2020, confidence=0.99),),
-        ),
-        [_row("Host", 736769, year=2020)],
-    )
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert "Host" in reply.text
-    assert reply.reply_markup is not None
-    assert overseerr.request_calls == []
-
-
-@pytest.mark.asyncio
-async def test_lane_off_and_missing_key_do_not_download(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "telegram_vision_lane", False)
-    bot, overseerr, provider = vision_bot(
-        VisionResult(kind="single", candidates=(_candidate("Host"),)),
-        [],
-    )
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert reply.text == format_reject_download()
-    assert bot._fetch.ids == []  # type: ignore[attr-defined]
-    assert provider.calls == []
-    assert overseerr.request_calls == []
-
-    monkeypatch.setattr(settings, "telegram_vision_lane", True)
-    monkeypatch.setattr(settings, "telegram_vision_provider", "openai")
-    monkeypatch.setattr(settings, "openai_api_key", "")
-    bot._vision_provider = None
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert reply.text == format_reject_download()
-    assert bot._fetch.ids == []  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_unknown_chat_never_downloads(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    bot, _overseerr, provider = vision_bot(VisionResult(kind="not_media"), [])
-    reply = await bot.handle_message(_photo(chat_id=-1, user_id=99))
-    assert reply is None
-    assert provider.calls == []
-    assert bot._fetch.ids == []  # type: ignore[attr-defined]
-
-
-@pytest.mark.asyncio
-async def test_caption_fallback_when_the_image_cannot_be_read(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    bot, overseerr, _provider = vision_bot(
-        VisionUnavailable("timeout"),
-        [_row("Arrival", 329865, year=2016)],
-    )
-    reply = await bot.handle_message(_photo("Arrival"))
-    assert reply is not None
-    assert "couldn't read that image" in reply.text
-    assert "Arrival" in reply.text
-    assert overseerr.search_calls
-    assert overseerr.request_calls == []
-
-
-@pytest.mark.asyncio
-async def test_filename_is_not_a_title(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    bot, overseerr, _provider = vision_bot(
-        VisionResult(kind="not_media"),
-        [_row("Inception", 27205)],
-    )
-    reply = await bot.handle_message(_document(file_name="Inception.jpg"))
-    assert reply is not None
-    assert "film or series" in reply.text
-    assert overseerr.search_calls == []
-
-
-@pytest.mark.asyncio
-async def test_vision_logs_have_no_pixels_file_url_or_base64(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    bot, _overseerr, _provider = vision_bot(
-        VisionResult(kind="single", candidates=(_candidate("Host", year=2020),)),
-        [_row("Host", 736769, year=2020)],
-    )
-    with caplog.at_level(logging.INFO, logger="hearth.telegram"):
-        reply = await bot.handle_message(_photo())
-    assert reply is not None
-    text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "SECRETPIXEL" not in text
-    assert "base64" not in text.casefold()
-    assert "api.telegram.org" not in text
-    assert "candidate_count" in text
-    assert "123456:test-token" not in text
-
-
-@pytest.mark.asyncio
-async def test_ack_is_edited_into_the_card(
-    vision_bot: Callable[..., tuple[TelegramMediaBot, QueryOverseerr, FixtureVisionProvider]],
-) -> None:
-    class FakeClient:
-        def __init__(self) -> None:
-            self.sent: list[str] = []
-            self.edits: list[str] = []
-
-        async def send_message(self, chat_id: int, text: str, **kwargs: Any) -> dict[str, Any]:
-            self.sent.append(text)
-            return {"ok": True, "result": {"message_id": 50}}
-
-        async def edit_message_text(
-            self,
-            chat_id: int,
-            message_id: int,
-            text: str,
-            **kwargs: Any,
-        ) -> dict[str, Any]:
-            self.edits.append(text)
-            return {"ok": True}
-
-    bot, overseerr, _provider = vision_bot(
-        VisionResult(kind="single", candidates=(_candidate("Host", year=2020),)),
-        [_row("Host", 736769, year=2020)],
-    )
-    client = FakeClient()
-    bot.bind_telegram(client)
-    reply = await bot.handle_message(_photo())
-    assert reply is not None
-    assert reply.text == ""
-    assert client.sent == ["Looking at that…"]
-    assert client.edits and "Host" in client.edits[-1]
-    assert overseerr.request_calls == []
-
-
-@pytest.mark.asyncio
-async def test_openai_provider_failure_does_not_log_the_image(
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Boom:
-        def __init__(self, **kwargs: Any) -> None:
-            self.kwargs = kwargs
-
-        class chat:
-            class completions:
-                @staticmethod
-                async def create(**kwargs: Any) -> Any:
-                    raise RuntimeError("data:image/jpeg;base64,SECRETPIXEL")
-
-    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
-    monkeypatch.setattr(settings, "telegram_vision_model", "gpt-4o-mini")
-    import openai
-
-    monkeypatch.setattr(openai, "AsyncOpenAI", Boom)
+async def test_structured_vision_payload_has_no_remote_file_url_and_no_retries(monkeypatch):
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
     provider = OpenAIVisionProvider()
-    with caplog.at_level(logging.DEBUG, logger="hearth.telegram"):
-        with pytest.raises(VisionUnavailable):
-            await provider.identify(JPEG, "image/jpeg", None)
-    text = "\n".join(record.getMessage() for record in caplog.records)
-    assert "SECRETPIXEL" not in text
+    calls = []
+    async def create(**kwargs):
+        calls.append(kwargs)
+        result = VisionResult(kind="titles", candidates=[candidate("Alien", year=1979)], more_visible=False)
+        return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+            refusal=None, content=result.model_dump_json()))])
+    provider._key = "test-key"
+    provider._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    identified = await provider.identify(pixels(), "image/png", "best horror movies", limit=8)
+    assert identified.candidates[0].title == "Alien"
+    request = calls[0]
+    assert request["store"] is False
+    assert request["response_format"]["json_schema"]["strict"] is True
+    assert request["messages"][1]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
-def test_openai_schema_is_json_not_free_text() -> None:
-    with pytest.raises(ValueError):
-        parse_vision_payload("The Witch")
-    parsed = parse_vision_payload(json.loads('{"kind": "not_media", "candidates": []}'))
-    assert parsed.kind == "not_media"
-    assert parsed.candidates == ()
+@pytest.mark.asyncio
+async def test_list_cap_visible_and_all_results_fit_message(setup_bot, monkeypatch):
+    monkeypatch.setattr(settings, "telegram_vision_max_items", 2)
+    bot, _, _, catalog = setup_bot([candidate("Alien"), candidate("Arrival"), candidate("Dune")],
+                                   [movie("Alien", 1, 1979), movie("Arrival", 2, 2016), movie("Dune", 3, 2021)])
+    reply = await bot.handle_message(photo())
+    assert len(catalog.requests) == 2
+    assert reply and "remaining" in reply.text and len(reply.text) < 4096
+
+
+def test_caption_mode_and_thumbnail_choice():
+    assert caption_mode("download these movies") == "request"
+    assert caption_mode("download this list of horror films") == "request"
+    assert caption_mode("get these shows") == "request"
+    assert caption_mode("show me what is in this image") == "preview"
+    assert caption_mode("don’t download this list") == "preview"
+    assert caption_mode("") == "request"
+    assert caption_mode("stop") == "cancel"
+    assert image_attachment(photo(), max_bytes=1024).file_id == "readable"
+
+
+@pytest.mark.asyncio
+async def test_vision_close_failure_still_releases_poller_lock(setup_bot, monkeypatch):
+    bot, _, vision, _ = setup_bot([], [])
+    released = []
+    async def close():
+        raise RuntimeError("vision client close failed")
+    vision.aclose = close
+    monkeypatch.setattr(bot.store, "release_poller_lock", lambda: released.append(True))
+    service = TelegramBotService(bot=bot)
+    with pytest.raises(RuntimeError, match="close failed"):
+        await service.stop()
+    assert released == [True]
+
+
+@pytest.mark.asyncio
+async def test_stream_limit_applies_without_content_length_and_successful_files_return_bytes():
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"x" * 600
+            yield b"x" * 600
+    async def handler(request):
+        if request.url.path.endswith("getFile"):
+            return httpx.Response(200, json={"ok": True, "result": {"file_path": "photos/file.png"}})
+        return httpx.Response(200, stream=Stream())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramBotClient("123:SECRET", client=http)
+        with pytest.raises(TelegramFileError, match="too large"):
+            await client.download_image("file", max_bytes=1024)
+        assert await client.download_image("file", max_bytes=2048) == b"x" * 1200
+
+
+@pytest.mark.asyncio
+async def test_typing_task_is_cancelled_when_image_fails(setup_bot):
+    bot, files, _, _ = setup_bot([], [])
+    stopped = asyncio.Event()
+    async def action(chat_id):
+        files.typing.append(chat_id)
+        try:
+            await asyncio.sleep(60)
+        finally:
+            stopped.set()
+    files.send_chat_action = action
+    files.data = b"not image bytes"
+    reply = await bot.handle_message(photo())
+    assert reply and "couldn't read" in reply.text
+    assert files.typing == [-1001] and stopped.is_set()

@@ -38,10 +38,12 @@ _KIND_TOOLS: dict[str, frozenset[str]] = {
             "infuse_play",
             "infuse_transport",
             "house_media",
+            "house_shelf",
             "media_activity",
         }
     ),
     "downloads": frozenset({"radarr_queue", "sonarr_queue"}),
+    "information": frozenset({"web_search"}),
 }
 
 _KIND_LEXICON: dict[str, frozenset[str]] = {
@@ -323,6 +325,11 @@ def entity_topics_for_widget(widget: Widget) -> list[str]:
         for row in list(data.get("downloads") or [])[:8]:
             if isinstance(row, dict):
                 topics |= _entity_tokens_from_chunks(row.get("title"))
+    elif kind == "information":
+        topics |= _entity_tokens_from_chunks(widget.title, data.get("query"))
+        for row in list(data.get("items") or [])[:12]:
+            if isinstance(row, dict):
+                topics |= _entity_tokens_from_chunks(row.get("title"))
     else:
         topics |= _entity_tokens_from_chunks(widget.title, widget.body)
     ordered = sorted(topics)
@@ -435,7 +442,7 @@ def apply_media_focus(widget: Widget, active_id: str) -> bool:
     elif match.get("player"):
         detail_parts.append(str(match["player"]))
     if match.get("skeleton"):
-        detail_parts.append("looking up")
+        detail_parts.append(str(match.get("reason") or "Metadata unavailable"))
     n = len(items)
     if n > 1:
         detail_parts.append(f"{n} on screen")

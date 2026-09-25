@@ -188,19 +188,24 @@ look empty.
 
 ## 11. Posters and list graphics
 
-Needs `OPENAI_API_KEY` (or another configured vision provider) and
-`HEARTH_TELEGRAM_VISION_LANE=true` (the default) with mode `confirm` (also the
-default). Overseerr shows a request only after Get.
+Needs `OPENAI_API_KEY` and the configured Overseerr connection. Image intake
+is enabled by default in `HEARTH_TELEGRAM_VISION_MODE=auto`.
 
 | Send | Expect |
 | --- | --- |
-| one movie poster | `Looking at that…`, then one card. **Get** only if it is missing. Nothing queued before the tap. |
-| an ambiguous remake (two *Dune*s, no year on the image) | both catalog hits named. Nothing queued until you tap one. |
-| a poster grid (up to 16, including a 4×4) | one plan, one row per title, one **Get** per title that is actually missing. A miss is named. No **Get all**. |
-| a selfie, pet, or receipt | it isn't a film or series. No Get, no Overseerr request. |
-| a `.torrent` file, a video, or a photo whose caption contains `magnet:?` | the download refusal. No "Looking at that…". |
+| one clear movie poster | Identified title and actual request/status outcome. A confident exact missing match queues once. |
+| an ambiguous remake (two *Dune*s, no year on the image) | Both catalog hits offered; no automatic guess. |
+| a list of wanted movies | Each confidently resolved missing title is requested, up to the automatic cap of eight. Overflow is explicitly reported. |
+| the same Telegram update replayed | The stored result is returned without a second request. |
+| a caption `preview` or `don't download` | Identification and Get choices, zero automatic requests. |
+| a selective caption `only the first two` | No silent request for the entire image. |
+| a selfie, pet, or receipt | No depicted movie titles, no Overseerr request. |
+| a `.torrent` file, a video, or a caption containing `magnet:?` | Attachment refusal without a provider call. |
 
-With `HEARTH_TELEGRAM_VISION_MODE=shadow`, every row above that is an image
-still gets the download refusal and Overseerr stays empty. With
-`HEARTH_TELEGRAM_VISION_LANE=false`, same refusal, and the bot does not
-download the file.
+With `HEARTH_TELEGRAM_VISION_MODE=confirm`, a poster or grid of up to 16
+becomes a preview with signed Get buttons. Nothing queues before a tap.
+With mode `shadow`, or either enable switch false, images are refused without
+recognition or catalog requests. Text and house commands remain available.
+
+See [ambient UI and image smoke checks](ambient-ai-and-images.md) for voice,
+automatic presentation, provider failures and malformed-image checks.

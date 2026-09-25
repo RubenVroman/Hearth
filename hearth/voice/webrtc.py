@@ -16,6 +16,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import time
+from contextlib import nullcontext
 from typing import Any
 
 import httpx
@@ -25,7 +28,7 @@ from hearth.agent.prompts import compose_system_prompt, compose_system_prompt_as
 from hearth.agent.registry import registry
 from hearth.butler.decision import JEV_GATED_TOOL_NAMES, decide_butler_tool, hide_from_llm
 from hearth.config import settings
-from hearth.jev import adopt_verdict, evaluate_message, log_shadow_outcome, tool_turn
+from hearth.jev import adopt_verdict, current_turn, evaluate_message, is_write_tool, log_shadow_outcome, tool_turn
 from hearth.memory import store as memory_store
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps
@@ -35,6 +38,9 @@ CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets"
 SIDEBAND_URL = "wss://api.openai.com/v1/realtime"
 PATH_ID = "webrtc-ga"
+log = logging.getLogger("hearth.voice")
+TOOL_TIMEOUT_SECONDS = 60.0
+_executions: dict[tuple[str, str], tuple[str, asyncio.Task[dict[str, Any]], float]] = {}
 # One transparent sideband reopen per call. A second drop ends the server session
 # so the client can place a fresh call instead of looping on a dead socket.
 MAX_SIDEBAND_RECONNECTS = 1
@@ -146,9 +152,8 @@ def session_config(*, query: str | None = None, instructions: str | None = None)
     to fire ``speech_started``. Client barge-in gate (``/static/vad.js``) adds a
     second speech-band check while the assistant is talking.
 
-    Input ``transcription`` stays on even when the phone hides live captions.
-    The text feeds house memory, the Jev ``said`` gate, and the next-turn
-    instruction slice — it is not only a UI caption.
+    Input transcription supplies Jev's decision context and memory; it is an
+    internal input, not the visual presentation. The UI shows grounded results.
     """
     if instructions is not None:
         text = voice_instructions(instructions=instructions)
@@ -186,7 +191,57 @@ def secret_value(data: Any) -> str | None:
     return None
 
 
-async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> dict[str, Any]:
+async def run_house_tool(
+    name: str,
+    args: dict[str, Any],
+    *,
+    said: str = "",
+    execution_id: str = "",
+    session_id: str = "",
+) -> dict[str, Any]:
+    """Deduplicate retried voice delivery without replaying a house action."""
+    scope = current_turn()
+    utterance = said or (scope.said if scope is not None else "")
+    if execution_id and is_write_tool(name) and not utterance.strip():
+        return {"ok": False, "name": name, "data": {
+            "error": "missing_current_utterance",
+            "speak": "I couldn't verify what you asked, so I haven't run that action. Please say it again.",
+        }}
+    if not execution_id:
+        return await _execute_house_tool(name, args, said=said)
+    now = time.monotonic()
+    for key, (_, task, started) in list(_executions.items()):
+        if task.done() and (now - started > 600 or len(_executions) >= 512):
+            _executions.pop(key, None)
+    key = (session_id, execution_id)
+    fingerprint = name + ":" + json.dumps(args, sort_keys=True, default=str)
+    previous = _executions.get(key)
+    if previous is not None:
+        if previous[0] != fingerprint:
+            return {"ok": False, "name": name, "data": {"error": "execution_id_conflict"}}
+        return await asyncio.shield(previous[1])
+    if len(_executions) >= 512:
+        return {"ok": False, "name": name, "data": {"error": "voice_tools_busy"}}
+    task = asyncio.create_task(_execute_house_tool(name, args, said=said))
+    _executions[key] = (fingerprint, task, now)
+    # Client disconnects may interrupt the wait, not an action already in flight.
+    return await asyncio.shield(task)
+
+
+async def _execute_house_tool(name: str, args: dict[str, Any], *, said: str) -> dict[str, Any]:
+    try:
+        async with asyncio.timeout(TOOL_TIMEOUT_SECONDS):
+            return await _execute_house_tool_gated(name, args, said=said)
+    except TimeoutError:
+        return {"ok": False, "name": name, "data": {"error": "tool_timeout", "uncertain": True,
+            "speak": "That took too long. I couldn't verify its outcome; check its status before retrying."}}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Voice tool %s failed: %s", name, type(exc).__name__)
+        return {"ok": False, "name": name, "data": {"error": "tool_failed", "uncertain": True,
+            "speak": "I couldn't verify that action's outcome. Check its status before retrying."}}
+
+
+async def _execute_house_tool_gated(name: str, args: dict[str, Any], *, said: str) -> dict[str, Any]:
     payload = dict(args or {})
     if name == "chief_of_staff":
         payload.setdefault("said", said or json.dumps(payload))
@@ -194,8 +249,11 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
     # still wraps the call for allow/deny; butler_ask picks which tool may run.
     butler_verdict = None
     if name in JEV_GATED_TOOL_NAMES:
-        uttered = (said or runtime.latest_user() or "").strip()
-        butler_verdict = await evaluate_message(uttered or name)
+        uttered = (said or "").strip()
+        scope = current_turn()
+        butler_verdict = scope.verdict if scope is not None else None
+        if butler_verdict is None:
+            butler_verdict = await evaluate_message(uttered or name)
         decision = decide_butler_tool(uttered, butler_verdict)
         log_shadow_outcome(
             butler_verdict,
@@ -213,7 +271,7 @@ async def run_house_tool(name: str, args: dict[str, Any], *, said: str = "") -> 
         payload = decision.as_args()
     # Voice tool calls pass the same Jev gate as chat and Telegram. Without a
     # transcript there is no state to gate on, and the gate fails open.
-    with tool_turn(said, channel="voice"):
+    with (nullcontext() if current_turn() is not None else tool_turn(said, channel="voice")):
         if butler_verdict is not None:
             adopt_verdict(butler_verdict)
         result = await registry.call(name, payload, said=said)
@@ -239,6 +297,20 @@ class Sideband:
         self._done_calls: set[str] = set()
         self._pending_hangup = False
         self._hangup_task: asyncio.Task[None] | None = None
+        self._jobs: set[asyncio.Task[None]] = set()
+        self._tool_lock = asyncio.Lock()
+        self._memory_task: asyncio.Task[None] | None = None
+        self._done_responses: set[str] = set()
+        self._transcripts: set[tuple[str, str, str]] = set()
+        self._utterance = ""
+        self._generation = 0
+        self._verdict = None
+        self._response_generations: dict[str, int] = {}
+        self._input_item_id = ""
+        self._writes: dict[str, dict[str, Any]] = {}
+        self._tool_count = 0
+        self._transcript_ready = asyncio.Event()
+        self._transcript_ready.set()
         self._closing = False
         self._abandoned = False
         self._sideband_reconnects = 0
@@ -247,7 +319,11 @@ class Sideband:
         self._pending_query: str | None = None
         self._latest_user = ""
         self._partial_user = ""
-        self._last_assistant = ""
+        self._active_response_ids: set[str] = set()
+        self._ended_response_ids: set[str] = set()
+        self._continuation_pending = False
+        self._instruction_lock = asyncio.Lock()
+        self._socket_ready = asyncio.Event()
 
     async def start(self) -> None:
         last_exc: Exception | None = None
@@ -263,6 +339,7 @@ class Sideband:
             raise last_exc
         assert self._ws is not None
         await self._ws.send(dumps({"type": "session.update", "session": session_config()}))
+        self._socket_ready.set()
         self._pump = asyncio.create_task(self._listen())
         runtime.voice_mode = "live"
         runtime.voice_path = PATH_ID
@@ -281,6 +358,12 @@ class Sideband:
         ):
             self._hangup_task.cancel()
             self._hangup_task = None
+        if self._memory_task is not None:
+            self._memory_task.cancel()
+            self._memory_task = None
+        for task in list(self._jobs):
+            if task is not current:
+                task.cancel()
         if self._pump is not None and self._pump is not current:
             self._pump.cancel()
             self._pump = None
@@ -291,7 +374,7 @@ class Sideband:
         """Clear the live flag only when no other call still owns the path."""
         if runtime.voice_path != PATH_ID:
             return
-        others = [cid for cid in _sidebands if cid != self.call_id]
+        others = [band for band in _sidebands.values() if band is not self and not band._closing]
         if others:
             return
         runtime.voice_mode = "disconnected"
@@ -307,12 +390,39 @@ class Sideband:
     async def _discard_socket(self) -> None:
         ws = self._ws
         self._ws = None
+        self._socket_ready.clear()
         if ws is None:
             return
         try:
             await ws.close()
         except Exception:  # noqa: BLE001
             return
+
+    async def _send_tool_output(self, event: dict[str, Any]) -> bool:
+        """Keep a completed action's result through the one permitted reopen."""
+        if self._closing:
+            return False
+        if self._ws is None:
+            async with asyncio.timeout(10.0):
+                await self._socket_ready.wait()
+        ws = self._ws
+        if ws is None or self._closing:
+            return False
+        try:
+            await ws.send(dumps(event))
+        except Exception:
+            if self._closing:
+                return False
+            if ws is self._ws:
+                self._socket_ready.clear()
+            # The event pump owns reconnecting; only resend this output on the
+            # replacement socket. Never execute the associated tool again.
+            async with asyncio.timeout(10.0):
+                await self._socket_ready.wait()
+            if self._ws is None or self._ws is ws or self._closing:
+                raise ConnectionError("sideband could not deliver tool result") from None
+            await self._ws.send(dumps(event))
+        return True
 
     def _schedule_hangup(self) -> None:
         """Close this call once the current Realtime response has finished."""
@@ -351,7 +461,7 @@ class Sideband:
                     if self._closing:
                         return
                     if self._sideband_reconnects >= MAX_SIDEBAND_RECONNECTS:
-                        self._fail_reason = f"sideband dropped: {exc}"[:300]
+                        self._fail_reason = f"sideband dropped: {type(exc).__name__}"
                         abandon = True
                         return
                     self._sideband_reconnects += 1
@@ -376,15 +486,22 @@ class Sideband:
                 event = json.loads(payload)
             except json.JSONDecodeError:
                 continue
-            await self._on_event(event)
+            if isinstance(event, dict):
+                await self._on_event(event)
 
     async def _reopen_socket(self) -> bool:
         await self._discard_socket()
         try:
             await self._connect_socket()
-            instructions = voice_instructions(self._latest_user or runtime.latest_user())
+            instructions = voice_instructions(self._latest_user or self._utterance)
             assert self._ws is not None
             await self._ws.send(dumps(instructions_update(instructions, include_tools=True)))
+            # Completion events may have been lost with the old socket. Do not
+            # leave memory refreshes waiting forever for an unseen response.
+            self._active_responses = 0
+            self._active_response_ids.clear()
+            self._continuation_pending = False
+            self._socket_ready.set()
             runtime.voice_mode = "live"
             runtime.voice_path = PATH_ID
             runtime.openai_live = True
@@ -398,48 +515,54 @@ class Sideband:
         if self._abandoned:
             return
         self._abandoned = True
-        self._closing = True
-        await self._discard_socket()
         current = _sidebands.get(self.call_id)
         if current is self:
             _sidebands.pop(self.call_id, None)
-        self._release_runtime()
+        await self.close()
 
     def _said(self) -> str:
-        return (self._latest_user or self._partial_user or runtime.latest_user() or "").strip()
+        """Current-call context; partial ASR is suitable only for read tools."""
+        return (self._utterance or self._latest_user or self._partial_user).strip()
 
-    def _note_assistant(self, text: str) -> None:
-        cleaned = (text or "").strip()
-        if not cleaned or cleaned == self._last_assistant:
-            return
-        self._last_assistant = cleaned
-        runtime.note("assistant", cleaned)
-        _persist_voice_turn("assistant", cleaned)
-
-    async def _remember_user_final(self, text: str) -> None:
+    async def _remember_user_final(self, text: str, *, item_id: str = "") -> None:
         cleaned = (text or "").strip()
         if not cleaned:
             return
-        self._partial_user = ""
-        if cleaned == self._latest_user:
+        if item_id and self._input_item_id and item_id != self._input_item_id:
+            self._note_transcript("user", cleaned, item_id)
             return
-        self._latest_user = cleaned[:800]
-        runtime.note("user", self._latest_user)
-        _persist_voice_turn("user", self._latest_user)
+        self._partial_user = ""
+        if cleaned != self._utterance:
+            self._verdict = None
+        self._utterance = self._latest_user = cleaned[:800]
+        self._transcript_ready.set()
+        self._note_transcript("user", self._latest_user, item_id)
         self._pending_query = self._latest_user
         if self._active_responses == 0 and not self._pending_hangup:
-            await self._flush_instructions()
+            self._schedule_instruction_refresh()
 
     def _remember_user_delta(self, delta: str) -> None:
         if not delta:
             return
         self._partial_user = f"{self._partial_user}{delta}"[-800:]
 
-    def _begin_response(self) -> None:
+    def _begin_response(self, response_id: str = "") -> None:
+        if response_id:
+            if response_id in self._active_response_ids or response_id in self._ended_response_ids:
+                return
+            self._active_response_ids.add(response_id)
+        self._continuation_pending = False
         self._active_responses += 1
 
-    def _end_response(self) -> bool:
+    def _end_response(self, response_id: str = "") -> bool:
         """Return True when no Realtime response is still in flight."""
+        if response_id:
+            if response_id in self._ended_response_ids:
+                return self._active_responses == 0
+            self._ended_response_ids.add(response_id)
+            if response_id not in self._active_response_ids and self._active_response_ids:
+                return self._active_responses == 0
+            self._active_response_ids.discard(response_id)
         if self._active_responses <= 0:
             self._active_responses = 0
             return True
@@ -449,105 +572,229 @@ class Sideband:
     async def _on_event(self, event: dict[str, Any]) -> None:
         etype = event.get("type")
         if etype == "input_audio_buffer.speech_started":
+            self._generation += 1
+            self._utterance = ""
+            self._latest_user = ""
+            self._partial_user = ""
+            self._pending_query = None
+            self._continuation_pending = False
+            self._verdict = None
+            self._input_item_id = str(event.get("item_id") or "")
+            self._writes = {}
+            self._tool_count = 0
+            self._transcript_ready.clear()
             runtime.set_status("listening")
         elif etype == "response.created":
-            self._begin_response()
+            response = event.get("response") or {}
+            if isinstance(response, dict) and response.get("id") and str(response["id"]) not in self._ended_response_ids:
+                self._response_generations[str(response["id"])] = self._generation
+            self._begin_response(str(response.get("id") or "") if isinstance(response, dict) else "")
             runtime.set_status("thinking")
         elif etype == "response.cancelled":
-            if self._end_response() and not self._pending_hangup:
-                await self._flush_instructions()
+            response = event.get("response") or {}
+            if not isinstance(response, dict):
+                return
+            response_id = str(response.get("id") or event.get("response_id") or "")
+            if not response_id and len(self._active_response_ids) == 1:
+                response_id = next(iter(self._active_response_ids))
+            if response_id:
+                self._done_responses.add(response_id)
+                self._response_generations.pop(response_id, None)
+            if self._end_response(response_id) and not self._pending_hangup:
+                self._schedule_instruction_refresh()
         elif etype in {"response.output_audio.delta", "response.audio.delta"}:
             runtime.set_status("speaking")
         elif etype in _ASSISTANT_TRANSCRIPT_DONE:
             runtime.set_status("speaking")
-            self._note_assistant(event.get("transcript") or "")
+            text = (event.get("transcript") or "").strip()
+            if text:
+                self._note_transcript("assistant", text, str(event.get("item_id") or event.get("response_id") or ""))
         elif etype in _USER_TRANSCRIPT_DELTA:
-            self._remember_user_delta(str(event.get("delta") or ""))
+            item_id = str(event.get("item_id") or "")
+            if not (item_id and self._input_item_id and item_id != self._input_item_id):
+                self._remember_user_delta(str(event.get("delta") or ""))
         elif etype in _USER_TRANSCRIPT_DONE:
-            await self._remember_user_final(str(event.get("transcript") or ""))
-        elif etype == "response.function_call_arguments.done":
-            await self._run_function_call(
-                event.get("name") or "",
-                event.get("arguments") or "{}",
-                event.get("call_id") or "",
+            await self._remember_user_final(
+                str(event.get("transcript") or ""), item_id=str(event.get("item_id") or "")
             )
+        elif etype == "response.function_call_arguments.done":
+            # Arguments may complete on a response that is subsequently
+            # cancelled. Execute only the final completed response's output.
+            return
         elif etype == "response.done":
-            await self._handle_function_calls(event)
-            idle = self._end_response()
-            runtime.set_status("listening")
-            if idle and not self._pending_hangup:
-                await self._flush_instructions()
-            if self._pending_hangup:
-                self._schedule_hangup()
+            response = event.get("response") or {}
+            if not isinstance(response, dict):
+                return
+            response_id = str(response.get("id") or "")
+            if not response_id and len(self._active_response_ids) == 1:
+                response_id = next(iter(self._active_response_ids))
+            if response_id and response_id in self._done_responses:
+                return
+            if response_id:
+                self._done_responses.add(response_id)
+            self._end_response(response_id)
+            generation = self._response_generations.pop(response_id, self._generation)
+            if response.get("status", "completed") != "completed":
+                runtime.set_status("listening")
+                self._schedule_instruction_refresh()
+                return
+            job = asyncio.create_task(self._finish_response(event, generation, self._utterance))
+            self._jobs.add(job)
+            job.add_done_callback(self._jobs.discard)
         elif etype == "error":
             err = event.get("error") or event
             runtime.voice_reason = str(err)[:300]
             if is_fatal_realtime_error(err):
                 raise SidebandFatal(runtime.voice_reason)
 
-    async def _handle_function_calls(self, event: dict[str, Any]) -> None:
+    def _note_transcript(self, role: str, text: str, item_id: str) -> None:
+        key = (role, item_id or str(self._generation), text)
+        if key in self._transcripts:
+            return
+        self._transcripts.add(key)
+        runtime.note(role, text)
+        _persist_voice_turn(role, text)
+
+    async def _finish_response(self, event: dict[str, Any], generation: int, said: str) -> None:
+        try:
+            async with self._tool_lock:
+                if generation != self._generation or self._ws is None:
+                    return
+                if not said and not self._transcript_ready.is_set():
+                    # Transcription arrives independently from audio reasoning.
+                    # Keep reading events while giving Jev a small chance to
+                    # receive this utterance instead of gating an empty string.
+                    try:
+                        async with asyncio.timeout(1.0):
+                            await self._transcript_ready.wait()
+                    except TimeoutError:
+                        pass
+                    if generation != self._generation:
+                        return
+                    said = self._utterance
+                with tool_turn(said, channel="voice") as scope:
+                    if self._verdict is not None:
+                        adopt_verdict(self._verdict)
+                    await self._handle_function_calls(event, generation=generation, said=said)
+                    if generation == self._generation:
+                        self._verdict = scope.verdict
+                if generation != self._generation:
+                    return
+                if self._pending_hangup:
+                    self._schedule_hangup()
+                else:
+                    await self._flush_instructions()
+                    runtime.set_status("listening")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Voice response failed: %s", type(exc).__name__)
+            runtime.voice_reason = "Voice response interrupted. Please try again."
+            runtime.set_status("listening")
+
+    async def _handle_function_calls(self, event: dict[str, Any], *, generation: int | None = None, said: str = "") -> None:
         response = event.get("response") or {}
         output = response.get("output") or []
+        output = [item for item in output if isinstance(item, dict)]
         calls = [item for item in output if item.get("type") == "function_call"]
         if not calls:
             for item in output:
                 if item.get("type") == "message":
                     for content in item.get("content") or []:
+                        if not isinstance(content, dict):
+                            continue
                         text = content.get("transcript") or content.get("text")
                         if text:
-                            self._note_assistant(text)
+                            self._note_transcript("assistant", str(text), str(item.get("id") or response.get("id") or ""))
             return
         for item in calls:
+            if generation is not None and generation != self._generation:
+                return
             await self._run_function_call(
                 item.get("name") or "",
                 item.get("arguments") or "{}",
                 item.get("call_id") or "",
+                said=said,
+                resume=False,
             )
+            if self._pending_hangup:
+                break
+        if self._ws is not None and not self._pending_hangup and (generation is None or generation == self._generation):
+            followup: dict[str, Any] = {"type": "response.create"}
+            if self._tool_count >= 32:
+                followup["response"] = {"tool_choice": "none"}
+            self._continuation_pending = True
+            await self._ws.send(dumps(followup))
 
-    async def _run_function_call(self, name: str, arguments: str, call_id: str) -> None:
-        if self._ws is None or not name:
+    async def _run_function_call(self, name: str, arguments: str, call_id: str, *, said: str = "", resume: bool = True) -> None:
+        if self._ws is None or not name or not call_id:
             return
         if call_id and call_id in self._done_calls:
             return
         if call_id:
             self._done_calls.add(call_id)
+        self._tool_count += 1
         runtime.begin_tool(name)
         try:
             args = json.loads(arguments or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        result = await run_house_tool(
-            name,
-            args if isinstance(args, dict) else {},
-            said=self._said(),
-        )
-        await self._ws.send(
-            dumps(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": json.dumps(result, default=str),
-                    },
-                }
-            )
-        )
-        if name == "end_call":
+            if not isinstance(args, dict):
+                raise ValueError("non-object arguments")
+        except (ValueError, TypeError):
+            result = {"ok": False, "name": name, "data": {"error": "invalid_arguments", "speak": "The tool arguments were invalid; nothing ran."}}
+        else:
+            fingerprint = name + ":" + json.dumps(args, sort_keys=True)
+            writes = self._writes
+            utterance = (said or self._utterance or (self._said() if not is_write_tool(name) else "")).strip()
+            if is_write_tool(name) and not utterance:
+                result = {"ok": False, "name": name, "data": {
+                    "error": "missing_current_utterance",
+                    "speak": "I couldn't verify what you asked, so I haven't run that action. Please say it again.",
+                }}
+            elif is_write_tool(name) and fingerprint in writes:
+                result = writes[fingerprint]
+            elif self._tool_count > 32:
+                result = {"ok": False, "name": name, "data": {"error": "tool_limit", "speak": "I stopped the tool loop. Summarize the results already returned."}}
+            else:
+                result = await run_house_tool(name, args, said=utterance, execution_id=call_id, session_id=self.call_id)
+                if is_write_tool(name):
+                    writes[fingerprint] = result
+        delivered = await self._send_tool_output({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": json.dumps(result, default=str),
+            },
+        })
+        if not delivered:
+            return
+        if name == "end_call" and result.get("ok"):
             # Close after this response finishes so farewell audio can play.
             self._pending_hangup = True
             runtime.voice_reason = f"close_of_call:{result.get('reason', 'close_of_call')}"
             return
-        await self._ws.send(dumps({"type": "response.create"}))
+        if resume:
+            self._continuation_pending = True
+            await self._ws.send(dumps({"type": "response.create"}))
+
+    def _schedule_instruction_refresh(self) -> None:
+        if self._memory_task is None or self._memory_task.done():
+            self._memory_task = asyncio.create_task(self._flush_instructions())
 
     async def _flush_instructions(self, *, include_tools: bool = False) -> None:
         """Push a memory refresh between turns, never over an in-flight response."""
+        async with self._instruction_lock:
+            await self._flush_instructions_locked(include_tools=include_tools)
+
+    async def _flush_instructions_locked(self, *, include_tools: bool = False) -> None:
         query = self._pending_query
-        if not query or self._ws is None or self._active_responses > 0 or self._pending_hangup:
+        if not query or self._ws is None or self._active_responses > 0 or self._pending_hangup or self._continuation_pending:
             return
         self._pending_query = None
+        generation = self._generation
         try:
-            instructions = await voice_instructions_async(query)
+            async with asyncio.timeout(5.0):
+                instructions = await voice_instructions_async(query)
             # A response may have started while memory was loading. Hold the
             # slice for the next idle boundary instead of resetting the turn.
             if (
@@ -555,13 +802,16 @@ class Sideband:
                 or self._active_responses > 0
                 or self._pending_hangup
                 or self._closing
+                or self._continuation_pending
+                or generation != self._generation
+                or (self._pending_query is not None and self._pending_query != query)
             ):
-                if self._pending_query is None:
+                if self._pending_query is None and generation == self._generation:
                     self._pending_query = query
                 return
             await self._ws.send(dumps(instructions_update(instructions, include_tools=include_tools)))
         except Exception:  # noqa: BLE001
-            if self._pending_query is None:
+            if self._pending_query is None and generation == self._generation:
                 self._pending_query = query
             return
 
@@ -668,8 +918,8 @@ async def create_call(sdp: str) -> dict[str, Any]:
             _sidebands[call_id] = band
             sideband = "ok"
         except Exception as exc:  # noqa: BLE001
-            sideband = f"failed:{exc}"
             await band.close()
+            sideband = f"failed:{type(exc).__name__}"
     else:
         sideband = "no-call-id"
         runtime.voice_mode = "live"

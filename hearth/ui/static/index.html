@@ -92,10 +92,11 @@
             <span class="activity-dot" aria-hidden="true"></span>
             <span class="activity-label" id="activity-label"></span>
           </p>
-          <!-- Live spoken-answer read-along (Realtime output transcript). Zero flow height — no orb/composer jump. -->
+          <!-- Optional captions stay off; tool results are presented on the ambient board. -->
           <div
             id="spoken-answer"
             class="spoken-answer"
+            data-enabled="false"
             hidden
             aria-hidden="true"
             role="status"
@@ -179,7 +180,7 @@
       <section class="transcript is-empty" id="transcript">
         <details class="transcript-details" id="transcript-details">
           <summary class="transcript-toggle">Conversation</summary>
-          <ol id="log" aria-live="polite"></ol>
+          <ol id="log"></ol>
         </details>
       </section>
     </main>
@@ -190,16 +191,17 @@
       hidden
       aria-hidden="true"
     >
-      <button type="button" class="info-overlay-backdrop" id="info-backdrop" aria-label="Dismiss"></button>
+      <div class="info-overlay-backdrop" id="info-backdrop" aria-hidden="true"></div>
       <div
         class="info-glass"
         id="info-glass"
-        role="dialog"
-        aria-modal="false"
-        aria-live="polite"
+        role="region"
         aria-labelledby="info-title"
       >
-        <button type="button" class="info-dismiss" id="info-dismiss" aria-label="Dismiss">×</button>
+        <header class="info-toolbar">
+          <div class="info-toolbar-label"><span class="info-live-dot" aria-hidden="true"></span><span id="info-reading-status" role="status" aria-live="polite">All results · at a glance</span></div>
+          <div class="info-toolbar-actions"><button type="button" class="info-reading-toggle" id="info-reading-toggle" hidden>Pause reading</button><button type="button" class="info-dismiss" id="info-dismiss" aria-label="Dismiss information">×</button></div>
+        </header>
         <div class="info-glass-inner" id="info-content"></div>
       </div>
     </div>
@@ -231,6 +233,7 @@
     <script src="/static/pwa.js"></script>
     <script src="/static/vad.js"></script>
     <script src="/static/spoken-answer.js"></script>
+    <script src="/static/presentation.js"></script>
     <script src="/static/voice-session.js"></script>
     <script src="/static/settings.js"></script>
     <script src="/static/app.js"></script>

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import shutil
 from pathlib import Path
 
 UI = Path(__file__).resolve().parents[1] / "hearth" / "ui" / "static"
@@ -34,13 +35,13 @@ def test_live_transcription_defaults_hidden_in_look_settings(client):
     assert "replaceTrack" in app_js
     assert "recoverConversation" in app_js
     sw = (UI / "sw.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v22" in sw
+    assert "hearth-shell-v23" in sw
     assert "/static/voice-session.js" in sw
 
 
 def test_voice_session_policy_node():
     """Reconnect budget, ICE wait, caption flag, and utterance merge."""
-    node_bin = str(NODE if NODE.is_file() else Path("/usr/bin/node"))
+    node_bin = shutil.which("node") or str(NODE if NODE.is_file() else Path("/usr/bin/node"))
     script = r"""
 const vs = require('./hearth/ui/static/voice-session.js');
 const assert = (cond, msg) => { if (!cond) { console.error(msg); process.exit(1); } };
@@ -58,6 +59,8 @@ assert(back.action === 'keep' && back.reason === 'connected', 'recovered ice sta
 
 const failed = vs.connectionAction({ connectionState: 'failed', reconnectsUsed: 0 });
 assert(failed.action === 'reconnect' && failed.reason === 'peer_failed', 'first failure reconnects');
+assert(vs.connectionAction({connectionState:'connected',iceConnectionState:'failed'}).action === 'reconnect', 'terminal ICE takes precedence over stale connected peer state');
+assert(vs.connectionAction({connectionState:'connected',iceConnectionState:'disconnected'}).action === 'wait', 'ICE disconnect waits while peer still reports connected');
 
 const dc = vs.connectionAction({ connectionState: 'connected', dataChannelState: 'closed', reconnectsUsed: 0 });
 assert(dc.action === 'reconnect' && dc.reason === 'datachannel_closed', 'dead data channel reconnects');

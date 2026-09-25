@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -373,17 +373,20 @@ class Settings(BaseSettings):
         le=16,
         alias="HEARTH_TELEGRAM_BATCH_MAX_ITEMS",
     )
+    # Authorized Telegram images become catalog requests; captions can opt out.
+    telegram_vision_enabled: bool = Field(default=True, alias="HEARTH_TELEGRAM_VISION_ENABLED")
+    telegram_vision_auto_request: bool = Field(default=True, alias="HEARTH_TELEGRAM_VISION_AUTO_REQUEST")
+    telegram_vision_max_items: int = Field(default=8, ge=1, le=8, alias="HEARTH_TELEGRAM_VISION_MAX_ITEMS")
     # Still-image intake. On by default so a poster in an allowlisted chat
     # becomes Overseerr cards after deploy when OPENAI_API_KEY is set.
     # Empty provider, or openai without a key, keeps today's download refusal.
-    # Mode ``auto`` is accepted and treated as ``confirm``: nothing queues
-    # without Get / yes. See docs/proposals/telegram-image-recognition.md.
+    # Explicit confirm/shadow modes remain available; auto uses Jev's write gate.
     telegram_vision_lane: bool = Field(default=True, alias="HEARTH_TELEGRAM_VISION_LANE")
-    telegram_vision_mode: str = Field(default="confirm", alias="HEARTH_TELEGRAM_VISION_MODE")
+    telegram_vision_mode: str = Field(default="auto", alias="HEARTH_TELEGRAM_VISION_MODE")
     telegram_vision_provider: str = Field(default="openai", alias="HEARTH_TELEGRAM_VISION_PROVIDER")
     telegram_vision_fallback: str = Field(default="", alias="HEARTH_TELEGRAM_VISION_FALLBACK")
     telegram_vision_model: str = Field(
-        default="gpt-4o-mini",
+        default="gpt-4o",
         alias="HEARTH_TELEGRAM_VISION_MODEL",
     )
     telegram_vision_timeout_seconds: float = Field(
@@ -409,7 +412,15 @@ class Settings(BaseSettings):
         ge=1,
         le=30,
         alias="HEARTH_TELEGRAM_VISION_PER_MINUTE",
+        validation_alias=AliasChoices("HEARTH_TELEGRAM_VISION_PER_MINUTE", "HEARTH_TELEGRAM_VISION_RATE_PER_MINUTE"),
     )
+    @property
+    def telegram_vision_rate_per_minute(self) -> int:
+        return self.telegram_vision_per_minute
+
+    @telegram_vision_rate_per_minute.setter
+    def telegram_vision_rate_per_minute(self, value: int) -> None:
+        self.telegram_vision_per_minute = value
     telegram_vision_daily_cap: int = Field(
         default=30,
         ge=1,
@@ -436,8 +447,8 @@ class Settings(BaseSettings):
         le=1.0,
         alias="HEARTH_TELEGRAM_VISION_AMBIGUOUS_MARGIN",
     )
-    # Reserved for a later single-title auto-request bar. This slice does not
-    # queue from it; Get / yes remains the only confirm.
+    # Recognition confidence alone is insufficient: auto also requires exact
+    # catalog agreement and the existing Jev write gate.
     telegram_vision_auto_confidence: float = Field(
         default=0.92,
         ge=0.0,
@@ -449,6 +460,7 @@ class Settings(BaseSettings):
     # or the provider is ``local``.
     telegram_vision_residency: str = Field(default="", alias="HEARTH_TELEGRAM_VISION_RESIDENCY")
     telegram_vision_detail: str = Field(default="high", alias="HEARTH_TELEGRAM_VISION_DETAIL")
+
     # In-thread follow-up memory ("the sequel", "all of them", "more like that").
     telegram_context_ttl_seconds: int = Field(
         default=30 * 60,

@@ -26,7 +26,7 @@ def test_command_center_includes_info_overlay(client):
     assert "softHideInfoOverlay" in js.text
     assert "noteOverlayConversation" in js.text
     assert "focusMediaFromText" in js.text
-    assert "cycleMedia" in js.text
+    assert "focusPresentation" in js.text
     assert "info-media-stack" in js.text
     assert "is-soft-hidden" in js.text
     assert "renderWidgets" in js.text
@@ -49,7 +49,7 @@ def test_command_center_includes_info_overlay(client):
     assert ".widget-stack" not in css.text
     assert "widget-in" not in css.text
     sw = client.get("/sw.js")
-    assert "hearth-shell-v22" in sw.text
+    assert "hearth-shell-v23" in sw.text
     assert "clientMediaFocusId" in js.text
     assert "reconcileClientMediaFocus" in js.text
     assert "rememberClientMediaFocus" in js.text
@@ -69,17 +69,17 @@ def test_command_center_includes_info_overlay(client):
     assert "playActiveInInfuse(playBtn.getAttribute" in js.text
     assert "setRefreshInterval" in js.text
     assert ".info-infuse-btn" in css.text
-    assert ".info-media-card.is-selectable" in css.text
-    assert "is-carousel" in js.text
+    assert ".info-media-board .info-media-card" in css.text
+    assert "info-media-board" in js.text
     assert "dataset.settled" in js.text
-    assert ".info-media-carousel" in css.text
+    assert ".info-media-board" in css.text
     assert "#info-content[data-settled" in css.text
-    assert "Swipe or tap cards to browse" in js.text
+    assert "Swipe or tap cards to browse" not in js.text
     assert ".info-media-banner" in css.text
     assert ".info-media-empty" in css.text
     assert "min-height: 120px" in css.text
     assert "--stack-i" not in css.text
-    assert "var(--slot" in css.text
+    assert "var(--slot" not in css.text
     assert ".info-media-link" in css.text
     assert "Suggested" in js.text
     assert "info-media-link" in js.text
@@ -253,7 +253,7 @@ def test_ambiguous_play_surfaces_pickable_media_overlay(client):
         assert row.get("ratingKey") or row.get("tmdbId")
     js = client.get("/static/app.js")
     assert "mediaStatusBanner" in js.text
-    assert "Ready to play" in js.text
+    assert "Catalog match" in js.text
 
 
 def test_play_movie_surfaces_infuse_controls(client):
@@ -286,16 +286,16 @@ def test_animation_genre_browse_surfaces_media_stack(client):
     assert "Spirited Away" in titles or "Spirited Away" in media["title"]
     assert "animation" in body["reply"].lower() or "Spirited" in body["reply"]
     # Ask once → stacked cards with title + year, no confirm gate.
-    assert media["data"].get("presentation") == "carousel"
+    assert media["data"].get("presentation") == "board"
     assert media["data"].get("genre") == "Animation"
     assert len(items) >= 2
     for row in items:
         assert row.get("title")
         assert row.get("year") is not None
     js = client.get("/static/app.js")
-    assert "cycleMedia" in js.text
+    assert "focusPresentation" in js.text
     assert "MEDIA_STACK_CAP = 12" in js.text
-    assert "Swipe or tap cards to browse" in js.text
+    assert "Swipe or tap cards to browse" not in js.text
 
 
 def test_sci_fi_genre_browse_surfaces_media_stack(client):
@@ -311,7 +311,7 @@ def test_sci_fi_genre_browse_surfaces_media_stack(client):
     assert "Dune: Part Two" in titles or "The Endless" in titles
     assert media["data"]["active_id"]
     assert media["data"]["item"]["id"] == media["data"]["active_id"]
-    assert media["data"].get("presentation") == "carousel"
+    assert media["data"].get("presentation") == "board"
     assert media["data"].get("genre") == "Science Fiction"
     assert len(items) >= 2
     # Active card carries Infuse-resolvable identifiers for the UI button.

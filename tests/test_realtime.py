@@ -263,11 +263,19 @@ async def test_sideband_end_call_closes_after_response_done(monkeypatch):
             "call_id": "call_end_1",
         }
     )
-    assert band._pending_hangup is True
-    assert any(m.get("type") == "conversation.item.create" for m in sent)
+    # Partial argument events must not execute tools: the response can still
+    # be cancelled. Only its completed final output may end the call.
+    assert band._pending_hangup is False
+    assert not any(m.get("type") == "conversation.item.create" for m in sent)
     assert not any(m.get("type") == "response.create" for m in sent)
 
-    await band._on_event({"type": "response.done", "response": {"output": []}})
+    await band._on_event({"type": "response.done", "response": {"output": [{
+        "type": "function_call", "name": "end_call", "arguments": '{"reason":"goodbye"}',
+        "call_id": "call_end_1",
+    }]}})
+    import asyncio
+
+    await asyncio.gather(*list(band._jobs))
     # Hangup is scheduled as a task; let it run.
     if band._hangup_task is not None:
         await band._hangup_task
@@ -364,6 +372,10 @@ async def test_memory_refresh_waits_until_the_response_is_idle(monkeypatch):
     assert band._said() == "play the other one"
     assert sent == []
     await band._on_event({"type": "response.done", "response": {"output": []}})
+    # Completed responses run outside the event pump so interrupts still arrive.
+    import asyncio
+
+    await asyncio.gather(*list(band._jobs))
     updates = [m for m in sent if m.get("type") == "session.update"]
     assert len(updates) == 1
     assert updates[0]["session"]["instructions"] == "VOICE play the other one"
@@ -406,7 +418,7 @@ async def test_memory_refresh_holds_if_a_response_starts_while_loading(monkeypat
 async def test_sideband_tool_call_passes_spoken_utterance(monkeypatch):
     captured: dict = {}
 
-    async def fake(name, args, said=""):
+    async def fake(name, args, said="", **_delivery):
         captured["name"] = name
         captured["said"] = said
         return {"ok": True, "name": name, "speak": "Done."}

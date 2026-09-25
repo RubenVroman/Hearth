@@ -6,6 +6,7 @@ sends ``OpenAI-Beta: realtime=v1`` (that shape is disabled).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any
@@ -17,6 +18,8 @@ from hearth.agent.registry import registry
 from hearth.config import settings
 from hearth.runtime import runtime
 from hearth.voice.protocol import dumps, pcm16_to_wav
+
+MAX_AUDIO_BYTES = 5 * 1024 * 1024
 
 
 class VoiceSession:
@@ -60,6 +63,9 @@ class VoiceSession:
                 except json.JSONDecodeError:
                     await self.send({"type": "error", "message": "invalid json"})
                     continue
+                if not isinstance(event, dict):
+                    await self.send({"type": "error", "message": "expected an event object"})
+                    continue
                 await self._on_client(event)
         except WebSocketDisconnect:
             pass
@@ -82,7 +88,12 @@ class VoiceSession:
         if etype == "input_audio.append":
             chunk = event.get("audio") or ""
             try:
-                self.audio_buf.extend(base64.b64decode(chunk))
+                decoded = base64.b64decode(chunk, validate=True)
+                if len(decoded) + len(self.audio_buf) > MAX_AUDIO_BYTES:
+                    self.audio_buf.clear()
+                    await self.send({"type": "error", "message": "audio limit reached; start a shorter recording"})
+                    return
+                self.audio_buf.extend(decoded)
             except Exception:  # noqa: BLE001
                 await self.send({"type": "error", "message": "bad audio chunk"})
             return
@@ -105,13 +116,18 @@ class VoiceSession:
         await self.send({"type": "status", "agent": "thinking"})
         if text:
             await self.send({"type": "transcript.user", "text": text})
-        result = await self.agent.run(text or "(confirm)", confirm=confirm)
-        for tool in result.get("tools") or []:
-            await self.send({"type": "tool.result", "name": tool.get("name"), "result": tool})
-        reply = result.get("reply") or ""
-        await self.send({"type": "transcript.assistant", "text": reply, "final": True})
-        runtime.set_status("idle")
-        await self.send({"type": "status", "agent": "idle"})
+        try:
+            result = await self.agent.run(text or "(confirm)", confirm=confirm)
+            for tool in result.get("tools") or []:
+                await self.send({"type": "tool.result", "name": tool.get("name"), "result": tool})
+            reply = result.get("reply") or ""
+            await self.send({"type": "transcript.assistant", "text": reply, "final": True})
+        except Exception:  # noqa: BLE001
+            await self.send({"type": "error", "message": "That turn was interrupted. Please try again."})
+            return
+        finally:
+            runtime.set_status("idle")
+            await self.send({"type": "status", "agent": "idle"})
 
     async def _transcribe(self, pcm: bytes) -> str:
         if not pcm or not settings.openai_configured:
@@ -120,12 +136,13 @@ class VoiceSession:
             from openai import AsyncOpenAI
 
             wav = pcm16_to_wav(pcm)
-            client = AsyncOpenAI(api_key=settings.openai_api_key)
             file = ("speech.wav", wav, "audio/wav")
-            out = await client.audio.transcriptions.create(
-                model=settings.openai_transcribe_model,
-                file=file,
-            )
+            async with AsyncOpenAI(api_key=settings.openai_api_key, timeout=20.0, max_retries=0) as client:
+                async with asyncio.timeout(20.0):
+                    out = await client.audio.transcriptions.create(
+                        model=settings.openai_transcribe_model,
+                        file=file,
+                    )
             return (getattr(out, "text", None) or str(out)).strip()
         except Exception:  # noqa: BLE001
             return ""

@@ -49,7 +49,7 @@
     const iceDown =
       connectionState === "disconnected" || iceConnectionState === "disconnected";
 
-    if (connectionState === "connected" && !dcDead) {
+    if (connectionState === "connected" && !dcDead && !terminal && !iceDown) {
       return { action: "keep", reason: "connected" };
     }
     // `disconnected` is the browser's own grace window. Do not invent a timer

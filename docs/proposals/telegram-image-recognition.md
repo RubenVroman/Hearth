@@ -2,24 +2,12 @@
 
 **Issue:** [#96](https://github.com/RubenVroman/Hearth/issues/96)
 
-Status: **shipped** (confirm-to-request). A still image in an allowlisted chat
-is identified and turned into the same Overseerr cards a typed title already
-gets. Queueing still happens only after **Get** or an explicit yes, and only
-by TMDB `mediaId`.
-
-`HEARTH_TELEGRAM_VISION_LANE` defaults on, `HEARTH_TELEGRAM_VISION_MODE`
-defaults to `confirm`, and the provider defaults to `openai`. The lane stays
-dark until `OPENAI_API_KEY` is set, so the house can use posters after deploy
-without a shadow reply that still shows the download refusal. Set mode to
-`shadow` to log candidates and keep that refusal. `auto` is accepted and
-behaves as `confirm` — a picture never queues itself.
-
-The vision list cap defaults to 16 (`HEARTH_TELEGRAM_VISION_LIST_CAP`) so a
-4×4 poster grid fits. Typed batches stay on `HEARTH_TELEGRAM_BATCH_MAX_ITEMS`
-(default 4, ceiling 16). Catalog posters are not blocked on an EU residency
-note. Household photos are outside this lane; `residency_allows_upload("personal")`
-still requires `HEARTH_TELEGRAM_VISION_RESIDENCY=accepted` or `eu`, or the
-`local` provider.
+Status: **historical proposal**. Image intake is now implemented; see
+[the current behavior and smoke checks](../ambient-ai-and-images.md).
+The implementation follows the owner's subsequent request for automatic
+requests of confidently resolved pictured titles. This supersedes the
+default-off and per-item-confirmation requirements below. The remaining
+proposal is retained as design history, not the current operating contract.
 
 This RFC lives in `docs/proposals/` with the other product proposals. It is
 not part of the [tier-3 house-intelligence RFC](tier-3-smart-as-hell.md); that

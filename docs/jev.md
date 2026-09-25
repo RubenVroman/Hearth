@@ -114,9 +114,12 @@ Franchise seeds, edition tokens, person names, discover coordinates and plan ite
 
 The Telegram question map has no `tool_lane`: on Telegram `media_ask` **is** the lane choice, and `tool_allow` is what gates the queue and play tools.
 
-Overseerr still queues **only** after Get or an explicit yes on a pending guess, and that queue always goes out by `mediaId` — confirming never re-searches the title.
+Text media searches queue after Get or an explicit yes on a pending guess.
+The [image lane](ambient-ai-and-images.md) also requests confidently resolved
+pictured titles automatically when enabled and permitted by the caption. Both
+paths use the same Jev gate and durable queue, always by resolved `mediaId`.
 
-A poster or list graphic does not go through `media_ask`. The vision lane returns structured titles, then each title uses the same Overseerr search and signed Get path as `exact_title` / `batch_multi`. The image is not sent to Jev. Lists do not auto-queue. See `docs/proposals/telegram-image-recognition.md`.
+A poster or list graphic first becomes structured titles and verified catalog coordinates. The image itself is not sent to Jev. Automatic requests and signed Get callbacks share the same `tool_allow` gate and durable queue; automatic requests do not claim the explicit confirmation that a Get tap supplies. See [current image behavior](ambient-ai-and-images.md).
 
 The Telegram media question map does **not** include `butler_ask` or `domain`. Shelf and scene asks on Telegram call `evaluate_message` (the shared hearth map) before Plex or Home Assistant.
 
@@ -135,7 +138,7 @@ The Telegram media question map does **not** include `butler_ask` or `domain`. S
 
 - **Shadow** (`HEARTH_JEV_ENABLED=true`, `HEARTH_JEV_SHADOW=true`): cancel/confirm/CoS stay advisory (logged). Telegram **media_ask routing still applies** when confidence clears the media threshold — that is the product differentiator. Confident **butler_ask** choices still run `house_shelf` / `house_scene`.
 - **Enforce** (`HEARTH_JEV_SHADOW=false`): high-confidence cancel → do not run queue tools; high-confidence `escalate_cos` → Chief of Staff; API errors / low confidence → fail open.
-- Telegram media: never invents a queue without a pending guess or Get tap. Enforce may treat high-confidence Jev confirm/cancel like yes/nah.
+- Telegram text media: Get or a pending-guess confirmation authorizes the queue. Image auto-requests use the configured picture-request policy and trusted caption, with one Jev scope for the resolved batch. Enforce-mode cancel/refuse/risk decisions remain authoritative.
 - Telegram house: shadow logs the intended HA tool; enforce blocks the tool on a high-confidence cancel/refuse verdict. API errors still fail open.
 ## State sent to Jev
 

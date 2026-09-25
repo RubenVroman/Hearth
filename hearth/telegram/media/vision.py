@@ -55,6 +55,7 @@ class VisionCandidate:
     year: int | None = None
     media_type: str | None = None
     confidence: float = 0.0
+    season: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +65,7 @@ class VisionResult:
     kind: VisionKind
     candidates: tuple[VisionCandidate, ...] = ()
     list_label: str = ""
+    more_visible: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,12 +88,12 @@ class VisionPlan:
 
 
 def vision_mode() -> str:
-    """``confirm`` is the product. ``auto`` stays on that path (no silent queue)."""
+    """Preserve explicit preview/shadow modes; auto uses the guarded queue."""
     mode = (settings.telegram_vision_mode or "").strip().lower()
     if mode == "shadow":
         return "shadow"
     if mode in {"confirm", "auto"}:
-        return "confirm"
+        return mode
     return ""
 
 
@@ -106,9 +108,9 @@ def vision_lane_active() -> bool:
     and the OpenAI adapter stays dark without ``OPENAI_API_KEY``, so a house
     with no key keeps today's refusal.
     """
-    if not settings.telegram_vision_lane:
+    if not settings.telegram_vision_lane or not settings.telegram_vision_enabled:
         return False
-    if vision_mode() not in {"shadow", "confirm"}:
+    if vision_mode() not in {"shadow", "confirm", "auto"}:
         return False
     name = vision_provider_name()
     if name == "openai":
