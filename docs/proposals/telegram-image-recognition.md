@@ -4,6 +4,10 @@ Status: **proposal**. Nothing in this document is implemented. The house bot
 still refuses every photo, document, and other attachment. Queueing still
 happens only after **Get** or an explicit yes, and only by TMDB `mediaId`.
 
+This RFC lives in `docs/proposals/` with the other product proposals. It is
+not part of the [tier-3 house-intelligence RFC](tier-3-smart-as-hell.md); that
+work does not add an image intake.
+
 This request adds one intake lane: a picture of a movie or series, or a
 picture of a list of them, becomes the same catalog cards the text bot already
 sends. Vision stops at titles. Overseerr, Radarr, and Sonarr are reached only
