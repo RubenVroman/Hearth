@@ -35,6 +35,8 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
    docker compose up -d --build
    ```
 
+   The Synology compose file bind-mounts `./hearth` over the image copy of the package. After the image exists, a recreate applies host edits to the running process without a `--no-cache` rebuild. `HEARTH_BIND` and Home Assistant `network_mode: host` are unchanged.
+
 4. Set `APP_SECRET_KEY` (long random string) and create the first user (see Login below). Open `https://vault.taileff393.ts.net/login` on Tailscale, never a WAN port-forward.
 
 5. Home Assistant onboarding: `http://<vault-lan-or-tailscale>:8123`  

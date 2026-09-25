@@ -228,6 +228,51 @@ async def test_cover_query_named_lights_does_not_touch_lights() -> None:
         assert await _state(entity_id) == "on"
 
 
+@pytest.mark.parametrize(
+    ("text", "device", "action"),
+    [
+        ("lights off", "lights", "turn_off"),
+        ("lights on", "lights", "turn_on"),
+        ("Lights off please", "lights", "turn_off"),
+        ("lights off, please", "lights", "turn_off"),
+        ("please lights off", "lights", "turn_off"),
+        ("please lights on thanks", "lights", "turn_on"),
+        ("all lights off", "all lights", "turn_off"),
+        ("all the lights off", "all the lights", "turn_off"),
+        ("turn the lights off", "lights", "turn_off"),
+        ("turn the lights on", "lights", "turn_on"),
+        ("switch the lights off", "lights", "turn_off"),
+        ("turn off the lights", "lights", "turn_off"),
+        ("turn off every light", "every light", "turn_off"),
+        ("toggle the lights", "lights", "toggle"),
+        ("toggle kitchen lights", "kitchen lights", "toggle"),
+        ("turn off kitchen lights", "kitchen lights", "turn_off"),
+        ("switch on the living room lights", "living room lights", "turn_on"),
+        ("turn the kitchen lights off", "kitchen lights", "turn_off"),
+        ("kitchen lights off", "kitchen lights", "turn_off"),
+        ("can you turn the lights off please", "lights", "turn_off"),
+    ],
+)
+def test_natural_light_commands_accept_target_first_and_politeness(
+    text: str,
+    device: str,
+    action: str,
+) -> None:
+    parsed = parse_house_command(text)
+    assert parsed is not None
+    assert parsed.kind == "control_light"
+    assert parsed.tool == "ha_device_control"
+    assert parsed.args == {"device": device, "domain": "light", "action": action}
+    assert not parsed.error
+
+
+def test_trailing_please_on_a_bare_lights_list_stays_a_list() -> None:
+    listed = parse_house_command("lights please")
+    assert listed is not None
+    assert listed.kind == "list_lights"
+    assert listed.tool == "ha_list_entities"
+
+
 async def test_telegram_collective_and_match_miss_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
