@@ -6,7 +6,7 @@ The house screen presents information automatically. Movie and series lists
 appear as a readable board with posters, summaries, and known availability.
 Web searches appear as sourced findings. Longer boards advance through reading
 pages automatically, with a pause control. Spoken words still inform the
-conversation and title focus internally, but are not displayed as captions.
+conversation and title focus internally, but captions are hidden by default. An optional settings toggle shows them.
 
 Recommendation lists resolve up to 12 titles, four concurrently. Unavailable
 metadata leaves an honestly labeled title card. Empty and failed searches
@@ -32,7 +32,7 @@ are not automatically added.
 2. Only bounded Telegram JPEG, PNG and WebP still images are accepted. The image
    is decoded and re-encoded in memory without metadata; it is not saved in the
    workspace or conversation history.
-3. One structured vision call returns candidate titles, years, types, seasons,
+3. A structured vision call returns candidate titles, years, types, seasons,
    and confidence. Image text is evidence, never an executable instruction.
 4. Catalog searches resolve the candidates concurrently. Title agreement,
    confidence, year/type constraints and ambiguity checks determine which are
@@ -56,20 +56,27 @@ is preserved; set `HEARTH_JEV_SHADOW=false` only when enforcement is intended.
 ## Configuration
 
 The existing Telegram allowlist, `OPENAI_API_KEY`, and live Overseerr connection
-are needed for real image requests. No credentials ship with this change.
+are needed for real image requests. The optional fallback provider is used only
+after a timeout or server error, never after an invalid recognition result.
+No credentials ship with this change.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HEARTH_TELEGRAM_VISION_ENABLED` | `true` | Enable image recognition |
+| `HEARTH_TELEGRAM_VISION_ENABLED` / `HEARTH_TELEGRAM_VISION_LANE` | `true` | Both switches must allow image recognition |
+| `HEARTH_TELEGRAM_VISION_MODE` | `auto` | `auto`, `confirm` or `shadow` |
+| `HEARTH_TELEGRAM_VISION_PROVIDER` | `openai` | Provider adapter; local inference is not bundled |
 | `HEARTH_TELEGRAM_VISION_AUTO_REQUEST` | `true` | Automatically request confident missing pictured titles |
 | `HEARTH_TELEGRAM_VISION_MODEL` | `gpt-4o` | Configurable image/structured-output model |
 | `HEARTH_TELEGRAM_VISION_MAX_BYTES` | `4194304` | Maximum input/processed image size |
-| `HEARTH_TELEGRAM_VISION_MAX_ITEMS` | `8` | Maximum titles handled per image; overflow is reported |
+| `HEARTH_TELEGRAM_VISION_MAX_ITEMS` | `8` | Maximum automatic requests per image; overflow is reported |
+| `HEARTH_TELEGRAM_VISION_LIST_CAP` | `16` | Maximum titles in a confirmation preview |
+| `HEARTH_TELEGRAM_VISION_AUTO_CONFIDENCE` | `0.92` | Minimum extraction confidence for automatic requests; exact catalog checks still apply |
 | `HEARTH_TELEGRAM_VISION_TIMEOUT_SECONDS` | `20` | Bounded recognition time |
-| `HEARTH_TELEGRAM_VISION_RATE_PER_MINUTE` | `2` | Image turns per chat/user per minute |
+| `HEARTH_TELEGRAM_VISION_PER_MINUTE` | `2` | Image turns per chat/user per minute; `RATE_PER_MINUTE` alias accepted |
+| `HEARTH_TELEGRAM_VISION_DAILY_CAP` | `30` | Daily image intake budget |
 
-Set auto-request to `false` for identify-and-Get behavior, or disable vision to
-return to attachment refusal. Text/house commands continue to work independently.
+Set mode to `confirm` or auto-request to `false` for identify-and-Get behavior.
+Set mode to `shadow` or disable vision to return to attachment refusal. Text/house commands continue to work independently.
 
 ## Live smoke checks after deployment
 

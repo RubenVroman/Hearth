@@ -16,7 +16,7 @@ from hearth.config import settings
 from hearth.telegram.bot import TelegramMediaBot
 from hearth.telegram.client import TelegramBotClient, TelegramFileError
 from hearth.telegram.media.memory import speaker_scope
-from hearth.telegram.media.vision import (
+from hearth.telegram.media.image_requests import (
     OpenAIVisionProvider, VisionCandidate, VisionError, VisionResult,
     caption_mode, image_attachment, prepare_image,
 )

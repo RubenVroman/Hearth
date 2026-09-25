@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
 MediaType = Literal["movie", "tv"]
-QueryAction = Literal["search", "help", "status", "ignore", "reject"]
+QueryAction = Literal["search", "help", "status", "ignore", "reject", "vision"]
 
 
 @dataclass(frozen=True, slots=True)

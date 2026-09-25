@@ -473,9 +473,10 @@ eval aid**, and it is not a Hearth runtime dependency.
 
 ## Phased rollout
 
-Each phase is a mode on a default-off lane. Shipping the code for a later
-phase does not enable it. Suggested flag names, **not added by this document**
-and not to be put in the live `.env` until a later change:
+The lane shipped with confirm-to-request as the default mode (see the status
+at the top). Shadow remains available. Auto-request did not ship: `auto` is
+accepted and behaves as confirm, so a picture still cannot queue itself.
+Suggested flag names from the original request, now real settings:
 
 | Flag | Intent |
 | --- | --- |
@@ -523,5 +524,5 @@ list, one non-media image, one torrent document. Expect Get only where the
 table above says Get, and expect Overseerr to show a request only after the
 tap. Shadow mode's expected reply is the old refusal.
 
-Until that implementation lands, the smoke script is unchanged and photos
-remain a refusal.
+The smoke script's poster section is the live check. With the lane off, or
+in shadow mode, photos remain the download refusal.

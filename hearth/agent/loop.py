@@ -739,6 +739,10 @@ def _pretty_tool(name: str, data: dict[str, Any]) -> str | None:
     if name == "media_activity":
         return str(data.get("speak") or f"Media activity{mock}: {data.get('activity', 'done')}.")
     if name == "ha_device_control":
+        if data.get("collective"):
+            spoken = str(data.get("speak") or data.get("error") or "").strip()
+            if spoken:
+                return spoken if mock == "" else f"{spoken.rstrip('.')}{mock}."
         state = data.get("state") or {}
         label = (state.get("attributes") or {}).get("friendly_name") or data.get("entity_id")
         return f"Done{mock}: {label or data.get('device')} is {state.get('state', 'updated')}."

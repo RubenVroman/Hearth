@@ -15,7 +15,8 @@ pytest -q                                   # whole suite
 pytest -q tests/test_telegram_media_psychic.py    # this surface's regressions
 pytest -q tests/test_telegram_media_magic.py \
          tests/test_telegram_media_next_tier.py \
-         tests/test_telegram_media_intelligence.py
+         tests/test_telegram_media_intelligence.py \
+         tests/test_telegram_vision.py
 ```
 
 A deterministic lane check with no Overseerr, no OpenAI and no TypeSafe:
@@ -184,3 +185,27 @@ Fail-open is the point: stop TypeSafe, or clear `TYPESAFE_API_KEY`, and the bot
 must behave exactly as it did before the gate existed — every lane still
 answers. A gate the house cannot reach must never be able to make the catalog
 look empty.
+
+## 11. Posters and list graphics
+
+Needs `OPENAI_API_KEY` and the configured Overseerr connection. Image intake
+is enabled by default in `HEARTH_TELEGRAM_VISION_MODE=auto`.
+
+| Send | Expect |
+| --- | --- |
+| one clear movie poster | Identified title and actual request/status outcome. A confident exact missing match queues once. |
+| an ambiguous remake (two *Dune*s, no year on the image) | Both catalog hits offered; no automatic guess. |
+| a list of wanted movies | Each confidently resolved missing title is requested, up to the automatic cap of eight. Overflow is explicitly reported. |
+| the same Telegram update replayed | The stored result is returned without a second request. |
+| a caption `preview` or `don't download` | Identification and Get choices, zero automatic requests. |
+| a selective caption `only the first two` | No silent request for the entire image. |
+| a selfie, pet, or receipt | No depicted movie titles, no Overseerr request. |
+| a `.torrent` file, a video, or a caption containing `magnet:?` | Attachment refusal without a provider call. |
+
+With `HEARTH_TELEGRAM_VISION_MODE=confirm`, a poster or grid of up to 16
+becomes a preview with signed Get buttons. Nothing queues before a tap.
+With mode `shadow`, or either enable switch false, images are refused without
+recognition or catalog requests. Text and house commands remain available.
+
+See [ambient UI and image smoke checks](ambient-ai-and-images.md) for voice,
+automatic presentation, provider failures and malformed-image checks.

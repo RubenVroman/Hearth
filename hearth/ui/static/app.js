@@ -21,7 +21,6 @@ const MIC_GATE_COOLDOWN_MS = 14 * 24 * 60 * 60 * 1000;
 const state = {
   pending: null,
   call: null,
-  callStarting: false,
   /** Kept alive across hangups so iOS Safari / Home Screen PWAs avoid re-prompting. */
   mic: null,
   micPermission: "unknown",
@@ -59,7 +58,12 @@ const state = {
    */
   spokenAnswer: null,
   ambientReader: null,
+  /** Latest mic transcript (final preferred, partial while STT is still streaming). */
+  userUtterance: { final: "", partial: "" },
 };
+
+/** Epoch + one-reconnect budget for the live WebRTC call. Policy lives in voice-session.js. */
+const voiceLife = new HearthVoiceSession.VoiceLifecycle();
 
 /** Client grace before fading when talk is clearly unrelated (ms). */
 const OVERLAY_IRRELEVANT_GRACE_MS = 650;
@@ -1071,7 +1075,8 @@ function mediaCardMarkup(item, { active = false, labelled = false, genre = "" } 
   const genres = Array.isArray(item.genres) ? item.genres.slice(0, 3).map(escapeHtml).join(" · ") : "";
   const availability = typeof item.availability === "string" ? item.availability : item.status || "";
   const unresolved = item.status === "unresolved";
-  const label = unresolved ? "Metadata unavailable" : item.skeleton ? "Looking this up…" : item.player ? item.state === "opening" ? "Opening" : "Now playing" : item.source === "suggest" ? "Suggested" : availability || (item.source === "plex" ? "In your library" : "Catalog match");
+  const playbackLabels = { opening: "Opening", playing: "Now playing", paused: "Paused", stopped: "Stopped", buffering: "Buffering", ready: "Ready to play" };
+  const label = unresolved ? "Metadata unavailable" : item.skeleton ? "Looking this up…" : item.pending ? "Ready to play" : item.player ? playbackLabels[item.state] || "Playback not confirmed" : item.source === "suggest" ? "Suggested" : availability || (item.source === "plex" ? "In your library" : "Catalog match");
   const id = escapeHtml(String(item.id || mediaItemKey(item)));
   const summary = item.summary || item.overview || "";
   const rating = item.rating != null ? '<span class="info-rating">★ ' + escapeHtml(item.rating) + '</span>' : "";
@@ -1927,6 +1932,17 @@ function renderStatus(status) {
     ? `voice ${rt.path || voice.path || "webrtc-ga"}`
     : `voice ${voice.mode || "off"}`;
   $("voice-pill").classList.toggle("live", live);
+  if (
+    HearthVoiceSession.shouldRecoverFromServer({
+      hasCall: Boolean(state.call),
+      voiceMode: voice.mode,
+      sidebandOk: Boolean(state.call && state.call.sidebandOk),
+      phase: voiceLife.phase,
+      userEnded: voiceLife.userEnded || Boolean(state.call?.pendingHangup),
+    })
+  ) {
+    void recoverConversation("sideband_disconnected");
+  }
   $("mode-pill").textContent = rt.beta ? "beta" : status.openai ? "openai" : "local";
   state.pending = status.pending;
   const confirmBtn = $("confirm-btn");
@@ -1942,7 +1958,13 @@ function renderStatus(status) {
   if (Array.isArray(status.widgets)) {
     renderWidgets(status.widgets);
   }
-  if (!state.call) {
+  // A reconnect briefly clears state.call. Don't paint "Tap to talk" over it.
+  if (
+    !state.call &&
+    voiceLife.phase !== "connecting" &&
+    voiceLife.phase !== "recovering" &&
+    voiceLife.phase !== "ending"
+  ) {
     $("hint").textContent = idleHint();
     $("orb-label").textContent = "Tap to talk";
   }
@@ -2064,7 +2086,13 @@ $("composer").addEventListener("submit", async (ev) => {
   input.value = "";
   appendLog("you", text);
   noteOverlayConversation(text);
-  if (state.call) { state.call.said = text; state.call.inputItemId = ""; }
+  if (state.call) {
+    // Invalidate any older tool batch before its next awaited action resumes.
+    state.call.responseGeneration += 1;
+    state.call.said = text;
+    state.call.inputItemId = "typed-message";
+    state.userUtterance = { final: text, partial: "" };
+  }
   if (
     sendRealtime({
       type: "conversation.item.create",
@@ -2108,10 +2136,43 @@ function ensureSpokenAnswer() {
   return state.spokenAnswer;
 }
 
+function captionsPreference() {
+  try {
+    const look = globalThis.HearthSettings?.get?.();
+    if (!look || look.captions == null) return "hidden";
+    return look.captions;
+  } catch (_) {
+    return "hidden";
+  }
+}
+
+function liveCaptionsOn() {
+  try {
+    return HearthVoiceSession.captionsVisible(captionsPreference());
+  } catch (_) {
+    return false;
+  }
+}
+
+function applyCaptionPreference(value) {
+  try {
+    const panel = ensureSpokenAnswer();
+    panel?.setEnabled?.(HearthVoiceSession.captionsVisible(value));
+  } catch (_) {
+    /* overlay must never break the voice path */
+  }
+}
+
 function noteSpokenAnswer(type, event) {
   try {
     const panel = ensureSpokenAnswer();
-    panel?.onRealtimeEvent?.(type, event);
+    if (!panel) return;
+    if (!liveCaptionsOn()) {
+      panel.setEnabled?.(false);
+      return;
+    }
+    panel.setEnabled?.(true);
+    panel.onRealtimeEvent?.(type, event);
   } catch (_) {
     /* overlay must never break the voice path */
   }
@@ -2182,19 +2243,35 @@ function onRealtimeEvent(event) {
   }
   if (state.call && (type === "response.created" || type === "input_audio_buffer.speech_started")) {
     state.call.responseGeneration += 1;
+    if (type === "response.created") {
+      state.call.responseId = event.response?.id || "";
+      state.call.responseStartedGeneration = state.call.responseGeneration;
+    }
   }
   if (state.call && type === "input_audio_buffer.speech_started") {
     state.call.said = "";
+    state.userUtterance = { final: "", partial: "" };
     state.call.inputItemId = event.item_id || "";
   }
   // User speech — requires session audio.input.transcription (see webrtc.session_config).
   // User mic transcript is NOT shown on the spoken-answer panel (assistant only).
+  // Only a final transcript from this input may authorize a tool call.
+  if (
+    type === "conversation.item.input_audio_transcription.delta" ||
+    type === "conversation.item.audio_transcription.delta"
+  ) {
+    if (state.call && (!state.call.inputItemId || state.call.inputItemId === event.item_id)) {
+      state.userUtterance = HearthVoiceSession.mergeUserUtterance(state.userUtterance, event, true);
+    }
+  }
   if (
     type === "conversation.item.input_audio_transcription.completed" ||
     type === "conversation.item.audio_transcription.completed"
   ) {
     if (state.call && (!state.call.inputItemId || state.call.inputItemId === event.item_id)) {
-      state.call.said = String(event.transcript || "").slice(0, 6000);
+      state.userUtterance = HearthVoiceSession.mergeUserUtterance(state.userUtterance, event, false);
+      state.call.said = String(event.transcript || event.text || "").trim()
+        ? HearthVoiceSession.utteranceText(state.userUtterance) : "";
     }
     appendLog("you", event.transcript);
     noteOverlayConversation(event.transcript || "");
@@ -2230,14 +2307,17 @@ async function relayCompletedTools(event) {
   const call = state.call;
   const response = event.response || {};
   if (!call || call.sidebandOk || response.status !== "completed") return;
+  if (response.id && (response.id !== call.responseId ||
+      call.responseStartedGeneration !== call.responseGeneration)) return;
   const tools = Array.isArray(response.output) ? response.output.filter((item) => item.type === "function_call") : [];
   const generation = call.responseGeneration;
+  const said = call.said || "";
   let completed = false;
   for (const tool of tools) {
     if (state.call !== call || call.responseGeneration !== generation) break;
     if (!tool.call_id || call.toolCalls.has(tool.call_id)) continue;
     call.toolCalls.add(tool.call_id);
-    completed = await relayTool(tool, call) || completed;
+    completed = await relayTool(tool, call, said) || completed;
     if (isEndCallTool(tool)) {
       finishCallAfterAudio(call);
       return;
@@ -2248,7 +2328,7 @@ async function relayCompletedTools(event) {
   }
 }
 
-async function relayTool(event, call = state.call) {
+async function relayTool(event, call = state.call, said = call?.said || "") {
   if (!call || state.call !== call) return false;
   let args = {};
   try {
@@ -2266,8 +2346,8 @@ async function relayTool(event, call = state.call) {
         name: event.name,
         arguments: args,
         call_id: event.call_id || "",
-        session_id: call.callId,
-        said: call.said || "",
+        session_id: call.sessionId || call.callId,
+        said,
       }),
     });
     if (state.call !== call) return false;
@@ -2314,117 +2394,43 @@ function abandonCallSetup(pc) {
   releaseMicStream({ hard: false });
 }
 
-async function startConversation() {
-  const remote = $("remote-audio");
-  const pc = new RTCPeerConnection();
-  try {
-  let stream;
-  try {
-    stream = await acquireMicStream();
-  } catch (err) {
-    pc.close();
-    throw err;
-  }
-  for (const track of stream.getAudioTracks()) {
-    pc.addTrack(track, stream);
-  }
-  pc.ontrack = (ev) => {
-    remote.srcObject = ev.streams[0];
-    remote.play().catch(() => {});
-  };
-  const dc = pc.createDataChannel("oai-events");
-  dc.addEventListener("message", (ev) => {
-    try {
-      onRealtimeEvent(JSON.parse(ev.data));
-    } catch (_) {
-      /* ignore non-json */
-    }
-  });
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  const sdpResponse = await request("/api/realtime/calls", {
-    method: "POST",
-    body: offer.sdp,
-    headers: { "Content-Type": "application/sdp" },
-  });
-  const path = sdpResponse.headers.get("X-Hearth-Realtime-Path") || "";
-  const beta = sdpResponse.headers.get("X-Hearth-Realtime-Beta") || "";
-  if (!sdpResponse.ok) {
-    let err = { error: `calls ${sdpResponse.status}` };
-    try {
-      err = await sdpResponse.json();
-    } catch (_) {
-      /* ignore */
-    }
-    abandonCallSetup(pc);
-    throw new Error(err.error || err.message || `realtime/calls ${sdpResponse.status}`);
-  }
-  if (path && path !== "webrtc-ga") {
-    abandonCallSetup(pc);
-    throw new Error(`unexpected realtime path ${path}`);
-  }
-  if (beta === "true") {
-    abandonCallSetup(pc);
-    throw new Error("beta realtime path is disabled");
-  }
-  const answer = await sdpResponse.text();
-  await pc.setRemoteDescription({ type: "answer", sdp: answer });
-  const callId = sdpResponse.headers.get("X-Hearth-Call-Id") || crypto.randomUUID();
-  const sideband = sdpResponse.headers.get("X-Hearth-Sideband") || "";
-  hideMicPanels();
-  const micTrack = stream.getAudioTracks()[0] || null;
-  let bargeIn = null;
-  if (micTrack && globalThis.HearthVad?.SpeechBargeIn) {
-    bargeIn = new HearthVad.SpeechBargeIn(micTrack, stream);
-    await bargeIn.start();
-  }
-  state.call = {
-    pc,
-    dc,
-    stream,
-    callId,
-    sidebandOk: sideband === "ok" || sideband === "starting",
-    bargeIn,
-    pendingHangup: false,
-    audioPlaying: false,
-    responseGeneration: 0,
-    toolCalls: new Set(),
-    said: "",
-    inputItemId: "",
-  };
-  pc.addEventListener("connectionstatechange", () => {
-    if (!state.call || state.call.pc !== pc) return;
-    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-      stopConversation();
-    }
-  });
+function showListeningChrome() {
   $("orb").classList.add("live", "hot");
   $("orb").setAttribute("aria-label", "End conversation");
   $("orb-label").textContent = "Listening";
   $("hint").textContent = "Listening. Speak naturally. Tap to end the conversation.";
   $("voice-pill").textContent = "voice webrtc-ga";
   $("voice-pill").classList.add("live");
-  setRefreshInterval(1200);
-  } catch (err) {
-    abandonCallSetup(pc);
-    throw err;
-  }
 }
 
-async function stopConversation() {
-  const call = state.call;
-  state.call = null;
-  setRefreshInterval(8000);
-  // Conversation panel rule: voice session end → spoken read-along must go.
-  dismissSpokenAnswer({ callEnded: true });
+function showIdleVoiceChrome() {
   $("orb").classList.remove("live", "hot");
   $("orb").setAttribute("aria-label", "Tap to talk");
   $("orb-label").textContent = "Tap to talk";
   $("hint").textContent = idleHint();
   $("voice-pill").classList.remove("live");
+}
+
+function showReconnectingChrome() {
+  $("orb").classList.add("live", "hot");
+  $("orb-label").textContent = "Reconnecting";
+  $("hint").textContent = phoneUi() ? "Reconnecting…" : "Reconnecting the live call…";
+}
+
+async function hangupCallId(callId) {
+  if (!callId) return;
+  try {
+    await request(`/api/realtime/calls/${encodeURIComponent(callId)}/hangup`, { method: "POST" });
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function teardownCall(call) {
   if (!call) return;
   clearTimeout(call.endAudioGrace);
   clearTimeout(call.endAudioFallback);
+  call.superseded = true;
   try {
     call.bargeIn && call.bargeIn.stop();
     /* Detach from PC first so close() does not end the local MediaStreamTrack. */
@@ -2445,29 +2451,293 @@ async function stopConversation() {
   } catch (_) {
     /* ignore */
   }
-  $("remote-audio").srcObject = null;
-  if (call.callId) {
+  const remote = $("remote-audio");
+  if (remote) remote.srcObject = null;
+  await hangupCallId(call.callId);
+}
+
+function applyTransportDecision(decision) {
+  if (!decision || !state.call || state.call.superseded) return;
+  if (state.call.pendingHangup) return;
+  if (decision.action === "wait") {
+    showReconnectingChrome();
+    return;
+  }
+  if (decision.action === "keep") {
+    if (decision.reason === "connected" && $("orb-label").textContent === "Reconnecting") {
+      showListeningChrome();
+    }
+    return;
+  }
+  if (decision.action === "reconnect") {
+    void recoverConversation();
+    return;
+  }
+  if (decision.action === "end" && decision.reason !== "user") {
+    appendLog("system", "Voice dropped. Tap the hearth to try again.");
+    void stopConversation();
+  }
+}
+
+function bindCallTransport(call) {
+  const onSignal = () => {
+    if (!state.call || state.call !== call || call.superseded) return;
+    if (!voiceLife.isCurrent(call.epoch)) return;
+    applyTransportDecision(
+      voiceLife.onTransport({
+        connectionState: call.pc ? call.pc.connectionState : "",
+        iceConnectionState: call.pc ? call.pc.iceConnectionState : "",
+        dataChannelState: call.dc ? call.dc.readyState : "",
+      })
+    );
+  };
+  call.pc.addEventListener("connectionstatechange", onSignal);
+  call.pc.addEventListener("iceconnectionstatechange", onSignal);
+  if (call.dc) call.dc.addEventListener("close", onSignal);
+}
+
+async function onMicTrackEnded(call) {
+  if (!call || call.superseded || state.call !== call) return;
+  if (!voiceLife.isCurrent(call.epoch)) return;
+  if ((call.micSwaps || 0) >= 1) {
+    appendLog("system", "Microphone ended. Tap the hearth to talk again.");
+    await stopConversation();
+    return;
+  }
+  call.micSwaps += 1;
+  try {
+    const fresh = await acquireMicStream();
+    if (state.call !== call || !voiceLife.isCurrent(call.epoch)) return;
+    const next = fresh.getAudioTracks()[0];
+    const sender = call.pc.getSenders().find((s) => !s.track || s.track.kind === "audio");
+    if (!sender || !next) throw new Error("no audio sender");
+    await sender.replaceTrack(next);
+    call.stream = fresh;
+    if (call.bargeIn && call.bargeIn.retarget) await call.bargeIn.retarget(next, fresh);
+    next.addEventListener("ended", () => {
+      void onMicTrackEnded(call);
+    }, { once: true });
+  } catch (_) {
+    if (state.call !== call) return;
+    appendLog("system", "Microphone ended. Tap the hearth to talk again.");
+    await stopConversation();
+  }
+}
+
+async function recoverConversation() {
+  const epoch = voiceLife.beginReconnect();
+  if (epoch == null) {
+    if (voiceLife.phase === "recovering" || voiceLife.phase === "ending" || voiceLife.userEnded) return;
+    appendLog("system", "Voice dropped. Tap the hearth to try again.");
+    await stopConversation();
+    return;
+  }
+  const previous = state.call;
+  if (previous) previous.superseded = true;
+  state.call = null;
+  showReconnectingChrome();
+  dismissSpokenAnswer({ callEnded: true });
+  await teardownCall(previous);
+  if (!voiceLife.isCurrent(epoch)) return;
+  try {
+    await startConversation({ epoch });
+  } catch (err) {
+    if (!voiceLife.isCurrent(epoch)) return;
+    voiceLife.beginUserStop();
+    voiceLife.markIdle();
+    showIdleVoiceChrome();
+    setRefreshInterval(8000);
+    const classified = classifyMicError(err);
+    appendLog("system", classified.message || "Voice dropped. Tap the hearth to try again.");
+  }
+}
+
+async function startConversation({ epoch } = {}) {
+  state.userUtterance = { final: "", partial: "" };
+  const lifeEpoch = epoch == null ? voiceLife.beginUserStart() : epoch;
+  const remote = $("remote-audio");
+  const pc = new RTCPeerConnection();
+  let callId = "";
+  let bargeIn = null;
+  const stale = () => !voiceLife.isCurrent(lifeEpoch);
+  const bail = async () => {
     try {
-      await request(`/api/realtime/calls/${encodeURIComponent(call.callId)}/hangup`, {
-        method: "POST",
-      });
+      bargeIn && bargeIn.stop();
     } catch (_) {
       /* ignore */
     }
+    abandonCallSetup(pc);
+    await hangupCallId(callId);
+  };
+
+  let stream;
+  try {
+    stream = await acquireMicStream();
+  } catch (err) {
+    try {
+      pc.close();
+    } catch (_) {
+      /* ignore */
+    }
+    throw err;
   }
+  if (stale()) {
+    await bail();
+    return;
+  }
+  for (const track of stream.getAudioTracks()) {
+    pc.addTrack(track, stream);
+  }
+  pc.ontrack = (ev) => {
+    if (stale()) return;
+    remote.srcObject = ev.streams[0];
+    remote.play().catch(() => {});
+  };
+  const dc = pc.createDataChannel("oai-events");
+  dc.addEventListener("message", (ev) => {
+    try {
+      if (stale()) return;
+      onRealtimeEvent(JSON.parse(ev.data));
+    } catch (_) {
+      /* ignore non-json */
+    }
+  });
+  try {
+    const offer = await pc.createOffer();
+    if (stale()) {
+      await bail();
+      return;
+    }
+    await pc.setLocalDescription(offer);
+    if (stale()) {
+      await bail();
+      return;
+    }
+    const sdpResponse = await request("/api/realtime/calls", {
+      method: "POST",
+      body: offer.sdp,
+      headers: { "Content-Type": "application/sdp" },
+    });
+    const path = sdpResponse.headers.get("X-Hearth-Realtime-Path") || "";
+    const beta = sdpResponse.headers.get("X-Hearth-Realtime-Beta") || "";
+    callId = sdpResponse.headers.get("X-Hearth-Call-Id") || "";
+    if (stale()) {
+      await bail();
+      return;
+    }
+    if (!sdpResponse.ok) {
+      let err = { error: `calls ${sdpResponse.status}` };
+      try {
+        err = await sdpResponse.json();
+      } catch (_) {
+        /* ignore */
+      }
+      throw new Error(err.error || err.message || `realtime/calls ${sdpResponse.status}`);
+    }
+    if (path && path !== "webrtc-ga") {
+      throw new Error(`unexpected realtime path ${path}`);
+    }
+    if (beta === "true") {
+      throw new Error("beta realtime path is disabled");
+    }
+    const answer = await sdpResponse.text();
+    if (stale()) {
+      await bail();
+      return;
+    }
+    await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    if (stale()) {
+      await bail();
+      return;
+    }
+    const sideband = sdpResponse.headers.get("X-Hearth-Sideband") || "";
+    hideMicPanels();
+    const micTrack = stream.getAudioTracks()[0] || null;
+    if (micTrack && globalThis.HearthVad?.SpeechBargeIn) {
+      bargeIn = new HearthVad.SpeechBargeIn(micTrack, stream);
+      await bargeIn.start();
+    }
+    if (stale() || !voiceLife.markLive(lifeEpoch)) {
+      await bail();
+      return;
+    }
+    const call = {
+      pc,
+      dc,
+      stream,
+      callId,
+      sidebandOk: sideband === "ok" || sideband === "starting",
+      bargeIn,
+      pendingHangup: false,
+      audioPlaying: false,
+      responseGeneration: 0,
+      toolCalls: new Set(),
+      said: "",
+      inputItemId: "",
+      sessionId: callId || crypto.randomUUID(),
+      superseded: false,
+      micSwaps: 0,
+      epoch: lifeEpoch,
+    };
+    state.call = call;
+    bindCallTransport(call);
+    if (micTrack) {
+      micTrack.addEventListener("ended", () => {
+        void onMicTrackEnded(call);
+      }, { once: true });
+    }
+    showListeningChrome();
+    setRefreshInterval(1200);
+    applyTransportDecision(
+      voiceLife.onTransport({
+        connectionState: pc.connectionState,
+        iceConnectionState: pc.iceConnectionState,
+        dataChannelState: dc.readyState,
+      })
+    );
+  } catch (err) {
+    if (state.call && state.call.pc === pc) state.call = null;
+    await bail();
+    throw err;
+  }
+}
+
+async function stopConversation() {
+  voiceLife.beginUserStop();
+  const call = state.call;
+  if (call) call.superseded = true;
+  state.call = null;
+  setRefreshInterval(8000);
+  // Conversation panel rule: voice session end → spoken read-along must go.
+  dismissSpokenAnswer({ callEnded: true });
+  showIdleVoiceChrome();
+  state.userUtterance = { final: "", partial: "" };
+  await teardownCall(call);
+  voiceLife.markIdle();
   refresh();
 }
 
 async function beginVoiceFromUserGesture() {
-  if (state.callStarting || state.call) return;
-  state.callStarting = true;
+  if (
+    state.call ||
+    voiceLife.phase === "connecting" ||
+    voiceLife.phase === "recovering" ||
+    voiceLife.phase === "live" ||
+    voiceLife.phase === "ending"
+  ) {
+    return;
+  }
+  const epoch = voiceLife.beginUserStart();
   hideMicPanels();
   $("orb").classList.add("hot");
   $("orb-label").textContent = "Connecting";
   $("hint").textContent = "Connecting…";
   try {
-    await startConversation();
+    await startConversation({ epoch });
   } catch (err) {
+    if (!voiceLife.isCurrent(epoch)) return;
+    voiceLife.beginUserStop();
+    voiceLife.markIdle();
     $("orb").classList.remove("hot", "live");
     $("orb-label").textContent = "Tap to talk";
     const classified = classifyMicError(err);
@@ -2478,13 +2748,17 @@ async function beginVoiceFromUserGesture() {
       $("hint").textContent = idleHint();
       appendLog("system", classified.message);
     }
-  } finally {
-    state.callStarting = false;
   }
 }
 
 async function handleOrbTap() {
-  if (state.call) {
+  if (voiceLife.phase === "ending") return;
+  if (
+    state.call ||
+    voiceLife.phase === "connecting" ||
+    voiceLife.phase === "recovering" ||
+    voiceLife.phase === "live"
+  ) {
     await stopConversation();
     return;
   }
@@ -2551,14 +2825,28 @@ $("logout-btn").addEventListener("click", async () => {
 
 function onPageHide() {
   state.ambientReader?.stop();
-  /* Document is going away — release hardware. A warm mute is useless across navigations. */
-  if (state.call) {
+  /* Document is going away — release hardware and tell Hearth to drop the sideband.
+     A warm mute is useless across navigations, and an async hangup will not finish. */
+  const call = state.call;
+  voiceLife.beginUserStop();
+  if (call) call.superseded = true;
+  state.call = null;
+  if (call && call.callId && navigator.sendBeacon) {
     try {
-      state.call.pc && state.call.pc.close();
+      navigator.sendBeacon(`/api/realtime/calls/${encodeURIComponent(call.callId)}/hangup`);
     } catch (_) {
       /* ignore */
     }
-    state.call = null;
+  }
+  try {
+    call && call.bargeIn && call.bargeIn.stop();
+  } catch (_) {
+    /* ignore */
+  }
+  try {
+    call && call.pc && call.pc.close();
+  } catch (_) {
+    /* ignore */
   }
   releaseMicStream({ hard: true });
 }
@@ -2577,6 +2865,10 @@ async function boot() {
   if (window.HearthSettings) {
     window.HearthSettings.mount();
     window.HearthSettings.setSpendFetcher(() => api("/api/openai/spend?days=30"));
+    window.HearthSettings.subscribe((values) => {
+      applyCaptionPreference(values && values.captions);
+    });
+    applyCaptionPreference(window.HearthSettings.get().captions);
   }
   bindInfoOverlay();
   const ok = await refreshAccessToken();

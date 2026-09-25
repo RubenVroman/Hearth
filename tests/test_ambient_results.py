@@ -64,6 +64,23 @@ def test_shelf_presents_distinct_titles_and_context():
     assert first["progress_pct"] == 40
 
 
+@pytest.mark.parametrize("ok", [True, False])
+def test_empty_genre_directory_replaces_previous_media_board(ok):
+    publish_tool(media_result(results=[{"title": "Old title", "tmdbId": 1}]))
+    widget = publish_tool({"name": "plex_browse_genre", "ok": ok, "data": {
+        "ok": ok, "listed_genres": True, "genres": [], "media_type": "movie",
+    }})
+    assert runtime.get_widget("media") is widget
+    assert widget.data["items"] == []
+    assert widget.data["empty"] is True
+    assert widget.status == ("info" if ok else "error")
+    assert "Old title" not in str(widget.data)
+    assert widget.body == (
+        "No movie or series categories found." if ok
+        else "I couldn't load the media results."
+    )
+
+
 def test_suggestion_endpoint_preserves_the_whole_explicit_list(client, monkeypatch):
     async def resolve(title, *, media_type):
         return {"title": title, "type": "movie", "skeleton": True}

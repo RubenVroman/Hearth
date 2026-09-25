@@ -9,7 +9,7 @@ function element() {
   const classes = new Set();
   return {
     hidden: true, innerHTML: '', textContent: '', dataset: {}, scrollTop: 0, scrollHeight: 1800, clientHeight: 600,
-    setAttribute() {}, removeAttribute() {}, addEventListener() {}, querySelectorAll() { return []; },
+    handlers: {}, setAttribute() {}, removeAttribute() {}, addEventListener(name, fn) { this.handlers[name] = fn; }, querySelectorAll() { return []; },
     classList: { add(...values) { values.forEach(x => classes.add(x)); }, remove(...values) { values.forEach(x => classes.delete(x)); }, contains(x) { return classes.has(x); }, toggle(x, value) { value ? classes.add(x) : classes.delete(x); } },
     scrollTo({top}) { this.scrollTop = top; },
   };
@@ -26,6 +26,7 @@ function load() {
   context.window=context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(ui,'presentation.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(path.join(ui,'voice-session.js'),'utf8'),context);
   vm.runInContext(fs.readFileSync(path.join(ui,'app.js'),'utf8').replace(/\nboot\(\);\s*$/, '\n'),context);
   const run = (source) => vm.runInContext(source,context);
   return {context,document,getElementById,run,timers,tick(){const [id,fn]=timers.entries().next().value;timers.delete(id);fn();}};
@@ -73,6 +74,19 @@ test('bounded result lists explicitly show the total instead of implying complet
   assert.ok(run(`mediaMarkup({kind:'media',data:{items:[{id:'1',title:'One'},{id:'2',title:'Two'}],total:14,truncated:true}})`).includes('2 of 14 titles'));
 });
 
+test('playback cards distinguish confirmed playback from ready, pending, and unknown states',()=>{
+  const {run}=load();
+  for (const [state, pending, expected] of [
+    ['ready', false, 'Ready to play'], ['playing', true, 'Ready to play'],
+    ['paused', false, 'Paused'], ['opening', false, 'Opening'],
+    [null, false, 'Playback not confirmed'], ['playing', false, 'Now playing'],
+  ]) {
+    const html=run(`mediaCardMarkup(${JSON.stringify({title:'Arrival',player:'Infuse',state,pending})})`);
+    assert.ok(html.includes('>' + expected + '</p>'), expected);
+    if (expected !== 'Now playing') assert.ok(!html.includes('Now playing'));
+  }
+});
+
 test('sideband end-call waits for final audio; partial or invalid arguments never hang up',()=>{
   const {run}=load();
   run(`var stopped=0;stopConversation=()=>{stopped+=1;state.call=null;};refresh=()=>{};
@@ -108,6 +122,40 @@ test('tool authorization text belongs to the current utterance, never a previous
   assert.equal(run('state.call.said'),'');
   run(`onRealtimeEvent({type:'conversation.item.input_audio_transcription.completed',item_id:'new',transcript:'current request'})`);
   assert.equal(run('state.call.said'),'current request');
+  run(`onRealtimeEvent({type:'input_audio_buffer.speech_started',item_id:'third'});
+    onRealtimeEvent({type:'conversation.item.input_audio_transcription.delta',item_id:'third',delta:'download '});`);
+  assert.equal(run('state.call.said'),'');
+  run(`onRealtimeEvent({type:'conversation.item.input_audio_transcription.completed',item_id:'third',transcript:''})`);
+  assert.equal(run('state.call.said'),'');
+});
+
+test('a deliberate end-call cannot be mistaken for a reconnectable transport failure',()=>{
+  const {run}=load();
+  run(`var retries=0;recoverConversation=()=>{retries++;};state.call={pendingHangup:true};
+    applyTransportDecision({action:'reconnect',reason:'peer_failed'});`);
+  assert.equal(run('retries'),0);
+});
+
+test('new call instances keep lifecycle recovery and scoped tool state together',async()=>{
+  const {run}=load();
+  run(`var peers=[];var hangups=[];var received=0;
+    var track={kind:'audio',enabled:true,addEventListener(){}};
+    acquireMicStream=async()=>({getAudioTracks:()=>[track]});
+    hideMicPanels=()=>{};showListeningChrome=()=>{};setRefreshInterval=()=>{};applyTransportDecision=()=>{};
+    request=async()=>({ok:true,headers:{get:(name)=>name==='X-Hearth-Call-Id'?'real-session':name==='X-Hearth-Realtime-Path'?'webrtc-ga':''},text:async()=> 'answer'});
+    RTCPeerConnection=class {
+      constructor(){this.connectionState='connected';this.iceConnectionState='connected';peers.push(this);}
+      addTrack(){} addEventListener(){} getSenders(){return [];} close(){}
+      createDataChannel(){this.dc={readyState:'open',handlers:{},addEventListener(name,fn){this.handlers[name]=fn;}};return this.dc;}
+      async createOffer(){return {sdp:'offer'};} async setLocalDescription(){} async setRemoteDescription(){}
+    };`);
+  await run('startConversation()');
+  assert.equal(run('voiceLife.phase'),'live');
+  assert.equal(run('state.call.sessionId'),'real-session');
+  assert.equal(run('state.call.said'),'');
+  assert.equal(run('state.call.toolCalls.size'),0);
+  run(`onRealtimeEvent=()=>{received++;};voiceLife.beginUserStop();peers[0].dc.handlers.message({data:'{"type":"response.done"}'});`);
+  assert.equal(run('received'),0);
 });
 
 test('speech focus and status polling preserve card DOM; enrichment updates it',()=>{
@@ -148,4 +196,43 @@ test('fallback tools wait for a completed response, run once, and continue once 
   await run('relayCompletedTools(result)');
   assert.equal(run('invoked.length'),2);
   assert.equal(run(`sent.filter(e=>e.type==='response.create').length`),1);
+});
+
+test('a new typed turn stops remaining tools in an earlier fallback batch',async()=>{
+  const {run,getElementById}=load();
+  run(`var invoked=[];var sent=[];var release;
+    refresh=()=>{};applyWidgetPayload=()=>{};appendLog=()=>{};noteOverlayConversation=()=>{};flashLocalActivity=()=>{};
+    state.call={callId:'session',said:'original request',sidebandOk:false,responseGeneration:0,toolCalls:new Set()};
+    sendRealtime=(event)=>{sent.push(event);return true;};
+    api=async(path,options)=>{invoked.push(JSON.parse(options.body));if(invoked.length>1)return {output:{ok:true}};return new Promise(resolve=>{release=()=>resolve({output:{ok:true}});});};
+    var result={response:{status:'completed',output:[{type:'function_call',call_id:'a',name:'search',arguments:'{}'},{type:'function_call',call_id:'b',name:'act',arguments:'{}'}]}};`);
+  const earlier=run('relayCompletedTools(result)');
+  assert.equal(run('invoked.length'),1);
+  getElementById('line').value='new request';
+  await getElementById('composer').handlers.submit({preventDefault(){}});
+  run('release()');
+  await earlier;
+  assert.equal(run('invoked.length'),1,'the old action must not use the newer request as authorization');
+  assert.equal(run('invoked[0].said'),'original request');
+  assert.equal(run('state.call.said'),'new request');
+  assert.equal(run(`sent.filter(e=>e.type==='response.create').length`),1,'only the typed turn starts a new response');
+});
+
+test('a delayed completed response cannot authorize old tools with a newer typed turn',async()=>{
+  const {run,getElementById}=load();
+  run(`var invoked=[];refresh=()=>{};applyWidgetPayload=()=>{};appendLog=()=>{};noteOverlayConversation=()=>{};flashLocalActivity=()=>{};
+    state.call={callId:'session',said:'old request',sidebandOk:false,responseGeneration:0,toolCalls:new Set()};
+    sendRealtime=()=>true;api=async(path,options)=>{invoked.push(JSON.parse(options.body));return {output:{ok:true}};};
+    onRealtimeEvent({type:'response.created',response:{id:'old'}});
+    var result={response:{id:'old',status:'completed',output:[{type:'function_call',call_id:'a',name:'act',arguments:'{}'}]}};`);
+  getElementById('line').value='new request';
+  await getElementById('composer').handlers.submit({preventDefault(){}});
+  await run('relayCompletedTools(result)');
+  assert.equal(run('invoked.length'),0);
+  run(`onRealtimeEvent({type:'response.created',response:{id:'new'}})`);
+  await run('relayCompletedTools(result)');
+  assert.equal(run('invoked.length'),0);
+  await run(`relayCompletedTools({response:{...result.response,id:'new'}})`);
+  assert.equal(run('invoked.length'),1);
+  assert.equal(run('invoked[0].said'),'new request');
 });

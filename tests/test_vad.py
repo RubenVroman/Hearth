@@ -202,5 +202,7 @@ def test_client_vad_js_mirrors_python_thresholds():
     assert "MIN_RMS = 0.018" in js
     assert "CONSECUTIVE_SPEECH_FRAMES = 4" in js
     assert "SpeechBargeIn" in js
+    assert "async retarget(track, stream)" in js
+    assert "restoreMic" in js
     index = (Path(__file__).resolve().parents[1] / "hearth/ui/static/index.html").read_text(encoding="utf-8")
     assert "/static/vad.js" in index

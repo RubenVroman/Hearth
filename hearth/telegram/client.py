@@ -296,7 +296,23 @@ class TelegramBotClient:
         result = data.get("result")
         if not data.get("ok") or not isinstance(result, dict):
             raise TelegramFileError("Telegram could not provide that image. Try sending it again.")
-        path = result.get("file_path")
+        size = result.get("file_size")
+        if size is not None and (type(size) is not int or size < 1 or size > max_bytes):
+            raise TelegramFileError("That image is too large. Send a smaller JPEG, PNG or WebP.")
+        return await self._download_file_path(result.get("file_path"), max_bytes=max_bytes)
+
+    async def get_file(self, file_id: str) -> dict[str, Any]:
+        return await self._call("getFile", {"file_id": str(file_id)})
+
+    async def download_file_bytes(self, file_path: str, *, max_bytes: int) -> bytes | None:
+        """Legacy transport API with the same strict path and byte boundary."""
+        try:
+            return await self._download_file_path(file_path, max_bytes=max_bytes)
+        except TelegramFileError:
+            return None
+
+    async def _download_file_path(self, file_path: Any, *, max_bytes: int) -> bytes:
+        path = file_path
         if (
             not isinstance(path, str)
             or not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
@@ -304,9 +320,6 @@ class TelegramBotClient:
             or any(part in {"", ".", ".."} for part in path.split("/"))
         ):
             raise TelegramFileError("Telegram returned an invalid image path.")
-        size = result.get("file_size")
-        if size is not None and (type(size) is not int or size < 1 or size > max_bytes):
-            raise TelegramFileError("That image is too large. Send a smaller JPEG, PNG or WebP.")
         client = await self._http()
         try:
             async with client.stream(

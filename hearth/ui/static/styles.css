@@ -508,6 +508,11 @@ input,
  * Spoken-answer read-along — glass caption under the orb.
  * Parent keeps zero flow height so the orb/composer never jump when text appears.
  */
+/* Look → Voice → Live transcription Hidden. The attribute is set from hearth.look.v1. */
+html[data-captions="hidden"] .spoken-answer {
+  display: none !important;
+}
+
 .spoken-answer {
   position: relative;
   width: min(440px, 92vw);
@@ -2346,6 +2351,13 @@ html[data-motion="still"] .orb.live .orb-ring {
   margin: 0 0 8px;
   font-size: 13px;
   color: var(--ink);
+}
+
+.settings-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
 }
 
 .settings-choices {

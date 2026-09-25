@@ -98,14 +98,19 @@ from hearth.telegram.media.watch_next import WatchNext, pick_next_in_order
 from hearth.telegram.models import BotReply, MediaHit, MediaQuery, MessageView
 from hearth.telegram.client import TelegramFileError
 from hearth.telegram.callbacks import RequestCallback
-from hearth.telegram.media.vision import (
-    OpenAIVisionProvider, VisionError, caption_mode, exact_matches,
-    image_attachment, names_selected_titles, prepare_image,
+from hearth.telegram.media.image_requests import (
+    ConfiguredVisionProvider, VisionError, caption_mode, exact_matches,
+    identify_compatible, image_attachment, names_selected_titles, prepare_image,
 )
+from hearth.telegram.media.vision import (
+    caption_season, confidence_bucket, log_vision_outcome, resolve_candidates,
+    vision_lane_active, vision_mode, vision_provider_name, VisionCandidate as LegacyCandidate,
+)
+from hearth.telegram.media.vision_provider import VisionSchemaError, VisionUnavailable
 from hearth.telegram.media.ranking import to_hits
 from hearth.telegram.media.memory import RememberedHit
 from hearth.telegram.house import house_control_reply, looks_like_house_control
-from hearth.telegram.parse import parse_message
+from hearth.telegram.parse import parse_message, parse_message_text, screen_media
 from hearth.telegram.progress import (
     ProgressTracker,
     format_guess_confirm,
@@ -221,8 +226,12 @@ class TelegramMediaBot:
         self.house = house_commands or TelegramHouseCommands()
         self.rate = RateLimiter()
         self.vision_rate = RateLimiter()
+        self.vision_daily = RateLimiter(max_calls=30, window_s=86400)
         self.image_client = image_client
-        self.vision = vision_provider or OpenAIVisionProvider()
+        self.vision = vision_provider or ConfiguredVisionProvider()
+        self._vision_provider: Any | None = None
+        self._file_fetcher: Any | None = None
+        self._telegram: Any | None = image_client
         self._vision_inflight: set[int] = set()
         self._vision_slots = asyncio.Semaphore(2)
         self.bot_user_id: int | None = None
@@ -232,9 +241,15 @@ class TelegramMediaBot:
     def reset(self) -> None:
         self.rate.reset()
         self.vision_rate.reset()
+        self.vision_daily.reset()
         self.progress.reset()
         self.bot_user_id = None
         self.agent.reset()
+
+    def bind_telegram(self, client: Any) -> None:
+        """Retain the upstream transport binding API for injected bot instances."""
+        self.image_client = client
+        self._telegram = client
 
     def _cards(self) -> CardRenderer:
         return CardRenderer(
@@ -322,7 +337,7 @@ class TelegramMediaBot:
     ) -> BotReply | None:
         if view.has_media:
             # Attachment captions must never be interpreted as house commands.
-            if view.media_kind in {"photo", "document"} and settings.telegram_vision_enabled:
+            if view.media_kind in {"photo", "document"} and settings.telegram_vision_enabled and settings.telegram_vision_lane:
                 return await self._image_reply(view, message)
             return BotReply(format_reject_download())
         house_reply = await self.house.handle(view.text)
@@ -477,84 +492,291 @@ class TelegramMediaBot:
             log.exception("telegram media lane failed for intent %s", intent.kind)
             return BotReply(voice.lane_failed())
 
+    async def _vision_ack(self, view: MessageView) -> int | None:
+        client = self._telegram
+        if client is None:
+            return None
+        try:
+            sent = await client.send_message(
+                view.chat_id,
+                voice.vision_looking(),
+                reply_to_message_id=view.message_id,
+            )
+        except Exception:  # noqa: BLE001 — the result message can still go out
+            log.warning("telegram vision ack failed")
+            return None
+        if not isinstance(sent, dict) or not sent.get("ok"):
+            return None
+        result = sent.get("result")
+        if not isinstance(result, dict):
+            return None
+        try:
+            return int(result["message_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    async def _vision_edit(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        client = self._telegram
+        if client is None:
+            return False
+        try:
+            edited = await client.edit_message_text(
+                chat_id,
+                message_id,
+                text,
+                reply_markup=reply_markup,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(isinstance(edited, dict) and edited.get("ok"))
+
+    async def _finish_vision_ack(
+        self,
+        view: MessageView,
+        ack_id: int | None,
+        reply: BotReply,
+    ) -> BotReply:
+        if ack_id is None:
+            return reply
+        edited = await self._vision_edit(
+            view.chat_id,
+            ack_id,
+            reply.text,
+            reply.reply_markup,
+        )
+        if edited:
+            # The ack message already shows the result. An empty reply keeps
+            # the service from sending a second bubble.
+            return BotReply("")
+        return reply
+
+    async def _vision_caption_fallback(self, view: MessageView) -> BotReply | None:
+        """If the picture cannot be read, a real caption may still be a title."""
+        parsed = parse_message_text(view.text)
+        if parsed.action != "search" or not (parsed.title or parsed.tmdb_id is not None):
+            return None
+        self._clear_pending_guess(view.chat_id)
+        try:
+            # A failed image may fall back to a caption title, never to house
+            # actions or the conversational tool router.
+            reply = await self._search_reply(view, parsed)
+        except CatalogUnavailable as exc:
+            reply = BotReply(exc.message)
+        lead = voice.vision_caption_fallback()
+        return BotReply(f"{lead}\n{reply.text}", reply.reply_markup)
+
+    async def _vision_read_failed(self, view: MessageView) -> BotReply:
+        fallback = await self._vision_caption_fallback(view)
+        if fallback is not None:
+            return fallback
+        return BotReply(voice.vision_unreadable())
+
+    async def _vision_search(self, query: MediaQuery) -> list[MediaHit]:
+        """Exact-title search plus the one bounded retry that lane already has."""
+        hits = await self.catalog.hits(query, limit=4)
+        kept = [hit for hit in hits if plausible_match(query.title, hit)]
+        if kept:
+            return kept
+        broadened = self._broaden(query)
+        if broadened is None:
+            return []
+        hits = await self.catalog.hits(broadened, limit=4)
+        return [
+            hit
+            for hit in hits
+            if plausible_match(broadened.title, hit) or plausible_match(query.title, hit)
+        ]
+
+    def _render_vision_plan(
+        self,
+        view: MessageView,
+        plan: Any,
+        *,
+        season: int | None,
+        episode_note: bool,
+    ) -> BotReply:
+        note = f"{voice.vision_episode_ignored()}\n" if episode_note else ""
+        if len(plan.items) == 1 and not plan.omitted:
+            item = plan.items[0]
+            if item.uncertain:
+                return BotReply(note + voice.vision_uncertain(item.label))
+            if not item.hits:
+                return BotReply(note + voice.no_match(item.label))
+            hits = list(item.hits)
+            single = len(hits) == 1
+            header = (
+                voice.exact_header(hits[0].display_label(), single=True)
+                if single
+                else "Which one matches the image?"
+            )
+            return self._present(
+                view.chat_id,
+                hits,
+                header=note + header,
+                ask_kind="exact_title",
+                ask_text=view.text or item.label,
+                search_title=item.label,
+                media_type=hits[0].media_type,
+                season=season if hits[0].media_type == "tv" else None,
+                remember_single_guess=single,
+                offer_similar=single,
+                offer_series=single and hits[0].media_type == "movie",
+                offer_dismiss=single,
+            )
+
+        groups = [(item.label, list(item.hits)) for item in plan.items if item.hits]
+        misses = [item.label for item in plan.items if not item.hits and not item.uncertain]
+        shown_hits = [hit for item in plan.items for hit in item.hits]
+        header = voice.vision_list_header(
+            plan.list_label,
+            shown=len(groups) + len(misses),
+            omitted=len(plan.omitted),
+        )
+        rendered = self._cards().render_plan(
+            view.chat_id,
+            groups,
+            header=note + header,
+            misses=misses,
+        )
+        extra: list[str] = []
+        for item in plan.items:
+            if item.uncertain:
+                extra.append(f"▸ {voice.vision_uncertain(item.label)}")
+        if plan.omitted:
+            extra.append("Left off: " + ", ".join(plan.omitted))
+        text = rendered.reply.text
+        if extra:
+            text = text + "\n" + "\n".join(extra)
+        if shown_hits:
+            self.memory.remember(
+                view.chat_id,
+                hits=shown_hits,
+                ask_kind="batch",
+                ask_text=view.text or plan.list_label or "image",
+                search_title=shown_hits[0].title,
+            )
+        return BotReply(text, rendered.reply.reply_markup)
+
     async def _image_reply(self, view: MessageView, message: dict[str, Any]) -> BotReply:
+        mode = caption_mode(view.text)
+        if mode == "cancel":
+            self._clear_pending_guess(view.chat_id)
+            self.thread.dismiss_confirm(view.chat_id)
+            self.memory.forget(view.chat_id)
+            return BotReply("Okay — I won't read or request anything from that image.")
+        configured_mode = vision_mode()
+        if not configured_mode or (self._vision_provider is None and isinstance(self.vision, ConfiguredVisionProvider) and not vision_lane_active()):
+            return BotReply(format_reject_download())
         turn_key = f"image:{view.chat_id}:{view.user_id}:{view.message_id}"
         saved = self.store.get_callback_media(turn_key) or {}
         if saved.get("reply"):
             return BotReply(str(saved["reply"]), saved.get("reply_markup"))
-        mode = caption_mode(view.text)
         self._clear_pending_guess(view.chat_id)
         self.thread.dismiss_confirm(view.chat_id)
         self.memory.forget(view.chat_id)
-        if mode == "cancel":
-            return BotReply("Okay — I won't read or request anything from that image.")
         try:
+            if screen_media(message).disposition != "eligible":
+                return BotReply(format_reject_download())
             attachment = image_attachment(message, max_bytes=settings.telegram_vision_max_bytes)
         except VisionError as exc:
             return BotReply(str(exc))
         if not self.backend_configured:
             return BotReply("Connect Overseerr on Hearth before requesting titles from images.")
-        if self.image_client is None:
+        if self.image_client is None and self._file_fetcher is None:
             return BotReply("Image intake is unavailable. Try again after the Telegram service reconnects.")
-        if isinstance(self.vision, OpenAIVisionProvider) and not settings.openai_configured:
-            return BotReply("Image recognition needs an OpenAI API key configured on Hearth.")
         if view.chat_id in self._vision_inflight:
             return BotReply("I'm still reading your previous image. Give me a moment.")
-        self.vision_rate.max_calls = settings.telegram_vision_rate_per_minute
-        if not saved and not self.vision_rate.allow((view.chat_id, view.user_id)):
-            wait = max(1, math.ceil(self.vision_rate.retry_after((view.chat_id, view.user_id))))
-            return BotReply(f"Give me {wait}s before another image, then send it again.")
+        self.vision_rate.max_calls = settings.telegram_vision_per_minute
+        self.vision_daily.max_calls = settings.telegram_vision_daily_cap
+        self.rate.max_calls = settings.telegram_rate_limit_per_minute
+        if not saved:
+            for bucket in (self.vision_rate, self.vision_daily, self.rate):
+                if not bucket.allow((view.chat_id, view.user_id)):
+                    wait = max(1, math.ceil(bucket.retry_after((view.chat_id, view.user_id))))
+                    return BotReply(f"Give me {wait}s before another image, then send it again.")
         self._vision_inflight.add(view.chat_id)
         typing_task = (
             asyncio.create_task(self._image_typing(view.chat_id))
             if hasattr(self.image_client, "send_chat_action") else None
         )
+        ack_id = None
         try:
+            if typing_task is None and self._telegram is not None and configured_mode != "shadow":
+                ack_id = await self._vision_ack(view)
             if not saved:
-                async with asyncio.timeout(settings.telegram_vision_timeout_seconds + 15):
+                async with asyncio.timeout(settings.telegram_vision_timeout_seconds * 2 + 15):
                     async with self._vision_slots:
-                        raw = await self.image_client.download_image(
-                            attachment.file_id, max_bytes=settings.telegram_vision_max_bytes,
-                        )
+                        if self._file_fetcher is not None:
+                            raw = await self._file_fetcher(attachment.file_id, max_bytes=settings.telegram_vision_max_bytes)
+                        else:
+                            raw = await self.image_client.download_image(attachment.file_id, max_bytes=settings.telegram_vision_max_bytes)
                         clean, mime = await asyncio.to_thread(
                             prepare_image, raw, mime=attachment.mime,
                             max_bytes=settings.telegram_vision_max_bytes,
                         )
-                        result = await self.vision.identify(
-                            clean, mime, view.text,
-                            limit=settings.telegram_vision_max_items,
-                        )
+                        if self._vision_provider is not None:
+                            result = await identify_compatible(self._vision_provider, clean, mime, view.text)
+                        else:
+                            result = await self.vision.identify(clean, mime, view.text, limit=settings.telegram_vision_list_cap)
+                log_vision_outcome(
+                    chat_id=view.chat_id, message_id=view.message_id, mime=mime,
+                    byte_length=len(clean), provider=vision_provider_name(), kind=result.kind,
+                    candidate_count=len(result.candidates), confidence_bucket=confidence_bucket(result.candidates),
+                    outcome=configured_mode,
+                )
+                if configured_mode == "shadow":
+                    return BotReply(format_reject_download())
                 if result.kind == "refuse":
-                    return BotReply("I can't identify movie titles from that image.")
+                    return await self._finish_vision_ack(view, ack_id, BotReply("I can't use that image."))
                 if result.kind == "not_media" or not result.candidates:
-                    return BotReply("I couldn't find readable movie or series titles. Send a clearer poster or list.")
-                # Freeze title evidence before any write: a transport retry must
-                # never re-run vision and discover a different set to request.
-                saved = {"result": result.model_dump(), "mode": mode}
+                    return await self._finish_vision_ack(view, ack_id, BotReply("I couldn't find readable film or series titles. Send a clearer poster or list."))
+                saved = {"result": result.model_dump(), "mode": mode, "configured_mode": configured_mode}
                 self.store.put_callback_media(turn_key, saved, ttl_s=86400)
-            from hearth.telegram.media.vision import VisionResult
+            from hearth.telegram.media.image_requests import VisionResult
             result = VisionResult.model_validate(saved["result"])
-            automatic = settings.telegram_vision_auto_request and saved.get("mode") == "request"
+            automatic = (settings.telegram_vision_auto_request and configured_mode == "auto"
+                         and saved.get("configured_mode", configured_mode) == "auto" and saved.get("mode") == "request")
             if names_selected_titles(view.text, result.candidates):
                 automatic = False
             said = "Request the depicted movies and series." if automatic else "Identify the depicted movies and series."
             said += " Titles: " + "; ".join(item.title for item in result.candidates[:8])
-            # All catalog lookups and requests reuse a single Jev verdict.
             with tool_turn(said + (f" Caption: {view.text[:500]}" if view.text else ""), channel="telegram_image"):
-                reply = await self._resolve_image(view, result, automatic=automatic, turn_key=turn_key)
+                if automatic:
+                    reply = await self._resolve_image(view, result, automatic=True, turn_key=turn_key)
+                else:
+                    season, episode_note = caption_season(view.text)
+                    if len(result.candidates) == 1 and result.candidates[0].season is not None:
+                        season = result.candidates[0].season
+                    plan = await resolve_candidates(
+                        [LegacyCandidate(item.title, item.year, item.media_type, item.confidence, item.season) for item in result.candidates],
+                        search_hits=self._vision_search, list_label=result.list_label, season=season,
+                    )
+                    if plan.catalog_message:
+                        reply = BotReply(plan.catalog_message)
+                    else:
+                        preview = self._render_vision_plan(view, plan, season=season, episode_note=episode_note)
+                        reply = BotReply("Image preview · nothing requested\n\n" + preview.text, preview.reply_markup)
             self.store.put_callback_media(
                 turn_key, {**saved, "reply": reply.text, "reply_markup": reply.reply_markup}, ttl_s=86400,
             )
-            return reply
+            return await self._finish_vision_ack(view, ack_id, reply)
+        except (VisionUnavailable, VisionSchemaError):
+            return await self._finish_vision_ack(view, ack_id, await self._vision_read_failed(view))
         except (VisionError, TelegramFileError) as exc:
-            return BotReply(str(exc))
+            return await self._finish_vision_ack(view, ack_id, BotReply(str(exc)))
         except TimeoutError:
-            return BotReply("Reading that image took too long. Try a smaller crop or send the titles as text.")
+            return await self._finish_vision_ack(view, ack_id, BotReply("Reading that image took too long. Try a smaller crop or send the titles as text."))
         except asyncio.CancelledError:
             raise
         except Exception:
             log.warning("telegram image turn failed; image and provider output omitted")
-            return BotReply("I couldn't finish that image request. Check Overseerr before trying again.")
+            return await self._finish_vision_ack(view, ack_id, BotReply("I couldn't finish that image request. Check Overseerr before trying again."))
         finally:
             self._vision_inflight.discard(view.chat_id)
             if typing_task is not None:
@@ -577,7 +799,7 @@ class TelegramMediaBot:
         slots = asyncio.Semaphore(3)
 
         async def resolve(candidate: Any) -> tuple[Any, list[MediaHit], str]:
-            if candidate.confidence < 0.90:
+            if candidate.confidence < max(0.90, settings.telegram_vision_auto_confidence):
                 return candidate, [], "The title is unclear; send it as text."
             try:
                 async with slots:

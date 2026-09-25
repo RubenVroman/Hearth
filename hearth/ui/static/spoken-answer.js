@@ -101,7 +101,7 @@
       this._visible = false;
       this._closing = false;
       this._generation = 0;
-      this.enabled = !els || els.enabled !== false;
+      this._enabled = !els || els.enabled !== false;
     }
 
     bind(root, textEl) {
@@ -110,10 +110,23 @@
       return this;
     }
 
+    /**
+     * Look setting. Hidden dismisses immediately and ignores later deltas
+     * until captions are turned back on.
+     */
+    setEnabled(on) {
+      const next = Boolean(on);
+      if (this.root?.dataset) this.root.dataset.enabled = String(next);
+      if (this._enabled === next) return this;
+      this._enabled = next;
+      if (!next) this.dismiss({ reason: "captions_hidden", immediate: true });
+      return this;
+    }
+
     /** Feed a Realtime data-channel event. Never throws. */
     onRealtimeEvent(type, event) {
       try {
-        if (!this.enabled) return;
+        if (this._enabled === false) return;
         const action = classifyEvent(type);
         if (action === "reveal") {
           const delta = (event && event.delta) || "";

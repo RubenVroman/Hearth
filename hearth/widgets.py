@@ -803,15 +803,21 @@ def _media_widget(result: dict[str, Any]) -> Widget | None:
     ok = bool(result.get("ok")) and data.get("ok") is not False
 
     # List-genres asks → category picker (not an empty media stack).
-    if name == "plex_browse_genre" and data.get("listed_genres"):
-        return _genres_widget(result)
+    if name == "plex_browse_genre" and data.get("listed_genres") and ok:
+        directory = _genres_widget(result)
+        if directory is not None:
+            return directory
 
     incoming = _media_items_from_tool(name, data)
     if not incoming:
         # Replace stale titles with an honest result, including failed lookups.
         query = str(data.get("query") or "").strip()
+        empty_message = (
+            "No movie or series categories found." if data.get("listed_genres")
+            else "No matching titles found."
+        )
         body = str(data.get("speak") or (
-            "No matching titles found." if ok else "I couldn't load the media results."
+            empty_message if ok else "I couldn't load the media results."
         ))[:1200]
         return runtime.upsert_widget(Widget(
             id="media", kind="media", title=query or "Your media",

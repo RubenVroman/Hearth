@@ -468,3 +468,103 @@ async def test_sideband_eof_cleans_live_state_and_ignores_non_object_json():
     assert band.call_id not in webrtc._sidebands
     assert runtime.voice_mode == "disconnected"
     assert runtime.openai_live is False
+
+
+@pytest.mark.asyncio
+async def test_voice_memory_refresh_waits_through_tool_continuation(monkeypatch):
+    async def run(name, _args, **_kwargs):
+        return {"ok": True, "name": name}
+
+    async def instructions(query):
+        return f"remember {query}"
+
+    monkeypatch.setattr(webrtc, "run_house_tool", run)
+    monkeypatch.setattr(webrtc, "voice_instructions_async", instructions)
+    band = webrtc.Sideband("rtc_memory_continuation")
+    band._ws = socket = Socket()
+    await band._on_event({"type": "response.created", "response": {"id": "resp1"}})
+    await band._on_event({"type": "conversation.item.input_audio_transcription.completed", "transcript": "show horror"})
+    await band._on_event(_event("plex_search"))
+    await _drain(band)
+    assert not any(event["type"] == "session.update" for event in socket.sent)
+    await band._on_event({"type": "response.created", "response": {"id": "resp2"}})
+    await band._on_event(_event(response_id="resp2"))
+    await _drain(band)
+    updates = [event for event in socket.sent if event["type"] == "session.update"]
+    assert len(updates) == 1
+    assert updates[0]["session"]["instructions"] == "remember show horror"
+    assert "audio" not in updates[0]["session"]
+    await band.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_and_done_do_not_finish_a_different_active_response():
+    band = webrtc.Sideband("rtc_response_accounting")
+    band._ws = Socket()
+    for response_id in ("r1", "r1", "r2"):
+        await band._on_event({"type": "response.created", "response": {"id": response_id}})
+    assert band._active_responses == 2
+    await band._on_event({"type": "response.cancelled", "response": {"id": "r1"}})
+    await band._on_event(_event(response_id="r1", status="cancelled"))
+    assert band._active_responses == 1
+    await band._on_event(_event(response_id="r2"))
+    await _drain(band)
+    assert band._active_responses == 0
+    await band.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_voice_transcript_cannot_authorize_a_write(monkeypatch):
+    async def forbidden(*_args, **_kwargs):
+        pytest.fail("partial speech must not authorize a write")
+
+    monkeypatch.setattr(webrtc, "run_house_tool", forbidden)
+    band = webrtc.Sideband("rtc_partial_write")
+    band._ws = Socket()
+    band._partial_user = "download Dune unless"
+    await band._run_function_call("radarr_add", "{}", "partial_write1")
+    result = json.loads(band._ws.sent[0]["item"]["output"])
+    assert result["data"]["error"] == "missing_current_utterance"
+    await band.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_tool_result_survives_socket_reopen_without_reexecution(monkeypatch):
+    started, finish_action, reconnect = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def run(name, _args, **_kwargs):
+        calls.append(name)
+        started.set()
+        await finish_action.wait()
+        return {"ok": True, "name": name}
+
+    monkeypatch.setattr(webrtc, "run_house_tool", run)
+    band = webrtc.Sideband("rtc_mid_action_reopen")
+    band._ws = Socket()
+    band._utterance = "download Dune"
+    band._active_responses = 1
+    replacement = Socket()
+
+    async def connect():
+        await reconnect.wait()
+        band._ws = replacement
+
+    monkeypatch.setattr(band, "_connect_socket", connect)
+    action = asyncio.create_task(band._run_function_call("radarr_add", "{}", "reopen-write"))
+    await started.wait()
+    reopening = asyncio.create_task(band._reopen_socket())
+    await asyncio.sleep(0)
+    assert band._ws is None
+    finish_action.set()
+    await asyncio.sleep(0)
+    reconnect.set()
+    assert await reopening
+    await action
+    await band._run_function_call("radarr_add", "{}", "reopen-write")
+    assert calls == ["radarr_add"]
+    assert [event["type"] for event in replacement.sent] == [
+        "session.update", "conversation.item.create", "response.create",
+    ]
+    assert band._active_responses == 0
+    await band.close()

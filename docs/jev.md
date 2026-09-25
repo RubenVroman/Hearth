@@ -104,7 +104,7 @@ One parallel System One call (`evaluate_telegram_media`) classifies every media-
 | `person_filmography` | `search_person` → `person_combined_credits` → ranked credits | no |
 | `mood_vibe` | Vibe language → `discover` genre / runtime / era / rating filters | no |
 | `similar_to` | Resolve the anchor once → `/{movie,tv}/{id}/similar` + `/recommendations` | no |
-| `batch_multi` | Split into ≤ `HEARTH_TELEGRAM_BATCH_MAX_ITEMS` items → one plan, one Get per item | no |
+| `batch_multi` | Split into ≤ `HEARTH_TELEGRAM_BATCH_MAX_ITEMS` items (default 4, ceiling 16) → one plan, one Get per item | no |
 | `follow_up` | Resolve against the recent chat context (sequel, all of them, nth, other, more) | no |
 | `descriptive_riddle` | gpt-4o catalog guess → search → Get/yes confirm | yes |
 | `chat_about_title` | gpt-4o short answer (info only) — **no** Get / queue | yes |
@@ -118,6 +118,8 @@ Text media searches queue after Get or an explicit yes on a pending guess.
 The [image lane](ambient-ai-and-images.md) also requests confidently resolved
 pictured titles automatically when enabled and permitted by the caption. Both
 paths use the same Jev gate and durable queue, always by resolved `mediaId`.
+
+A poster or list graphic first becomes structured titles and verified catalog coordinates. The image itself is not sent to Jev. Automatic requests and signed Get callbacks share the same `tool_allow` gate and durable queue; automatic requests do not claim the explicit confirmation that a Get tap supplies. See [current image behavior](ambient-ai-and-images.md).
 
 The Telegram media question map does **not** include `butler_ask` or `domain`. Shelf and scene asks on Telegram call `evaluate_message` (the shared hearth map) before Plex or Home Assistant.
 
