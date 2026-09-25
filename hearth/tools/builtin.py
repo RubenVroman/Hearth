@@ -721,12 +721,19 @@ def register_builtin_tools() -> None:
             description=(
                 "Resolve any routine Home Assistant device by entity id or friendly name and control "
                 "it. Supports lights, switches, fans, covers, climate, media, remotes, scenes, "
-                "scripts, buttons and vacuums. Never guess an entity id; ambiguous names are returned."
+                "scripts, buttons and vacuums. Never guess an entity id; ambiguous names are returned. "
+                "lights, all lights, every light, and the lights control every light entity."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "device": {"type": "string", "description": "Friendly name or entity_id."},
+                    "device": {
+                        "type": "string",
+                        "description": (
+                            "Friendly name or entity_id. lights, all lights, every light, "
+                            "and the lights control every light entity."
+                        ),
+                    },
                     "action": {
                         "type": "string",
                         "description": (
