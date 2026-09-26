@@ -439,7 +439,7 @@ class AgentLoop:
                             data={"error": "invalid_arguments", "speak": "The tool needs valid JSON object arguments; nothing ran."},
                         )
                         used.append(invalid.as_dict())
-                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(invalid.as_dict())})
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(invalid.as_dict(), ensure_ascii=False, separators=(",", ":"))})
                         continue
                     if tc.function.name == "chief_of_staff":
                         args.setdefault("said", user_text)
@@ -476,7 +476,7 @@ class AgentLoop:
                         {
                             "role": "tool",
                             "tool_call_id": tc.id,
-                            "content": json.dumps(result.as_dict(), default=str),
+                            "content": json.dumps(result.as_dict(), default=str, ensure_ascii=False, separators=(",", ":")),
                         }
                     )
                 continue

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from hearth.agent.loop import route_intent
 from hearth.agent.registry import registry
@@ -213,6 +214,13 @@ async def test_web_search_openai_uses_existing_key(monkeypatch):
         def __init__(self, *args, **kwargs):
             captured["timeout"] = kwargs.get("timeout")
             captured["api_key"] = kwargs.get("api_key")
+            captured["max_retries"] = kwargs.get("max_retries")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            captured["closed"] = True
 
         @property
         def responses(self):
@@ -230,10 +238,146 @@ async def test_web_search_openai_uses_existing_key(monkeypatch):
     assert result.data["mode"] == "openai"
     assert captured["api_key"] == "sk-hearth-search-test"
     assert captured["timeout"] == websearch_mod.HTTP_TIMEOUT
+    assert captured["max_retries"] == 0
+    assert captured["closed"] is True
     tools = captured.get("tools") or []
     assert tools and tools[0]["type"] == "web_search"
     assert result.data["results"][0]["source"] == "justwatch.com"
     assert "Disney+" in result.data["speak"]
+
+
+@pytest.mark.parametrize("status", [400, 401, 429, 500, 502, 504])
+async def test_hosted_search_does_not_replay_provider_failure(monkeypatch, status):
+    import openai
+
+    calls = []
+    closed = []
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    error = openai.APIStatusError(
+        "provider failed",
+        response=httpx.Response(status, request=request),
+        body={"code": "server_error", "param": None},
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs["max_retries"] == 0
+            self.responses = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            closed.append(True)
+
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            raise error
+
+    async def fallback(query, *, limit):
+        return {"ok": True, "mode": "duckduckgo"}
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeClient)
+    monkeypatch.setattr(websearch_mod, "_search_duckduckgo", fallback)
+    result = await websearch_mod._search_openai("test", limit=2, locale={"country": "BE"})
+    assert result["mode"] == "duckduckgo"
+    assert len(calls) == 1
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("rejected", ["include", "tool_choice"])
+async def test_hosted_search_retries_only_explicit_option_rejection(monkeypatch, rejected):
+    import openai
+    from types import SimpleNamespace
+
+    calls = []
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.responses = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise openai.BadRequestError(
+                    "Unsupported option",
+                    response=httpx.Response(400, request=request),
+                    body={"code": "unsupported_parameter", "param": rejected},
+                )
+            return SimpleNamespace(output_text="Found a source.", output=[
+                {"type": "web_search_call", "status": "completed"},
+            ])
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeClient)
+    result = await websearch_mod._search_openai(
+        "test", limit=2, locale={"country": "BE", "city": "Brussels"}
+    )
+    assert result["ok"]
+    assert len(calls) == 2
+    assert rejected not in calls[1]
+    supported = "include" if rejected == "tool_choice" else "tool_choice"
+    assert calls[1][supported] == calls[0][supported]
+    assert calls[1]["tools"][0]["user_location"]["city"] == "Brussels"
+
+
+async def test_hosted_search_does_not_label_unsearched_answer_as_live(monkeypatch):
+    import openai
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.responses = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def create(self, **kwargs):
+            return SimpleNamespace(output_text="A guess from model memory.", output=[])
+
+    fallback = AsyncMock(return_value={"ok": True, "mode": "duckduckgo"})
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeClient)
+    monkeypatch.setattr(websearch_mod, "_search_duckduckgo", fallback)
+    result = await websearch_mod._search_openai("test", limit=2, locale={"country": "BE"})
+    assert result["mode"] == "duckduckgo"
+    fallback.assert_awaited_once_with("test", limit=2)
+
+
+async def test_hosted_search_timeout_never_replays(monkeypatch):
+    import openai
+
+    calls = []
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs["max_retries"] == 0
+            self.responses = self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            raise openai.APITimeoutError(request=request)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeClient)
+    with pytest.raises(openai.APITimeoutError):
+        await websearch_mod._search_openai("test", limit=2, locale={"country": "BE"})
+    assert len(calls) == 1
 
 
 async def test_web_search_timeout_is_speakable(monkeypatch):

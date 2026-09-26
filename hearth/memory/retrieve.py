@@ -40,12 +40,15 @@ def _hit_text(item: dict[str, Any]) -> str:
     return str(item.get("body") or "")
 
 
-async def search(query: str, *, k: int | None = None) -> list[dict[str, Any]]:
+async def search(
+    query: str, *, k: int | None = None, exclude_turn_ids: set[str] | None = None
+) -> list[dict[str, Any]]:
     """Keyword (FTS5) plus optional cosine over stored embeddings."""
     if not store.memory_enabled():
         return []
     limit = k or max(1, int(settings.memory_retrieve_k))
     q = redact(query).strip()
+    excluded = exclude_turn_ids or set()
     scored: dict[tuple[str, str], dict[str, Any]] = {}
 
     def bump(kind: str, owner_id: str, score: float, source: str, payload: dict[str, Any]) -> None:
@@ -60,9 +63,11 @@ async def search(query: str, *, k: int | None = None) -> list[dict[str, Any]]:
             scored[key] = row
 
     if q:
-        for row in store.fts_search(q, limit=max(limit * 4, 12)):
+        for row in store.fts_search(q, limit=max(limit * 4, 12) + len(excluded)):
             owner_kind = str(row["owner_kind"])
             owner_id = str(row["owner_id"])
+            if owner_kind == "turn" and owner_id in excluded:
+                continue
             rank = float(row.get("rank") or 0.0)
             # bm25: more negative is better; convert to 0..1-ish.
             fts_score = 1.0 / (1.0 + max(0.0, rank + 10.0))
@@ -74,15 +79,23 @@ async def search(query: str, *, k: int | None = None) -> list[dict[str, Any]]:
             bump(owner_kind, owner_id, 0.7 * fts_score + 0.3 * recency, "fts", payload)
 
     query_vec: list[float] | None = None
+    vectors: list[dict[str, Any]] = []
     if q and embeddings_enabled():
+        # An embedding cannot contribute when the index is empty or contains
+        # only vectors from a different model. Avoid paying for a discarded query.
+        vectors = [
+            row for row in store.embeddings_for(
+                ["preference", "summary", "house_event", "turn"], limit=400
+            )
+            if row["model"] == settings.memory_embedding_model
+            and not (row["owner_kind"] == "turn" and row["owner_id"] in excluded)
+        ]
+    if vectors:
         from hearth.memory.embed import embed_one
 
         query_vec = await embed_one(q)
     if query_vec:
-        for row in store.embeddings_for(
-            ["preference", "summary", "house_event", "turn"],
-            limit=400,
-        ):
+        for row in vectors:
             vec = unpack_vector(row["vector"])
             sim = cosine(query_vec, vec)
             if sim < 0.18:
@@ -121,21 +134,15 @@ def _preference_lines(limit: int = MAX_PREFERENCES) -> list[str]:
     return lines
 
 
-def prompt_block(
-    query: str = "",
-    *,
-    include_recent_turns: bool = True,
-    hits: list[dict[str, Any]] | None = None,
-    turn_limit: int = 4,
-) -> str:
-    """Compact text injected into the system prompt for chat and Realtime."""
+def session_context_block(*, include_recent_turns: bool = True, turn_limit: int = 4) -> str:
+    """Capture prior conversation once when a Realtime call starts.
+
+    Current-call turns already live in the provider's conversation. A stable
+    snapshot avoids repeatedly inserting them into the system instructions.
+    """
     if not store.memory_enabled() or not settings.memory_inject:
         return ""
     sections: list[str] = []
-    prefs = _preference_lines()
-    if prefs:
-        sections.append("Preferences:\n" + "\n".join(prefs))
-
     session_id = store.kv_get("current_session_id")
     if session_id:
         summary = store.latest_summary(session_id)
@@ -150,6 +157,29 @@ def prompt_block(
                     text = redact(str(turn.get("text") or "")).replace("\n", " ")[:180]
                     bits.append(f"{role}: {text}")
                 sections.append("Recent turns:\n" + "\n".join(bits))
+    return "\n\n".join(sections)
+
+
+def prompt_block(
+    query: str = "",
+    *,
+    include_recent_turns: bool = True,
+    hits: list[dict[str, Any]] | None = None,
+    turn_limit: int = 4,
+    session_context: str | None = None,
+) -> str:
+    """Compact text injected into the system prompt for chat and Realtime."""
+    if not store.memory_enabled() or not settings.memory_inject:
+        return ""
+    sections: list[str] = []
+    prefs = _preference_lines()
+    if prefs:
+        sections.append("Preferences:\n" + "\n".join(prefs))
+    context = session_context if session_context is not None else session_context_block(
+        include_recent_turns=include_recent_turns, turn_limit=turn_limit
+    )
+    if context:
+        sections.append(context)
 
     if hits:
         lines = []
@@ -179,13 +209,20 @@ async def prompt_block_async(
     *,
     include_recent_turns: bool = True,
     turn_limit: int = 4,
+    session_context: str | None = None,
+    exclude_turn_ids: set[str] | None = None,
 ) -> str:
-    hits = await search(query, k=int(settings.memory_retrieve_k)) if query.strip() else []
+    if not store.memory_enabled() or not settings.memory_inject:
+        return ""
+    hits = await search(
+        query, k=int(settings.memory_retrieve_k), exclude_turn_ids=exclude_turn_ids
+    ) if query.strip() else []
     return prompt_block(
         query,
         include_recent_turns=include_recent_turns,
         hits=hits,
         turn_limit=turn_limit,
+        session_context=session_context,
     )
 
 

@@ -31,7 +31,7 @@ ADMIN_KEYS_URL = "https://platform.openai.com/settings/organization/admin-keys"
 OFFICIAL_LIST_PRICING: dict[str, Any] = {
     "label": "official list pricing (not your invoice)",
     "source": OFFICIAL_PRICING_URL,
-    "as_of": "2026-08-30",
+    "as_of": "2026-09-26",
     "unit": "USD per 1M tokens unless noted",
     "models": [
         {
@@ -63,11 +63,56 @@ OFFICIAL_LIST_PRICING: dict[str, Any] = {
     ],
 }
 
-# Map model id → rate keys for local estimate math (text chat / embeddings only).
+# Map model id → rate keys for local estimate math (text chat / embeddings).
 _RATE_BY_MODEL: dict[str, dict[str, float]] = {
     "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
     "text-embedding-3-small": {"input": 0.02, "cached_input": 0.02, "output": 0.0},
 }
+
+_RECENT_RESPONSE_LIMIT = 128
+_DEDUPE_RESPONSE_LIMIT = 2048
+_TOKEN_FIELDS = (
+    "input_tokens", "output_tokens", "total_tokens", "cached_input_tokens",
+    "input_text_tokens", "input_audio_tokens", "input_image_tokens",
+    "cached_input_text_tokens", "cached_input_audio_tokens", "cached_input_image_tokens",
+    "output_text_tokens", "output_audio_tokens", "reasoning_output_tokens",
+)
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+
+def _count(value: Any) -> int:
+    # Telemetry must never break a voice turn if a provider field is absent/malformed.
+    if not isinstance(value, (int, float, str)) or isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+def _response_id(response: Any) -> str:
+    value = _field(response, "id")
+    return value if isinstance(value, str) and len(value) <= 128 else ""
+
+
+def _complete_realtime_breakdown(row: dict[str, Any]) -> bool:
+    if _count(row.get("incomplete_realtime_usage_requests")):
+        return False
+    inp = _count(row.get("input_tokens"))
+    out = _count(row.get("output_tokens"))
+    kinds = ("text", "audio", "image")
+    return (
+        _count(row.get("total_tokens")) == inp + out
+        and sum(_count(row.get(f"input_{kind}_tokens")) for kind in kinds) == inp
+        and sum(_count(row.get(f"cached_input_{kind}_tokens")) for kind in kinds)
+        == _count(row.get("cached_input_tokens"))
+        and sum(_count(row.get(f"output_{kind}_tokens")) for kind in ("text", "audio")) == out
+        and all(_count(row.get(f"cached_input_{kind}_tokens"))
+                <= _count(row.get(f"input_{kind}_tokens")) for kind in kinds)
+    )
 
 
 def _usage_store_path() -> Path:
@@ -80,13 +125,17 @@ class LocalUsageLedger:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._data = self._load()
+        self._seen_responses = set(self._data.get("response_ids") or [])
 
     def _empty(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": None,
             "by_model": {},
+            "response_ids": [],
+            "recent_responses": [],
+            "duplicate_events_ignored": 0,
             "totals": {
                 "requests": 0,
                 "input_tokens": 0,
@@ -126,20 +175,41 @@ class LocalUsageLedger:
         output_tokens: int = 0,
         total_tokens: int = 0,
         cached_input_tokens: int = 0,
+        token_details: dict[str, int] | None = None,
+        response_id: str = "",
+        status: str = "completed",
+        record_zero_usage: bool = False,
     ) -> None:
         """Record only numeric fields supplied by OpenAI ``usage`` objects."""
         model = (model or "unknown").strip() or "unknown"
         kind = (kind or "other").strip() or "other"
-        inp = max(0, int(input_tokens or 0))
-        out = max(0, int(output_tokens or 0))
-        cached = max(0, int(cached_input_tokens or 0))
-        total = max(0, int(total_tokens or 0))
+        inp = _count(input_tokens)
+        out = _count(output_tokens)
+        cached = min(inp, _count(cached_input_tokens))
+        total = _count(total_tokens)
         if total <= 0:
             total = inp + out
-        if inp <= 0 and out <= 0 and total <= 0:
+        if inp <= 0 and out <= 0 and total <= 0 and not record_zero_usage:
             return
+        counts = {key: _count((token_details or {}).get(key)) for key in _TOKEN_FIELDS}
+        counts.update(input_tokens=inp, output_tokens=out, total_tokens=total,
+                      cached_input_tokens=cached)
+        counts["incomplete_realtime_usage_requests"] = int(
+            kind == "realtime" and not _complete_realtime_breakdown(counts)
+        )
+        response_id = response_id if isinstance(response_id, str) and len(response_id) <= 128 else ""
+        if not isinstance(status, str) or status not in {
+            "completed", "cancelled", "failed", "incomplete"
+        }:
+            status = "unknown"
 
         with self._lock:
+            if response_id and response_id in self._seen_responses:
+                self._data["duplicate_events_ignored"] = (
+                    _count(self._data.get("duplicate_events_ignored")) + 1
+                )
+                self._save_unlocked()
+                return
             row = self._data["by_model"].setdefault(
                 model,
                 {
@@ -164,11 +234,23 @@ class LocalUsageLedger:
             )
             for target in (row, kind_row, self._data["totals"]):
                 target["requests"] = int(target.get("requests") or 0) + 1
-                target["input_tokens"] = int(target.get("input_tokens") or 0) + inp
-                target["output_tokens"] = int(target.get("output_tokens") or 0) + out
-                target["total_tokens"] = int(target.get("total_tokens") or 0) + total
-                target["cached_input_tokens"] = int(target.get("cached_input_tokens") or 0) + cached
-            self._data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                for key, value in counts.items():
+                    target[key] = _count(target.get(key)) + value
+                statuses = target.setdefault("by_status", {})
+                statuses[status] = _count(statuses.get(status)) + 1
+            now = datetime.now(timezone.utc).isoformat()
+            self._data["updated_at"] = now
+            self._data["version"] = 2
+            recent = self._data.setdefault("recent_responses", [])
+            recent.append({"at": now, "response_id": response_id or None, "model": model,
+                           "kind": kind, "status": status, **counts})
+            del recent[:-_RECENT_RESPONSE_LIMIT]
+            if response_id:
+                ids = self._data.setdefault("response_ids", [])
+                ids.append(response_id)
+                self._seen_responses.add(response_id)
+                while len(ids) > _DEDUPE_RESPONSE_LIMIT:
+                    self._seen_responses.discard(ids.pop(0))
             self._save_unlocked()
 
     def snapshot(self) -> dict[str, Any]:
@@ -185,6 +267,17 @@ class LocalUsageLedger:
             "totals": data.get("totals") or {},
             "by_model": list((data.get("by_model") or {}).values()),
             "list_price_estimate": estimates,
+            "recent_responses": data.get("recent_responses") or [],
+            "duplicate_events_ignored": data.get("duplicate_events_ignored", 0),
+            "coverage": (
+                "Only provider usage received by Hearth is counted; missing responses and "
+                "voice sessions without a server sideband are not included. Local token "
+                "estimates exclude separately billed tools, duration-based transcription, "
+                "and models without a verified rate mapping."
+            ),
+            "retention": {"recent_responses": _RECENT_RESPONSE_LIMIT,
+                          "deduplicated_response_ids": _DEDUPE_RESPONSE_LIMIT,
+                          "aggregate_totals": "since started_at", "conversation_content": False},
         }
 
 
@@ -192,29 +285,29 @@ local_ledger = LocalUsageLedger()
 
 
 def record_chat_usage(response: Any, *, model: str, kind: str = "chat") -> None:
-    usage = getattr(response, "usage", None)
+    usage = _field(response, "usage")
     if usage is None:
         return
-    details = getattr(usage, "prompt_tokens_details", None)
-    cached = 0
-    if details is not None:
-        cached = int(getattr(details, "cached_tokens", 0) or 0)
+    details = _field(usage, "prompt_tokens_details")
     local_ledger.record(
         model=model or settings.openai_model,
         kind=kind,
-        input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
-        output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
-        total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
-        cached_input_tokens=cached,
+        input_tokens=_count(_field(usage, "prompt_tokens")),
+        output_tokens=_count(_field(usage, "completion_tokens")),
+        total_tokens=_count(_field(usage, "total_tokens")),
+        cached_input_tokens=_count(_field(details, "cached_tokens")),
+        token_details={"reasoning_output_tokens": _count(
+            _field(_field(usage, "completion_tokens_details"), "reasoning_tokens"))},
+        response_id=_response_id(response),
     )
 
 
 def record_embedding_usage(response: Any, *, model: str) -> None:
-    usage = getattr(response, "usage", None)
+    usage = _field(response, "usage")
     if usage is None:
         return
-    prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
-    total = int(getattr(usage, "total_tokens", 0) or prompt)
+    prompt = _count(_field(usage, "prompt_tokens"))
+    total = _count(_field(usage, "total_tokens")) or prompt
     local_ledger.record(
         model=model or settings.memory_embedding_model,
         kind="embeddings",
@@ -222,39 +315,115 @@ def record_embedding_usage(response: Any, *, model: str) -> None:
         output_tokens=0,
         total_tokens=total,
         cached_input_tokens=0,
+        response_id=_response_id(response),
     )
 
 
 def record_responses_usage(response: Any, *, model: str, kind: str = "responses") -> None:
-    usage = getattr(response, "usage", None)
-    if usage is None and isinstance(response, dict):
-        usage = response.get("usage")
+    usage = _field(response, "usage")
     if usage is None:
         return
-    if isinstance(usage, dict):
-        inp = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
-        out = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
-        total = int(usage.get("total_tokens") or (inp + out))
-        cached = 0
-        details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
-        if isinstance(details, dict):
-            cached = int(details.get("cached_tokens") or 0)
-    else:
-        inp = int(getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0)
-        out = int(getattr(usage, "output_tokens", 0) or getattr(usage, "completion_tokens", 0) or 0)
-        total = int(getattr(usage, "total_tokens", 0) or (inp + out))
-        details = getattr(usage, "input_tokens_details", None) or getattr(
-            usage, "prompt_tokens_details", None
-        )
-        cached = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+    inp = _count(_field(usage, "input_tokens") or _field(usage, "prompt_tokens"))
+    out = _count(_field(usage, "output_tokens") or _field(usage, "completion_tokens"))
+    details = _field(usage, "input_tokens_details") or _field(usage, "prompt_tokens_details")
     local_ledger.record(
         model=model or settings.openai_model,
         kind=kind,
         input_tokens=inp,
         output_tokens=out,
-        total_tokens=total,
-        cached_input_tokens=cached,
+        total_tokens=_count(_field(usage, "total_tokens")) or (inp + out),
+        cached_input_tokens=_count(_field(details, "cached_tokens")),
+        token_details={"reasoning_output_tokens": _count(
+            _field(_field(usage, "output_tokens_details"), "reasoning_tokens"))},
+        response_id=_response_id(response),
+        status=_field(response, "status", "completed"),
     )
+
+
+def record_realtime_usage(response: Any, *, model: str) -> None:
+    """Record a provider response.done, including spent tokens on interrupted replies.
+
+    Realtime uses singular ``input_token_details``, unlike the Responses API.
+    Cached/reasoning counts are subsets, never additional input/output tokens.
+    Only ids, status and usage are retained; never transcript/audio/tool arguments.
+    """
+    usage = _field(response, "usage")
+    if usage is None or not any(
+        _field(usage, key) is not None for key in ("input_tokens", "output_tokens", "total_tokens")
+    ):
+        return
+    inp = _field(usage, "input_token_details")
+    out = _field(usage, "output_token_details")
+    cached = _field(inp, "cached_tokens_details")
+    details = {f"input_{kind}_tokens": _count(_field(inp, f"{kind}_tokens"))
+               for kind in ("text", "audio", "image")}
+    details.update({f"cached_input_{kind}_tokens": _count(_field(cached, f"{kind}_tokens"))
+                    for kind in ("text", "audio", "image")})
+    details.update({f"output_{kind}_tokens": _count(_field(out, f"{kind}_tokens"))
+                    for kind in ("text", "audio")})
+    details["reasoning_output_tokens"] = _count(_field(out, "reasoning_tokens"))
+    local_ledger.record(
+        model=model or settings.openai_realtime_model,
+        kind="realtime",
+        input_tokens=_count(_field(usage, "input_tokens")),
+        output_tokens=_count(_field(usage, "output_tokens")),
+        total_tokens=_count(_field(usage, "total_tokens")),
+        cached_input_tokens=_count(_field(inp, "cached_tokens")),
+        token_details=details,
+        response_id=_response_id(response),
+        status=_field(response, "status", "unknown"),
+        record_zero_usage=True,
+    )
+
+
+def record_transcription_usage(event: Any, *, model: str) -> None:
+    """Account for the separately billed input transcription, never its text.
+
+    Token usage is distinct from the speech-to-speech response usage. Duration
+    usage (e.g. Whisper) must not be converted to invented token counts.
+    """
+    usage = _field(event, "usage")
+    if _field(usage, "type") != "tokens":
+        return
+    if not any(_field(usage, key) is not None
+               for key in ("input_tokens", "output_tokens", "total_tokens")):
+        return
+    inp = _field(usage, "input_token_details")
+    item_id = _field(event, "item_id") or _field(event, "event_id")
+    identity = ""
+    if isinstance(item_id, str) and len(item_id) <= 100:
+        identity = f"transcription:{item_id}:{_count(_field(event, 'content_index'))}"
+    local_ledger.record(
+        model=model,
+        kind="input_transcription",
+        input_tokens=_count(_field(usage, "input_tokens")),
+        output_tokens=_count(_field(usage, "output_tokens")),
+        total_tokens=_count(_field(usage, "total_tokens")),
+        token_details={
+            "input_text_tokens": _count(_field(inp, "text_tokens")),
+            "input_audio_tokens": _count(_field(inp, "audio_tokens")),
+            "output_text_tokens": _count(_field(usage, "output_tokens")),
+        },
+        response_id=identity,
+        record_zero_usage=True,
+    )
+
+
+def _realtime_list_price_estimate(row: dict[str, Any]) -> float | None:
+    """Do not silently price unknown audio/cache modalities at text rates."""
+    if not _complete_realtime_breakdown(row):
+        return None
+    rates = next(item for item in OFFICIAL_LIST_PRICING["models"]
+                 if item["id"] == "gpt-realtime-2.1")
+    cost = 0.0
+    for kind in ("text", "audio", "image"):
+        kind_input = _count(row.get(f"input_{kind}_tokens"))
+        kind_cached = _count(row.get(f"cached_input_{kind}_tokens"))
+        cost += ((kind_input - kind_cached) * rates[f"{kind}_input_per_1m"]
+                 + kind_cached * rates[f"{kind}_cached_input_per_1m"])
+    for kind in ("text", "audio"):
+        cost += _count(row.get(f"output_{kind}_tokens")) * rates[f"{kind}_output_per_1m"]
+    return cost / 1_000_000.0
 
 
 def _local_list_price_estimates(data: dict[str, Any]) -> dict[str, Any]:
@@ -264,6 +433,19 @@ def _local_list_price_estimates(data: dict[str, Any]) -> dict[str, Any]:
     any_priced = False
     for model, row in (data.get("by_model") or {}).items():
         rates = _RATE_BY_MODEL.get(model)
+        if model == "gpt-realtime-2.1":
+            cost = _realtime_list_price_estimate(row)
+            estimate = {"model": model, "available": cost is not None,
+                        "input_tokens": row.get("input_tokens"),
+                        "output_tokens": row.get("output_tokens")}
+            if cost is None:
+                estimate["reason"] = "incomplete measured audio/text/image or cache breakdown"
+            else:
+                usd_total += cost
+                any_priced = True
+                estimate.update(estimated_usd=round(cost, 6), rate_source=OFFICIAL_PRICING_URL)
+            rows.append(estimate)
+            continue
         if not rates:
             rows.append(
                 {
@@ -304,6 +486,8 @@ def _local_list_price_estimates(data: dict[str, Any]) -> dict[str, Any]:
         "currency": "usd",
         "estimated_usd": round(usd_total, 6) if any_priced else None,
         "by_model": rows,
+        "complete": bool(rows) and all(row["available"] for row in rows),
+        "excludes": ["unobserved usage", "separately billed tools", "duration-based transcription"],
     }
 
 

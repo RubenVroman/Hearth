@@ -180,6 +180,7 @@ def compose_system_prompt(
     include_recent_turns: bool = True,
     hits: list | None = None,
     turn_limit: int = 4,
+    session_context: str | None = None,
 ) -> str:
     """SYSTEM_PROMPT plus a small retrieved memory slice (chat + Realtime)."""
     from hearth.memory.retrieve import prompt_block
@@ -189,6 +190,7 @@ def compose_system_prompt(
         include_recent_turns=include_recent_turns,
         hits=hits,
         turn_limit=turn_limit,
+        session_context=session_context,
     )
     if extra:
         return f"{SYSTEM_PROMPT}\n\n{extra}"
@@ -200,6 +202,8 @@ async def compose_system_prompt_async(
     *,
     include_recent_turns: bool = True,
     turn_limit: int = 4,
+    session_context: str | None = None,
+    exclude_turn_ids: set[str] | None = None,
 ) -> str:
     from hearth.memory.retrieve import prompt_block_async
 
@@ -207,6 +211,8 @@ async def compose_system_prompt_async(
         query,
         include_recent_turns=include_recent_turns,
         turn_limit=turn_limit,
+        session_context=session_context,
+        exclude_turn_ids=exclude_turn_ids,
     )
     if extra:
         return f"{SYSTEM_PROMPT}\n\n{extra}"

@@ -423,25 +423,29 @@ async def _search_openai(query: str, *, limit: int, locale: dict[str, str]) -> d
         "snippet — source domain. No HTML, no long quotes. Prefer current, reliable sources. "
         "For where-to-watch / streaming, name the services and region if known."
     )
-    client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=HTTP_TIMEOUT)
     try:
-        try:
-            response = await client.responses.create(
-                model=settings.openai_model,
-                tools=[tool],
-                tool_choice="required",
-                include=["web_search_call.action.sources"],
-                input=prompt,
-            )
-        except Exception as exc:
-            if "timeout" in type(exc).__name__.lower():
-                raise
-            # Older SDK / model may reject include or tool_choice shape — retry simply.
-            response = await client.responses.create(
-                model=settings.openai_model,
-                tools=[{"type": "web_search", "search_context_size": "low"}],
-                input=prompt,
-            )
+        # A lost response may already have incurred a model/search charge. Avoid
+        # both SDK retries and replaying an ambiguous failure with simpler args.
+        async with AsyncOpenAI(
+            api_key=settings.openai_api_key, timeout=HTTP_TIMEOUT, max_retries=0
+        ) as client:
+            options = {
+                "model": settings.openai_model,
+                "tools": [tool],
+                "tool_choice": "required",
+                "include": ["web_search_call.action.sources"],
+                "input": prompt,
+            }
+            try:
+                response = await client.responses.create(**options)
+            except Exception as exc:
+                rejected = _rejected_search_option(exc)
+                if not rejected:
+                    raise
+                # Only a definite pre-generation rejection of these optional
+                # fields is safe to retry. Retain every supported argument.
+                options.pop(rejected)
+                response = await client.responses.create(**options)
     except Exception as exc:
         if "timeout" in type(exc).__name__.lower():
             raise
@@ -457,8 +461,14 @@ async def _search_openai(query: str, *, limit: int, locale: dict[str, str]) -> d
 
     results = _openai_results(response, limit=limit)
     summary = _clip(str(getattr(response, "output_text", "") or ""), SPEAK_LEN)
-    if not results and not summary:
+    searched = any(
+        (item if isinstance(item, dict) else _maybe_dump(item) or {}).get("type") == "web_search_call"
+        and (item if isinstance(item, dict) else _maybe_dump(item) or {}).get("status") == "completed"
+        for item in (getattr(response, "output", None) or [])
+    )
+    if not results and (not summary or not searched):
         # Hosted search unavailable on this model — last-resort HTML search.
+        # A plain model answer without search evidence is not a live result.
         return await _search_duckduckgo(query, limit=limit)
     if not results and summary:
         results = [{"title": "Web", "url": "", "snippet": summary, "source": "openai"}]
@@ -467,6 +477,29 @@ async def _search_openai(query: str, *, limit: int, locale: dict[str, str]) -> d
         payload["speak"] = _clip(summary, SPEAK_LEN)
         payload["summary"] = summary
     return payload
+
+
+def _rejected_search_option(exc: Exception) -> str | None:
+    """Recognize unsupported optional args, never transport/provider failures."""
+    if isinstance(exc, TypeError):
+        message = str(exc).lower()
+        if "unexpected keyword argument" in message:
+            return next((field for field in ("include", "tool_choice") if f"'{field}'" in message), None)
+        return None
+    if getattr(exc, "status_code", None) not in {400, 422}:
+        return None
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error", body)
+    if not isinstance(error, dict):
+        return None
+    parameter = str(error.get("param") or "").split("[", 1)[0].split(".", 1)[0]
+    if parameter in {"include", "tool_choice"} and error.get("code") in {
+        "unsupported_parameter", "unknown_parameter", "invalid_parameter", "invalid_value",
+    }:
+        return parameter
+    return None
 
 
 def _openai_results(response: Any, *, limit: int) -> list[dict[str, str]]:

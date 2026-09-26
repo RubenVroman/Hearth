@@ -7,10 +7,13 @@ fall back to FTS5. Using embeddings sends redacted text to OpenAI.
 from __future__ import annotations
 
 import array
+import asyncio
 import math
 from typing import Sequence
 
 from hearth.config import settings
+
+EMBED_TIMEOUT_SECONDS = 10.0
 
 
 def embeddings_enabled() -> bool:
@@ -52,11 +55,16 @@ async def embed_texts(texts: list[str]) -> list[list[float]] | None:
     try:
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
-        response = await client.embeddings.create(
-            model=settings.memory_embedding_model,
-            input=cleaned,
-        )
+        async with AsyncOpenAI(
+            api_key=settings.openai_api_key,
+            timeout=EMBED_TIMEOUT_SECONDS,
+            max_retries=0,
+        ) as client:
+            async with asyncio.timeout(EMBED_TIMEOUT_SECONDS):
+                response = await client.embeddings.create(
+                    model=settings.memory_embedding_model,
+                    input=cleaned,
+                )
         try:
             from hearth.openai_usage import record_embedding_usage
 

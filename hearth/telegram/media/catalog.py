@@ -5,6 +5,7 @@ Queue/download never happens here — callers still require Get / yes confirm.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -17,6 +18,7 @@ from hearth.memory.redact import redact
 log = logging.getLogger("hearth.telegram")
 
 TELEGRAM_INTENT_MODEL = "gpt-4o"
+CATALOG_TIMEOUT_SECONDS = 15.0
 
 _DESCRIPTIVE = re.compile(
     r"\b("
@@ -138,29 +140,43 @@ def _parse_guess_payload(data: dict[str, Any]) -> list[CatalogGuess]:
     return out
 
 
+async def _catalog_completion(system: str, payload: dict[str, str], *, max_tokens: int):
+    from openai import AsyncOpenAI
+
+    model = telegram_intent_model()
+    async with AsyncOpenAI(
+        api_key=settings.openai_api_key,
+        timeout=CATALOG_TIMEOUT_SECONDS,
+        max_retries=0,
+    ) as client:
+        async with asyncio.timeout(CATALOG_TIMEOUT_SECONDS):
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens,
+                temperature=0,
+            )
+    try:
+        from hearth.openai_usage import record_chat_usage
+
+        record_chat_usage(response, model=model, kind="telegram_catalog")
+    except Exception as exc:  # noqa: BLE001 — metering cannot break a catalog answer
+        log.warning("Could not record Telegram catalog usage (%s)", type(exc).__name__)
+    return response
+
+
 async def guess_catalog_titles(text: str) -> list[CatalogGuess]:
     """Resolve a plot/vibe/actor ask to one or more catalog title guesses."""
     raw = (text or "").strip()
     if not raw or not settings.openai_configured:
         return []
     try:
-        from openai import AsyncOpenAI
-
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
         payload = {"user_message": redact(raw)[:240]}
-        response = await client.chat.completions.create(
-            model=telegram_intent_model(),
-            messages=[
-                {"role": "system", "content": _GUESS_SYSTEM},
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False),
-                },
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=280,
-            temperature=0,
-        )
+        response = await _catalog_completion(_GUESS_SYSTEM, payload, max_tokens=280)
         drafted = (response.choices[0].message.content or "").strip()
         if not drafted:
             return []
@@ -189,26 +205,11 @@ async def answer_catalog_question(
     if not raw or not settings.openai_configured:
         return None
     try:
-        from openai import AsyncOpenAI
-
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
         payload = {
             "user_message": redact(raw)[:240],
             "catalog_context": redact(catalog_context or "")[:600],
         }
-        response = await client.chat.completions.create(
-            model=telegram_intent_model(),
-            messages=[
-                {"role": "system", "content": _CHAT_SYSTEM},
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False),
-                },
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=220,
-            temperature=0,
-        )
+        response = await _catalog_completion(_CHAT_SYSTEM, payload, max_tokens=220)
         drafted = (response.choices[0].message.content or "").strip()
         if not drafted:
             return None

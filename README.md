@@ -151,13 +151,13 @@ Reach Plex on the existing stack:
 
 ## OpenAI spend monitor
 
-Look → **OpenAI spend** shows real usage/cost for the house app. The browser never sees API keys; Hearth proxies OpenAI server-side.
+Look → **OpenAI spend** shows organization billing alongside usage measured by Hearth. Organization totals can include other applications; they are not automatically Hearth-only spend. The browser never sees API keys; Hearth proxies OpenAI server-side.
 
 | Source | What you get | Requirement |
 | --- | --- | --- |
 | `GET /v1/organization/costs` | Billed USD amounts (org Costs API) | `OPENAI_ADMIN_KEY` (Admin API key) |
 | `GET /v1/organization/usage/completions` | Token counts by model | `OPENAI_ADMIN_KEY` |
-| Hearth local ledger | Measured `usage` fields from Hearth’s own chat/embed/search calls | `OPENAI_API_KEY` (already used for inference) |
+| Hearth local ledger | Provider-reported tokens from voice responses/transcription, chat, embeddings, search and Telegram helpers | `OPENAI_API_KEY` (already used for inference) |
 | Official list pricing | Public per-model rates, labeled **not your invoice** | None (shipped reference) |
 
 **Security**
@@ -171,6 +171,14 @@ Look → **OpenAI spend** shows real usage/cost for the house app. The browser n
 
 API surface (auth required): `GET /api/openai/spend`, `/api/openai/costs`, `/api/openai/usage`, `/api/openai/pricing`.
 
+The local ledger is cumulative since its `started_at`, independently of the organization date window. It records audio/text/image and cached-input counts, call type, and response status; interrupted responses can still incur tokens. The last 128 response records contain identifiers and counts, never audio, transcripts, or tool arguments. The last 2,048 provider response IDs suppress duplicate event accounting across reconnects/restarts. Browser-only voice fallback and responses Hearth never receives remain outside this ledger. Unknown or incomplete token breakdowns are marked unpriced; a partial estimate is not presented as a complete bill. Separately billed search/tool fees are excluded.
+
+### Keeping voice costs under control
+
+The browser WebRTC connection and server sideband attach to the **same** provider call. Reconnecting that control socket does not open a second model session. Hearth configures the prompt and tools once, keeps the pre-call memory snapshot stable, and appends changed recall context as internal conversation items without requesting an extra reply. Current-call transcripts are already in Realtime history and are not copied back into instructions. This follows OpenAI's [prompt-cache guidance](https://developers.openai.com/api/docs/guides/voice-latency-cost?voice-api=realtime): rewriting early instructions/tools can invalidate cached conversation tokens.
+
+Tool batches continue once even if delivery is repeated. Explicit hangup and abandoned SDP setup release the upstream call. Slow supporting summaries finish once behind the short foreground wait; memory retrieval skips embeddings when no compatible stored vectors exist. Hosted web search only repeats a request after an explicit rejection of optional arguments, never after an ambiguous provider/network failure. The configured models, tool catalog, reply limits, and semantic recall remain intact.
+
 ## Voice
 
 Live voice is the **GA OpenAI Realtime API over WebRTC** — the same family as ChatGPT Advanced Voice / GPT Realtime. It is **not** hold-to-talk, and it is **not** the old beta websocket.
@@ -179,7 +187,7 @@ Live voice is the **GA OpenAI Realtime API over WebRTC** — the same family as 
 
 **Close of call:** when the conversation is finished (goodbye / done / nothing left), the model calls `end_call`. After that response completes, Hearth closes the sideband and the UI hangs up the WebRTC peer connection so the session does not stay open idle.
 
-Realtime session instructions include the same retrieved memory slice as text chat; after each spoken transcript the sideband refreshes that slice.
+Realtime starts with preferences and a prior-conversation snapshot. The sideband refreshes relevant memory between responses using internal context items, preserving the instruction prefix and avoiding duplicate current-call history.
 
 **Fallback** (`WS /ws/voice`, or no key): text only. Composer always uses `POST /api/chat`. Do not send PCM over that socket expecting live voice.
 

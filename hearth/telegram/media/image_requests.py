@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
 import re
 import unicodedata
 import warnings
@@ -21,6 +22,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hearth.config import settings
 from hearth.telegram.models import MediaHit, MediaQuery
+
+log = logging.getLogger(__name__)
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 _UNSAFE = re.compile(r"https?://|www\.|magnet:|\.torrent\b|[\x00-\x1f]", re.I)
@@ -256,6 +259,13 @@ class OpenAIVisionProvider:
                     max_completion_tokens=2600,
                     store=False,
                 )
+            try:
+                from hearth.openai_usage import record_chat_usage
+
+                record_chat_usage(response, model=self._model or settings.telegram_vision_model,
+                                  kind="telegram_vision")
+            except Exception as exc:  # noqa: BLE001 — preserve a paid answer if telemetry fails
+                log.warning("Could not record Telegram vision usage (%s)", type(exc).__name__)
             choice = response.choices[0]
             if choice.message.refusal:
                 return VisionResult(kind="refuse", candidates=[], more_visible=False)

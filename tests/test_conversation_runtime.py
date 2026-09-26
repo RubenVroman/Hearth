@@ -475,25 +475,25 @@ async def test_voice_memory_refresh_waits_through_tool_continuation(monkeypatch)
     async def run(name, _args, **_kwargs):
         return {"ok": True, "name": name}
 
-    async def instructions(query):
+    async def instructions(query, **_context):
         return f"remember {query}"
 
     monkeypatch.setattr(webrtc, "run_house_tool", run)
-    monkeypatch.setattr(webrtc, "voice_instructions_async", instructions)
+    monkeypatch.setattr(webrtc, "voice_memory_async", instructions)
     band = webrtc.Sideband("rtc_memory_continuation")
     band._ws = socket = Socket()
     await band._on_event({"type": "response.created", "response": {"id": "resp1"}})
     await band._on_event({"type": "conversation.item.input_audio_transcription.completed", "transcript": "show horror"})
     await band._on_event(_event("plex_search"))
     await _drain(band)
-    assert not any(event["type"] == "session.update" for event in socket.sent)
+    assert not any(event.get("item", {}).get("role") == "system" for event in socket.sent)
     await band._on_event({"type": "response.created", "response": {"id": "resp2"}})
     await band._on_event(_event(response_id="resp2"))
     await _drain(band)
-    updates = [event for event in socket.sent if event["type"] == "session.update"]
+    updates = [event for event in socket.sent if event.get("item", {}).get("role") == "system"]
     assert len(updates) == 1
-    assert updates[0]["session"]["instructions"] == "remember show horror"
-    assert "audio" not in updates[0]["session"]
+    assert updates[0]["item"]["content"][0]["text"].endswith("remember show horror")
+    assert not any(event["type"] == "session.update" for event in socket.sent)
     await band.close()
 
 
@@ -564,7 +564,7 @@ async def test_completed_tool_result_survives_socket_reopen_without_reexecution(
     await band._run_function_call("radarr_add", "{}", "reopen-write")
     assert calls == ["radarr_add"]
     assert [event["type"] for event in replacement.sent] == [
-        "session.update", "conversation.item.create", "response.create",
+        "conversation.item.create", "response.create",
     ]
     assert band._active_responses == 0
     await band.close()

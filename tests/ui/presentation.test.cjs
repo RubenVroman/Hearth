@@ -136,24 +136,30 @@ test('a deliberate end-call cannot be mistaken for a reconnectable transport fai
   assert.equal(run('retries'),0);
 });
 
-test('new call instances keep lifecycle recovery and scoped tool state together',async()=>{
+test('rapid start and reconnect gestures make one call per lifecycle transition',async()=>{
   const {run}=load();
-  run(`var peers=[];var hangups=[];var received=0;
+  run(`var peers=[];var hangups=[];var received=0;var callsPosted=0;
     var track={kind:'audio',enabled:true,addEventListener(){}};
     acquireMicStream=async()=>({getAudioTracks:()=>[track]});
     hideMicPanels=()=>{};showListeningChrome=()=>{};setRefreshInterval=()=>{};applyTransportDecision=()=>{};
-    request=async()=>({ok:true,headers:{get:(name)=>name==='X-Hearth-Call-Id'?'real-session':name==='X-Hearth-Realtime-Path'?'webrtc-ga':''},text:async()=> 'answer'});
+    request=async(path)=>{if(path==='/api/realtime/calls')callsPosted++;return {ok:true,headers:{get:(name)=>name==='X-Hearth-Call-Id'?'real-session':name==='X-Hearth-Realtime-Path'?'webrtc-ga':''},text:async()=> 'answer'};};
     RTCPeerConnection=class {
       constructor(){this.connectionState='connected';this.iceConnectionState='connected';peers.push(this);}
       addTrack(){} addEventListener(){} getSenders(){return [];} close(){}
       createDataChannel(){this.dc={readyState:'open',handlers:{},addEventListener(name,fn){this.handlers[name]=fn;}};return this.dc;}
       async createOffer(){return {sdp:'offer'};} async setLocalDescription(){} async setRemoteDescription(){}
     };`);
-  await run('startConversation()');
+  await run('Promise.all([beginVoiceFromUserGesture(),beginVoiceFromUserGesture()])');
+  assert.equal(run('callsPosted'),1);
+  assert.equal(run('peers.length'),1);
   assert.equal(run('voiceLife.phase'),'live');
   assert.equal(run('state.call.sessionId'),'real-session');
   assert.equal(run('state.call.said'),'');
   assert.equal(run('state.call.toolCalls.size'),0);
+  await run('Promise.all([recoverConversation(),recoverConversation()])');
+  assert.equal(run('callsPosted'),2,'one replacement, never parallel calls for the same recovery');
+  assert.equal(run('peers.length'),2);
+  assert.equal(run('voiceLife.phase'),'live');
   run(`onRealtimeEvent=()=>{received++;};voiceLife.beginUserStop();peers[0].dc.handlers.message({data:'{"type":"response.done"}'});`);
   assert.equal(run('received'),0);
 });
@@ -194,6 +200,23 @@ test('fallback tools wait for a completed response, run once, and continue once 
   assert.equal(run('invoked[0].session_id'),'session-one');
   assert.equal(run(`sent.filter(e=>e.type==='response.create').length`),1);
   await run('relayCompletedTools(result)');
+  assert.equal(run('invoked.length'),2);
+  assert.equal(run(`sent.filter(e=>e.type==='response.create').length`),1);
+});
+
+test('overlapping duplicate fallback batches cannot split tools and create two responses',async()=>{
+  const {run}=load();
+  run(`var sent=[];var invoked=[];var release;
+    refresh=()=>{};applyWidgetPayload=()=>{};
+    state.call={callId:'session-one',sidebandOk:false,responseGeneration:0,toolCalls:new Set()};
+    sendRealtime=(event)=>{sent.push(event);return true;};
+    api=async(path,options)=>{invoked.push(JSON.parse(options.body));if(invoked.length===1)await new Promise(resolve=>{release=resolve;});return {output:{ok:true}};};
+    var result={response:{status:'completed',output:[{type:'function_call',call_id:'a',name:'search',arguments:'{}'},{type:'function_call',call_id:'b',name:'lookup',arguments:'{}'}]}};`);
+  const first=run('relayCompletedTools(result)');
+  const duplicate=run('relayCompletedTools(result)');
+  assert.equal(run('invoked.length'),1,'the replay must not steal the remaining tool');
+  run('release()');
+  await Promise.all([first,duplicate]);
   assert.equal(run('invoked.length'),2);
   assert.equal(run(`sent.filter(e=>e.type==='response.create').length`),1);
 });
