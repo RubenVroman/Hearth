@@ -6,7 +6,7 @@ The house screen presents information automatically. Movie and series lists
 appear as a readable board with posters, summaries, and known availability.
 Web searches appear as sourced findings. Longer boards advance through reading
 pages automatically, with a pause control. Spoken words still inform the
-conversation and title focus internally, but captions are hidden by default. An optional settings toggle shows them.
+conversation and title focus internally. Live captions are not displayed.
 
 Recommendation lists resolve up to 12 titles, four concurrently. Unavailable
 metadata leaves an honestly labeled title card. Empty and failed searches

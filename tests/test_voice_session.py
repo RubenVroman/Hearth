@@ -1,4 +1,4 @@
-"""Live voice session policy and the hide-transcription preference."""
+"""Live voice session policy without live transcription on the UI."""
 
 from __future__ import annotations
 
@@ -10,46 +10,31 @@ UI = Path(__file__).resolve().parents[1] / "hearth" / "ui" / "static"
 NODE = Path("/exec-daemon/node")
 
 
-def test_live_transcription_defaults_hidden_in_look_settings(client):
-    """Same localStorage Look store as the other knobs. Default is hidden."""
+def test_live_transcription_is_removed_from_ui(client):
     page = client.get("/")
     assert page.status_code == 200
     assert 'src="/static/voice-session.js"' in page.text
+    assert 'src="/static/presentation.js"' in page.text
+    assert "spoken-answer" not in page.text
     settings = (UI / "settings.js").read_text(encoding="utf-8")
-    assert 'id: "captions"' in settings
-    assert 'default: "hidden"' in settings
-    assert 'value: "shown"' in settings
-    assert 'label: "Live transcription"' in settings
-    assert "hearth.look.v1" in settings
-    assert "subscribe" in settings
-    css = (UI / "styles.css").read_text(encoding="utf-8")
-    assert 'html[data-captions="hidden"] .spoken-answer' in css
+    assert 'id: "captions"' not in settings
     app_js = (UI / "app.js").read_text(encoding="utf-8")
-    assert "liveCaptionsOn" in app_js
-    assert "applyCaptionPreference" in app_js
-    assert "HearthSettings.subscribe" in app_js
-    assert "captionsVisible" in app_js
-    # Captions off must not block the spoken utterance used for tools.
+    # Speech still drives tools and the information board internally.
     assert "HearthVoiceSession.utteranceText(state.userUtterance)" in app_js
-    assert "sendBeacon" in app_js
-    assert "replaceTrack" in app_js
+    assert "noteOverlayConversation(state.liveAssistantTranscript" in app_js
     assert "recoverConversation" in app_js
     sw = (UI / "sw.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v23" in sw
-    assert "/static/voice-session.js" in sw
+    assert "hearth-shell-v24" in sw
+    assert "/static/spoken-answer.js" not in sw
 
 
 def test_voice_session_policy_node():
-    """Reconnect budget, ICE wait, caption flag, and utterance merge."""
+    """Reconnect budget, ICE wait, and utterance merge."""
     node_bin = shutil.which("node") or str(NODE if NODE.is_file() else Path("/usr/bin/node"))
     script = r"""
 const vs = require('./hearth/ui/static/voice-session.js');
 const assert = (cond, msg) => { if (!cond) { console.error(msg); process.exit(1); } };
 
-assert(vs.captionsVisible('shown') === true, 'shown');
-assert(vs.captionsVisible('hidden') === false, 'hidden');
-assert(vs.captionsVisible(undefined) === false, 'missing defaults hidden');
-assert(vs.captionsVisible('Shown') === false, 'case sensitive');
 
 const ice = vs.connectionAction({ connectionState: 'disconnected', iceConnectionState: 'disconnected' });
 assert(ice.action === 'wait' && ice.reason === 'ice_disconnected', 'ice blip waits');
