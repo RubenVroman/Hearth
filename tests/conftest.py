@@ -10,6 +10,7 @@ from hearth.auth.db import reset_engine
 from hearth.config import settings
 from hearth.runtime import runtime
 from hearth.tools.builtin import register_builtin_tools
+from hearth.tools.docker import docker
 
 TEST_ADMIN_EMAIL = "admin@hearth.test"
 TEST_ADMIN_PASSWORD = "test-house-passphrase"
@@ -24,6 +25,10 @@ def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(settings, "ha_token", "")
     monkeypatch.setattr(settings, "plex_token", "")
     monkeypatch.setattr(settings, "mock_if_unconfigured", True)
+    # Hosted runners ship /var/run/docker.sock. These tests expect the mock
+    # docker host; a live socket would stop a real container named in the test.
+    monkeypatch.setattr(settings, "docker_socket", tmp_path / "no-docker.sock")
+    docker._client = None
     monkeypatch.setattr(settings, "token", "")
     monkeypatch.setattr(settings, "cos_webhook", "")
     monkeypatch.setattr(settings, "cos_webhook_key", "")

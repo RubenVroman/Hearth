@@ -304,6 +304,7 @@ async def test_docker_stop_needs_confirm():
     live = await registry.call("docker_stop", {"container": "plex", "confirm": True})
     assert live.ok
     assert not live.needs_confirm
+    assert live.data.get("mode") == "mock"
 
 
 async def test_chief_of_staff_not_configured_is_not_fake_success():
