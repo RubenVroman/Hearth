@@ -123,6 +123,9 @@ def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
             return False
 
         async def post(self, url, headers=None, json=None, files=None):
+            if url.endswith("/hangup"):
+                captured["hangup_url"] = url
+                return FakeResp()
             captured["url"] = url
             captured["headers"] = dict(headers or {})
             captured["files"] = files
@@ -164,6 +167,7 @@ def test_create_call_posts_ga_calls_without_beta_header(client, monkeypatch):
     assert "OpenAI-Beta" not in captured["ws_headers"]
     assert hangup.status_code == 200
     assert hangup.json()["path"] == "webrtc-ga"
+    assert captured["hangup_url"] == f"{realtime_rtc.CALLS_URL}/rtc_test_call/hangup"
 
 
 def test_create_call_empty_sdp_is_400(client):
@@ -320,16 +324,16 @@ def test_voice_instructions_keep_a_wider_turn_slice_than_chat():
     assert "voice-user-5" in chat
 
 
-def test_instructions_update_does_not_resend_turn_detection():
-    event = realtime_rtc.instructions_update("Stay with the film we just picked.")
-    assert event["type"] == "session.update"
-    assert event["session"]["type"] == "realtime"
-    assert "audio" not in event["session"]
-    assert "turn_detection" not in event["session"]
-    assert "tools" not in event["session"]
-    with_tools = realtime_rtc.instructions_update("again", include_tools=True)
-    assert with_tools["session"]["tool_choice"] == "auto"
-    assert "audio" not in with_tools["session"]
+def test_memory_update_appends_context_without_resetting_session_or_requesting_speech():
+    event = realtime_rtc.memory_update("Stay with the film we just picked.")
+    assert event["type"] == "conversation.item.create"
+    assert event["item"]["type"] == "message"
+    assert event["item"]["role"] == "system"
+    assert event["item"]["content"][0]["type"] == "input_text"
+    assert event["item"]["content"][0]["text"].endswith("Stay with the film we just picked.")
+    assert "Do not answer" in event["item"]["content"][0]["text"]
+    assert "session" not in event
+    assert "previous_item_id" not in event  # Append; never edit an old cached item.
 
 
 def test_fatal_realtime_error_tokens():
@@ -349,10 +353,10 @@ async def test_memory_refresh_waits_until_the_response_is_idle(monkeypatch):
         async def close(self):
             return None
 
-    async def fake_voice(query: str) -> str:
+    async def fake_voice(query: str, **_context) -> str:
         return f"VOICE {query}"
 
-    monkeypatch.setattr(realtime_rtc, "voice_instructions_async", fake_voice)
+    monkeypatch.setattr(realtime_rtc, "voice_memory_async", fake_voice)
     band = realtime_rtc.Sideband("rtc_ctx")
     band._ws = DummyWS()
     await band._on_event({"type": "response.created", "response": {"id": "r1"}})
@@ -376,10 +380,10 @@ async def test_memory_refresh_waits_until_the_response_is_idle(monkeypatch):
     import asyncio
 
     await asyncio.gather(*list(band._jobs))
-    updates = [m for m in sent if m.get("type") == "session.update"]
+    updates = [m for m in sent if m.get("item", {}).get("role") == "system"]
     assert len(updates) == 1
-    assert updates[0]["session"]["instructions"] == "VOICE play the other one"
-    assert "audio" not in updates[0]["session"]
+    assert updates[0]["item"]["content"][0]["text"].endswith("VOICE play the other one")
+    assert not any(m["type"] in {"session.update", "response.create"} for m in sent)
 
 
 @pytest.mark.asyncio
@@ -398,20 +402,20 @@ async def test_memory_refresh_holds_if_a_response_starts_while_loading(monkeypat
 
     calls = {"n": 0}
 
-    async def fake_voice(query: str) -> str:
+    async def fake_voice(query: str, **_context) -> str:
         calls["n"] += 1
         if calls["n"] == 1:
             band._active_responses += 1
         return f"VOICE {query}"
 
-    monkeypatch.setattr(realtime_rtc, "voice_instructions_async", fake_voice)
+    monkeypatch.setattr(realtime_rtc, "voice_memory_async", fake_voice)
     band._pending_query = "the other one"
-    await band._flush_instructions()
+    await band._flush_memory()
     assert sent == []
     assert band._pending_query == "the other one"
     band._active_responses = 0
-    await band._flush_instructions()
-    assert sent[0]["session"]["instructions"] == "VOICE the other one"
+    await band._flush_memory()
+    assert sent[0]["item"]["content"][0]["text"].endswith("VOICE the other one")
 
 
 @pytest.mark.asyncio
@@ -491,9 +495,7 @@ async def test_sideband_reconnects_once_then_drops_a_closed_socket(monkeypatch):
     await band._listen()
     assert band._sideband_reconnects == 1
     assert len(opened) == 1
-    assert opened[0].sent[0]["type"] == "session.update"
-    assert "tools" in opened[0].sent[0]["session"]
-    assert "audio" not in opened[0].sent[0]["session"]
+    assert opened[0].sent == []  # Same call keeps its instructions/tools.
     assert "rtc_reconnect" not in realtime_rtc._sidebands
     assert runtime.voice_mode == "disconnected"
 

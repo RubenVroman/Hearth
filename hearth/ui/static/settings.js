@@ -407,8 +407,12 @@
     const local = payload.local || {};
     const localCard = el("div", "spend-card");
     localCard.appendChild(el("p", "spend-card-title", "Hearth local ledger"));
+    const ledgerStart = new Date(local.started_at || "");
+    if (!Number.isNaN(ledgerStart.getTime())) {
+      localCard.appendChild(el("p", "spend-note", `Cumulative since ${ledgerStart.toLocaleDateString()}.`));
+    }
     const localTotals = local.totals || {};
-    if (localTotals.total_tokens) {
+    if (localTotals.requests || localTotals.total_tokens) {
       localCard.appendChild(
         el(
           "p",
@@ -422,7 +426,7 @@
           el(
             "p",
             "spend-metric soft",
-            `List-price estimate ${formatUsd(est.estimated_usd, "usd")}`
+            `${est.complete === false ? "Partial list-price estimate" : "List-price estimate"} ${formatUsd(est.estimated_usd, "usd")}`
           )
         );
       }
@@ -433,6 +437,27 @@
           "Local estimate from measured tokens × official list pricing — not OpenAI-billed."
         )
       );
+      if (localTotals.input_tokens) {
+        const cacheShare = Math.min(100, 100 * Number(localTotals.cached_input_tokens || 0) / Number(localTotals.input_tokens));
+        localCard.appendChild(el("p", "spend-note",
+          `${formatTokens(localTotals.cached_input_tokens || 0)} cached input tokens (${cacheShare.toFixed(1)}%). Audio and text have different prices.`));
+      }
+      const models = local.by_model || [];
+      if (models.length) {
+        const list = el("ul", "spend-list");
+        models.forEach((model) => {
+          Object.entries(model.kinds || {}).forEach(([kind, counts]) => {
+            list.appendChild(el("li", "",
+              `${model.model} · ${kind.replaceAll("_", " ")}: ${formatTokens(counts.requests)} calls · ${formatTokens(counts.input_tokens)} in / ${formatTokens(counts.output_tokens)} out`));
+          });
+        });
+        localCard.appendChild(list);
+      }
+      const interrupted = Number((localTotals.by_status || {}).cancelled || 0);
+      if (interrupted) {
+        localCard.appendChild(el("p", "spend-note",
+          `${formatTokens(interrupted)} interrupted responses included. Generated tokens still count when speech is stopped.`));
+      }
     } else {
       localCard.appendChild(
         el(
@@ -442,6 +467,7 @@
         )
       );
     }
+    if (local.coverage) localCard.appendChild(el("p", "spend-note", local.coverage));
     content.appendChild(localCard);
 
     const pricing = payload.list_pricing || {};

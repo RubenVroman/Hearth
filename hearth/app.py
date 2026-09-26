@@ -653,6 +653,11 @@ async def realtime_calls(request: Request) -> Response:
     if not result.get("ok"):
         status = 503 if not result.get("configured") else 502
         return JSONResponse(result, status_code=status)
+    if await request.is_disconnected():
+        # The SDP response never reached this browser, so it has no call_id
+        # with which to release the upstream session after navigation/cancel.
+        await realtime_rtc.hangup(str(result.get("call_id") or ""))
+        return Response(status_code=499)
     return Response(
         content=result["sdp"],
         media_type="application/sdp",

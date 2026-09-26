@@ -2237,6 +2237,14 @@ async function relayCompletedTools(event) {
   if (response.id && (response.id !== call.responseId ||
       call.responseStartedGeneration !== call.responseGeneration)) return;
   const tools = Array.isArray(response.output) ? response.output.filter((item) => item.type === "function_call") : [];
+  if (!tools.length) return;
+  // Claim the whole completed batch before awaiting its first tool. Otherwise
+  // a duplicate event can take the second tool while this handler awaits the
+  // first, causing both handlers to start their own paid continuation.
+  const batchId = response.id || JSON.stringify(tools.map((tool) => tool.call_id));
+  call.toolResponses ||= new Set();
+  if (call.toolResponses.has(batchId)) return;
+  call.toolResponses.add(batchId);
   const generation = call.responseGeneration;
   const said = call.said || "";
   let completed = false;
@@ -2598,6 +2606,7 @@ async function startConversation({ epoch } = {}) {
       audioPlaying: false,
       responseGeneration: 0,
       toolCalls: new Set(),
+      toolResponses: new Set(),
       said: "",
       inputItemId: "",
       sessionId: callId || crypto.randomUUID(),

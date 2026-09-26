@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from hearth.config import settings
 from hearth.memory import store
 from hearth.memory.redact import redact
+
+log = logging.getLogger("hearth.memory")
+SUMMARY_TIMEOUT_SECONDS = 20.0
+_pending: dict[tuple[int, str, str], asyncio.Task] = {}
 
 
 def heuristic_summary(turns: list[dict]) -> str:
@@ -33,6 +40,26 @@ def heuristic_summary(turns: list[dict]) -> str:
 async def maybe_summarize(session_id: str) -> dict | None:
     if not store.memory_enabled() or not session_id:
         return None
+    # Callers have a short response deadline. Keep one summary alive beyond
+    # that wait, so a slow provider response is saved instead of being paid for
+    # again on every following turn. All channels share the session checkpoint.
+    key = (id(asyncio.get_running_loop()), str(store.db_path()), session_id)
+    task = _pending.get(key)
+    if task is None:
+        task = asyncio.create_task(_summarize_once(session_id))
+        _pending[key] = task
+
+        def finished(done: asyncio.Task) -> None:
+            if _pending.get(key) is done:
+                _pending.pop(key, None)
+            if not done.cancelled() and done.exception() is not None:
+                log.warning("Memory summary failed: %s", type(done.exception()).__name__)
+
+        task.add_done_callback(finished)
+    return await asyncio.shield(task)
+
+
+async def _summarize_once(session_id: str) -> dict | None:
     session = store.session_row(session_id)
     if session is None:
         return None
@@ -51,25 +78,30 @@ async def maybe_summarize(session_id: str) -> dict | None:
         try:
             from openai import AsyncOpenAI
 
-            client = AsyncOpenAI(api_key=settings.openai_api_key)
             blob = "\n".join(
                 f"{t.get('role')}: {redact(str(t.get('text') or ''))[:400]}" for t in turns[-40:]
             )
-            response = await client.chat.completions.create(
-                model=settings.openai_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Summarize this house-agent conversation for later recall. "
-                            "Keep facts, preferences, and notable house actions. "
-                            "No secrets, tokens, or passwords. Max 120 words."
-                        ),
-                    },
-                    {"role": "user", "content": blob},
-                ],
-                max_tokens=220,
-            )
+            async with AsyncOpenAI(
+                api_key=settings.openai_api_key,
+                timeout=SUMMARY_TIMEOUT_SECONDS,
+                max_retries=0,
+            ) as client:
+                async with asyncio.timeout(SUMMARY_TIMEOUT_SECONDS):
+                    response = await client.chat.completions.create(
+                        model=settings.openai_model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Summarize this house-agent conversation for later recall. "
+                                    "Keep facts, preferences, and notable house actions. "
+                                    "No secrets, tokens, or passwords. Max 120 words."
+                                ),
+                            },
+                            {"role": "user", "content": blob},
+                        ],
+                        max_tokens=220,
+                    )
             try:
                 from hearth.openai_usage import record_chat_usage
 
@@ -80,8 +112,13 @@ async def maybe_summarize(session_id: str) -> dict | None:
             if drafted:
                 text = redact(drafted)[:1500]
                 source = "openai"
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Memory summary using local fallback: %s", type(exc).__name__)
             source = "heuristic"
+    # A user can forget conversations while the provider is still answering.
+    # Do not recreate content after that session was removed.
+    if not store.memory_enabled() or not store.session_row(session_id):
+        return None
     row = store.add_summary(session_id, text, covers_until_ts=covers, source=source)
     await _embed_owner("summary", row["id"], row["text"])
     return row
