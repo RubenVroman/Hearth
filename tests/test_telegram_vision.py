@@ -436,6 +436,53 @@ async def test_stream_limit_applies_without_content_length_and_successful_files_
 
 
 @pytest.mark.asyncio
+async def test_zero_vision_caps_allow_back_to_back_posters(setup_bot, monkeypatch):
+    monkeypatch.setattr(settings, "telegram_vision_per_minute", 0)
+    monkeypatch.setattr(settings, "telegram_vision_daily_cap", 0)
+    monkeypatch.setattr(settings, "telegram_rate_limit_per_minute", 1)
+    bot, files, vision, _catalog = setup_bot(
+        [candidate("Alien", year=1979)],
+        [movie("Alien", 348, 1979)],
+    )
+    replies = []
+    for message_id in range(1, 6):
+        replies.append(await bot.handle_message(photo(message_id=message_id)))
+    assert len(replies) == 5
+    assert all(reply is not None and "before another image" not in reply.text for reply in replies)
+    assert len(vision.calls) == 5
+    assert files.calls == ["readable"] * 5
+
+
+@pytest.mark.asyncio
+async def test_inflight_image_still_asks_to_wait(setup_bot):
+    bot, files, vision, _catalog = setup_bot(
+        [candidate("Alien", year=1979)],
+        [movie("Alien", 348, 1979)],
+    )
+    bot._vision_inflight.add(-1001)
+    reply = await bot.handle_message(photo())
+    assert reply is not None
+    assert reply.text == "I'm still reading your previous image. Give me a moment."
+    assert vision.calls == []
+    assert files.calls == []
+
+
+@pytest.mark.asyncio
+async def test_positive_vision_cap_still_waits(setup_bot, monkeypatch):
+    monkeypatch.setattr(settings, "telegram_vision_per_minute", 1)
+    monkeypatch.setattr(settings, "telegram_vision_daily_cap", 0)
+    bot, _files, vision, _catalog = setup_bot(
+        [candidate("Alien", year=1979)],
+        [movie("Alien", 348, 1979)],
+    )
+    first = await bot.handle_message(photo(message_id=1))
+    second = await bot.handle_message(photo(message_id=2))
+    assert first is not None and "before another image" not in first.text
+    assert second is not None and "before another image" in second.text
+    assert len(vision.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_typing_task_is_cancelled_when_image_fails(setup_bot):
     bot, files, _, _ = setup_bot([], [])
     stopped = asyncio.Event()

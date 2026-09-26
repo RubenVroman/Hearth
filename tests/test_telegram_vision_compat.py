@@ -733,6 +733,17 @@ def test_vision_rate_environment_aliases_share_one_setting() -> None:
     assert compatibility.telegram_vision_rate_per_minute == compatibility.telegram_vision_per_minute == 9
     compatibility.telegram_vision_rate_per_minute = 4
     assert compatibility.telegram_vision_per_minute == 4
+    unlimited = Settings.model_validate({
+        "HEARTH_TELEGRAM_VISION_PER_MINUTE": 0,
+        "HEARTH_TELEGRAM_VISION_DAILY_CAP": 0,
+    })
+    assert unlimited.telegram_vision_per_minute == 0
+    assert unlimited.telegram_vision_daily_cap == 0
+    assert Settings.model_fields["telegram_vision_per_minute"].default == 0
+    assert Settings.model_fields["telegram_vision_daily_cap"].default == 0
+    high = Settings.model_validate({"HEARTH_TELEGRAM_VISION_PER_MINUTE": 1000, "HEARTH_TELEGRAM_VISION_DAILY_CAP": 5000})
+    assert high.telegram_vision_per_minute == 1000
+    assert high.telegram_vision_daily_cap == 5000
 
 
 @pytest.mark.parametrize("failure", ["schema", "authentication", "timeout"])

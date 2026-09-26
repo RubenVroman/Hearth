@@ -202,6 +202,8 @@ is enabled by default in `HEARTH_TELEGRAM_VISION_MODE=auto`.
 | a selective caption `only the first two` | No silent request for the entire image. |
 | a selfie, pet, or receipt | No depicted movie titles, no Overseerr request. |
 | a `.torrent` file, a video, or a caption containing `magnet:?` | Attachment refusal without a provider call. |
+| several posters in the same minute | Each is read. No `Give me Ns before another image` cooldown. |
+| a second poster while the first is still being read | `I'm still reading your previous image. Give me a moment.` |
 
 With `HEARTH_TELEGRAM_VISION_MODE=confirm`, a poster or grid of up to 16
 becomes a preview with signed Get buttons. Nothing queues before a tap.
