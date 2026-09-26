@@ -39,6 +39,7 @@
       <span class="hud-rail hud-rail-r"></span>
     </div>
 
+    <div class="app-shell">
     <header class="top">
       <div class="brand">
         <span class="mark">Hearth</span>
@@ -80,56 +81,12 @@
         </div>
       </aside>
 
-      <section class="hearth">
+      <section class="hearth" aria-labelledby="welcome-title">
         <div class="hearth-hero">
-          <audio id="remote-audio" autoplay playsinline></audio>
-          <button type="button" id="orb" class="orb" aria-label="Tap to talk">
-            <span class="orb-ring"></span>
-            <span class="orb-core"></span>
-            <span class="orb-label" id="orb-label">Tap to talk</span>
-          </button>
-          <p id="activity" class="activity is-idle" role="status" aria-live="polite" hidden>
-            <span class="activity-dot" aria-hidden="true"></span>
-            <span class="activity-label" id="activity-label"></span>
-          </p>
-        </div>
-        <div class="phone-rest-anchor" aria-hidden="true"></div>
-        <p class="hint" id="hint">Tap to talk.</p>
-        <div id="mic-gate" class="mic-panel hidden" role="dialog" aria-labelledby="mic-gate-title">
-          <p class="mic-panel-title" id="mic-gate-title">Microphone for live voice</p>
-          <p class="mic-panel-copy" id="mic-gate-detail">
-            Hearth only opens the mic when you tap to talk — never in the background.
-          </p>
-          <div class="mic-panel-actions">
-            <button type="button" id="mic-gate-continue" class="mic-panel-primary">Continue</button>
-            <button type="button" id="mic-gate-not-now" class="mic-panel-secondary">Not now</button>
-          </div>
-        </div>
-        <div id="mic-denied" class="mic-panel hidden" role="status" aria-live="polite">
-          <p class="mic-panel-title">Microphone blocked</p>
-          <p class="mic-panel-copy" id="mic-denied-detail">
-            Enable the microphone in Settings, then tap the hearth again.
-          </p>
-          <div class="mic-panel-actions">
-            <button type="button" id="mic-denied-retry" class="mic-panel-primary">Try again</button>
-            <button type="button" id="mic-denied-dismiss" class="mic-panel-secondary">Dismiss</button>
-          </div>
-        </div>
-        <div class="composer-dock">
-          <form id="composer" class="composer" autocomplete="off">
-            <input
-              id="line"
-              type="text"
-              name="line"
-              placeholder="Ask the house…"
-              maxlength="2000"
-              enterkeyhint="send"
-              autocapitalize="sentences"
-              autocomplete="off"
-            />
-            <button type="submit">Send</button>
-          </form>
-          <button type="button" id="confirm-btn" class="confirm hidden">Confirm last action</button>
+          <div class="welcome-spark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <p class="kicker">A little more at home</p>
+          <h1 id="welcome-title">What’s on<br />your mind?</h1>
+          <p class="welcome-copy">A film for tonight. The perfect atmosphere.<br />Just ask. We’ll take it from here.</p>
         </div>
       </section>
 
@@ -186,8 +143,64 @@
           <div class="info-toolbar-label"><span class="info-live-dot" aria-hidden="true"></span><span id="info-reading-status" role="status" aria-live="polite">All results · at a glance</span></div>
           <div class="info-toolbar-actions"><button type="button" class="info-reading-toggle" id="info-reading-toggle" hidden>Pause reading</button><button type="button" class="info-dismiss" id="info-dismiss" aria-label="Dismiss information">×</button></div>
         </header>
-        <div class="info-glass-inner" id="info-content"></div>
+        <div class="info-glass-inner" id="info-glass-inner" tabindex="0" aria-label="Information results">
+          <div id="info-content"></div>
+        </div>
       </div>
+    </div>
+
+    <footer class="interaction-dock" aria-label="Talk to Hearth">
+      <audio id="remote-audio" autoplay playsinline></audio>
+          <p id="activity" class="activity is-idle" role="status" aria-live="polite" hidden>
+            <span class="activity-dot" aria-hidden="true"></span>
+            <span class="activity-label" id="activity-label"></span>
+          </p>
+        <div id="mic-gate" class="mic-panel hidden" role="dialog" aria-labelledby="mic-gate-title">
+          <p class="mic-panel-title" id="mic-gate-title">Microphone for live voice</p>
+          <p class="mic-panel-copy" id="mic-gate-detail">
+            Hearth only opens the mic when you tap to talk — never in the background.
+          </p>
+          <div class="mic-panel-actions">
+            <button type="button" id="mic-gate-continue" class="mic-panel-primary">Continue</button>
+            <button type="button" id="mic-gate-not-now" class="mic-panel-secondary">Not now</button>
+          </div>
+        </div>
+        <div id="mic-denied" class="mic-panel hidden" role="status" aria-live="polite">
+          <p class="mic-panel-title">Microphone blocked</p>
+          <p class="mic-panel-copy" id="mic-denied-detail">
+            Enable the microphone in Settings, then tap the hearth again.
+          </p>
+          <div class="mic-panel-actions">
+            <button type="button" id="mic-denied-retry" class="mic-panel-primary">Try again</button>
+            <button type="button" id="mic-denied-dismiss" class="mic-panel-secondary">Dismiss</button>
+          </div>
+        </div>
+      <div class="interaction-row">
+          <button type="button" id="orb" class="orb" aria-label="Tap to talk">
+            <span class="orb-ring"></span>
+            <span class="orb-core"></span>
+            <span class="orb-label" id="orb-label">Tap to talk</span>
+          </button>
+        <div class="composer-dock">
+          <form id="composer" class="composer" autocomplete="off">
+            <input
+              id="line"
+              type="text"
+              name="line"
+              aria-label="Message Hearth"
+              placeholder="Ask the house…"
+              maxlength="2000"
+              enterkeyhint="send"
+              autocapitalize="sentences"
+              autocomplete="off"
+            />
+            <button type="submit">Send</button>
+          </form>
+          <button type="button" id="confirm-btn" class="confirm hidden">Confirm last action</button>
+        </div>
+      </div>
+      <p class="hint" id="hint">Tap to talk, or type a thought.</p>
+    </footer>
     </div>
 
     <div

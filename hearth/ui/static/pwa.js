@@ -1,73 +1,114 @@
 (function () {
   const root = document.documentElement;
 
+  const viewport = window.visualViewport;
+  const header = document.querySelector(".top");
+  const controls = document.querySelector(".interaction-dock");
+  const composer = document.querySelector(".composer-dock");
+  let frame = 0;
+  let orientationFrames = 0;
+  let orientationTimer = 0;
+  let layoutWidth = window.innerWidth;
+  let unoccludedHeight = window.innerHeight;
+
   function isTyping() {
     const el = document.activeElement;
-    if (!el) return false;
-    const tag = el.tagName;
-    return tag === "INPUT" || tag === "TEXTAREA";
+    if (!el || el.disabled || el.readOnly) return false;
+    if (el.isContentEditable || el.tagName === "TEXTAREA") return true;
+    return el.tagName === "INPUT" && !/^(button|checkbox|color|file|hidden|image|radio|range|reset|submit)$/i.test(el.type || "text");
   }
 
-  function keyboardInset() {
-    if (!isTyping()) return 0;
-    const viewport = window.visualViewport;
-    if (!viewport) return 0;
-    return Math.max(0, window.innerHeight - (viewport.height + viewport.offsetTop));
+  function setProperty(name, value) {
+    // Unchanged ResizeObserver measurements must not trigger a layout loop.
+    if (root.style.getPropertyValue(name) !== value) root.style.setProperty(name, value);
   }
 
-  /*
-   * iOS Safari / Home Screen PWAs often keep 100svh/100dvh (and sometimes
-   * innerHeight) stale across orientationchange until a later resize. The
-   * orb-first fold is keyed off --phone-fold so the listening sphere stays
-   * a full screen tall (under the fixed Look chrome) as soon as the layout
-   * viewport updates.
-   */
-  function syncPhoneFold() {
-    if (isTyping()) return;
-    const height = Math.round(window.innerHeight);
-    if (height > 0) root.style.setProperty("--phone-fold", `${height}px`);
+  function measure(element, property) {
+    if (!element) return;
+    const height = Math.ceil(element.getBoundingClientRect().height);
+    if (Number.isFinite(height)) setProperty(property, `${Math.max(0, height)}px`);
   }
 
   function applyPhoneInsets() {
-    syncPhoneFold();
-    const keyboard = keyboardInset();
-    root.style.setProperty("--keyboard-inset", `${keyboard}px`);
-    root.style.setProperty(
-      "--dock-safe-bottom",
-      keyboard > 0 ? "0px" : "env(safe-area-inset-bottom, 0px)"
-    );
-    const dock = document.querySelector(".composer-dock");
-    if (!dock) return;
-    const height = Math.ceil(dock.getBoundingClientRect().height);
-    if (height > 0) root.style.setProperty("--dock-space", `${height}px`);
+    const layoutHeight = window.innerHeight || root.clientHeight;
+    const height = viewport && viewport.height > 0 ? viewport.height : layoutHeight;
+    const top = viewport ? Math.max(0, viewport.offsetTop || 0) : 0;
+    if (!(height > 0)) return;
+
+    // Width changes invalidate the portrait keyboard baseline. Android may
+    // resize innerHeight with the keyboard; iOS resizes only visualViewport.
+    if (layoutWidth !== window.innerWidth) {
+      layoutWidth = window.innerWidth;
+      unoccludedHeight = layoutHeight;
+    }
+    const typing = isTyping();
+    if (!typing) unoccludedHeight = layoutHeight;
+    const unzoomed = !viewport || Math.abs((viewport.scale || 1) - 1) < 0.05;
+    const occlusion = typing && unzoomed
+      ? Math.max(0, Math.max(unoccludedHeight, layoutHeight) - height - top)
+      : 0;
+    // Browser chrome and fractional viewport changes are not a keyboard.
+    const keyboard = occlusion > 80 ? Math.round(occlusion) : 0;
+
+    // --app-height already excludes the keyboard. Never subtract its inset
+    // again when positioning content inside this viewport.
+    setProperty("--app-height", `${Math.round(height)}px`);
+    setProperty("--viewport-top", `${Math.round(top)}px`);
+    setProperty("--keyboard-inset", `${keyboard}px`);
+    setProperty("--dock-safe-bottom", keyboard ? "0px" : "env(safe-area-inset-bottom, 0px)");
+    const keyboardState = keyboard ? "true" : "false";
+    if (root.dataset.keyboard !== keyboardState) root.dataset.keyboard = keyboardState;
+
+    // Compatibility for the login screen and cached shell styles.
+    syncPhoneFold(height);
+    measure(header, "--header-height");
+    measure(controls || composer, "--controls-height");
+    measure(composer, "--dock-space");
   }
 
-  /* orientationchange fires before iOS swaps the layout viewport — paint twice. */
-  function afterOrientation() {
-    requestAnimationFrame(() => {
+  function syncPhoneFold(height) {
+    setProperty("--phone-fold", `${Math.round(height)}px`);
+  }
+
+  function scheduleInsets() {
+    if (frame) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
       applyPhoneInsets();
-      requestAnimationFrame(applyPhoneInsets);
+      if (orientationFrames > 0) {
+        orientationFrames -= 1;
+        scheduleInsets();
+      }
     });
   }
 
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener("resize", applyPhoneInsets);
-    window.visualViewport.addEventListener("scroll", applyPhoneInsets);
+  function afterOrientation() {
+    // Safari can report the old viewport for the first rotation frame.
+    unoccludedHeight = window.innerHeight;
+    orientationFrames = 2;
+    scheduleInsets();
+    clearTimeout(orientationTimer);
+    orientationTimer = setTimeout(scheduleInsets, 250);
+  }
+
+  if (viewport) {
+    viewport.addEventListener("resize", scheduleInsets, { passive: true });
+    viewport.addEventListener("scroll", scheduleInsets, { passive: true });
   }
   window.addEventListener("orientationchange", afterOrientation);
-  if (window.screen && screen.orientation && typeof screen.orientation.addEventListener === "function") {
-    screen.orientation.addEventListener("change", afterOrientation);
+  if (window.screen && window.screen.orientation && typeof window.screen.orientation.addEventListener === "function") {
+    window.screen.orientation.addEventListener("change", afterOrientation);
   }
-  window.addEventListener("focusin", applyPhoneInsets);
-  window.addEventListener("focusout", applyPhoneInsets);
-  window.addEventListener("resize", applyPhoneInsets);
-  window.addEventListener("pageshow", applyPhoneInsets);
-
-  const dock = document.querySelector(".composer-dock");
-  if (dock && typeof ResizeObserver === "function") {
-    new ResizeObserver(applyPhoneInsets).observe(dock);
+  for (const event of ["focusin", "focusout", "resize", "pageshow"]) {
+    window.addEventListener(event, scheduleInsets, { passive: true });
   }
 
+  if (typeof ResizeObserver === "function") {
+    const observer = new ResizeObserver(scheduleInsets);
+    for (const element of new Set([header, controls, composer])) {
+      if (element) observer.observe(element);
+    }
+  }
   applyPhoneInsets();
 
   if (!("serviceWorker" in navigator)) return;

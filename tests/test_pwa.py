@@ -76,23 +76,18 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert ".pills .pill" in css
     assert ".is-empty" in css
     assert "min-height: 28vh" not in css
-    # Phone: first viewport is the orb under fixed Look chrome.
-    assert ".hearth-hero" in css
-    assert "--phone-fold: 100dvh" in css
-    assert "--phone-fold: 100svh" in css
-    assert "min-height: var(--phone-fold)" in css
-    assert "phone-rest-anchor" in css
-    assert 'class="hearth-hero"' in index_html
-    assert 'class="phone-rest-anchor"' in index_html
-    # Composer/widgets are not pinned over the orb on phone.
-    assert ".composer-dock:focus-within" in css
+    # The visible viewport has independent header, reading and control rows.
+    assert 'class="app-shell"' in index_html
+    assert 'class="interaction-dock"' in index_html
+    assert 'id="info-glass-inner"' in index_html
+    assert 'grid-template-rows: auto minmax(0, 1fr) auto' in css
+    assert 'grid-area: controls' in css
+    assert 'grid-area: content' in css
+    assert "min-height: var(--phone-fold)" not in css
     assert "isolation: isolate" in css
-    # Phone: confirm stacks above Ask the House; hidden confirm must not reserve space.
     assert ".composer-dock .confirm" in css
-    assert "order: 0" in css
-    assert "margin-bottom: 8px" in css
     assert "has-confirm" in (UI / "app.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v24" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v25" in (UI / "sw.js").read_text(encoding="utf-8")
     assert 'id="logout-btn"' in index_html
     assert 'id="agent-pill"' in index_html
     assert 'id="settings-btn"' in index_html
@@ -121,7 +116,7 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert 'html[data-look="forge"]' in css
     assert ".pill-actions" in css
     assert "gap: 12px" in css
-    assert "hearth-shell-v24" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "hearth-shell-v25" in (UI / "sw.js").read_text(encoding="utf-8")
     assert (UI / "icons" / "apple-touch-icon.png").stat().st_size > 200
     assert (UI / "icons" / "icon-192.png").stat().st_size > 200
     assert (UI / "icons" / "icon-512.png").stat().st_size > 200
@@ -129,38 +124,31 @@ def test_login_and_home_are_installable_and_phone_ready():
     assert "/static/vad.js" in (UI / "sw.js").read_text(encoding="utf-8")
 
 
-def test_phone_orb_owns_first_viewport_alone():
-    css = (UI / "styles.css").read_text(encoding="utf-8")
+def test_phone_controls_share_a_dock_outside_the_reading_area():
     index_html = (UI / "index.html").read_text(encoding="utf-8")
-    assert 'class="hearth-hero"' in index_html
-    assert 'id="orb"' in index_html
-    # Hero is a full phone screen; Look chrome is fixed on the first screen.
-    assert ".hearth-hero" in css and "min-height: var(--phone-fold)" in css
-    assert "--phone-fold: 100svh" in css
-    phone = _phone_media_block(css)
-    assert "position: fixed" in phone
-    assert "top: var(--phone-fold)" not in phone
-    assert "#settings-btn" in index_html or 'id="settings-btn"' in index_html
-    # Fixed dock/widgets over the sphere are gone on phone.
-    assert "bottom: calc(var(--dock-space) + var(--keyboard-inset) + 10px)" not in css
-    assert ".composer-dock:focus-within" in css
-
-
-def test_phone_fold_resyncs_on_orientation_change():
-    """Ask the House must settle immediately after rotate — not after a second resize."""
-    pwa = (UI / "pwa.js").read_text(encoding="utf-8")
+    dock = index_html.split('<footer class="interaction-dock"', 1)[1].split('</footer>', 1)[0]
+    for element in ('orb', 'activity', 'composer', 'confirm-btn', 'mic-gate', 'mic-denied'):
+        assert f'id="{element}"' in dock
+    assert 'id="line"' in dock
+    assert 'aria-label="Message Hearth"' in dock
+    assert index_html.count('id="orb"') == 1
     css = (UI / "styles.css").read_text(encoding="utf-8")
-    assert "--phone-fold" in pwa
-    assert "syncPhoneFold" in pwa
+    assert '.info-overlay.is-open .info-glass { min-width: 0; min-height: 0; }' in css
+
+
+def test_phone_viewport_tracks_keyboard_and_rotation():
+    pwa = (UI / "pwa.js").read_text(encoding="utf-8")
+    for variable in ('--app-height', '--viewport-top', '--header-height', '--controls-height'):
+        assert variable in pwa
     assert "afterOrientation" in pwa
-    assert 'addEventListener("orientationchange"' in pwa
+    assert "orientationchange" in pwa
     assert "screen.orientation" in pwa
     assert "requestAnimationFrame" in pwa
-    assert 'addEventListener("pageshow"' in pwa
-    assert "min-height: var(--phone-fold)" in css
-    # Do not freeze the fold to a stale height while the keyboard is open.
-    assert "isTyping" in pwa
-    assert "hearth-shell-v24" in (UI / "sw.js").read_text(encoding="utf-8")
+    assert "pageshow" in pwa
+    assert "ResizeObserver" in pwa
+    assert "hearth-shell-v25" in (UI / "sw.js").read_text(encoding="utf-8")
+
+
 def _css_brace_depth(css: str) -> int:
     """Return final brace depth after stripping comments and strings (0 = balanced)."""
     depth = 0
@@ -249,21 +237,16 @@ def test_settings_apply_writes_html_data_look_attribute():
     assert 'html[data-style=' not in css
 
 
-def test_phone_layout_keeps_look_reachable_and_orb_centered():
+def test_phone_layout_keeps_look_and_result_controls_reachable():
     css = (UI / "styles.css").read_text(encoding="utf-8")
-    phone = _phone_media_block(css)
-    assert ".top" in phone
-    assert "position: fixed" in phone
-    assert "top: var(--phone-fold)" not in phone
-    assert ".hearth-hero" in phone
-    assert "min-height: var(--phone-fold)" in phone
-    assert "justify-content: center" in phone
-    assert ".composer-dock" in phone
-    assert "position: relative" in phone
-    # Look button exists in chrome; phone chrome is first-screen fixed.
     index_html = (UI / "index.html").read_text(encoding="utf-8")
+    assert 'grid-template-areas: "header" "content" "controls"' in css
+    assert '.info-toolbar' in css
+    assert '.info-glass-inner { flex: 1 1 0; min-width: 0; min-height: 0; overflow: auto;' in css
     assert 'id="settings-btn"' in index_html
-    assert ">Look<" in index_html or "Look\n" in index_html
+    assert 'id="info-reading-toggle"' in index_html
+    assert 'id="info-dismiss"' in index_html
+    assert 'id="info-content"' in index_html
 
 
 def test_orb_focus_outline_is_circular():
@@ -283,7 +266,7 @@ def test_phone_transcript_shows_user_and_assistant_roles():
     css = (UI / "styles.css").read_text(encoding="utf-8")
     assert 'li[data-role="you"]' in css
     assert ".transcript-details[open]" in css
-    assert ".rail-media" in css and "z-index: 0" in css
+    assert ".rail-media" in css and "grid-area: content" in css
 
 def test_conversation_is_collapsed_until_opened():
     """Transcript stays out of the way; expand only via the Conversation control."""
