@@ -226,8 +226,8 @@ class TelegramMediaBot:
         self.agent = agent or AgentLoop()
         self.house = house_commands or TelegramHouseCommands()
         self.rate = RateLimiter()
-        self.vision_rate = RateLimiter()
-        self.vision_daily = RateLimiter(max_calls=30, window_s=86400)
+        self.vision_rate = RateLimiter(max_calls=0, window_s=60.0)
+        self.vision_daily = RateLimiter(max_calls=0, window_s=86400)
         self.image_client = image_client
         self.vision = vision_provider or ConfiguredVisionProvider()
         self._vision_provider: Any | None = None
@@ -664,6 +664,29 @@ class TelegramMediaBot:
             )
         return BotReply(text, rendered.reply.reply_markup)
 
+    def _vision_cap_wait(self, view: MessageView) -> int | None:
+        """Seconds to wait when an optional vision cap is set.
+
+        ``0`` (the default) skips that bucket. The general chat limiter is not
+        consulted here, so a poster dump is not answered with the image cooldown.
+        """
+        key = (view.chat_id, view.user_id)
+        buckets: list[RateLimiter] = []
+        per_minute = int(settings.telegram_vision_per_minute)
+        daily = int(settings.telegram_vision_daily_cap)
+        if per_minute > 0:
+            self.vision_rate.max_calls = per_minute
+            self.vision_rate.window_s = 60.0
+            buckets.append(self.vision_rate)
+        if daily > 0:
+            self.vision_daily.max_calls = daily
+            self.vision_daily.window_s = 86400.0
+            buckets.append(self.vision_daily)
+        for bucket in buckets:
+            if not bucket.allow(key):
+                return max(1, math.ceil(bucket.retry_after(key)))
+        return None
+
     async def _image_reply(self, view: MessageView, message: dict[str, Any]) -> BotReply:
         mode = caption_mode(view.text)
         if mode == "cancel":
@@ -693,14 +716,10 @@ class TelegramMediaBot:
             return BotReply("Image intake is unavailable. Try again after the Telegram service reconnects.")
         if view.chat_id in self._vision_inflight:
             return BotReply("I'm still reading your previous image. Give me a moment.")
-        self.vision_rate.max_calls = settings.telegram_vision_per_minute
-        self.vision_daily.max_calls = settings.telegram_vision_daily_cap
-        self.rate.max_calls = settings.telegram_rate_limit_per_minute
         if not saved:
-            for bucket in (self.vision_rate, self.vision_daily, self.rate):
-                if not bucket.allow((view.chat_id, view.user_id)):
-                    wait = max(1, math.ceil(bucket.retry_after((view.chat_id, view.user_id))))
-                    return BotReply(f"Give me {wait}s before another image, then send it again.")
+            wait = self._vision_cap_wait(view)
+            if wait is not None:
+                return BotReply(f"Give me {wait}s before another image, then send it again.")
         self._vision_inflight.add(view.chat_id)
         typing_task = (
             asyncio.create_task(self._image_typing(view.chat_id))

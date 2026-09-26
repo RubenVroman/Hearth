@@ -407,10 +407,11 @@ class Settings(BaseSettings):
         le=4096,
         alias="HEARTH_TELEGRAM_VISION_MIN_EDGE",
     )
+    # 0 is unlimited. A positive value is an optional per-chat/user cap with no
+    # low ceiling, so a poster dump is not stuck at the old 2/min or 30/min max.
     telegram_vision_per_minute: int = Field(
-        default=2,
-        ge=1,
-        le=30,
+        default=0,
+        ge=0,
         alias="HEARTH_TELEGRAM_VISION_PER_MINUTE",
         validation_alias=AliasChoices("HEARTH_TELEGRAM_VISION_PER_MINUTE", "HEARTH_TELEGRAM_VISION_RATE_PER_MINUTE"),
     )
@@ -421,10 +422,10 @@ class Settings(BaseSettings):
     @telegram_vision_rate_per_minute.setter
     def telegram_vision_rate_per_minute(self, value: int) -> None:
         self.telegram_vision_per_minute = value
+    # 0 is unlimited. A positive value is an optional daily image cap.
     telegram_vision_daily_cap: int = Field(
-        default=30,
-        ge=1,
-        le=500,
+        default=0,
+        ge=0,
         alias="HEARTH_TELEGRAM_VISION_DAILY_CAP",
     )
     # Separate from the typed-batch cap so a 4×4 poster grid fits without

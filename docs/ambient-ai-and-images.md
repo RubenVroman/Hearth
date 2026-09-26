@@ -73,8 +73,8 @@ No credentials ship with this change.
 | `HEARTH_TELEGRAM_VISION_LIST_CAP` | `16` | Maximum titles in a confirmation preview |
 | `HEARTH_TELEGRAM_VISION_AUTO_CONFIDENCE` | `0.92` | Minimum extraction confidence for automatic requests; exact catalog checks still apply |
 | `HEARTH_TELEGRAM_VISION_TIMEOUT_SECONDS` | `20` | Bounded recognition time |
-| `HEARTH_TELEGRAM_VISION_PER_MINUTE` | `2` | Image turns per chat/user per minute; `RATE_PER_MINUTE` alias accepted |
-| `HEARTH_TELEGRAM_VISION_DAILY_CAP` | `30` | Daily image intake budget |
+| `HEARTH_TELEGRAM_VISION_PER_MINUTE` | `0` | Optional image turns per chat/user per minute. `0` is unlimited. `RATE_PER_MINUTE` is a legacy alias |
+| `HEARTH_TELEGRAM_VISION_DAILY_CAP` | `0` | Optional daily image cap. `0` is unlimited |
 
 Set mode to `confirm` or auto-request to `false` for identify-and-Get behavior.
 Set mode to `shadow` or disable vision to return to attachment refusal. Text/house commands continue to work independently.
@@ -91,6 +91,10 @@ Set mode to `shadow` or disable vision to return to attachment refusal. Text/hou
   that audio and tool continuation recover without overlapping responses.
 - Send a clear screenshot of two wanted titles in an authorized Telegram chat:
   verify exact IDs, one request per missing title, and accurate status text.
+- Send several posters in the same minute. None of them should answer
+  `Give me Ns before another image`. A second image while the first is still
+  being read should answer `I'm still reading your previous image`. Text
+  searches still use `TELEGRAM_RATE_LIMIT_PER_MINUTE`.
 - Resend the same image: already requested/available titles should not be queued
   twice. Use a screenshot of a film with a same-name remake: unclear candidates
   must remain choices, not substitutions.
