@@ -485,7 +485,10 @@ class Settings(BaseSettings):
     # TypeSafe Jev (System One) — the typed decision gate in front of every
     # house tool call. On by default so VAULT gets Jev routing as soon as a key
     # is present; without TYPESAFE_API_KEY nothing is called and every path
-    # fails open to today's heuristics. Shadow stays on so enforcement is opt-in.
+    # fails open to today's heuristics. VAULT compose sets HEARTH_JEV_SHADOW
+    # false so decisions are enforced. This field stays shadow when the
+    # variable is unset, so a process that never received the env var does not
+    # start denying writes. Set true only to log decisions while tuning.
     # API key stays on the VAULT host .env; never log it.
     typesafe_api_key: str = Field(default="", alias="TYPESAFE_API_KEY")
     jev_enabled: bool = Field(default=True, alias="HEARTH_JEV_ENABLED")

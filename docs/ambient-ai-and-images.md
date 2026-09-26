@@ -50,8 +50,9 @@ Selective/negative captions do not silently request the whole image. Ordinary
 text searches retain the existing Get/yes workflow.
 
 Jev remains a typed decision engine, not the vision model. One inherited Jev
-scope serves the image batch. Existing shadow/enforce and missing-key behavior
-is preserved; set `HEARTH_JEV_SHADOW=false` only when enforcement is intended.
+scope serves the image batch. VAULT enforces (`HEARTH_JEV_ENABLED=true`,
+`HEARTH_JEV_SHADOW=false`). Set `HEARTH_JEV_SHADOW=true` only while tuning, so
+decisions are logged and not taken. A missing key still fails open.
 
 ## Configuration
 
