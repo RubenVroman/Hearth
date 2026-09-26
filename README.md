@@ -489,7 +489,7 @@ hearth/jev/      TypeSafe Jev (System One) tool-calling gate — see docs/jev.md
 hearth/ui/       Static command center (no Node build)
 workspace/       Sandboxed files + skills
 ha/              Home Assistant config (onboarding still required)
-docs/            Operator notes (Jev gate, Telegram media smoke, proposals/)
+docs/            Operator notes (CI/CD, Jev gate, Telegram media smoke, proposals/)
 data/            Auth + memory SQLite (compose bind-mount; gitignores *.db)
 docker-compose.yml
 Dockerfile
@@ -504,6 +504,8 @@ python -m venv .venv
 pip install -r requirements-dev.txt
 pytest
 ```
+
+GitHub Actions runs that `pytest` command on Python 3.12 for every pull request and push. A green push to `main` deploys to VAULT once the secrets in [docs/ci-cd.md](docs/ci-cd.md) are set. Until then the deploy job skips and CI still passes.
 
 Text chat without Docker:
 
