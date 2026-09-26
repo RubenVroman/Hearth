@@ -121,6 +121,10 @@ class MediaIntent:
     ordinal: int | None = None
     drop_last: int = 0
     drop_first: int = 0
+    # Set when the ask is "franchise + part/episode N" (Harry Potter part 6).
+    # ``installment_kind`` is "episode" (saga order) or "index" (release order).
+    installment: int | None = None
+    installment_kind: str = ""
 
     @property
     def wants_download_path(self) -> bool:

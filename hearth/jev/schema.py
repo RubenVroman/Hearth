@@ -37,7 +37,10 @@ DOMAIN_CRITERIA: dict[str, str] = {
 MEDIA_ASK_CRITERIA: dict[str, str] = {
     "exact_title": (
         "User named one clear movie/show title to find or download "
-        "(e.g. 'Dune', 'Talk to Me', 'Severance S02') — not a plot riddle."
+        "(e.g. 'Dune', 'Talk to Me', 'Severance S02'). A known franchise plus a "
+        "part, episode, or number ('Harry Potter part 6', 'harry potter 6', "
+        "'Star Wars episode 5', 'fast and furious 7') is still one title — not a "
+        "plot riddle and not a request for every entry."
     ),
     "known_franchise": (
         "User named a well-known franchise seed without asking for every entry "
@@ -326,7 +329,8 @@ def _media_router_questions() -> dict[str, dict[str, Any]]:
             "type": "choice",
             "instructions": (
                 "Classify this Telegram house message for the Overseerr movie/TV bot. "
-                "Prefer exact_title or known_franchise when the user named a real title. "
+                "Prefer exact_title or known_franchise when the user named a real title, "
+                "including a franchise with a part or episode number. "
                 "Use series_all only when they want every entry. "
                 "Use edition_aware when a cut/quality preference is attached to a title. "
                 "Use person_filmography for actor/director asks, mood_vibe for "

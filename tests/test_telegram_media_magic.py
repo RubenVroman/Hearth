@@ -27,6 +27,9 @@ from hearth.telegram.media import (
     split_compound_ask,
 )
 from hearth.telegram.media.moods import FAMILY, HORROR
+from hearth.telegram.media.phrases import extract_numbered_franchise
+from hearth.telegram.media.ranking import select_franchise_installment
+from hearth.telegram.models import MediaHit
 from hearth.telegram.store import TelegramStore
 
 CHAT_ID = -100999
@@ -442,6 +445,146 @@ def test_riddle_framing_beats_a_title_shaped_sentence() -> None:
     assert intent.needs_llm is True
 
 
+def _hit(tmdb_id: int, title: str, year: int) -> MediaHit:
+    return MediaHit(media_type="movie", tmdb_id=tmdb_id, title=title, year=year)
+
+
+HARRY_POTTER_SAGA = (
+    _hit(671, "Harry Potter and the Philosopher's Stone", 2001),
+    _hit(672, "Harry Potter and the Chamber of Secrets", 2002),
+    _hit(673, "Harry Potter and the Prisoner of Azkaban", 2004),
+    _hit(674, "Harry Potter and the Goblet of Fire", 2005),
+    _hit(675, "Harry Potter and the Order of the Phoenix", 2007),
+    _hit(767, "Harry Potter and the Half-Blood Prince", 2009),
+    _hit(12444, "Harry Potter and the Deathly Hallows: Part 1", 2010),
+    _hit(12445, "Harry Potter and the Deathly Hallows: Part 2", 2011),
+)
+STAR_WARS_SAGA = (
+    _hit(11, "Star Wars: Episode IV - A New Hope", 1977),
+    _hit(1891, "Star Wars: Episode V - The Empire Strikes Back", 1980),
+    _hit(1892, "Star Wars: Episode VI - Return of the Jedi", 1983),
+    _hit(1893, "Star Wars: Episode I - The Phantom Menace", 1999),
+    _hit(1894, "Star Wars: Episode II - Attack of the Clones", 2002),
+    _hit(1895, "Star Wars: Episode III - Revenge of the Sith", 2005),
+    _hit(330459, "Rogue One: A Star Wars Story", 2016),
+)
+FAST_SAGA = (
+    _hit(9799, "The Fast and the Furious", 2001),
+    _hit(584, "2 Fast 2 Furious", 2003),
+    _hit(9615, "The Fast and the Furious: Tokyo Drift", 2006),
+    _hit(13804, "Fast & Furious", 2009),
+    _hit(51497, "Fast Five", 2011),
+    _hit(82992, "Fast & Furious 6", 2013),
+    _hit(168259, "Furious 7", 2015),
+    _hit(337339, "The Fate of the Furious", 2017),
+)
+MISSION_IMPOSSIBLE = (
+    _hit(954, "Mission: Impossible", 1996),
+    _hit(955, "Mission: Impossible II", 2000),
+    _hit(956, "Mission: Impossible III", 2006),
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "seed", "index", "numbering"),
+    [
+        ("Harry potter part 6", "Harry potter", 6, "index"),
+        ("Harry potter part 6 (2009)", "Harry potter", 6, "index"),
+        ("harry potter 6", "harry potter", 6, "index"),
+        ("harry potter part six", "harry potter", 6, "index"),
+        ("get harry potter deel 6", "harry potter", 6, "index"),
+        ("star wars episode 5", "star wars", 5, "episode"),
+        ("Star Wars episode V", "Star Wars", 5, "episode"),
+        ("star wars 5", "star wars", 5, "index"),
+        ("fast and furious 7", "fast and furious", 7, "index"),
+        ("mission impossible 3", "mission impossible", 3, "index"),
+        ("mission: impossible iii", "mission: impossible", 3, "index"),
+    ],
+)
+def test_numbered_franchise_ask_keeps_the_seed_and_the_slot(
+    text: str,
+    seed: str,
+    index: int,
+    numbering: str,
+) -> None:
+    numbered = extract_numbered_franchise(text)
+    assert numbered is not None, text
+    assert numbered.seed == seed
+    assert numbered.index == index
+    assert numbered.numbering == numbering
+
+    intent = classify_media_ask_sync(text)
+    assert intent.kind == "exact_title", text
+    assert intent.needs_llm is False
+    assert intent.installment == index
+    assert intent.installment_kind == numbering
+    assert intent.search_title == seed
+    assert intent.note == "franchise_installment"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Dune: Part Two",
+        "Harry Potter and the Deathly Hallows: Part 1",
+        "Harry Potter and the Chamber of Secrets",
+        "Harry Potter",
+        "Blade Runner 2049",
+        "District 9",
+        "1917",
+        "the sequel",
+    ],
+)
+def test_real_titles_are_not_rewritten_as_franchise_slots(title: str) -> None:
+    assert extract_numbered_franchise(title) is None
+    intent = classify_media_ask_sync(title)
+    assert intent.installment is None
+    if title != "the sequel":
+        assert title in intent.search_title or intent.search_title in title
+
+
+def test_sixth_harry_potter_is_the_half_blood_prince() -> None:
+    picked = select_franchise_installment(list(HARRY_POTTER_SAGA), 6, numbering="index")
+    assert picked is not None
+    assert picked.tmdb_id == 767
+    assert picked.title == "Harry Potter and the Half-Blood Prince"
+
+
+def test_star_wars_episode_five_is_empire_not_the_fifth_release() -> None:
+    """The fifth release in this pack is Attack of the Clones, not Empire."""
+    shuffled = list(reversed(STAR_WARS_SAGA))
+    for numbering in ("episode", "index"):
+        picked = select_franchise_installment(shuffled, 5, numbering=numbering)
+        assert picked is not None
+        assert picked.tmdb_id == 1891
+        assert "Empire Strikes Back" in picked.title
+
+
+def test_fast_and_furious_seven_and_mission_impossible_three() -> None:
+    furious = select_franchise_installment(list(FAST_SAGA), 7, numbering="index")
+    assert furious is not None
+    assert furious.title == "Furious 7"
+    mission = select_franchise_installment(list(MISSION_IMPOSSIBLE), 3, numbering="index")
+    assert mission is not None
+    assert mission.title == "Mission: Impossible III"
+
+
+def test_an_installment_past_the_pack_is_not_invented() -> None:
+    assert select_franchise_installment(list(HARRY_POTTER_SAGA), 9) is None
+    assert select_franchise_installment(list(STAR_WARS_SAGA), 15, numbering="episode") is None
+
+
+def test_episode_word_on_a_dated_series_still_uses_release_order() -> None:
+    picked = select_franchise_installment(list(HARRY_POTTER_SAGA), 6, numbering="episode")
+    assert picked is not None
+    assert picked.tmdb_id == 767
+
+
+def test_get_harry_potter_part_6_is_not_split_into_a_plan() -> None:
+    assert split_compound_ask("get Harry Potter part 6") == ()
+    assert split_compound_ask("grab fast and furious 7") == ()
+
+
 def test_local_classifier_routes_every_new_lane_without_an_llm() -> None:
     expected = {
         "Dune": "exact_title",
@@ -505,6 +648,23 @@ async def test_jev_lane_without_evidence_degrades_instead_of_dumb_search(
     intent = await classify_media_ask("that movie with the glasses that became a wizard")
     assert intent.kind == "describe"
     assert intent.needs_llm is True
+
+
+@pytest.mark.asyncio
+async def test_jev_riddle_label_still_resolves_a_numbered_franchise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Jev may call "part 6" a riddle; the slot is already enough to search."""
+    monkeypatch.setattr(settings, "jev_enabled", True)
+    monkeypatch.setattr(settings, "typesafe_api_key", "ts-test")
+    set_client(FakeSystemOne(_media_payload("descriptive_riddle", needs_llm=0.95)))
+
+    intent = await classify_media_ask("Harry potter part 6")
+    assert intent.kind == "exact_title"
+    assert intent.needs_llm is False
+    assert intent.installment == 6
+    assert intent.installment_kind == "index"
+    assert intent.search_title == "Harry potter"
 
 
 # --- lane integration ----------------------------------------------------------
@@ -699,6 +859,67 @@ async def test_franchise_prefers_the_real_tmdb_collection_over_fuzzy_titles(
     assert fake.collection_calls == [1241]
     assert "Prisoner of Azkaban" in reply.text
     assert len(_get_rows(reply)) == 3
+
+
+def _catalog_row(hit: MediaHit) -> dict[str, Any]:
+    return {
+        "mediaType": "movie",
+        "id": hit.tmdb_id,
+        "title": hit.title,
+        "releaseDate": f"{hit.year}-06-01",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    ["Harry potter part 6", "harry potter 6", "Harry Potter part six"],
+)
+async def test_harry_potter_part_6_resolves_to_the_half_blood_prince(
+    bot_factory: Callable[..., TelegramMediaBot],
+    text: str,
+) -> None:
+    rows = [_catalog_row(hit) for hit in HARRY_POTTER_SAGA]
+    fake = FakeOverseerr(results=rows, collection_id=1241, collection_parts=rows)
+    bot = bot_factory(fake)
+
+    reply = await bot.handle_message(_message(text))
+
+    assert reply is not None
+    assert "Half-Blood Prince" in reply.text
+    assert "No catalog hit" not in reply.text
+    assert "Nothing in the catalog" not in reply.text
+    assert "Philosopher" not in reply.text
+    assert fake.search_calls
+    assert fake.search_calls[0][0].casefold() == "harry potter"
+    assert all("part" not in query.casefold() for query, _ in fake.search_calls)
+    gets = _get_rows(reply)
+    assert len(gets) == 1
+    assert "Half-Blood Prince" in gets[0]["text"]
+    assert fake.request_calls == []
+
+
+@pytest.mark.asyncio
+async def test_star_wars_episode_5_resolves_to_empire(
+    bot_factory: Callable[..., TelegramMediaBot],
+) -> None:
+    rows = [_catalog_row(hit) for hit in STAR_WARS_SAGA]
+    fake = FakeOverseerr(
+        results=list(reversed(rows)),
+        collection_id=10,
+        collection_parts=rows,
+    )
+    bot = bot_factory(fake)
+
+    reply = await bot.handle_message(_message("star wars episode 5"))
+
+    assert reply is not None
+    assert "Empire Strikes Back" in reply.text
+    assert "Attack of the Clones" not in reply.text
+    assert "No catalog hit" not in reply.text
+    assert fake.search_calls[0][0].casefold() == "star wars"
+    assert len(_get_rows(reply)) == 1
+    assert fake.request_calls == []
 
 
 @pytest.mark.asyncio

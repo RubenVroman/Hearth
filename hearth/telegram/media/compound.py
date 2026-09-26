@@ -22,6 +22,7 @@ from hearth.telegram.media.phrases import (
     BARE_SERIES_ALL,
     clean_title_bits,
     extract_exclusion,
+    extract_numbered_franchise,
     is_known_franchise,
     normalize_franchise_seed,
     series_seed,
@@ -252,6 +253,9 @@ def split_compound_ask(text: str, *, max_parts: int = MAX_PARTS) -> tuple[AskPar
         return ()
     body = _GRAB_PREFIX.sub("", raw, count=1).strip()
     if not body:
+        return ()
+    # "get Harry Potter part 6" is one numbered entry, not "Harry" + "Potter part 6".
+    if extract_numbered_franchise(raw) is not None or extract_numbered_franchise(body) is not None:
         return ()
 
     plan_signal = _has_plan_signal(body, grab_prefix=body != raw)

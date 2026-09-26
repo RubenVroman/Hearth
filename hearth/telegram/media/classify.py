@@ -42,6 +42,7 @@ from hearth.telegram.media.people import detect_person_ask
 from hearth.telegram.media.phrases import (
     clean_title_bits,
     extract_exclusion,
+    extract_numbered_franchise,
     is_known_franchise,
     series_seed,
 )
@@ -180,6 +181,24 @@ def _enrich(
     raw = (text or "").strip()
     media_type = (parsed.media_type or "") if parsed else ""
     base = dict(confidence=confidence, source=source, raw_text=raw, jev=jev)
+
+    # "Harry potter part 6" is one film. Resolve the slot from the franchise
+    # pack instead of searching the raw string or sending it to the guess lane.
+    # not_media / chat-about stay on their own paths — Jev still owns that gate.
+    if kind not in {"chat_about", "other"}:
+        numbered = extract_numbered_franchise(raw)
+        if numbered is not None:
+            return MediaIntent(
+                kind="exact_title",
+                search_title=numbered.seed,
+                year=parsed.year if parsed else None,
+                media_type=media_type,
+                needs_llm=False,
+                note=note or "franchise_installment",
+                installment=numbered.index,
+                installment_kind=numbered.numbering,
+                **base,
+            )
 
     if kind == "batch":
         parts = split_compound_ask(raw)
@@ -489,6 +508,8 @@ def _carry_local(local: MediaIntent, *, source: str, note: str, needs_llm: bool 
         ordinal=local.ordinal,
         drop_last=local.drop_last,
         drop_first=local.drop_first,
+        installment=local.installment,
+        installment_kind=local.installment_kind,
     )
 
 

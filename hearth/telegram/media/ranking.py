@@ -17,6 +17,8 @@ from hearth.tools.arr import normalize_title_tokens, title_seed_matches
 
 MAX_RESULTS = 5
 SERIES_MAX_RESULTS = 8
+# Long enough for a saga (Star Wars, Fast & Furious) without paging the catalog.
+INSTALLMENT_LIMIT = 24
 
 
 def normalized(value: str) -> str:
@@ -198,6 +200,88 @@ def without_ids(hits: list[MediaHit], exclude: set[int] | frozenset[int]) -> lis
     return [hit for hit in hits if hit.tmdb_id not in exclude]
 
 
+_EPISODE_IN_TITLE = re.compile(
+    r"\bepisodes?\s+(?P<num>[ivxlcdm]{1,8}|\d{1,2})\b",
+    re.I,
+)
+_TITLE_ROMAN = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+    "vi": 6,
+    "vii": 7,
+    "viii": 8,
+    "ix": 9,
+    "x": 10,
+    "xi": 11,
+    "xii": 12,
+    "xiii": 13,
+    "xiv": 14,
+    "xv": 15,
+}
+
+
+def _title_episode_index(title: str) -> int | None:
+    """Return the saga episode written in a title, if it has one."""
+    match = _EPISODE_IN_TITLE.search(title or "")
+    if not match:
+        return None
+    token = match.group("num").casefold()
+    if token.isdigit():
+        value = int(token)
+    else:
+        value = _TITLE_ROMAN.get(token)
+    if value is None or value < 1:
+        return None
+    return value
+
+
+def _hit_episode_index(hit: MediaHit) -> int | None:
+    return _title_episode_index(hit.title) or _title_episode_index(hit.original_title)
+
+
+def _mostly_episode_numbered(hits: list[MediaHit]) -> bool:
+    """True when the pack is a numbered saga (Star Wars), not a dated series."""
+    if len(hits) < 2:
+        return False
+    tagged = sum(1 for hit in hits if _hit_episode_index(hit) is not None)
+    return tagged >= 2 and tagged * 2 >= len(hits)
+
+
+def select_franchise_installment(
+    hits: list[MediaHit],
+    index: int,
+    *,
+    numbering: str = "index",
+) -> MediaHit | None:
+    """Pick part ``index`` (1-based) out of a franchise pack.
+
+    "Episode 5" follows the episode number written in the title, so Star Wars
+    episode 5 is Empire and not the fifth film by release date. "Part 6" and a
+    bare "6" follow release order, which is how Harry Potter part 6 is the
+    Half-Blood Prince. A saga whose titles already say "Episode N" uses that
+    number for a bare ask too ("star wars 5").
+    """
+    if index < 1 or not hits:
+        return None
+    saga = numbering == "episode" or _mostly_episode_numbered(hits)
+    if saga:
+        matched = [hit for hit in hits if _hit_episode_index(hit) == index]
+        if matched:
+            return in_release_order(matched)[0]
+        # No "Episode N" labels in this pack ("Harry Potter episode 6") — the
+        # number is a release slot. A real saga with no such episode stays a miss
+        # so Star Wars episode 15 cannot become some other film.
+        if any(_hit_episode_index(hit) is not None for hit in hits):
+            return None
+    ordered = in_release_order(hits)
+    if index > len(ordered):
+        return None
+    return ordered[index - 1]
+
+
 def best_franchise_seed(title: str) -> str:
     """Trim a full entry title down to its franchise seed for collection asks."""
     raw = (title or "").strip()
@@ -213,6 +297,7 @@ def best_franchise_seed(title: str) -> str:
 
 
 __all__ = [
+    "INSTALLMENT_LIMIT",
     "MAX_RESULTS",
     "SERIES_MAX_RESULTS",
     "apply_exclusions",
@@ -222,6 +307,7 @@ __all__ = [
     "normalized",
     "plausible_match",
     "rank_hits",
+    "select_franchise_installment",
     "to_hits",
     "without_ids",
 ]

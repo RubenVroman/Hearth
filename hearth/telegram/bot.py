@@ -91,7 +91,8 @@ from hearth.telegram.media import (
     without_ids,
 )
 from hearth.telegram.media.memory import speaker_scope, storage_key
-from hearth.telegram.media.phrases import is_known_franchise
+from hearth.telegram.media.phrases import extract_numbered_franchise, is_known_franchise
+from hearth.telegram.media.ranking import INSTALLMENT_LIMIT, select_franchise_installment
 from hearth.telegram.media.play import looks_like_play_command, play_lane_enabled, play_on_tv
 from hearth.telegram.media.watch_next import WatchNext, pick_next_in_order
 
@@ -981,6 +982,9 @@ class TelegramMediaBot:
         if intent.kind == "describe":
             return await self._guess_reply(view, query, intent=intent)
 
+        if intent.installment:
+            return await self._installment_reply(view, query, intent)
+
         # Jev can flag needs_llm on a turn whose lane is still fully
         # deterministic ("all Harry Potters", "LOTR extended"). Spend the gpt
         # hop only when there is genuinely no seed to search with, otherwise a
@@ -1380,6 +1384,89 @@ class TelegramMediaBot:
             remember_single_guess=len(ordered) == 1,
             offer_similar=len(ordered) == 1,
             offer_dismiss=len(ordered) == 1,
+        )
+
+    async def _installment_pool(
+        self,
+        search_query: MediaQuery,
+        seed: str,
+        index: int,
+    ) -> list[MediaHit]:
+        """Franchise entries to pick part ``index`` from.
+
+        The TMDB collection is the pack when it is long enough to hold that
+        part. A shorter collection falls through to the seeded title search.
+        """
+        hits = await self.catalog.hits(
+            search_query,
+            franchise_seed=seed,
+            limit=INSTALLMENT_LIMIT,
+        )
+        movies = [hit for hit in hits if hit.media_type == "movie"]
+        pool = movies or hits
+        if not pool:
+            return []
+        anchor = in_release_order(pool)[0]
+        if anchor.media_type != "movie":
+            return pool
+        try:
+            _, parts = await self.catalog.collection_hits(
+                anchor.media_type,
+                anchor.tmdb_id,
+                limit=INSTALLMENT_LIMIT,
+            )
+        except CatalogUnavailable:
+            return pool
+        if parts and (len(parts) >= index or len(parts) >= len(pool)):
+            return parts
+        return pool
+
+    async def _installment_reply(
+        self,
+        view: MessageView,
+        query: MediaQuery,
+        intent: MediaIntent,
+    ) -> BotReply:
+        """Map "Harry Potter part 6" onto one film, then the normal Get card."""
+        seed = (intent.search_title or "").strip()
+        index = int(intent.installment or 0)
+        label = (intent.raw_text or query.raw_text or query.title or seed).strip()
+        if not seed or index < 1:
+            return self._miss(label or seed or "that title")
+        if not self.backend_configured:
+            return BotReply(voice.backend_not_configured())
+
+        search_query = MediaQuery(
+            action="search",
+            media_type="movie",
+            title=seed,
+            reason="franchise_installment",
+            raw_text=query.raw_text or intent.raw_text,
+        )
+        pool = await self._installment_pool(search_query, seed, index)
+        picked = select_franchise_installment(
+            pool,
+            index,
+            numbering=intent.installment_kind or "index",
+        )
+        if picked is None:
+            return self._miss(label or seed)
+        return self._present(
+            view.chat_id,
+            [picked],
+            header=voice.exact_header(
+                _display_title(picked.title, picked.year),
+                single=True,
+            ),
+            ask_kind="exact_title",
+            ask_text=query.raw_text or view.text,
+            search_title=picked.title,
+            franchise_seed=seed,
+            media_type=picked.media_type,
+            remember_single_guess=True,
+            offer_similar=True,
+            offer_series=picked.media_type == "movie",
+            offer_dismiss=True,
         )
 
     async def _edition_reply(
@@ -2089,6 +2176,25 @@ class TelegramMediaBot:
 
     async def _search_reply(self, view: MessageView, query: MediaQuery) -> BotReply:
         """Exact-title lane: one Overseerr search, ranked, no LLM."""
+        if query.tmdb_id is None:
+            numbered = extract_numbered_franchise(query.raw_text or query.title or "")
+            if numbered is None and query.title:
+                numbered = extract_numbered_franchise(query.title)
+            if numbered is not None:
+                return await self._installment_reply(
+                    view,
+                    query,
+                    MediaIntent(
+                        kind="exact_title",
+                        search_title=numbered.seed,
+                        year=query.year,
+                        media_type=query.media_type or "",
+                        raw_text=query.raw_text or query.title,
+                        note="franchise_installment",
+                        installment=numbered.index,
+                        installment_kind=numbered.numbering,
+                    ),
+                )
         if not self.backend_configured:
             return BotReply(voice.backend_not_configured())
         hits = await self.catalog.hits(query)
