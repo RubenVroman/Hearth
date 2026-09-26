@@ -52,11 +52,6 @@ const state = {
   /** Optimistic / client-flash activity (chat submit, fetch errors). */
   localActivity: null,
   localActivityTimer: null,
-  /**
-   * Live spoken-answer read-along panel (Realtime output transcript).
-   * Isolated from the voice path — failures never break audio.
-   */
-  spokenAnswer: null,
   ambientReader: null,
   /** Latest mic transcript (final preferred, partial while STT is still streaming). */
   userUtterance: { final: "", partial: "" },
@@ -2124,71 +2119,6 @@ $("confirm-btn").addEventListener("click", async () => {
   refresh();
 });
 
-function ensureSpokenAnswer() {
-  if (state.spokenAnswer) return state.spokenAnswer;
-  try {
-    if (globalThis.HearthSpokenAnswer?.createFromDocument) {
-      state.spokenAnswer = globalThis.HearthSpokenAnswer.createFromDocument(document);
-    }
-  } catch (_) {
-    state.spokenAnswer = null;
-  }
-  return state.spokenAnswer;
-}
-
-function captionsPreference() {
-  try {
-    const look = globalThis.HearthSettings?.get?.();
-    if (!look || look.captions == null) return "hidden";
-    return look.captions;
-  } catch (_) {
-    return "hidden";
-  }
-}
-
-function liveCaptionsOn() {
-  try {
-    return HearthVoiceSession.captionsVisible(captionsPreference());
-  } catch (_) {
-    return false;
-  }
-}
-
-function applyCaptionPreference(value) {
-  try {
-    const panel = ensureSpokenAnswer();
-    panel?.setEnabled?.(HearthVoiceSession.captionsVisible(value));
-  } catch (_) {
-    /* overlay must never break the voice path */
-  }
-}
-
-function noteSpokenAnswer(type, event) {
-  try {
-    const panel = ensureSpokenAnswer();
-    if (!panel) return;
-    if (!liveCaptionsOn()) {
-      panel.setEnabled?.(false);
-      return;
-    }
-    panel.setEnabled?.(true);
-    panel.onRealtimeEvent?.(type, event);
-  } catch (_) {
-    /* overlay must never break the voice path */
-  }
-}
-
-function dismissSpokenAnswer(opts) {
-  try {
-    const panel = ensureSpokenAnswer();
-    if (!panel) return;
-    if (opts && opts.callEnded) panel.onCallEnded();
-    else panel.dismiss?.(opts || { immediate: true });
-  } catch (_) {
-    /* ignore */
-  }
-}
-
 function finishCallAfterAudio(call) {
   if (!call || state.call !== call || call.pendingHangup) return;
   call.pendingHangup = true;
@@ -2220,8 +2150,6 @@ function onRealtimeEvent(event) {
   if (state.call?.bargeIn) {
     state.call.bargeIn.noteRealtimeEvent(type);
   }
-  // Spoken read-along — same DC transcript events; fail-soft and independent of audio.
-  noteSpokenAnswer(type, event);
   if (
     type === "response.output_audio_transcript.delta" ||
     type === "response.audio_transcript.delta"
@@ -2254,7 +2182,6 @@ function onRealtimeEvent(event) {
     state.call.inputItemId = event.item_id || "";
   }
   // User speech — requires session audio.input.transcription (see webrtc.session_config).
-  // User mic transcript is NOT shown on the spoken-answer panel (assistant only).
   // Only a final transcript from this input may authorize a tool call.
   if (
     type === "conversation.item.input_audio_transcription.delta" ||
@@ -2536,7 +2463,6 @@ async function recoverConversation() {
   if (previous) previous.superseded = true;
   state.call = null;
   showReconnectingChrome();
-  dismissSpokenAnswer({ callEnded: true });
   await teardownCall(previous);
   if (!voiceLife.isCurrent(epoch)) return;
   try {
@@ -2708,8 +2634,6 @@ async function stopConversation() {
   if (call) call.superseded = true;
   state.call = null;
   setRefreshInterval(8000);
-  // Conversation panel rule: voice session end → spoken read-along must go.
-  dismissSpokenAnswer({ callEnded: true });
   showIdleVoiceChrome();
   state.userUtterance = { final: "", partial: "" };
   await teardownCall(call);
@@ -2865,10 +2789,6 @@ async function boot() {
   if (window.HearthSettings) {
     window.HearthSettings.mount();
     window.HearthSettings.setSpendFetcher(() => api("/api/openai/spend?days=30"));
-    window.HearthSettings.subscribe((values) => {
-      applyCaptionPreference(values && values.captions);
-    });
-    applyCaptionPreference(window.HearthSettings.get().captions);
   }
   bindInfoOverlay();
   const ok = await refreshAccessToken();

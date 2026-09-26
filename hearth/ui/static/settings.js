@@ -83,18 +83,6 @@
         { value: "alive", label: "Alive" },
       ],
     },
-    {
-      id: "captions",
-      label: "Live transcription",
-      group: "Voice",
-      type: "choice",
-      default: "hidden",
-      hint: "Hidden keeps the call free of read-along captions. Hearth still hears you.",
-      options: [
-        { value: "hidden", label: "Hidden" },
-        { value: "shown", label: "Shown" },
-      ],
-    },
   ];
 
   const THEME_COLORS = {

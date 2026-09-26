@@ -2,18 +2,13 @@
  * Live-voice session policy.
  *
  * WebRTC and the DOM stay in app.js. This module decides when a dropped
- * peer should wait, reconnect once, or end — and whether live captions
- * are allowed to paint. Safe to require() from node tests.
+ * peer should wait, reconnect once, or end. Safe to require() from node tests.
  */
 (function (global) {
   "use strict";
 
   /** One automatic new call after a terminal peer failure. Not a retry loop. */
   const RECONNECTS_ALLOWED = 1;
-
-  function captionsVisible(value) {
-    return value === "shown";
-  }
 
   /**
    * @param {{
@@ -173,7 +168,6 @@
 
   const api = {
     RECONNECTS_ALLOWED,
-    captionsVisible,
     connectionAction,
     shouldRecoverFromServer,
     VoiceLifecycle,
