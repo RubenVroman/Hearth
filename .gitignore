@@ -38,4 +38,7 @@ data/telegram-chat-memory.tmp
 # Redacted memory exports written by memory_export
 workspace/memory/
 
+# SHA written on VAULT by the deploy job. Not part of the source tree.
+deployed-sha.txt
+
 
