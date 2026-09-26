@@ -8,6 +8,13 @@ Web searches appear as sourced findings. Longer boards advance through reading
 pages automatically, with a pause control. Spoken words still inform the
 conversation and title focus internally. Live captions are not displayed.
 
+On phones, the header, glass reading surface and voice/typing dock occupy separate
+rows of the visible viewport. Opening the keyboard or rotating the phone resizes
+the reading area without placing controls over results. Movie summaries span the
+card width. New boards enter with a short stagger; background refreshes retain
+reading position and do not replay the animation. The Still setting and system
+reduced-motion preference disable these transitions.
+
 Recommendation lists resolve up to 12 titles, four concurrently. Unavailable
 metadata leaves an honestly labeled title card. Empty and failed searches
 replace stale results. Starting a fresh recommendation or shelf list replaces

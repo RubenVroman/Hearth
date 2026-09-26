@@ -5,13 +5,21 @@ const vm = require('node:vm');
 const path = require('node:path');
 const ui = path.resolve(__dirname, '../../hearth/ui/static');
 
+function eventTarget() {
+  return {
+    handlers: {},
+    addEventListener(name, fn) { this.handlers[name] = fn; },
+    removeEventListener(name, fn) { if (this.handlers[name] === fn) delete this.handlers[name]; },
+  };
+}
+
 function element() {
   const classes = new Set();
   return {
     hidden: true, innerHTML: '', textContent: '', dataset: {}, scrollTop: 0, scrollHeight: 1800, clientHeight: 600,
-    handlers: {}, setAttribute() {}, removeAttribute() {}, addEventListener(name, fn) { this.handlers[name] = fn; }, querySelectorAll() { return []; },
+    ...eventTarget(), setAttribute() {}, removeAttribute() {}, querySelectorAll() { return []; },
     classList: { add(...values) { values.forEach(x => classes.add(x)); }, remove(...values) { values.forEach(x => classes.delete(x)); }, contains(x) { return classes.has(x); }, toggle(x, value) { value ? classes.add(x) : classes.delete(x); } },
-    scrollTo({top}) { this.scrollTop = top; },
+    scrollTo(options) { this.scrollTop = options.top; this.lastScroll = options; },
   };
 }
 function load() {
@@ -19,10 +27,10 @@ function load() {
   const timers=new Map();
   const elements = new Map();
   const getElementById = (id) => { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); };
-  const document={getElementById,addEventListener(){},querySelector(){return element();},querySelectorAll(){return [];},body:element(),documentElement:{dataset:{}},hidden:false};
+  const document={...eventTarget(),getElementById,querySelector(selector){return getElementById(selector);},querySelectorAll(){return [];},body:element(),documentElement:{dataset:{}},hidden:false};
   const context = {console, URL, URLSearchParams, document, navigator:{}, Element: class {}, localStorage:{getItem(){return null;}},
     setTimeout(fn){timers.set(++timerId,fn);return timerId;},clearTimeout(id){timers.delete(id);},setInterval(){return 0;},clearInterval(){},
-    addEventListener(){},matchMedia(){return {matches:false};},module:{exports:{}}};
+    ...eventTarget(),matchMedia(){return {matches:false};},module:{exports:{}}};
   context.window=context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(ui,'presentation.js'),'utf8'),context);
@@ -179,6 +187,123 @@ test('hands-free reader reaches every page, pauses and resumes, and releases tim
   reader.setPaused(false);assert.equal(timers.size,1);
   reader.show('new-list');assert.equal(viewport.scrollTop,0);
   reader.stop();assert.equal(timers.size,0);
+});
+
+test('result polling and spoken focus preserve mounted cards, reading position, and entrance timing',()=>{
+  const {run,getElementById,timers}=load();
+  const content=getElementById('info-content');
+  let html='',writes=0;
+  Object.defineProperty(content,'innerHTML',{get(){return html;},set(value){html=value;writes++;}});
+  run(`var widget={id:'media',kind:'media',title:'One',data:{items:[{id:'1',title:'One'},{id:'2',title:'Two'}],active_id:'1'}};
+    openInfoOverlay(widget);`);
+  const entrance=run('state.infoEnterTimer');
+  assert.equal(content.classList.contains('is-entering'),true);
+  getElementById('info-glass-inner').scrollTop=240;
+  run(`widget.updated_at='later';widget.title='Two';widget.data.active_id='2';openInfoOverlay(widget);`);
+  assert.equal(writes,1);
+  assert.equal(run('state.infoEnterTimer'),entrance);
+  assert.equal(getElementById('info-glass-inner').scrollTop,240);
+  const finish=timers.get(entrance);timers.delete(entrance);finish();
+  run(`widget.data.items[1].summary='New details';openInfoOverlay(widget);`);
+  assert.equal(writes,2);
+  assert.equal(content.classList.contains('is-entering'),false,'metadata enrichment does not animate every card again');
+  run(`widget.data.items=[{id:'3',title:'A new result'}];openInfoOverlay(widget);`);
+  assert.equal(content.classList.contains('is-entering'),true);
+  assert.equal(getElementById('info-glass-inner').scrollTop,0);
+});
+
+test('temporarily hidden results retain their DOM and keep home controls out of keyboard focus only while visible',()=>{
+  const {run,document,getElementById}=load();
+  run(`var widget={id:'media',kind:'media',data:{items:[{id:'1',title:'One'}]}};openInfoOverlay(widget);`);
+  const stage=document.querySelector('.stage');
+  const overlay=getElementById('info-overlay');
+  const content=getElementById('info-content');
+  const html=content.innerHTML;
+  Object.defineProperty(content,'innerHTML',{get(){return html;},set(){throw new Error('unchanged board remounted');}});
+  getElementById('info-glass-inner').scrollTop=120;
+  assert.equal(stage.inert,true);
+  assert.equal(overlay.inert,false);
+  run('softHideInfoOverlay()');
+  assert.equal(stage.inert,false);
+  assert.equal(overlay.inert,true,'soft-hidden controls leave the tab sequence immediately');
+  run('openInfoOverlay(widget)');
+  assert.equal(stage.inert,true);
+  assert.equal(overlay.inert,false);
+  assert.equal(getElementById('info-glass-inner').scrollTop,120);
+  run('closeInfoOverlay()');
+  assert.equal(stage.inert,false);
+  assert.equal(overlay.inert,true,'closing controls leave the tab sequence before the fade finishes');
+});
+
+test('focusing or touching results pauses automatic reading while the toolbar toggle can resume it',()=>{
+  const {context,document,timers}=load();
+  const viewport=element(),button=element();
+  const reader=new context.HearthPresentation.AmbientReader({viewport,button,status:element(),document});
+  reader.show('results');
+  viewport.handlers.focusin({target:viewport});
+  assert.equal(reader.paused,true,'tabbing into the scroll viewport gives the user reading control');
+  assert.equal(timers.size,0);
+  button.handlers.click();
+  assert.equal(reader.paused,false);
+  assert.equal(timers.size,1);
+  viewport.handlers.pointerdown({target:viewport});
+  assert.equal(reader.paused,true);
+  assert.equal(timers.size,0);
+  reader.destroy();
+});
+
+test('result entrances honor both system reduced motion and the Still look preference',()=>{
+  for(const preference of ['system','look']) {
+    const {run,context,document,getElementById}=load();
+    if(preference==='system') context.matchMedia=()=>({matches:true});
+    else document.documentElement.dataset.motion='still';
+    run(`openInfoOverlay({id:'media',kind:'media',data:{items:[{id:'1',title:'One'}]}})`);
+    assert.equal(getElementById('info-content').classList.contains('is-entering'),false,preference);
+    assert.equal(run('state.infoEnterTimer'),null,preference);
+    run('closeInfoOverlay()');
+    assert.equal(getElementById('info-overlay').hidden,true,preference);
+  }
+});
+
+test('reader follows keyboard and content resizing, then releases every observer when hidden',()=>{
+  const {context,document,timers}=load();
+  const observers=[];
+  context.ResizeObserver=class {
+    constructor(callback){this.callback=callback;this.observed=[];this.disconnected=false;observers.push(this);}
+    observe(target){this.observed.push(target);}
+    disconnect(){this.disconnected=true;}
+  };
+  context.visualViewport=eventTarget();
+  const viewport=element(),content=element(),button=element();
+  viewport.scrollHeight=500;
+  const reader=new context.HearthPresentation.AmbientReader({viewport,content,button,status:element(),document});
+  reader.show('list');
+  assert.equal(button.hidden,true);
+  assert.equal(timers.size,0,'short boards do not run pointless scrolling timers');
+  assert.deepEqual(observers[0].observed,[viewport,content]);
+  viewport.clientHeight=200;
+  context.visualViewport.handlers.resize();
+  assert.equal(button.hidden,false);
+  assert.equal(timers.size,1,'keyboard shrink starts automatic reading when results no longer fit');
+  reader.setPaused(true);
+  viewport.clientHeight=300;
+  observers[0].callback();
+  assert.equal(timers.size,0,'geometry changes respect an explicit reading pause');
+  reader.setPaused(false);
+  viewport.scrollTop=200;
+  viewport.scrollHeight=310;
+  observers[0].callback();
+  assert.equal(viewport.scrollTop,10,'shorter content clamps the reader to an existing page');
+  reader.stop();
+  assert.equal(observers[0].disconnected,true);
+  assert.equal(context.handlers.resize,undefined);
+  assert.equal(context.visualViewport.handlers.resize,undefined);
+  assert.equal(document.handlers.visibilitychange,undefined);
+  observers[0].callback();
+  assert.equal(timers.size,0,'a late resize cannot revive a closed result board');
+  reader.destroy();
+  assert.deepEqual(Object.keys(viewport.handlers),[]);
+  assert.deepEqual(Object.keys(button.handlers),[]);
 });
 
 test('fallback tools wait for a completed response, run once, and continue once per batch',async()=>{

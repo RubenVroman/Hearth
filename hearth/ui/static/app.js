@@ -29,6 +29,8 @@ const state = {
   accessToken: "",
   widgets: [],
   infoSignature: "",
+  infoReadingKey: "",
+  infoEnterTimer: null,
   infoCloseTimer: null,
   /** Soft-hidden by context/idle — widget stays; can reappear without refetch. */
   infoSoftHidden: false,
@@ -522,7 +524,8 @@ function scheduleOverlayIdleHide() {
 function ensureAmbientReader() {
   if (!state.ambientReader && globalThis.HearthPresentation?.AmbientReader) {
     state.ambientReader = new globalThis.HearthPresentation.AmbientReader({
-      viewport: $("info-glass"), button: $("info-reading-toggle"), status: $("info-reading-status"),
+      viewport: $("info-glass-inner"), content: $("info-content"),
+      button: $("info-reading-toggle"), status: $("info-reading-status"),
     });
   }
   return state.ambientReader;
@@ -530,8 +533,42 @@ function ensureAmbientReader() {
 
 function presentationKey(widget) {
   return JSON.stringify([widget.id, widget.kind, widget.kind === "media"
-    ? mediaItemsOf(widget).map((item) => item.id)
+    ? [mediaItemsOf(widget).map(mediaItemKey), widget.data?.genre, widget.data?.listed_genres]
     : widget.data?.query || widget.title]);
+}
+
+function presentationMotionIsStill() {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches || document.documentElement.dataset.motion === "still";
+}
+
+function setPresentationVisible(visible) {
+  document.body.classList.toggle("has-presentation", visible);
+  const stage = document.querySelector(".stage");
+  if (stage) stage.inert = visible;
+  const root = $("info-overlay");
+  if (root) root.inert = !visible;
+}
+
+function clearInfoEntrance() {
+  if (state.infoEnterTimer != null) clearTimeout(state.infoEnterTimer);
+  state.infoEnterTimer = null;
+  $("info-content")?.classList.remove("is-entering");
+}
+
+function animateInfoContent(content) {
+  clearInfoEntrance();
+  // Narration can change the active card without re-running any entrance animation.
+  content.dataset.settled = "1";
+  if (presentationMotionIsStill()) return;
+  content.querySelectorAll(".info-media-card, .info-fact, .info-download-row").forEach((card, index) => {
+    card.style.setProperty("--reveal-index", String(Math.min(index, 5)));
+  });
+  void content.offsetWidth;
+  content.classList.add("is-entering");
+  state.infoEnterTimer = setTimeout(() => {
+    content.classList.remove("is-entering");
+    state.infoEnterTimer = null;
+  }, 700);
 }
 
 function focusPresentation(widget) {
@@ -547,7 +584,8 @@ function focusPresentation(widget) {
 
 function softHideInfoOverlay() {
   state.ambientReader?.stop();
-  document.body.classList.remove("has-presentation");
+  clearInfoEntrance();
+  setPresentationVisible(false);
   const root = $("info-overlay");
   if (!root || root.hidden) return;
   if (state.infoSoftHidden) return;
@@ -555,7 +593,7 @@ function softHideInfoOverlay() {
   clearInfoCloseTimer();
   state.infoSoftHidden = true;
   state.infoPinned = false;
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  if (presentationMotionIsStill()) {
     root.classList.remove("is-open", "is-closing");
     root.classList.add("is-soft-hidden");
     root.setAttribute("aria-hidden", "true");
@@ -986,7 +1024,7 @@ function renderWidgets(widgets) {
   if (!state.infoSoftHidden) {
     if (state.infoSignature !== overlaySignature(visual)) {
       const content = $("info-content");
-      const glass = $("info-glass");
+      const glass = $("info-glass-inner");
       const scrollTop = glass ? glass.scrollTop : 0;
       if (content) content.innerHTML = overlayInnerHtml(visual);
       state.infoSignature = overlaySignature(visual);
@@ -1306,13 +1344,14 @@ function overlayInnerHtml(widget) {
 function openInfoOverlay(widget) {
   const root = $("info-overlay");
   const content = $("info-content");
-  const glass = $("info-glass");
+  const glass = $("info-glass-inner");
   if (!root || !content || !widget) return;
   clearInfoCloseTimer();
   if (widget.kind === "media") {
     reconcileClientMediaFocus(widget);
   }
   const signature = overlaySignature(widget);
+  const readingKey = presentationKey(widget);
   const alreadyOpen =
     root.classList.contains("is-open") &&
     !root.classList.contains("is-closing") &&
@@ -1322,7 +1361,7 @@ function openInfoOverlay(widget) {
   // Never keep a blank glass open — remount when the DOM was cleared or markup is empty.
   if (alreadyOpen && state.infoSignature === signature && !contentEmpty) {
     focusPresentation(widget);
-    ensureAmbientReader()?.show(presentationKey(widget));
+    ensureAmbientReader()?.show(readingKey);
     scheduleOverlayIdleHide();
     return;
   }
@@ -1340,37 +1379,39 @@ function openInfoOverlay(widget) {
     closeInfoOverlay({ animate: false });
     return;
   }
-  // Preserve glass scroll across remounts (status polls / narration focus).
+  // Reopening an unchanged board retains its DOM, focus, and reading position.
   const scrollTop = glass ? glass.scrollTop : 0;
-  content.innerHTML = html;
+  const replaced = contentEmpty || state.infoSignature !== signature;
+  const newBoard = state.infoReadingKey !== readingKey;
+  if (replaced) content.innerHTML = html;
   state.infoSignature = signature;
+  state.infoReadingKey = readingKey;
   state.infoSoftHidden = false;
   root.hidden = false;
   root.setAttribute("aria-hidden", "false");
   root.classList.remove("is-closing", "is-soft-hidden");
-  // Content swaps while the glass stays up should not replay enter/pop animations
-  // (that was the main movie-card flicker when cycling or transcript-focusing).
-  if (alreadyOpen && !contentEmpty) {
-    content.dataset.settled = "1";
-  } else {
-    delete content.dataset.settled;
+  content.dataset.settled = "1";
+  if (!alreadyOpen) {
     // Force style flush so enter transition runs when opening from hidden / soft-hidden.
     void root.offsetWidth;
   }
   root.classList.add("is-open");
   root.dataset.kind = widget.kind;
-  document.body.classList.add("has-presentation");
+  setPresentationVisible(true);
   if (glass && scrollTop > 0) {
     glass.scrollTop = scrollTop;
   }
   focusPresentation(widget);
-  ensureAmbientReader()?.show(presentationKey(widget));
+  if (replaced && (newBoard || contentEmpty)) animateInfoContent(content);
+  else if (replaced) clearInfoEntrance();
+  ensureAmbientReader()?.show(readingKey);
   scheduleOverlayIdleHide();
 }
 
 function closeInfoOverlay({ animate = true } = {}) {
   state.ambientReader?.stop();
-  document.body.classList.remove("has-presentation");
+  clearInfoEntrance();
+  setPresentationVisible(false);
   const root = $("info-overlay");
   clearOverlayPolicyTimers();
   state.infoSoftHidden = false;
@@ -1378,14 +1419,16 @@ function closeInfoOverlay({ animate = true } = {}) {
   state.clientMediaFocusId = null;
   if (!root || root.hidden) {
     state.infoSignature = "";
+    state.infoReadingKey = "";
     return;
   }
   clearInfoCloseTimer();
   state.infoSignature = "";
+  state.infoReadingKey = "";
   root.classList.remove("is-soft-hidden");
   const content = $("info-content");
   if (content) delete content.dataset.settled;
-  if (!animate || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  if (!animate || presentationMotionIsStill()) {
     root.classList.remove("is-open", "is-closing");
     root.hidden = true;
     root.setAttribute("aria-hidden", "true");
@@ -2749,6 +2792,7 @@ $("logout-btn").addEventListener("click", async () => {
 
 function onPageHide() {
   state.ambientReader?.stop();
+  clearInfoEntrance();
   /* Document is going away — release hardware and tell Hearth to drop the sideband.
      A warm mute is useless across navigations, and an async hangup will not finish. */
   const call = state.call;

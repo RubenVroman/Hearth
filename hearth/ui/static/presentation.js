@@ -49,8 +49,9 @@
   }
 
   class AmbientReader {
-    constructor({ viewport, button, status, document: doc = global.document, delay = 15000 }) {
+    constructor({ viewport, content, button, status, document: doc = global.document, delay = 15000 }) {
       this.viewport = viewport;
+      this.content = content;
       this.button = button;
       this.status = status;
       this.document = doc;
@@ -59,17 +60,51 @@
       this.key = "";
       this.paused = false;
       this.running = false;
-      this.button?.addEventListener("click", () => this.setPaused(!this.paused));
-      for (const event of ["wheel", "touchstart", "pointerdown", "keydown"]) {
-        viewport?.addEventListener(event, (ev) => {
+      this.listeners = [];
+      this.onGeometryChange = () => this.refreshGeometry();
+      this.onVisibilityChange = () => {
+        this.clear();
+        if (!doc.hidden) this.refreshGeometry();
+      };
+      this.resizeObserver = global.ResizeObserver ? new global.ResizeObserver(this.onGeometryChange) : null;
+      this.listen(this.button, "click", () => this.setPaused(!this.paused));
+      for (const event of ["wheel", "touchstart", "pointerdown", "keydown", "focusin"]) {
+        this.listen(viewport, event, (ev) => {
           if (ev.target === this.button || this.button?.contains?.(ev.target)) return;
           this.setPaused(true);
         }, { passive: true });
       }
-      doc?.addEventListener("visibilitychange", () => {
-        this.clear();
-        if (!doc.hidden) this.schedule();
-      });
+      this.listen(viewport, "scroll", () => this.updateStatus(), { passive: true });
+    }
+
+    listen(target, event, handler, options) {
+      target?.addEventListener(event, handler, options);
+      this.listeners.push(() => target?.removeEventListener?.(event, handler, options));
+    }
+
+    observe() {
+      if (this.viewport) this.resizeObserver?.observe(this.viewport);
+      if (this.content && this.content !== this.viewport) this.resizeObserver?.observe(this.content);
+      global.addEventListener?.("resize", this.onGeometryChange, { passive: true });
+      global.visualViewport?.addEventListener("resize", this.onGeometryChange, { passive: true });
+      this.document?.addEventListener("visibilitychange", this.onVisibilityChange);
+    }
+
+    hasOverflow() {
+      return Boolean(this.viewport && this.viewport.clientHeight > 0 && this.viewport.scrollHeight > this.viewport.clientHeight + 8);
+    }
+
+    refreshGeometry() {
+      if (!this.running) return;
+      const el = this.viewport;
+      if (el) {
+        const max = Math.max(0, el.scrollHeight - el.clientHeight);
+        if (el.scrollTop > max) el.scrollTop = max;
+      }
+      // Give a newly resized page a full reading interval, including keyboard changes.
+      this.clear();
+      this.updateStatus();
+      this.schedule();
     }
 
     clear() { if (this.timer != null) clearTimeout(this.timer); this.timer = null; }
@@ -82,7 +117,7 @@
     }
 
     updateStatus() {
-      const overflow = this.viewport && this.viewport.scrollHeight > this.viewport.clientHeight + 8;
+      const overflow = this.hasOverflow();
       if (this.button) {
         this.button.hidden = !overflow;
         this.button.textContent = this.paused ? "Resume reading" : "Pause reading";
@@ -101,15 +136,29 @@
         this.paused = false;
         if (this.viewport) this.viewport.scrollTop = 0;
       }
+      if (!this.running) this.observe();
       this.running = true;
       this.updateStatus();
       this.schedule();
     }
 
-    stop() { this.running = false; this.clear(); }
+    stop() {
+      this.running = false;
+      this.clear();
+      this.resizeObserver?.disconnect();
+      global.removeEventListener?.("resize", this.onGeometryChange);
+      global.visualViewport?.removeEventListener("resize", this.onGeometryChange);
+      this.document?.removeEventListener?.("visibilitychange", this.onVisibilityChange);
+    }
+
+    destroy() {
+      this.stop();
+      this.listeners.forEach((remove) => remove());
+      this.listeners = [];
+    }
 
     schedule() {
-      if (!this.running || this.paused || this.timer != null || this.document?.hidden) return;
+      if (!this.running || this.paused || this.timer != null || this.document?.hidden || !this.hasOverflow()) return;
       this.timer = setTimeout(() => {
         this.timer = null;
         if (!this.running || this.paused || this.document?.hidden) return;
