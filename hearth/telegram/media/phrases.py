@@ -7,6 +7,7 @@ lane agree on what "all of them except the last" means.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 YEAR_PAREN = re.compile(r"\(\s*((?:19|20)\d{2})\s*\)")
 
@@ -207,6 +208,160 @@ def is_known_franchise(title: str) -> bool:
     return " ".join(stripped.split()) in KNOWN_FRANCHISE_SEEDS
 
 
+# "Harry Potter part 6" / "star wars episode 5" name a slot in a franchise, not
+# a catalog string. Only seeds already in KNOWN_FRANCHISE_SEEDS qualify, so a
+# real title that merely ends in "Part Two" ("Dune: Part Two") stays literal.
+_MAX_INSTALLMENT = 20
+_LEADING_ASK = re.compile(
+    r"^(?:please\s+|pls\s+)?"
+    r"(?:can\s+you\s+|could\s+you\s+|kun\s+je\s+)?"
+    r"(?:please\s+)?"
+    r"(?:grab|get|download|request|queue|find|search|fetch|haal|zoek|vraag)\s+"
+    r"(?:me\s+|us\s+|mij\s+)?",
+    re.I,
+)
+_TRAILING_POLITE = re.compile(r"\s+(?:please|pls|thanks|thx|graag|alsjeblieft)\s*$", re.I)
+_MARKER = r"part|pt\.?|episode|chapter|vol\.?|volume|deel|film|movie|nr\.?|no\.?|number"
+_NUMBER_WORD = (
+    r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"een|twee|drie|vier|vijf|zes|zeven|acht|negen|tien"
+)
+_NUM_TOKEN = rf"\d{{1,2}}(?:st|nd|rd|th)?|{_NUMBER_WORD}|[ivx]{{1,4}}"
+_MARKED_INSTALLMENT = re.compile(
+    rf"^(?P<seed>.+?)\s+(?P<marker>{_MARKER})\s+(?P<num>{_NUM_TOKEN})\s*$",
+    re.I,
+)
+# Bare "harry potter 6". Roman numerals need 2+ characters so "batman v" is not
+# installment 5; "episode v" still works through the marked pattern above.
+_BARE_INSTALLMENT = re.compile(
+    r"^(?P<seed>.+?)\s+(?P<num>\d{1,2}(?:st|nd|rd|th)?|[ivx]{2,4})\s*$",
+    re.I,
+)
+_ORDINAL_SUFFIX = re.compile(r"^(\d{1,2})(?:st|nd|rd|th)$", re.I)
+_LEADING_ARTICLE = re.compile(r"^(?:the|a|an|de|het)\s+", re.I)
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "een": 1,
+    "twee": 2,
+    "drie": 3,
+    "vier": 4,
+    "vijf": 5,
+    "zes": 6,
+    "zeven": 7,
+    "acht": 8,
+    "negen": 9,
+    "tien": 10,
+}
+_ROMAN = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+    "vi": 6,
+    "vii": 7,
+    "viii": 8,
+    "ix": 9,
+    "x": 10,
+    "xi": 11,
+    "xii": 12,
+    "xiii": 13,
+    "xiv": 14,
+    "xv": 15,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class NumberedFranchise:
+    """A known franchise seed plus the 1-based slot the user asked for."""
+
+    seed: str
+    index: int
+    numbering: str  # "episode" follows saga numbers; "index" follows release order
+
+
+def _prepare_installment_text(text: str) -> str:
+    raw = re.sub(r"\s+", " ", (text or "").strip())
+    raw = raw.strip("\"'“”‘’")
+    raw = re.sub(r"[.!?]+$", "", raw).strip()
+    raw = re.sub(r"\s*\(\s*(?:19|20)\d{2}\s*\)\s*$", "", raw).strip()
+    raw = _TRAILING_POLITE.sub("", raw).strip()
+    return _LEADING_ASK.sub("", raw, count=1).strip()
+
+
+def _clean_installment_seed(seed: str) -> str:
+    text = re.sub(r"\s+", " ", (seed or "").strip())
+    return text.strip(" -–—:|,.'\"")
+
+
+def _known_installment_seed(seed: str) -> str | None:
+    cleaned = _clean_installment_seed(seed)
+    if cleaned and is_known_franchise(cleaned):
+        return cleaned
+    stripped = _LEADING_ARTICLE.sub("", cleaned, count=1).strip()
+    if stripped and stripped != cleaned and is_known_franchise(stripped):
+        return stripped
+    return None
+
+
+def _parse_installment_index(token: str, *, allow_short_roman: bool) -> int | None:
+    raw = (token or "").casefold().strip(".")
+    ordinal = _ORDINAL_SUFFIX.match(raw)
+    if ordinal:
+        value = int(ordinal.group(1))
+    elif raw.isdigit():
+        value = int(raw)
+    elif raw in _NUMBER_WORDS:
+        value = _NUMBER_WORDS[raw]
+    elif raw in _ROMAN and (allow_short_roman or len(raw) >= 2):
+        value = _ROMAN[raw]
+    else:
+        return None
+    if 1 <= value <= _MAX_INSTALLMENT:
+        return value
+    return None
+
+
+def extract_numbered_franchise(text: str) -> NumberedFranchise | None:
+    """Parse "Harry potter part 6" into seed ``Harry potter`` and slot 6.
+
+    Returns None unless the words in front of the number are a known franchise
+    seed. That keeps exact titles such as "Dune: Part Two" and "Deathly
+    Hallows: Part 1" on the literal search path.
+    """
+    prepared = _prepare_installment_text(text)
+    if not prepared:
+        return None
+    marked = _MARKED_INSTALLMENT.match(prepared)
+    if marked:
+        seed = _known_installment_seed(marked.group("seed"))
+        index = _parse_installment_index(marked.group("num"), allow_short_roman=True)
+        if not seed or index is None:
+            return None
+        marker = marked.group("marker").casefold().rstrip(".")
+        numbering = "episode" if marker == "episode" else "index"
+        return NumberedFranchise(seed=seed, index=index, numbering=numbering)
+    bare = _BARE_INSTALLMENT.match(prepared)
+    if not bare:
+        return None
+    seed = _known_installment_seed(bare.group("seed"))
+    index = _parse_installment_index(bare.group("num"), allow_short_roman=False)
+    if not seed or index is None:
+        return None
+    return NumberedFranchise(seed=seed, index=index, numbering="index")
+
+
 __all__ = [
     "ALL_PREFIX",
     "BARE_SERIES_ALL",
@@ -216,8 +371,10 @@ __all__ = [
     "TITLE_ALL_SUFFIX",
     "WHOLE_OF",
     "YEAR_PAREN",
+    "NumberedFranchise",
     "clean_title_bits",
     "extract_exclusion",
+    "extract_numbered_franchise",
     "is_known_franchise",
     "normalize_franchise_seed",
     "series_seed",

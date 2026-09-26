@@ -22,8 +22,9 @@ Three invariants hold everywhere:
    unparseable answer set all return ``allow``. A house that cannot reach its
    gate behaves exactly like a house without one.
 3. **Shadow never changes behavior.** ``HEARTH_JEV_SHADOW=true`` still computes
-   and logs the decision it *would* have taken, so enforcement can be reviewed
-   from logs before it is switched on.
+   and logs the decision it *would* have taken and does not take it. VAULT
+   compose sets shadow false so those decisions are taken; set true only while
+   tuning.
 """
 
 from __future__ import annotations

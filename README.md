@@ -120,8 +120,8 @@ Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/au
 | `HEARTH_COS_WEBHOOK_KEY` | Optional. Sent as `Authorization: Bearer <key>`. |
 | `HEARTH_COS_REPO` | Default `RubenVroman/Hearth`. |
 | `TYPESAFE_API_KEY` | TypeSafe Jev (System One) — the tool-calling gate. Host `.env` only — never log. Without it Jev is a no-op and every path fails open. See [docs/jev.md](docs/jev.md). |
-| `HEARTH_JEV_ENABLED` | Default `true`. One typed System One call per turn decides every tool call in that turn. |
-| `HEARTH_JEV_SHADOW` | Default `true`. Log the allow/deny/confirm decision Jev *would* have taken without taking it. Set `false` only after reviewing `jev.tool_gate` logs. |
+| `HEARTH_JEV_ENABLED` | VAULT: `true`. One typed System One call per turn decides every tool call in that turn. |
+| `HEARTH_JEV_SHADOW` | VAULT: `false` (enforce — fast, taken decisions). Set `true` only while tuning: log the allow/deny/confirm Jev would have taken without taking it. |
 | `HEARTH_JEV_TOOL_GATE` | Default `true`. Gate every `ToolRegistry.call()` plus the Telegram queue/play chokepoints. |
 | `HEARTH_JEV_ROUTE_LOCAL_TOOLS` | Default `true`. Let a confident `tool_lane` pick the tool in the local (no-OpenAI) router. |
 | `HEARTH_JEV_TIMEOUT_SECONDS` | Default `8`. Hard ceiling on one System One call, so a slow gate cannot stall a house turn. |
@@ -275,9 +275,10 @@ never stop it *answering*. Button taps and typed yeses are pre-authorized — th
 logs, but only hard stops can block something the user just pressed.
 
 Everything fails open: Jev off, no `TYPESAFE_API_KEY`, no state, an API error, or a timeout all
-run the tool with a reason in the log. Shadow mode (the default) computes and logs the decision
-it *would* have taken, so enforcement can be reviewed from `jev.tool_gate` lines first. Full
-threshold table, decision order, and ops runbook in [docs/jev.md](docs/jev.md).
+run the tool with a reason in the log. VAULT runs enforce (`HEARTH_JEV_ENABLED=true`,
+`HEARTH_JEV_SHADOW=false`), so the logged decision is the one that ran. Shadow
+(`HEARTH_JEV_SHADOW=true`) is for tuning: it logs the decision it *would* have taken and does
+not take it. Full threshold table, decision order, and ops runbook in [docs/jev.md](docs/jev.md).
 
 ## Health and readiness
 
@@ -582,8 +583,9 @@ A dedicated house Telegram group can control routine Home Assistant devices and 
    TELEGRAM_CHAT_IDS=-1001234567890
    # optional house-member allowlist:
    # TELEGRAM_USER_IDS=111,222
-   # Jev routes the media lanes and gates the queue button. On by default; add
-   # the key to switch it on for real (shadow keeps allow/deny advisory):
+   # Jev routes the media lanes and gates the queue. VAULT enforces
+   # (HEARTH_JEV_ENABLED=true, HEARTH_JEV_SHADOW=false). Set SHADOW=true only
+   # while tuning. Compose must pass TYPESAFE_API_KEY and HEARTH_JEV_*.
    # TYPESAFE_API_KEY=…
    # OPENAI_API_KEY=…         # vision, conversation, descriptive riddles / title Q&A
    ```

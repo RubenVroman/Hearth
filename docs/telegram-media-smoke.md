@@ -176,10 +176,11 @@ docker compose logs -f hearth | grep jev.tool_gate
 1. **One typed call per turn.** A single message that classifies a lane *and*
    runs several catalog reads must produce one `jev.gate` line, not one per
    lookup — the router hands its verdict to the gate.
-2. **Shadow changes nothing.** With `HEARTH_JEV_SHADOW=true` every
-   `jev.tool_gate` line still reports the `suggested` action it *would* have
-   taken while `action` stays `allow`. Flip `HEARTH_JEV_SHADOW=false` only after
-   those log lines look right.
+2. **VAULT enforces.** With `HEARTH_JEV_ENABLED=true` and `HEARTH_JEV_SHADOW=false`,
+   `action` on each `jev.tool_gate` line is the decision that ran. To tune without
+   taking those decisions, set `HEARTH_JEV_SHADOW=true`: `suggested` is what enforce
+   would have done and `action` stays `allow`. Set shadow back to `false` when the
+   lines look right.
 
 Fail-open is the point: stop TypeSafe, or clear `TYPESAFE_API_KEY`, and the bot
 must behave exactly as it did before the gate existed — every lane still

@@ -15,15 +15,17 @@ Jev is **not** an LLM and does not generate text. It returns typed **Choice / No
 
 **Fail open.** Jev off, no `TYPESAFE_API_KEY`, no user text to reason about, an API error, a timeout, or an unparseable answer set all return `allow` with `ok=false` and a reason in the log. A house that cannot reach its gate behaves exactly like a house without one. **Reads are never denied** except by a hard stop, so a misread gate can stop Hearth *acting* but never stop it *answering*.
 
-**Shadow never changes behavior.** In shadow mode the gate still computes and logs the decision it *would* have taken. `suggested` is the enforce decision; `action` is what actually happened. Review `jev.tool_gate` log lines before switching enforcement on.
+**Shadow never changes behavior.** In shadow mode the gate still computes and logs the decision it *would* have taken. `suggested` is the enforce decision; `action` is what actually happened. VAULT does not stay in shadow: it runs enforce. Turn shadow on only while tuning, and read `jev.tool_gate` while you do.
 
-## Defaults (magic on, safely)
+## Defaults (VAULT enforces)
+
+VAULT's host `.env` and `docker-compose.yml` set `HEARTH_JEV_ENABLED=true` and `HEARTH_JEV_SHADOW=false`. Jev's allow, deny, and confirm decisions are what the house runs. `HEARTH_JEV_SHADOW=true` is the tuning switch: the same decision is logged and not taken. Compose only injects listed variables, including `TYPESAFE_API_KEY` and every `HEARTH_JEV_*` key below. The in-process default for `HEARTH_JEV_SHADOW` is still shadow when that variable is absent, so a process that never received the VAULT env does not start denying writes.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TYPESAFE_API_KEY` | empty | Bearer key for `POST https://api.typesafe.ai/v1/systemone`. **Host VAULT `.env` only — never commit, never log.** |
 | `HEARTH_JEV_ENABLED` | `true` | Master switch. Without a key this is a no-op: nothing is called and every path fails open. |
-| `HEARTH_JEV_SHADOW` | `true` | Log the decision without taking it. Enforcement is a deliberate flip. |
+| `HEARTH_JEV_SHADOW` | `false` on VAULT | Enforce. Set `true` to shadow while tuning: log the decision, do not take it. |
 | `HEARTH_JEV_TOOL_GATE` | `true` | Gate every `ToolRegistry.call()` plus the Telegram queue/play chokepoints. |
 | `HEARTH_JEV_ROUTE_LOCAL_TOOLS` | `true` | Let a confident `tool_lane` pick the tool in the local (no-OpenAI) router. |
 | `HEARTH_JEV_TIMEOUT_SECONDS` | `8.0` | Hard ceiling on one System One call, transport included. |
@@ -136,8 +138,8 @@ The Telegram media question map does **not** include `butler_ask` or `domain`. S
 
 ## Shadow vs enforce
 
-- **Shadow** (`HEARTH_JEV_ENABLED=true`, `HEARTH_JEV_SHADOW=true`): cancel/confirm/CoS stay advisory (logged). Telegram **media_ask routing still applies** when confidence clears the media threshold — that is the product differentiator. Confident **butler_ask** choices still run `house_shelf` / `house_scene`.
-- **Enforce** (`HEARTH_JEV_SHADOW=false`): high-confidence cancel → do not run queue tools; high-confidence `escalate_cos` → Chief of Staff; API errors / low confidence → fail open.
+- **Enforce** (`HEARTH_JEV_ENABLED=true`, `HEARTH_JEV_SHADOW=false`) — VAULT's steady state. High-confidence cancel does not run queue tools; high-confidence `escalate_cos` goes to Chief of Staff; API errors and low confidence fail open. Telegram **media_ask** routing still applies when confidence clears the media threshold.
+- **Shadow** (`HEARTH_JEV_SHADOW=true`) — tuning only. Cancel/confirm/CoS stay advisory (logged). `media_ask` routing and confident **butler_ask** choices (`house_shelf` / `house_scene`) still run. Set this while adjusting thresholds, then return to `false`.
 - Telegram text media: Get or a pending-guess confirmation authorizes the queue. Image auto-requests use the configured picture-request policy and trusted caption, with one Jev scope for the resolved batch. Enforce-mode cancel/refuse/risk decisions remain authoritative.
 - Telegram house: shadow logs the intended HA tool; enforce blocks the tool on a high-confidence cancel/refuse verdict. API errors still fail open.
 ## State sent to Jev
@@ -163,13 +165,11 @@ No line ever contains the API key, a bot token, or tool argument *values*.
 
 ## Ops
 
-1. Put `TYPESAFE_API_KEY=…` in the VAULT host `.env` (same place as other secrets).
-2. Restart Hearth / recreate the container so settings reload.
+1. Put these in the VAULT host `.env` (same place as other secrets; never commit the key): `TYPESAFE_API_KEY=…`, `HEARTH_JEV_ENABLED=true`, `HEARTH_JEV_SHADOW=false`. Compose passes them in; an unlisted name never reaches the container.
+2. Recreate the Hearth container so the new environment is injected.
 3. Check `GET /readyz`. `checks.jev.active` should be `true` and `degraded` should no longer contain `jev:no_api_key`.
-4. Watch `jev.tool_gate` lines for a few days. Every one carries `suggested` — the decision enforce *would* have taken — alongside `action`. Look for suggested denies you disagree with.
-5. Tune `HEARTH_JEV_TOOL_ALLOW_THRESHOLD` and `HEARTH_JEV_TOOL_LANE_CONFIDENCE` if the suggestions are too eager.
-6. Set `HEARTH_JEV_SHADOW=false` to enforce. To keep the message gate advisory while still letting Jev route tools, leave shadow on — `media_ask` routing and `tool_lane` steering are first-class in shadow; only allow/deny/confirm waits for enforce.
-7. To turn the gate off without turning Jev off, set `HEARTH_JEV_TOOL_GATE=false`. To stop Jev steering the local router, set `HEARTH_JEV_ROUTE_LOCAL_TOOLS=false`.
+4. Watch `jev.tool_gate`. In enforce, `action` is the decision that ran. If a deny looks wrong, set `HEARTH_JEV_SHADOW=true`, recreate, and compare `suggested` with `action` (shadow leaves `action` as allow). Tune `HEARTH_JEV_TOOL_ALLOW_THRESHOLD` and `HEARTH_JEV_TOOL_LANE_CONFIDENCE`, then set `HEARTH_JEV_SHADOW=false` again.
+5. To turn the gate off without turning Jev off, set `HEARTH_JEV_TOOL_GATE=false`. To stop Jev steering the local router, set `HEARTH_JEV_ROUTE_LOCAL_TOOLS=false`.
 
 The client prefers the official `typesafe-sdk` (`AsyncTypeSafeClient`); if the package is missing, Hearth falls back to a thin httpx POST to System One. Both honour `HEARTH_JEV_TIMEOUT_SECONDS`, and `evaluate_message` wraps the call in a hard `asyncio.timeout` so an injected or SDK client without its own budget still cannot stall a turn.
 
