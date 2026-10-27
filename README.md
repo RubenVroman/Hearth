@@ -12,6 +12,7 @@ Hearth is meant to sit in Docker **next to** the existing stack (Plex, Sonarr, R
 | --- | --- |
 | Agent loop + tool registry | Whole-house HA inventory/control, receiver-centric Denon/LG/Apple TV activities, Infuse play on ATV, *arr/Overseerr grab/request, Telegram house bot, Plex now-playing + play-on-client, live `web_search`, Thuisbezorgd food order, workspace, docker inspect, Chief of Staff escalate |
 | `GET /` command center | Now playing, lights/scenes, transcript, agent status. Requires login. |
+| `GET /tv` | Living-room command center for the LG webOS set. Large type, D-pad focus. Login or `X-Hearth-Token` on the TV. |
 | `GET /login` | Email + password. House FastAPI auth (X-Auth-Token + HttpOnly refresh cookie). |
 | `POST /api/realtime/calls` | GA OpenAI Realtime over WebRTC (ChatGPT-app voice). Browser mic, barge-in, house tools on a sideband. |
 | `WS /ws/voice` | Text fallback only. Never the disabled beta Realtime websocket. |
@@ -70,7 +71,7 @@ Users live in SQLite at `HEARTH_AUTH_DB` (compose bind-mounts `./data`). House m
 
 `COOKIE_SECURE=true` is correct behind Tailscale HTTPS. Set `COOKIE_SECURE=false` only if you are hitting plain HTTP on the LAN.
 
-Public without a session: `/login`, `/auth/token`, `/auth/session/refresh`, `/auth/session/logout`, `/health`, static files needed to render login. Everything else (including `/` and `/api/status`) requires a session or `X-Hearth-Token`.
+Public without a session: `/login`, `/tv` (the TV HTML only), `/auth/token`, `/auth/session/refresh`, `/auth/session/logout`, `/health`, static files needed to render login. Everything else (including `/`, `/api/status`, and `/api/tv/*`) requires a session or `X-Hearth-Token`.
 
 ## Environment
 
@@ -568,6 +569,19 @@ curl -sS \
 
 Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve → the app). Do not document or use `:8443` / `:8787` in the UI. Do **not** enable Tailscale Funnel. Hearth stays Tailscale-only; bind the app to LAN/Tailscale (or localhost behind Serve), never a WAN port-forward.
 
+## LG webOS TV
+
+The living-room set (OLED65G1RLA, `192.168.2.19` / `lgwebostv.home`, webOS 6) gets a packaged web app that opens Hearth’s `/tv` route fullscreen. The IPK is a thin wrapper: it stores the Hearth origin and navigates to it. The dashboard, Denon controls, scene buttons, and app launches are served by Hearth and call the same house tools as chat.
+
+- Default address for the TV is the LAN origin `http://192.168.2.26:8787` (VAULT). Tailscale (`https://vault.taileff393.ts.net`) works only when the TV can actually route there. Do not port-forward `8787`.
+- Sign in with the house email and password, or save `HEARTH_TOKEN` on the TV as `X-Hearth-Token`. The token is kept in the TV’s local storage for the Hearth origin and is never put in the URL. Hearth still ignores `?token=`.
+- Plain HTTP on the LAN needs `COOKIE_SECURE=false` if you rely on the refresh cookie. A machine token does not need the cookie.
+- `HEARTH_BIND` must include the LAN (compose publishes `0.0.0.0` unless you override it). A Tailscale-only bind is unreachable from the TV.
+
+Launch tiles ask Home Assistant to `select_source` or to open Infuse. They do not play a title inside Netflix, Prime Video, or Videoland, and they do not modify those apps. Continue watching plays a Plex On Deck title through the existing Infuse deep link. Overseerr requests stay on chat and Telegram — the TV card says so instead of pretending there is a queue API.
+
+Packaging, Developer Mode, Homebrew Channel, and a 1920×1080 browser check are in [docs/webos.md](docs/webos.md).
+
 ## Telegram house bot
 
 A dedicated house Telegram group can control routine Home Assistant devices and search/request movies and series through **Overseerr**. Explicit house commands run through the same Jev decision gate and shared tool registry as chat; enforce-mode cancel/refuse verdicts stop the tool call. Media classification remains on its existing Jev-first path. Hearth shows ranked matches with signed **Get** buttons; pressing a button (or explicit yes on a single pending guess) requests that exact TMDB id — confirming never re-searches by title. Chat alone never queues. Radarr/Sonarr are observed only for progress on requests made by this bot.
@@ -668,5 +682,6 @@ After a deploy, walk [docs/telegram-media-smoke.md](docs/telegram-media-smoke.md
 | Chief of Staff webhook | Live when `HEARTH_COS_WEBHOOK` is set; otherwise explicit not-configured |
 | HA onboarding, TV/AVR pairing | Yours — service is included unconfigured |
 | Auth | Login (bcrypt + X-Auth-Token + HttpOnly refresh). Optional `HEARTH_TOKEN` for machines |
+| LG webOS `/tv` | Live UI + IPK wrapper. House buttons call existing HA/Plex/Infuse tools. Netflix/Prime/Videoland launch the app only. Overseerr queue on the TV is an explicit stub |
 | House memory | Live (SQLite + FTS5; optional OpenAI embeddings). Not deployed until this lands on VAULT |
 | SMB / public internet | Not exposed. Don’t add it. |

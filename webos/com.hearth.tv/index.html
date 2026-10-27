@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>Hearth</title>
+    <link rel="stylesheet" href="shell.css" />
+  </head>
+  <body>
+    <main class="sheet">
+      <p class="kicker">LG webOS · OLED65G1</p>
+      <h1>Open Hearth</h1>
+      <p class="lede">
+        This app only remembers the house address, then opens Hearth fullscreen.
+        Sign in, or paste a machine token, on the next screen. Nothing here is sent to the internet.
+      </p>
+      <label>
+        Hearth address
+        <input
+          id="base-url"
+          type="url"
+          inputmode="url"
+          spellcheck="false"
+          autocomplete="off"
+          data-tv-focus
+          value="http://192.168.2.26:8787"
+        />
+      </label>
+      <p class="fine" id="hint">
+        LAN default is VAULT at 192.168.2.26 port 8787. Tailscale works only if this TV can route there.
+        Do not put a token in the URL, and do not port-forward Hearth.
+      </p>
+      <div class="row">
+        <button type="button" id="open-btn" data-tv-focus>Open Hearth</button>
+        <button type="button" id="forget-btn" class="ghost" data-tv-focus>Forget address</button>
+      </div>
+      <p class="fine" id="error" role="alert"></p>
+    </main>
+    <script src="shell.js"></script>
+  </body>
+</html>

@@ -1,5 +1,5 @@
 /* Minimal shell cache. Documents and API stay on the network so the cookie session stays live. */
-const VERSION = "hearth-shell-v24";
+const VERSION = "hearth-shell-v25";
 const SHELL = [
   "/static/styles.css",
   "/static/app.js",
@@ -38,6 +38,8 @@ self.addEventListener("fetch", (event) => {
     url.pathname.startsWith("/ws/") ||
     url.pathname === "/" ||
     url.pathname === "/login" ||
+    url.pathname === "/tv" ||
+    url.pathname.startsWith("/static/tv/") ||
     url.pathname === "/sw.js"
   ) {
     return;

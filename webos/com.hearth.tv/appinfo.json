@@ -1,0 +1,16 @@
+{
+  "id": "com.hearth.tv",
+  "version": "1.0.0",
+  "vendor": "Hearth",
+  "type": "web",
+  "main": "index.html",
+  "title": "Hearth",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "bgColor": "#070604",
+  "iconColor": "#E08A3A",
+  "splashBackground": "#070604",
+  "disableBackHistoryAPI": true,
+  "handlesRelaunch": true,
+  "transparent": false
+}
