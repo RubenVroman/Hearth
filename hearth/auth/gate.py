@@ -20,6 +20,8 @@ PUBLIC_EXACT = {
     "/manifest.webmanifest",
     "/sw.js",
     "/apple-touch-icon.png",
+    # Living-room shell. The HTML has no secrets; /api/tv/* stays gated.
+    "/tv",
 }
 PUBLIC_PREFIXES = ("/static/",)
 

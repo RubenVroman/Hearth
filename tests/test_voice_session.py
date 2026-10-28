@@ -24,7 +24,7 @@ def test_live_transcription_is_removed_from_ui(client):
     assert "noteOverlayConversation(state.liveAssistantTranscript" in app_js
     assert "recoverConversation" in app_js
     sw = (UI / "sw.js").read_text(encoding="utf-8")
-    assert "hearth-shell-v24" in sw
+    assert "hearth-shell-v25" in sw
     assert "/static/spoken-answer.js" not in sw
 
 

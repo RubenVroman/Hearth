@@ -17,6 +17,7 @@ from hearth.auth.bootstrap import bootstrap_admin
 from hearth.auth.db import init_db
 from hearth.auth.gate import http_authorized, is_public_path, ws_authorized
 from hearth.auth.routers import auth_router
+from hearth.tv.router import tv_router
 from hearth.config import settings
 from hearth.jev import status_snapshot as jev_status_snapshot
 from hearth.jev import tool_turn
@@ -93,6 +94,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(tv_router)
 
 
 @app.middleware("http")

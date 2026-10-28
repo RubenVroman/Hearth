@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hearth — TV</title>
+    <meta name="theme-color" content="#070604" />
+    <meta name="color-scheme" content="dark" />
+    <link rel="stylesheet" href="/static/tv/tv.css?v=3" />
+  </head>
+  <body class="tv">
+    <header class="top">
+      <div class="brand">
+        <p class="mark">Hearth</p>
+        <p class="house" id="house-line">Living room</p>
+      </div>
+      <p id="toast" class="toast" role="status" aria-live="polite"></p>
+      <p class="pill" id="mode-pill">…</p>
+      <button type="button" class="ghost" id="setup-btn" data-tv-focus>Setup</button>
+    </header>
+
+    <main id="dashboard" class="board" hidden>
+      <section class="hero" aria-labelledby="now-kicker">
+        <p class="kicker" id="now-kicker">Now playing</p>
+        <h1 id="now-title">Nothing on</h1>
+        <p class="lede" id="now-meta"></p>
+        <div class="progress" id="now-progress" hidden>
+          <span id="now-progress-bar"></span>
+        </div>
+        <div class="transport" id="transport">
+          <button type="button" data-tv-focus data-kind="transport" data-id="play">Play</button>
+          <button type="button" data-tv-focus data-kind="transport" data-id="pause">Pause</button>
+          <button type="button" data-tv-focus data-kind="transport" data-id="stop">Stop</button>
+        </div>
+        <div class="players" id="players"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="volume-kicker">
+        <p class="kicker" id="volume-kicker">Denon</p>
+        <p class="volume-readout" id="volume-readout">Volume</p>
+        <div class="row">
+          <button type="button" data-tv-focus data-kind="volume" data-id="down">Quieter</button>
+          <button type="button" data-tv-focus data-kind="volume" data-id="mute" id="mute-btn">Mute</button>
+          <button type="button" data-tv-focus data-kind="volume" data-id="up">Louder</button>
+        </div>
+        <p class="fine" id="volume-note">Volume stays on the receiver.</p>
+      </section>
+
+      <section class="panel" aria-labelledby="house-kicker">
+        <p class="kicker" id="house-kicker">House</p>
+        <div class="row" id="activities"></div>
+        <div class="row" id="scenes"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="launch-kicker">
+        <p class="kicker" id="launch-kicker">Launch</p>
+        <p class="fine">Opens the app. Does not play a title inside Netflix, Prime, or Videoland.</p>
+        <div class="row" id="launches"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="shelf-kicker">
+        <p class="kicker" id="shelf-kicker">Continue in Infuse</p>
+        <div class="row shelf" id="shelf"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="requests-kicker">
+        <p class="kicker" id="requests-kicker">Requests</p>
+        <button type="button" class="wide" id="overseerr" data-tv-focus></button>
+      </section>
+    </main>
+
+    <section id="gate" class="overlay" hidden>
+      <form id="login-form" class="sheet" autocomplete="off">
+        <p class="kicker">Sign in</p>
+        <h1>Hearth on the TV</h1>
+        <p class="lede">LAN or Tailscale only. The password is not saved on this screen.</p>
+        <label>
+          Email
+          <input id="email" name="email" type="email" autocomplete="username" data-tv-focus required />
+        </label>
+        <label>
+          Password
+          <input id="password" name="password" type="password" autocomplete="current-password" data-tv-focus required />
+        </label>
+        <div class="row">
+          <button type="submit" data-tv-focus>Sign in</button>
+          <button type="button" class="ghost" id="gate-setup" data-tv-focus>Use a machine token</button>
+        </div>
+        <p class="fine" id="login-error" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="settings" class="overlay" hidden>
+      <div class="sheet">
+        <p class="kicker">This TV</p>
+        <h1>Reach Hearth</h1>
+        <p class="lede" id="origin-line"></p>
+        <label>
+          Hearth address
+          <input id="base-url" type="url" inputmode="url" spellcheck="false" autocomplete="off" data-tv-focus />
+        </label>
+        <p class="fine">
+          The webOS app remembers the address the icon opens. Back on the remote returns to that setup.
+          Opening another address here only moves this screen. No port-forward.
+        </p>
+        <label>
+          Machine token
+          <input id="machine-token" type="password" autocomplete="off" spellcheck="false" data-tv-focus placeholder="X-Hearth-Token, optional" />
+        </label>
+        <p class="fine" id="token-state">Not saved on this TV.</p>
+        <div class="row">
+          <button type="button" id="save-settings" data-tv-focus>Save</button>
+          <button type="button" class="ghost" id="clear-token" data-tv-focus>Clear token</button>
+          <button type="button" class="ghost" id="logout-btn" data-tv-focus>Log out</button>
+          <button type="button" class="ghost" id="close-settings" data-tv-focus>Close</button>
+        </div>
+      </div>
+    </section>
+
+    <script src="/static/tv/tv.js?v=3"></script>
+  </body>
+</html>
