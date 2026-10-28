@@ -571,7 +571,7 @@ Live URL for Hearth is **https://vault.taileff393.ts.net/** (Tailscale Serve →
 
 ## LG webOS TV
 
-The living-room set (OLED65G1RLA, `192.168.2.19` / `lgwebostv.home`, webOS 6) gets a packaged web app that opens Hearth’s `/tv` route fullscreen. The IPK is a thin wrapper: it stores the Hearth origin and navigates to it. The dashboard, Denon controls, scene buttons, and app launches are served by Hearth and call the same house tools as chat.
+The living-room set (OLED65G1RLA, `192.168.2.19` / `lgwebostv.home`, webOS 6) gets a packaged web app that opens Hearth’s `/tv` route fullscreen. The IPK is a thin wrapper: it stores the Hearth origin and navigates to it. The dashboard is a dark tvOS-style glass layout for the Magic Remote. Denon controls, scene buttons, and app launches are served by Hearth and call the same house tools as chat.
 
 - Default address for the TV is the LAN origin `http://192.168.2.26:8787` (VAULT). Tailscale (`https://vault.taileff393.ts.net`) works only when the TV can actually route there. Do not port-forward `8787`.
 - Sign in with the house email and password, or save `HEARTH_TOKEN` on the TV as `X-Hearth-Token`. The token is kept in the TV’s local storage for the Hearth origin and is never put in the URL. Hearth still ignores `?token=`.
