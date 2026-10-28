@@ -193,14 +193,61 @@ function el(tag, text, className) {
   return node;
 }
 
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "glyph");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", `#i-${name}`);
+  use.setAttributeNS("http://www.w3.org/1999/xlink", "href", `#i-${name}`);
+  svg.appendChild(use);
+  return svg;
+}
+
+function glyphFor(kind, id) {
+  if (kind === "transport") return id === "pause" || id === "stop" ? id : "play";
+  if (kind === "volume") {
+    if (id === "down") return "speaker-down";
+    if (id === "up") return "speaker-up";
+    return id === "unmute" ? "speaker-slash" : "speaker";
+  }
+  if (kind === "activity") {
+    if (id === "movie_night") return "moon";
+    if (id === "apple_tv") return "tv";
+    if (id === "tv") return "waveform";
+    if (id === "off") return "power";
+  }
+  if (kind === "scene") return "light";
+  if (kind === "launch") {
+    if (id === "infuse") return "play";
+    if (id === "videoland") return "film";
+    if (id === "netflix") return "app";
+    if (id === "prime") return "play-circle";
+  }
+  if (kind === "continue") return "play";
+  return "app";
+}
+
+function setIcon(button, name) {
+  const use = button.querySelector("use");
+  if (!use) return;
+  use.setAttribute("href", `#i-${name}`);
+  use.setAttributeNS("http://www.w3.org/1999/xlink", "href", `#i-${name}`);
+}
+
 function actionButton(label, hint, attrs) {
-  const button = el("button", label);
+  const button = el("button");
   button.type = "button";
   button.setAttribute("data-tv-focus", "");
   Object.entries(attrs).forEach(([key, value]) => {
     button.dataset[key] = value;
   });
-  if (hint) button.appendChild(el("small", hint));
+  button.appendChild(icon(glyphFor(attrs.kind, attrs.id)));
+  const copy = el("span", null, "copy");
+  copy.appendChild(el("span", label, "label"));
+  if (hint) copy.appendChild(el("small", hint));
+  button.appendChild(copy);
   return button;
 }
 
@@ -213,14 +260,17 @@ function renderPlayers(players) {
     ["apple_tv", "Apple TV"],
   ].forEach(([role, fallback]) => {
     const row = players[role] || {};
-    const card = el("p");
+    const card = el("p", null, "player");
+    const glyph = role === "avr" ? "speaker" : role === "apple_tv" ? "play" : "tv";
     const title = el("strong", row.name || fallback);
     const bits = [row.state || "unknown"];
     if (row.source) bits.push(String(row.source));
     if (row.media_title) bits.push(String(row.media_title));
     if (row.volume_pct != null) bits.push(`${row.volume_pct}%`);
     if (row.muted) bits.push("muted");
-    card.append(title, document.createTextNode(bits.join(" · ")));
+    const copy = el("span", null, "copy");
+    copy.append(title, document.createTextNode(bits.join(" · ")));
+    card.append(icon(glyph), copy);
     host.appendChild(card);
   });
 }
@@ -256,8 +306,11 @@ function renderBoard(next) {
   const avr = (next.players || {}).avr || {};
   const volume = avr.volume_pct == null ? "—" : `${avr.volume_pct}%`;
   $("volume-readout").textContent = avr.muted ? `${volume} muted` : volume;
-  $("mute-btn").dataset.id = avr.muted ? "unmute" : "mute";
-  $("mute-btn").firstChild.textContent = avr.muted ? "Unmute" : "Mute";
+  const mute = $("mute-btn");
+  const muted = Boolean(avr.muted);
+  mute.dataset.id = muted ? "unmute" : "mute";
+  mute.querySelector(".label").textContent = muted ? "Unmute" : "Mute";
+  setIcon(mute, muted ? "speaker-slash" : "speaker");
   const sources = next.avr_sources || {};
   $("volume-note").textContent = next.receiver_centric
     ? `Louder and quieter go to the Denon. Apple TV selects ${sources.apple_tv || "Media Player"}. TV Audio selects ${sources.tv || "TV Audio"}.`
@@ -313,7 +366,7 @@ function renderBoard(next) {
   });
 
   const requests = next.overseerr || {};
-  $("overseerr").textContent = requests.todo || "Requests are not on this screen.";
+  $("overseerr").querySelector(".label").textContent = requests.todo || "Requests are not on this screen.";
   focusIfLost("dashboard");
 }
 
@@ -467,7 +520,8 @@ $("logout-btn").addEventListener("click", async () => {
 });
 
 $("overseerr").addEventListener("click", () => {
-  const text = (board && board.overseerr && board.overseerr.todo) || $("overseerr").textContent;
+  const label = $("overseerr").querySelector(".label");
+  const text = (board && board.overseerr && board.overseerr.todo) || (label ? label.textContent : "");
   showToast(text, true);
 });
 

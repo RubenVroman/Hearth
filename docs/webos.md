@@ -46,7 +46,7 @@ Home Assistant still has to know the set. After pairing, `HA_TV_ENTITY` may diff
 
 ## Magic Remote
 
-The page is a 10-foot layout: large type, 88px controls, an ember focus ring on `:focus`.
+The page is a 10-foot layout: large type, 88px controls, an ember focus ring on `:focus`. The screen is dark tvOS-style glass — frosted panels, soft blur, and rounded tiles on a graphite field.
 
 - **Arrows** move focus. Left/right inside a text field move the caret.
 - **Enter / OK** activates the focused button. Pointer clicks work too; every control is a `<button>`.

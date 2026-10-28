@@ -46,6 +46,8 @@ def test_tv_page_is_public_and_remote_friendly():
     script = (UI / "tv.js").read_text(encoding="utf-8")
     assert "min-height: 88px" in css
     assert "outline: 4px solid" in css
+    assert "backdrop-filter:" in css
+    assert "-webkit-backdrop-filter:" in css
     assert "keyCode === 461" in script
     assert "X-Hearth-Token" in script
     assert "X-Auth-Token" in script
